@@ -160,6 +160,7 @@ func (s *Server) serveConn(
 	connStart time.Time,
 	authOpt authOptions,
 ) {
+	log.Info(ctx, "serveConn")
 	if log.V(2) {
 		log.Infof(ctx, "new connection with options: %+v", sArgs)
 	}
@@ -171,6 +172,7 @@ func (s *Server) serveConn(
 	}
 
 	// Do the reading of commands from the network.
+	log.Info(ctx,"Do the reading of commands from the network")
 	c.serveImpl(ctx, s.IsDraining, s.SQLServer, reserved, authOpt)
 }
 
@@ -280,6 +282,7 @@ func (c *conn) serveImpl(
 	reserved *mon.BoundAccount,
 	authOpt authOptions,
 ) {
+	log.Info(ctx,"serveImpl serveImpl \n continuously reads from the network connection and pushes execution\ninstructions into a sql.StmtBuf")
 	defer func() { _ = c.conn.Close() }()
 
 	if c.sessionArgs.User.IsRootUser() || c.sessionArgs.User.IsNodeUser() {
@@ -396,6 +399,7 @@ func (c *conn) serveImpl(
 	var authDone, ignoreUntilSync bool
 	var repeatedErrorCount int
 	for {
+		log.Info(ctx, "serveImpl loop for read")
 		breakLoop, isSimpleQuery, err := func() (bool, bool, error) {
 			typ, n, err := c.readBuf.ReadTypedMsg(&c.rd)
 			c.metrics.BytesInCount.Inc(int64(n))
@@ -632,6 +636,7 @@ func (c *conn) processCommandsAsync(
 	cancelConn func(),
 	onDefaultIntSizeChange func(newSize int32),
 ) <-chan error {
+	log.Info(ctx, "processCommandsAsync pgwire/conn.go")
 	// reservedOwned is true while we own reserved, false when we pass ownership
 	// away.
 	reservedOwned := true
@@ -724,6 +729,8 @@ func (c *conn) processCommandsAsync(
 		authOK = true
 
 		// Now actually process commands.
+		log.Info(ctx,"Now actually process commands.")
+		log.Info(ctx,"ServeConn invoke conn_executor.")
 		reservedOwned = false // We're about to pass ownership away.
 		retErr = sqlServer.ServeConn(ctx, connHandler, reserved, cancelConn)
 	}()
@@ -818,6 +825,7 @@ func (c *conn) handleSimpleQuery(
 	timeReceived time.Time,
 	unqualifiedIntSize *types.T,
 ) error {
+	log.Info(ctx, "=== handle simple query === ")
 	query, err := buf.GetString()
 	if err != nil {
 		return c.stmtBuf.Push(ctx, sql.SendError{Err: err})
@@ -832,6 +840,7 @@ func (c *conn) handleSimpleQuery(
 	endParse := timeutil.Now()
 
 	if len(stmts) == 0 {
+		log.Info(ctx, "=== push statbuf empty === ")
 		return c.stmtBuf.Push(
 			ctx, sql.ExecStmt{
 				Statement:    parser.Statement{},
@@ -877,7 +886,7 @@ func (c *conn) handleSimpleQuery(
 			copyDone.Wait()
 			return nil
 		}
-
+		log.Infof(ctx, "=== push statbuf stmts[i] === %v", stmts[i])
 		if err := c.stmtBuf.Push(
 			ctx,
 			sql.ExecStmt{

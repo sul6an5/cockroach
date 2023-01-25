@@ -212,6 +212,8 @@ func prepareInsertOrUpdateBatch(
 			if err := helper.checkRowSize(ctx, kvKey, kvValue, family.ID); err != nil {
 				return nil, err
 			}
+			//log.Infof(ctx,"kvKey %v", kvKey)
+			//log.Infof(ctx,"kvValue %v", kvValue)
 			putFn(ctx, batch, kvKey, kvValue, traceKV)
 		}
 

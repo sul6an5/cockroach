@@ -13,6 +13,7 @@ package workload
 import (
 	"context"
 	"fmt"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -105,6 +106,7 @@ func (sr *SQLRunner) Define(sql string) StmtHandle {
 func (sr *SQLRunner) Init(
 	ctx context.Context, name string, mcp *MultiConnPool, flags *ConnFlags,
 ) error {
+	log.Info(ctx,"SQLRunner --- >  Init")
 	if sr.initialized {
 		panic("already initialized")
 	}

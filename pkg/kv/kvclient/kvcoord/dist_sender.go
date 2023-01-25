@@ -111,7 +111,6 @@ var (
 	metaDistSenderSlowRPCs = metric.Metadata{
 		Name: "requests.slow.distsender",
 		Help: `Number of replica-bound RPCs currently stuck or retrying for a long time.
-
 Note that this is not a good signal for KV health. The remote side of the
 RPCs tracked here may experience contention, so an end user can easily
 cause values for this metric to be emitted by leaving a transaction open
@@ -122,7 +121,6 @@ for a long time and contending with it using a second transaction.`,
 	metaDistSenderMethodCountTmpl = metric.Metadata{
 		Name: "distsender.rpc.%s.sent",
 		Help: `Number of %s requests processed.
-
 This counts the requests in batches handed to DistSender, not the RPCs
 sent to individual Ranges as a result.`,
 		Measurement: "RPCs",
@@ -131,7 +129,6 @@ sent to individual Ranges as a result.`,
 	metaDistSenderErrCountTmpl = metric.Metadata{
 		Name: "distsender.rpc.err.%s",
 		Help: `Number of %s errors received replica-bound RPCs
-
 This counts how often error of the specified type was received back from replicas
 as part of executing possibly range-spanning requests. Failures to reach the target
 replica will be accounted for as 'roachpb.CommunicationErrType' and unclassified
@@ -143,7 +140,6 @@ errors as 'roachpb.InternalErrType'.
 	metaDistSenderRangefeedTotalRanges = metric.Metadata{
 		Name: "distsender.rangefeed.total_ranges",
 		Help: `Number of ranges executing rangefeed
-
 This counts the number of ranges with an active rangefeed.
 `,
 		Measurement: "Ranges",
@@ -152,7 +148,6 @@ This counts the number of ranges with an active rangefeed.
 	metaDistSenderRangefeedCatchupRanges = metric.Metadata{
 		Name: "distsender.rangefeed.catchup_ranges",
 		Help: `Number of ranges in catchup mode
-
 This counts the number of ranges with an active rangefeed that are performing catchup scan.
 `,
 		Measurement: "Ranges",
@@ -827,8 +822,10 @@ func (ds *DistSender) Send(
 		// EndTxn request.
 		var withCommit, withParallelCommit bool
 		if etArg, ok := ba.GetArg(roachpb.EndTxn); ok {
+			log.Infof(ctx, "commt %v", etArg)
 			et := etArg.(*roachpb.EndTxnRequest)
 			withCommit = et.Commit
+			log.Infof(ctx, "withCommit %v", withCommit)
 			withParallelCommit = et.IsParallelCommit()
 		}
 

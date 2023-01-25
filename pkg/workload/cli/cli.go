@@ -23,6 +23,7 @@ import (
 // WorkloadCmd returns a new command that can serve as the root of the workload
 // command tree.
 func WorkloadCmd(userFacing bool) *cobra.Command {
+	fmt.Println("pkg/workload/cli/cli.go")
 	rootCmd := SetCmdDefaults(&cobra.Command{
 		Use:     `workload`,
 		Short:   `generators for data and query loads`,

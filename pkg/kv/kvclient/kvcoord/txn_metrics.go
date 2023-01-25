@@ -11,6 +11,8 @@
 package kvcoord
 
 import (
+	"context"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -291,4 +293,18 @@ func MakeTxnMetrics(histogramWindow time.Duration) TxnMetrics {
 		RollbacksFailed:                metric.NewCounter(metaRollbacksFailed),
 		AsyncRollbacksFailed:           metric.NewCounter(metaAsyncRollbacksFailed),
 	}
+}
+func (mc *TxnMetrics) GetEva(ctx context.Context) {
+	log.Info(ctx,"----GetEva-------")
+	log.Infof(ctx,"CommitWaits: %v", mc.CommitWaits.Count())
+	log.Infof(ctx,"Commits: %v", mc.Commits.Count())
+	log.Infof(ctx,"Commits1PC: %v", mc.Commits1PC.Count())
+	log.Infof(ctx,"ParallelCommits: %v", mc.ParallelCommits.Count())
+	log.Infof(ctx,"Aborts: %v", mc.Aborts.Count())
+	log.Infof(ctx,"AsyncRollbacksFailed: %v", mc.AsyncRollbacksFailed.Count())
+	log.Info(ctx,"---------------")
+
+}
+func (mc *TxnMetrics) GetCW() *metric.Counter{
+	return mc.CommitWaits
 }

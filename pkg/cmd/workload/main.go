@@ -11,6 +11,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/workloadccl/allccl" // init hooks
@@ -19,6 +20,7 @@ import (
 )
 
 func main() {
+	fmt.Println("pkg/cmd/workload/main.go")
 	if err := workloadcli.WorkloadCmd(false /* userFacing */).Execute(); err != nil {
 		// Cobra has already printed the error message.
 		os.Exit(1)

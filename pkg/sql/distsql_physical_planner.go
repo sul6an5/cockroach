@@ -822,7 +822,10 @@ func (p *PlanningCtx) EvalContext() *eval.Context {
 func (p *PlanningCtx) IsLocal() bool {
 	return p.isLocal
 }
-
+// how many phsical plan
+func (p *PlanningCtx) CountofPL() int {
+	return p.planDepth
+}
 // getDefaultSaveFlowsFunc returns the default function used to save physical
 // plans and their diagrams.
 func (p *PlanningCtx) getDefaultSaveFlowsFunc(
@@ -3103,6 +3106,7 @@ func (dsp *DistSQLPlanner) planJoiners(
 func (dsp *DistSQLPlanner) createPhysPlan(
 	ctx context.Context, planCtx *PlanningCtx, plan planMaybePhysical,
 ) (physPlan *PhysicalPlan, cleanup func(), err error) {
+	log.Info(ctx,"createPhysPlan")
 	if plan.isPhysicalPlan() {
 		// TODO(yuzefovich): figure out how to propagate
 		// planCtx.getCleanupFunc() from the experimental DistSQL spec factory.
@@ -3116,10 +3120,11 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 	ctx context.Context, planCtx *PlanningCtx, node planNode,
 ) (plan *PhysicalPlan, err error) {
 	planCtx.planDepth++
-
+	log.Infof(ctx, "planDepth %v", planCtx.CountofPL)
 	switch n := node.(type) {
 	// Keep these cases alphabetized, please!
 	case *createStatsNode:
+		log.Info(ctx, "createStatsNode")
 		if n.runAsJob {
 			plan, err = dsp.wrapPlan(ctx, planCtx, n, false /* allowPartialDistribution */)
 		} else {
@@ -3134,12 +3139,15 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 
 	case *distinctNode:
+		log.Info(ctx, "distinctNode")
 		plan, err = dsp.createPlanForDistinct(ctx, planCtx, n)
 
 	case *exportNode:
+		log.Info(ctx, "exportNode")
 		plan, err = dsp.createPlanForExport(ctx, planCtx, n)
 
 	case *filterNode:
+		log.Info(ctx, "filterNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source.plan)
 		if err != nil {
 			return nil, err
@@ -3150,6 +3158,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 
 	case *groupNode:
+		log.Info(ctx, "groupNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
 		if err != nil {
 			return nil, err
@@ -3160,18 +3169,23 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 
 	case *indexJoinNode:
+		log.Info(ctx, "indexJoinNode")
 		plan, err = dsp.createPlanForIndexJoin(ctx, planCtx, n)
 
 	case *invertedFilterNode:
+		log.Info(ctx, "invertedFilterNode")
 		plan, err = dsp.createPlanForInvertedFilter(ctx, planCtx, n)
 
 	case *invertedJoinNode:
+		log.Info(ctx, "invertedJoinNode")
 		plan, err = dsp.createPlanForInvertedJoin(ctx, planCtx, n)
 
 	case *joinNode:
+		log.Info(ctx, "joinNode")
 		plan, err = dsp.createPlanForJoin(ctx, planCtx, n)
 
 	case *limitNode:
+		log.Info(ctx, "limitNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
 		if err != nil {
 			return nil, err
@@ -3185,15 +3199,19 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 
 	case *lookupJoinNode:
+		log.Info(ctx, "lookupJoinNode")
 		plan, err = dsp.createPlanForLookupJoin(ctx, planCtx, n)
 
 	case *ordinalityNode:
+		log.Info(ctx, "ordinalityNode")
 		plan, err = dsp.createPlanForOrdinality(ctx, planCtx, n)
 
 	case *projectSetNode:
+		log.Info(ctx, "projectSetNode")
 		plan, err = dsp.createPlanForProjectSet(ctx, planCtx, n)
 
 	case *renderNode:
+		log.Info(ctx, "renderNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source.plan)
 		if err != nil {
 			return nil, err
@@ -3204,9 +3222,11 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 
 	case *scanNode:
+		log.Info(ctx, "scanNode")
 		plan, err = dsp.createTableReaders(ctx, planCtx, n)
 
 	case *sortNode:
+		log.Info(ctx, "sortNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
 		if err != nil {
 			return nil, err
@@ -3215,6 +3235,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		dsp.addSorters(plan, n.ordering, n.alreadyOrderedPrefix, 0 /* limit */)
 
 	case *topKNode:
+		log.Info(ctx, "topKNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
 		if err != nil {
 			return nil, err
@@ -3226,12 +3247,15 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		dsp.addSorters(plan, n.ordering, n.alreadyOrderedPrefix, n.k)
 
 	case *unaryNode:
+		log.Info(ctx, "unaryNode")
 		plan, err = dsp.createPlanForUnary(planCtx, n)
 
 	case *unionNode:
+		log.Info(ctx, "unionNode")
 		plan, err = dsp.createPlanForSetOp(ctx, planCtx, n)
 
 	case *valuesNode:
+		log.Info(ctx, "valuesNode")
 		if mustWrapValuesNode(planCtx, n.specifiedInQuery) {
 			plan, err = dsp.wrapPlan(ctx, planCtx, n, false /* allowPartialDistribution */)
 		} else {
@@ -3245,15 +3269,19 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 
 	case *windowNode:
+		log.Info(ctx, "windowNode")
 		plan, err = dsp.createPlanForWindow(ctx, planCtx, n)
 
 	case *zeroNode:
+		log.Info(ctx, "zeroNode")
 		plan, err = dsp.createPlanForZero(planCtx, n)
 
 	case *zigzagJoinNode:
+		log.Info(ctx, "zigzagJoinNode")
 		plan, err = dsp.createPlanForZigzagJoin(planCtx, n)
 
 	default:
+		log.Info(ctx, "default")
 		// Can't handle a node? We wrap it and continue on our way.
 		plan, err = dsp.wrapPlan(ctx, planCtx, n, false /* allowPartialDistribution */)
 	}
@@ -3265,6 +3293,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 	if planCtx.traceMetadata != nil {
 		processors := make(execComponents, len(plan.ResultRouters))
 		for i, resultProcIdx := range plan.ResultRouters {
+			log.Infof(ctx, "processors[i] %v" ,processors[i])
 			processors[i] = execinfrapb.ProcessorComponentID(
 				plan.Processors[resultProcIdx].SQLInstanceID,
 				execinfrapb.FlowID{UUID: planCtx.infra.FlowID},
@@ -3273,7 +3302,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 		planCtx.traceMetadata.associateNodeWithComponents(node, processors)
 	}
-
+	log.Infof(ctx, "plan %v", plan)
 	return plan, err
 }
 
@@ -4355,5 +4384,6 @@ func (dsp *DistSQLPlanner) finalizePlanWithRowCount(
 	// Assign processor IDs.
 	for i := range plan.Processors {
 		plan.Processors[i].Spec.ProcessorID = int32(i)
+		//println("processor id[%d]", i)
 	}
 }

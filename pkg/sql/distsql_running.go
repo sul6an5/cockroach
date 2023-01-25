@@ -371,6 +371,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 	statementSQL string,
 ) (context.Context, flowinfra.Flow, execopnode.OpChains, error) {
 	thisNodeID := dsp.gatewaySQLInstanceID
+	log.Infof(ctx, "thisNodeID %v",thisNodeID)
 	_, ok := flows[thisNodeID]
 	if !ok {
 		return nil, nil, nil, errors.AssertionFailedf("missing gateway flow")
@@ -431,6 +432,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 
 			// Send out a request to the workers; if no worker is available, run
 			// directly.
+			log.Info(ctx, "Send out a request to the workers; if no worker is available, run ")
 			select {
 			case dsp.runnerCoordinator.runnerChan <- runReq:
 			default:
@@ -495,6 +497,7 @@ func (dsp *DistSQLPlanner) Run(
 	evalCtx *extendedEvalContext,
 	finishedSetupFn func(),
 ) (cleanup func()) {
+	log.Info(ctx,"---------Run executes a physical plan \n DistSQLPlanner.Run----------")
 	cleanup = func() {}
 
 	flows := plan.GenerateFlowSpecs()
@@ -507,7 +510,6 @@ func (dsp *DistSQLPlanner) Run(
 		recv.SetError(errors.Errorf("expected to find gateway flow"))
 		return cleanup
 	}
-
 	var (
 		localState     distsql.LocalState
 		leafInputState *roachpb.LeafTxnInputState
@@ -545,6 +547,7 @@ func (dsp *DistSQLPlanner) Run(
 			// have decided to parallelize the scans. If that's the case, we
 			// will need to use the Leaf txn.
 			for _, flow := range flows {
+				log.Infof(ctx, "localState.Txn %v", localState.Txn)
 				localState.HasConcurrency = localState.HasConcurrency || execinfra.HasParallelProcessors(flow)
 			}
 		}
@@ -611,17 +614,23 @@ func (dsp *DistSQLPlanner) Run(
 
 	log.VEvent(ctx, 2, "running DistSQL plan")
 
+	log.Info(ctx,"running DistSQL plan")
+
+
+
 	dsp.distSQLSrv.ServerConfig.Metrics.QueryStart()
+	log.Infof(ctx,"running DistSQL plan %v", dsp.distSQLSrv.ServerConfig.Metrics.QueryStartPrint())
 	defer dsp.distSQLSrv.ServerConfig.Metrics.QueryStop()
 
 	recv.outputTypes = plan.GetResultTypes()
 	recv.contendedQueryMetric = dsp.distSQLSrv.Metrics.ContendedQueriesCount
-
 	if len(flows) == 1 {
 		// We ended up planning everything locally, regardless of whether we
 		// intended to distribute or not.
+		log.Info(ctx, "We ended up planning everything locally, regardless of whether we intended to distribute or not")
 		localState.IsLocal = true
 	} else {
+		log.Info(ctx, "else")
 		defer func() {
 			if recv.resultWriter.Err() != nil {
 				// The execution of this query encountered some error, so we
@@ -653,6 +662,7 @@ func (dsp *DistSQLPlanner) Run(
 	ctx, flow, opChains, err := dsp.setupFlows(
 		ctx, evalCtx, leafInputState, flows, recv, localState, planCtx.collectExecStats, statementSQL,
 	)
+	//log.Infof(ctx, "flow %v", flow)
 	// Make sure that the local flow is always cleaned up if it was created.
 	if flow != nil {
 		cleanup = func() {
@@ -1314,6 +1324,7 @@ func (dsp *DistSQLPlanner) PlanAndRunAll(
 	evalCtxFactory func() *extendedEvalContext,
 ) error {
 	if len(planner.curPlan.subqueryPlans) != 0 {
+		log.Info(ctx,"subqueryPlans")
 		// Create a separate memory account for the results of the subqueries.
 		// Note that we intentionally defer the closure of the account until we
 		// return from this method (after the main query is executed).
@@ -1593,9 +1604,11 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 	plan planMaybePhysical,
 	recv *DistSQLReceiver,
 ) (cleanup func()) {
+	log.Info(ctx,"PlanAndRun")
 	log.VEventf(ctx, 2, "creating DistSQL plan with isLocal=%v", planCtx.isLocal)
 
 	physPlan, physPlanCleanup, err := dsp.createPhysPlan(ctx, planCtx, plan)
+	log.Infof(ctx, "physPlan.PhysicalPlan = %v ", physPlan.PhysicalPlan)
 	if err != nil {
 		recv.SetError(err)
 		return func() {
@@ -1608,7 +1621,9 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 	}
 	dsp.finalizePlanWithRowCount(planCtx, physPlan, planCtx.planner.curPlan.mainRowCount)
 	recv.expectedRowsRead = int64(physPlan.TotalEstimatedScannedRows)
+	log.Infof(ctx, "----------------Run------------ Physical Plan")
 	runCleanup := dsp.Run(ctx, planCtx, txn, physPlan, recv, evalCtx, nil /* finishedSetupFn */)
+	//log.Infof(ctx, "txn %v " , txn)
 	return func() {
 		runCleanup()
 		physPlanCleanup()
@@ -1630,6 +1645,7 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 	plan *planComponents,
 	recv *DistSQLReceiver,
 ) bool {
+	log.Info(ctx,"PlanAndRunCascadesAndChecks")
 	if len(plan.cascades) == 0 && len(plan.checkPlans) == 0 {
 		return false
 	}

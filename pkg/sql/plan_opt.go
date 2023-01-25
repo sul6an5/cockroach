@@ -223,7 +223,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 // makeOptimizerPlan generates a plan using the cost-based optimizer.
 // On success, it populates p.curPlan.
 func (p *planner) makeOptimizerPlan(ctx context.Context) error {
-	ctx, sp := tracing.ChildSpan(ctx, "optimizer")
+	ctx, sp := tracing.ChildSpan(ctx, "optimizer cost-based")
 	defer sp.Finish()
 	p.curPlan.init(&p.stmt, &p.instrumentation)
 
@@ -233,15 +233,19 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	execMemo, err := opc.buildExecMemo(ctx)
 	if err != nil {
 		return err
+	}else{
+		log.Infof(ctx ,"Converting AST to memo = %v" , execMemo)
 	}
-
 	// Build the plan tree.
+	log.Info(ctx ,"-------- Build the plan tree ------")
 	if mode := p.SessionData().ExperimentalDistSQLPlanningMode; mode != sessiondatapb.ExperimentalDistSQLPlanningOff {
+		log.Info(ctx ,"-------- ExperimentalDistSQLPlanningMode ------")
 		planningMode := distSQLDefaultPlanning
 		// If this transaction has modified or created any types, it is not safe to
 		// distribute due to limitations around leasing descriptors modified in the
 		// current transaction.
 		if p.Descriptors().HasUncommittedTypes() {
+			log.Info(ctx ,"-------- HasUncommittedTypes ------")
 			planningMode = distSQLLocalOnlyPlanning
 		}
 		err := opc.runExecBuilder(
@@ -593,7 +597,7 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 		p.execCfg.QueryCache.Add(&p.queryCacheSession, &cachedData)
 		return memo, nil
 	}
-
+	log.Infof(ctx, "return f.Memo() %v", f.Memo())
 	return f.Memo(), nil
 }
 
@@ -684,6 +688,7 @@ func (opc *optPlanningCtx) runExecBuilder(
 	planTop.planComponents = *result
 	planTop.stmt = stmt
 	planTop.flags = opc.flags
+	//print("planTop %v", planTop)
 	if isDDL {
 		planTop.flags.Set(planFlagIsDDL)
 	}

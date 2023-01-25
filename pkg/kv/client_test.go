@@ -921,7 +921,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 		}
 		dbCtx.NodeID = base.NewSQLIDContainerForNode(&c)
 
-		db := kv.NewDBWithContext(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, dbCtx)
+		db := kv.NewDBWithContext(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, dbCtx,ctx)
 		return db
 	}
 

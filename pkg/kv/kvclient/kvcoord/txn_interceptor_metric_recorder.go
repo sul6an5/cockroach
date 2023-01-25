@@ -12,6 +12,7 @@ package kvcoord
 
 import (
 	"context"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -83,6 +84,7 @@ func (*txnMetricRecorder) rollbackToSavepointLocked(context.Context, savepoint) 
 
 // closeLocked is part of the txnInterceptor interface.
 func (m *txnMetricRecorder) closeLocked() {
+	ctx := context.Background()
 	if m.onePCCommit {
 		m.metrics.Commits1PC.Inc(1)
 	}
@@ -111,6 +113,8 @@ func (m *txnMetricRecorder) closeLocked() {
 	switch status {
 	case roachpb.ABORTED:
 		m.metrics.Aborts.Inc(1)
+		m.metrics.GetEva(ctx)
+		log.Info(ctx,"roachpb.ABORTED")
 	case roachpb.PENDING:
 		// NOTE(andrei): Getting a PENDING status here is possible when this
 		// interceptor is closed without a rollback ever succeeding.
@@ -120,9 +124,13 @@ func (m *txnMetricRecorder) closeLocked() {
 		// Record failed aborts separately as in this case EndTxn never succeeded
 		// which means intents are left for subsequent cleanup by reader.
 		m.metrics.RollbacksFailed.Inc(1)
+		m.metrics.GetEva(ctx)
+		log.Info(ctx,"roachpb.PENDING")
 	case roachpb.COMMITTED:
 		// Note that successful read-only txn are also counted as committed, even
 		// though they never had a txn record.
 		m.metrics.Commits.Inc(1)
+		m.metrics.GetEva(ctx)
+		log.Info(ctx,"roachpb.COMMITTED")
 	}
 }

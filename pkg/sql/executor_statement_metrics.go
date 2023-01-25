@@ -291,3 +291,7 @@ func getNodesFromPlanner(planner *planner) []int64 {
 
 	return nodes
 }
+
+func (Eng *EngineMetrics) GetValue(ctx context.Context){
+	log.Infof(ctx, "FullTableOrIndexScanCount %v", Eng.FullTableOrIndexScanCount.Counter)
+}

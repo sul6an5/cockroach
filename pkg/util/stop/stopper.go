@@ -348,6 +348,7 @@ func (s *Stopper) RunTaskWithErr(
 func (s *Stopper) RunAsyncTask(
 	ctx context.Context, taskName string, f func(context.Context),
 ) error {
+	log.Info(ctx,"RunAsyncTask")
 	return s.RunAsyncTaskEx(ctx,
 		TaskOpts{
 			TaskName:   taskName,

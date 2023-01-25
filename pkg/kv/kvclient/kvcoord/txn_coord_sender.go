@@ -474,6 +474,7 @@ func (tc *TxnCoordSender) finalizeNonLockingTxnLocked(
 func (tc *TxnCoordSender) Send(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
+	log.Info(ctx, "Send() in txn_coord_sender.go")
 	// NOTE: The locking here is unusual. Although it might look like it, we are
 	// NOT holding the lock continuously for the duration of the Send. We lock
 	// here, and unlock at the botton of the interceptor stack, in the
@@ -622,10 +623,12 @@ func (tc *TxnCoordSender) Send(
 // For more, see https://www.cockroachlabs.com/blog/consistency-model/ and
 // docs/RFCS/20200811_non_blocking_txns.md.
 func (tc *TxnCoordSender) maybeCommitWait(ctx context.Context, deferred bool) error {
+	log.Info(ctx,"maybeCommitWait TxnCoordSender")
 	if tc.mu.txn.Status != roachpb.COMMITTED {
 		log.Fatalf(ctx, "maybeCommitWait called when not committed")
 	}
 	if tc.mu.commitWaitDeferred && !deferred {
+		log.Info(ctx,"tc.mu.commitWaitDeferred && !deferred")
 		// If this is an automatic commit-wait call and the user of this
 		// transaction has opted to defer the commit-wait and handle it
 		// externally, there's nothing to do yet.
@@ -641,6 +644,7 @@ func (tc *TxnCoordSender) maybeCommitWait(ctx context.Context, deferred bool) er
 		waitUntil = waitUntil.Add(tc.clock.MaxOffset().Nanoseconds(), 0)
 	}
 	if waitUntil.LessEq(tc.clock.Now()) {
+		log.Info(ctx,"waitUntil.LessEq(tc.clock.Now())")
 		// No wait fast-path. This is the common case for most transactions. Only
 		// transactions who have their commit timestamp bumped into the future will
 		// need to wait.
@@ -665,6 +669,8 @@ func (tc *TxnCoordSender) maybeCommitWait(ctx context.Context, deferred bool) er
 	after := tc.clock.PhysicalTime()
 	log.VEventf(ctx, 2, "completed commit-wait sleep, took %s", after.Sub(before))
 	tc.metrics.CommitWaits.Inc(1)
+	log.Infof(ctx, "tc.metrics.CommitWaits %v", tc.metrics.GetCW())
+	tc.metrics.GetEva(ctx)
 	return nil
 }
 

@@ -11,12 +11,14 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
 )
 
 func main() {
+	fmt.Println("pkg/cmd/dev/main.go")
 	log.SetFlags(0)
 	log.SetPrefix("")
 

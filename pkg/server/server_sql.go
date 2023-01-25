@@ -1415,7 +1415,9 @@ func (s *SQLServer) startServeSQL(
 	pgL net.Listener,
 	socketFileCfg *string,
 ) error {
+	log.Info(ctx, "startServeSQL start lisenting ------ ")
 	log.Ops.Info(ctx, "serving sql connections")
+	log.Info(ctx, "serving sql connections")
 	// Start servicing SQL connections.
 
 	pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())

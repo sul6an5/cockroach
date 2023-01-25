@@ -415,6 +415,7 @@ func (buf *StmtBuf) Close() {
 //
 // An error is returned if the buffer has been closed.
 func (buf *StmtBuf) Push(ctx context.Context, cmd Command) error {
+	log.Infof(ctx,"Push adds a Command to the end of the buffer %v", cmd.command())
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
 	if buf.mu.closed {

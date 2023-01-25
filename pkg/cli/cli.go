@@ -49,6 +49,7 @@ import (
 // to be the body of an action package main `main` func elsewhere. It is
 // abstracted for reuse by duplicated `main` funcs in different distributions.
 func Main() {
+	fmt.Println("pkg/cli/cli.go")
 	// Seed the math/rand RNG from crypto/rand.
 	rand.Seed(randutil.NewPseudoSeed())
 
@@ -59,10 +60,13 @@ func Main() {
 	// We ignore the error in this lookup, because
 	// we want cobra to handle lookup errors with a verbose
 	// help message in Run() below.
+	fmt.Println("cockroachCmd find")
 	cmd, _, _ := cockroachCmd.Find(os.Args[1:])
 
+	fmt.Println("commandName path")
 	cmdName := commandName(cmd)
 
+	fmt.Println("doMain(cmd, cmdName)")
 	err := doMain(cmd, cmdName)
 	errCode := exit.Success()
 	if err != nil {

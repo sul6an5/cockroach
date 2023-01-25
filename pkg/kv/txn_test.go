@@ -169,7 +169,7 @@ func TestTransactionConfig(t *testing.T) {
 	dbCtx.UserPriority = 101
 	db := NewDBWithContext(
 		log.MakeTestingAmbientCtxWithNewTracer(),
-		newTestTxnFactory(nil), clock, dbCtx)
+		newTestTxnFactory(nil), clock, dbCtx,ctx)
 	for _, tc := range []struct {
 		label               string
 		txnCreator          func(context.Context, func(context.Context, *Txn) error) error

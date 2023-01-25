@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -182,6 +183,7 @@ func (ts *txnState) resetForNewSQLTxn(
 	tranCtx transitionCtx,
 	qualityOfService sessiondatapb.QoSLevel,
 ) (txnID uuid.UUID) {
+	log.Infof(connCtx, "resetForNewSQLTxn %v", txnType)
 	// Reset state vars to defaults.
 	ts.sqlTimestamp = sqlTimestamp
 	ts.isHistorical = false
@@ -236,6 +238,7 @@ func (ts *txnState) resetForNewSQLTxn(
 		ts.mu.txnStart = timeutil.Now()
 		ts.mu.autoRetryCounter = 0
 		ts.mu.autoRetryReason = nil
+		log.Infof(connCtx, "txnID %v", txnID)
 		return txnID
 	}()
 	if historicalTimestamp != nil {
@@ -246,7 +249,7 @@ func (ts *txnState) resetForNewSQLTxn(
 	if err := ts.setReadOnlyMode(readOnly); err != nil {
 		panic(err)
 	}
-
+	ts.getReadtxnState(connCtx)
 	return txnID
 }
 
@@ -511,4 +514,9 @@ func (ts *txnState) checkReadsAndWrites() error {
 			ts.mu.txn)
 	}
 	return nil
+}
+
+func (ts *txnState) getReadtxnState(connCtx context.Context) {
+	log.Infof(connCtx, "ts.mu.txn: %v\n, ts.mu.txnStart: %v\n, ts.mu.stmtCount: %v\n, ts.mu.autoRetryCounter: %v\n",
+		ts.mu.txn, ts.mu.txnStart, ts.mu.stmtCount, ts.mu.autoRetryCounter)
 }

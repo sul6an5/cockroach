@@ -12,6 +12,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
@@ -53,6 +54,7 @@ const (
 // specified, but only if the URL didn't already specify
 // application_name. It is prefixed with '$ ' to mark it as internal.
 func makeSQLClient(appName string, defaultMode defaultSQLDb) (clisqlclient.Conn, error) {
+	fmt.Println("cli/sql_client.go makeSQLClient()")
 	baseURL, err := cliCtx.makeClientConnURL()
 	if err != nil {
 		return nil, err

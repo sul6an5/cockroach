@@ -169,7 +169,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	if err := cfg.ValidateAddrs(context.Background()); err != nil {
 		return nil, err
 	}
-
 	st := cfg.Settings
 
 	if cfg.AmbientCtx.Tracer == nil {
@@ -212,7 +211,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	idContainer := base.NewSQLIDContainerForNode(nodeIDContainer)
 
 	ctx := cfg.AmbientCtx.AnnotateCtx(context.Background())
-
+	log.Info(ctx, "newserver that invoked from runStart pkg/server/server.go")
 	admissionOptions := admission.DefaultOptions
 	if opts, ok := cfg.TestingKnobs.AdmissionControl.(*admission.Options); ok {
 		admissionOptions.Override(opts)
@@ -402,7 +401,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	dbCtx := kv.DefaultDBContext(stopper)
 	dbCtx.NodeID = idContainer
 	dbCtx.Stopper = stopper
-	db := kv.NewDBWithContext(cfg.AmbientCtx, tcsFactory, clock, dbCtx)
+	db := kv.NewDBWithContext(cfg.AmbientCtx, tcsFactory, clock, dbCtx, ctx)
 	db.SQLKVResponseAdmissionQ = gcoords.Regular.GetWorkQueue(admission.SQLKVResponseWork)
 
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
@@ -923,6 +922,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		return nil, err
 	}
 
+	fmt.Println("return created server to runstart that contains all values sql server rpc server etc")
 	return lateBoundServer, err
 }
 
@@ -1407,6 +1407,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// provided.
 	advAddrU := util.NewUnresolvedAddr("tcp", s.cfg.AdvertiseAddr)
 
+	log.Info(ctx, "started gossip")
 	// We're going to need to start gossip before we spin up Node below.
 	s.gossip.Start(advAddrU, filtered)
 	log.Event(ctx, "started gossip")
@@ -1432,7 +1433,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
-
+	log.Info(ctx, "started node")
 	log.Event(ctx, "started node")
 	if err := s.startPersistingHLCUpperBound(ctx, hlcUpperBoundExists); err != nil {
 		return err
@@ -1642,6 +1643,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	publishPendingLossOfQuorumRecoveryEvents(ctx, s.node.stores, s.stopper)
 
 	log.Event(ctx, "server initialized")
+	log.Info(ctx, "server initialized")
 
 	// Begin recording time series data collected by the status monitor.
 	// This will perform the first write synchronously, which is now
@@ -1668,6 +1670,7 @@ func (s *Server) AcceptClients(ctx context.Context) error {
 	}
 
 	log.Event(ctx, "server ready")
+	log.Info(ctx, "server ready")
 	return nil
 }
 

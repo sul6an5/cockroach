@@ -350,7 +350,7 @@ func runStartJoin(cmd *cobra.Command, args []string) error {
 // will be set to 1 all zone configs (see initial_sql.go).
 func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnErr error) {
 	tBegin := timeutil.Now()
-
+	fmt.Println("the runStart command ===== %v", cmd)
 	// First things first: if the user wants background processing,
 	// relinquish the terminal ASAP by forking and exiting.
 	//
@@ -608,13 +608,14 @@ If problems persist, please see %s.`
 		if err := func() error {
 			// Instantiate the server.
 			var err error
+			log.Info(ctx,"=======start server server.NewServer ===========")
 			s, err = server.NewServer(serverCfg, stopper)
 			if err != nil {
 				return errors.Wrap(err, "failed to start server")
 			}
-
 			// Have we already received a signal to terminate? If so, just
 			// stop here.
+			log.Info(ctx,"======= server Created ===========")
 			serverStatusMu.Lock()
 			draining := serverStatusMu.draining
 			serverStatusMu.Unlock()
@@ -651,17 +652,20 @@ If problems persist, please see %s.`
 			// Run SQL for new clusters.
 			// TODO(knz): If/when we want auto-creation of an initial admin user,
 			// this can be achieved here.
+			log.Info(ctx, "run sql for new clusters")
 			if err := runInitialSQL(ctx, s, startSingleNode, "" /* adminUser */, "" /* adminPassword */); err != nil {
 				return err
 			}
 
 			// Now let SQL clients in.
+			log.Info(ctx, "AcceptClients")
 			if err := s.AcceptClients(ctx); err != nil {
 				return err
 			}
 
 			// Now inform the user that the server is running and tell the
 			// user about its run-time derived parameters.
+			log.Infof(ctx,"Now inform the user that the server is running")
 			return reportServerInfo(ctx, tBegin, &serverCfg, s.ClusterSettings(),
 				true /* isHostNode */, initialStart, uuid.UUID{} /* tenantClusterID */)
 		}(); err != nil {

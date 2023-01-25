@@ -168,6 +168,9 @@ func (m *DistSQLMetrics) QueryStart() {
 	m.QueriesActive.Inc(1)
 	m.QueriesTotal.Inc(1)
 }
+func (m *DistSQLMetrics) QueryStartPrint() int64{
+	return m.QueriesTotal.Count()
+}
 
 // QueryStop registers the end of a DistSQL query.
 func (m *DistSQLMetrics) QueryStop() {

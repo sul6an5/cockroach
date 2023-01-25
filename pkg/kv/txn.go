@@ -163,6 +163,7 @@ func NewTxnWithSteppingEnabled(
 	gatewayNodeID roachpb.NodeID,
 	qualityOfService sessiondatapb.QoSLevel,
 ) *Txn {
+	log.Info(ctx, "NewTxnWithSteppingEnabled called from sql/tx_state.go")
 	txn := NewTxnWithAdmissionControl(ctx, db, gatewayNodeID,
 		roachpb.AdmissionHeader_FROM_SQL, admissionpb.WorkPriority(qualityOfService))
 	_ = txn.ConfigureStepping(ctx, SteppingEnabled)
@@ -678,6 +679,7 @@ func (txn *Txn) commit(ctx context.Context) error {
 	// to reduce contention by releasing locks. In multi-tenant settings, it
 	// will be subject to admission control, and the zero CreateTime will give
 	// it preference within the tenant.
+	log.Info(ctx, "Txn commit")
 	et := endTxnReq(true, txn.deadline())
 	ba := roachpb.BatchRequest{Requests: et.unionArr[:]}
 	_, pErr := txn.Send(ctx, ba)

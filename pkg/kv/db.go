@@ -216,6 +216,7 @@ var _ Sender = &CrossRangeTxnWrapperSender{}
 func (s *CrossRangeTxnWrapperSender) Send(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
+	log.Infof(ctx, "CrossRangeTxnWrapperSender send")
 	if ba.Txn != nil {
 		log.Fatalf(ctx, "CrossRangeTxnWrapperSender can't handle transactional requests")
 	}
@@ -289,15 +290,17 @@ func (db *DB) Clock() *hlc.Clock {
 
 // NewDB returns a new DB.
 func NewDB(
-	actx log.AmbientContext, factory TxnSenderFactory, clock *hlc.Clock, stopper *stop.Stopper,
+	actx log.AmbientContext, factory TxnSenderFactory, clock *hlc.Clock, stopper *stop.Stopper, ctx1 context.Context,
 ) *DB {
-	return NewDBWithContext(actx, factory, clock, DefaultDBContext(stopper))
+	log.Info(ctx1, "NewDB in db.go")
+	return NewDBWithContext(actx, factory, clock, DefaultDBContext(stopper),ctx1)
 }
 
 // NewDBWithContext returns a new DB with the given parameters.
 func NewDBWithContext(
-	actx log.AmbientContext, factory TxnSenderFactory, clock *hlc.Clock, ctx DBContext,
+	actx log.AmbientContext, factory TxnSenderFactory, clock *hlc.Clock, ctx DBContext, ctx1 context.Context,
 ) *DB {
+	log.Info(ctx1,"NewDBWithContext DB")
 	if actx.Tracer == nil {
 		panic("no tracer set in AmbientCtx")
 	}
@@ -324,6 +327,7 @@ func NewDBWithContext(
 func (db *DB) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 	b := &Batch{}
 	b.Get(key)
+	log.Info(ctx,"Get DB")
 	return getOneRow(db.Run(ctx, b), b)
 }
 
@@ -377,6 +381,7 @@ func (db *DB) GetProtoTs(
 func (db *DB) Put(ctx context.Context, key, value interface{}) error {
 	b := &Batch{}
 	b.Put(key, value)
+	log.Info(ctx,"Put DB")
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -869,6 +874,7 @@ func (db *DB) Run(ctx context.Context, b *Batch) error {
 
 // NewTxn creates a new RootTxn.
 func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
+	log.Info(ctx, "db.NewTxn")
 	// Observed timestamps don't work with multi-tenancy. See:
 	//
 	// https://github.com/cockroachdb/cockroach/issues/48008

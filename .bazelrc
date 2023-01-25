@@ -99,3 +99,5 @@ build:simplestamp --stamp --workspace_status_command=./build/bazelutil/stamp.sh
 try-import %workspace%/.bazelrc.user
 
 # vi: ft=sh
+build --config=dev
+build --config nolintonbuild

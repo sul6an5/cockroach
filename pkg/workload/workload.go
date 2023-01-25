@@ -416,6 +416,7 @@ func Get(name string) (Meta, error) {
 
 // Registered returns all registered Generators.
 func Registered() []Meta {
+	fmt.Println("Registered() []Meta pkg/workload/workload.go")
 	gens := make([]Meta, 0, len(registered))
 	for _, gen := range registered {
 		gens = append(gens, gen)

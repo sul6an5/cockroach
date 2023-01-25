@@ -512,6 +512,7 @@ func makeServerMetrics(cfg *ExecutorConfig) ServerMetrics {
 
 // Start starts the Server's background processing.
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
+	log.Info(ctx,"Start in pkg/sql/conn_executor.go")
 	// Exclude SQL background processing from cost accounting and limiting.
 	// NOTE: Only exclude background processing that is not under user control.
 	// If a user can opt in/out of some aspect of background processing, then it
@@ -815,6 +816,7 @@ func (h ConnectionHandler) GetQueryCancelKey() pgwirecancel.BackendKeyData {
 func (s *Server) ServeConn(
 	ctx context.Context, h ConnectionHandler, reserved *mon.BoundAccount, cancel context.CancelFunc,
 ) error {
+	log.Info(ctx,"ServeConn serves a client connection by reading commands from the stmtBuf\n// embedded in the ConnHandler")
 	// Make sure to close the reserved account even if closeWrapper below
 	// panics: so we do it in a defer that is guaranteed to execute. We also
 	// cannot close it before closeWrapper since we need to close the internal
@@ -1817,6 +1819,8 @@ func (ex *connExecutor) run(
 	reserved *mon.BoundAccount,
 	onCancel context.CancelFunc,
 ) (err error) {
+	log.Infof(ctx,"run implements the run loop for a connExecutor. Commands are read one by one\n" +
+		"// from the input buffer; they are executed and the resulting state transitions\n// are performed.")
 	if !ex.activated {
 		ex.activate(ctx, parentMon, reserved)
 	}
@@ -1866,7 +1870,9 @@ var errDrainingComplete = fmt.Errorf("draining done. this is a good time to fini
 // complete (i.e. we received a DrainRequest - possibly previously - and the
 // connection is found to be idle).
 func (ex *connExecutor) execCmd() error {
+
 	ctx := ex.Ctx()
+	log.Info(ctx,"=========== Start execution execCmd() conn_executor.go ============")
 	cmd, pos, err := ex.stmtBuf.CurCmd()
 	if err != nil {
 		return err // err could be io.EOF
@@ -1880,12 +1886,14 @@ func (ex *connExecutor) execCmd() error {
 	var ev fsm.Event
 	var payload fsm.EventPayload
 	var res ResultBase
+
 	switch tcmd := cmd.(type) {
 	case ExecStmt:
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
-
+		log.Infof(ctx, "ExecStmt tcmd %v", tcmd)
+		log.Infof(ctx, "ExecStmt cmd %v", cmd)
 		// We use a closure for the body of the execution so as to
 		// guarantee that the full service time is captured below.
 		err := func() error {
@@ -1894,7 +1902,7 @@ func (ex *connExecutor) execCmd() error {
 				return nil
 			}
 			ex.curStmtAST = tcmd.AST
-
+			log.Infof(ctx,"ex.curStmtAST 1900 conn_executor.go %v", ex.curStmtAST)
 			stmtRes := ex.clientComm.CreateStatementResult(
 				tcmd.AST,
 				NeedRowDesc,
@@ -1916,9 +1924,12 @@ func (ex *connExecutor) execCmd() error {
 			// behavior from v21.2 and earlier.
 			implicitTxnForBatch := ex.sessionData().EnableImplicitTransactionForBatchStatements
 			canAutoCommit := ex.implicitTxn() && (tcmd.LastInBatch || !implicitTxnForBatch)
+			log.Info(ctx,"ex.execStmt")
 			ev, payload, err = ex.execStmt(
 				ctx, tcmd.Statement, nil /* prepared */, nil /* pinfo */, stmtRes, canAutoCommit,
 			)
+			//log.Infof(ctx, "ev.Event %v", ev.Event)
+			//log.Infof(ctx, "ev.payload %v", payload)
 			return err
 		}()
 		// Note: we write to ex.statsCollector.PhaseTimes, instead of ex.phaseTimes,
@@ -1927,12 +1938,15 @@ func (ex *connExecutor) execCmd() error {
 		// - ex.statsCollector merely contains a copy of the times, that
 		//   was created when the statement started executing (via the
 		//   Reset() method).
+
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
 		if err != nil {
 			return err
 		}
 
 	case ExecPortal:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"ExecPortal 1939 conn_executor.go")
 		// ExecPortal is handled like ExecStmt, except that the placeholder info
 		// is taken from the portal.
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
@@ -2015,25 +2029,37 @@ func (ex *connExecutor) execCmd() error {
 		}
 
 	case PrepareStmt:
+		log.Infof(ctx, "tcmd = %v", tcmd)
 		ex.curStmtAST = tcmd.AST
+		log.Infof(ctx,"PrepareStmt 2023 conn_executor.go %v", ex.curStmtAST)
 		res = ex.clientComm.CreatePrepareResult(pos)
 		stmtCtx := withStatement(ctx, ex.curStmtAST)
 		ev, payload = ex.execPrepare(stmtCtx, tcmd)
 	case DescribeStmt:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"DescribeStmt 2028 conn_executor.go")
 		descRes := ex.clientComm.CreateDescribeResult(pos)
 		res = descRes
 		ev, payload = ex.execDescribe(ctx, tcmd, descRes)
 	case BindStmt:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"BindStmt 2033 conn_executor.go")
 		res = ex.clientComm.CreateBindResult(pos)
 		ev, payload = ex.execBind(ctx, tcmd)
 	case DeletePreparedStmt:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"DeletePreparedStmt 2037 conn_executor.go")
 		res = ex.clientComm.CreateDeleteResult(pos)
 		ev, payload = ex.execDelPrepStmt(ctx, tcmd)
 	case SendError:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"SendError 2041 conn_executor.go")
 		res = ex.clientComm.CreateErrorResult(pos)
 		ev = eventNonRetriableErr{IsCommit: fsm.False}
 		payload = eventNonRetriableErrPayload{err: tcmd.Err}
 	case Sync:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"Sync 2046 conn_executor.go")
 		// The Postgres docs say: "At completion of each series of extended-query
 		// messages, the frontend should issue a Sync message. This parameterless
 		// message causes the backend to close the current transaction if it's not
@@ -2061,6 +2087,8 @@ func (ex *connExecutor) execCmd() error {
 			}
 		}
 	case CopyIn:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"CopyIn 2074 conn_executor.go")
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
@@ -2078,6 +2106,8 @@ func (ex *connExecutor) execCmd() error {
 			return err
 		}
 	case DrainRequest:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"DrainRequest 2092 conn_executor.go")
 		// We received a drain request. We terminate immediately if we're not in a
 		// transaction. If we are in a transaction, we'll finish as soon as a Sync
 		// command (i.e. the end of a batch) is processed outside of a
@@ -2088,9 +2118,13 @@ func (ex *connExecutor) execCmd() error {
 			return errDrainingComplete
 		}
 	case Flush:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"Flush 2103 conn_executor.go")
 		// Closing the res will flush the connection's buffer.
 		res = ex.clientComm.CreateFlushResult(pos)
 	default:
+		log.Infof(ctx, "tcmd = %v", tcmd)
+		log.Info(ctx,"default 2107 conn_executor.go")
 		panic(errors.AssertionFailedf("unsupported command type: %T", cmd))
 	}
 
@@ -2099,6 +2133,7 @@ func (ex *connExecutor) execCmd() error {
 	// If an event was generated, feed it to the state machine.
 	if ev != nil {
 		var err error
+		//log.Infof(ctx,"event was generated, feed it to the state machine %v", ev.Event)
 		advInfo, err = ex.txnStateTransitionsApplyWrapper(ev, payload, res, pos)
 		if err != nil {
 			return err
@@ -2106,6 +2141,7 @@ func (ex *connExecutor) execCmd() error {
 
 		// Massage the advancing for Sync, which is special.
 		if _, ok := cmd.(Sync); ok {
+			//log.Infof(ctx, "advInfo.code %v", advInfo.code)
 			switch advInfo.code {
 			case skipBatch:
 				// An error on Sync doesn't cause us to skip commands (and errors are
@@ -2131,6 +2167,7 @@ func (ex *connExecutor) execCmd() error {
 		ctx = ex.Ctx()
 	} else {
 		// If no event was generated synthesize an advance code.
+		//log.Infof(ctx,"event was not generated, no feed for the state machine %v", ev.Event)
 		advInfo = advanceInfo{code: advanceOne}
 	}
 
@@ -2138,6 +2175,7 @@ func (ex *connExecutor) execCmd() error {
 	// we're staying in place or rewinding - the statement will be executed
 	// again.
 	if advInfo.code != stayInPlace && advInfo.code != rewind {
+		log.Info(ctx, " stayInPlace")
 		// Close the result. In case of an execution error, the result might have
 		// its error set already or it might not.
 		resErr := res.Err()
@@ -2151,6 +2189,7 @@ func (ex *connExecutor) execCmd() error {
 		}
 		res.Close(ctx, stateToTxnStatusIndicator(ex.machine.CurState()))
 	} else {
+		log.Info(ctx, " close the result")
 		res.Discard()
 	}
 
@@ -2166,6 +2205,7 @@ func (ex *connExecutor) execCmd() error {
 		// command and only sends Syncs once it received some data. But we ignore
 		// flush commands (just like we ignore any other commands) when skipping
 		// to the next batch.
+		log.Info(ctx,"skipBatch")
 		if err := ex.clientComm.Flush(pos); err != nil {
 			return err
 		}
@@ -2183,6 +2223,7 @@ func (ex *connExecutor) execCmd() error {
 		advInfo.rewCap.rewindAndUnlock(ctx)
 	case stayInPlace:
 		// Nothing to do. The same statement will be executed again.
+		// log.Info(ctx,"stayinplace")
 	default:
 		panic(errors.AssertionFailedf("unexpected advance code: %s", advInfo.code))
 	}
@@ -2197,7 +2238,7 @@ func (ex *connExecutor) execCmd() error {
 	} else {
 		rewindCapability.close()
 	}
-
+	//log.Infof(ctx,"AfterExecCmd %v", cmd)
 	if ex.server.cfg.TestingKnobs.AfterExecCmd != nil {
 		ex.server.cfg.TestingKnobs.AfterExecCmd(ctx, cmd, ex.stmtBuf)
 	}
@@ -2226,17 +2267,20 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 	if _, ok := ex.machine.CurState().(stateOpen); !ok {
 		return nil
 	}
+	//log.Infof(ctx, "advInfo.txnEvent.eventType %v", advInfo.txnEvent.eventType)
 	if advInfo.txnEvent.eventType == txnStart ||
 		advInfo.txnEvent.eventType == txnRestart {
 		var nextPos CmdPos
 		switch advInfo.code {
 		case stayInPlace:
 			nextPos = pos
+			log.Info(ctx, "stayInPlace")
 		case advanceOne:
 			// Future rewinds will refer to the next position; the statement that
 			// started the transaction (i.e. BEGIN) will not be itself be executed
 			// again.
 			nextPos = pos + 1
+			log.Info(ctx, "advanceOne")
 		case rewind:
 			if advInfo.rewCap.rewindPos != ex.extraTxnState.txnRewindPos {
 				return errors.AssertionFailedf(
@@ -2244,9 +2288,11 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 					errors.Safe(advInfo.rewCap.rewindPos),
 					errors.Safe(ex.extraTxnState.txnRewindPos))
 			}
+			log.Info(ctx, "rewind")
 			// txnRewindPos stays unchanged.
 			return nil
 		default:
+			log.Info(ctx, "default")
 			return errors.AssertionFailedf(
 				"unexpected advance code when starting a txn: %s",
 				errors.Safe(advInfo.code))
@@ -2265,7 +2311,7 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 		// 2: BindStmt
 		// 3: ExecutePortal
 		// 4: Sync
-
+		log.Info(ctx, "Not txnStart and not txnRestart")
 		// Note that the current command cannot influence the rewind point if
 		// if the rewind point is not current set to the command's position
 		// (i.e. we don't do anything if txnRewindPos != pos).
@@ -2342,6 +2388,7 @@ func (ex *connExecutor) stmtDoesntNeedRetry(ast tree.Statement) bool {
 }
 
 func stateToTxnStatusIndicator(s fsm.State) TransactionStatusIndicator {
+	//fmt.Println("stateToTxnStatusIndicator conn_executor.go")
 	switch s.(type) {
 	case stateOpen:
 		return InTxnBlock
@@ -2925,7 +2972,6 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 			}
 		}
 	}
-
 	// Handle transaction events which cause updates to txnState.
 	switch advInfo.txnEvent.eventType {
 	case noEvent, txnUpgradeToExplicit:
@@ -3322,6 +3368,10 @@ func (ex *connExecutor) getDescIDGenerator() eval.DescIDGenerator {
 	return ex.server.cfg.DescIDGenerator
 }
 
+func (ex *connExecutor) getState() txnState{
+	return ex.state
+}
+
 // StatementCounters groups metrics for counting different types of
 // statements.
 type StatementCounters struct {
@@ -3490,6 +3540,26 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 	}
 }
 
+func (sc *StatementCounters) getMetrics(ctx context.Context){
+	log.Info(ctx, "================")
+	log.Infof(ctx, "SavepointCount %v ", sc.SavepointCount.Count())
+	log.Infof(ctx, "ReleaseSavepointCount %v ", sc.ReleaseSavepointCount.Count())
+	log.Infof(ctx, "TxnCommitCount %v ", sc.TxnCommitCount.Count())
+	log.Infof(ctx, "TxnRollbackCount %v ", sc.TxnRollbackCount.Count())
+	log.Infof(ctx, "SelectCount %v ", sc.SelectCount.Count())
+	log.Infof(ctx, "TxnBeginCount %v ", sc.TxnBeginCount.Count())
+	log.Infof(ctx, "InsertCount %v ", sc.InsertCount.Count())
+	log.Infof(ctx, "QueryCount %v ", sc.QueryCount.Count())
+	log.Infof(ctx, "CopyCount %v ", sc.CopyCount.Count())
+	log.Infof(ctx, "DdlCount %v ", sc.DdlCount.Count())
+	log.Infof(ctx, "DeleteCount %v ", sc.DeleteCount.Count())
+	log.Infof(ctx, "MiscCount %v ", sc.MiscCount.Count())
+	log.Infof(ctx, "ReleaseRestartSavepointCount %v ", sc.ReleaseRestartSavepointCount.Count())
+	log.Infof(ctx, "RollbackToRestartSavepointCount %v ", sc.RollbackToRestartSavepointCount.Count())
+	log.Infof(ctx, "RollbackToSavepointCount %v ", sc.RollbackToSavepointCount.Count())
+	log.Infof(ctx, "UpdateCount %v ", sc.UpdateCount.Count())
+	log.Info(ctx, "================")
+}
 // connExPrepStmtsAccessor is an implementation of preparedStatementsAccessor
 // that gives access to a connExecutor's prepared statements.
 type connExPrepStmtsAccessor struct {

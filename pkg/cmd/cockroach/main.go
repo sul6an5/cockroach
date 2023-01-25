@@ -16,6 +16,7 @@
 package main
 
 import (
+	"fmt"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl"        // ccl init hooks
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/cliccl" // cliccl init hooks
 	"github.com/cockroachdb/cockroach/pkg/cli"
@@ -23,5 +24,6 @@ import (
 )
 
 func main() {
+	fmt.Println("pkg/cmd/cockroach/main.go")
 	cli.Main()
 }

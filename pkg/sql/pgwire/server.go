@@ -329,7 +329,9 @@ func MakeServer(
 	parentMemoryMonitor *mon.BytesMonitor,
 	histogramWindow time.Duration,
 	executorConfig *sql.ExecutorConfig,
-) *Server {
+)*Server {
+	ctx2 := context.Background()
+	log.Info(ctx2,"server side of pgwire pkg/sql/pgwire/server.go")
 	server := &Server{
 		AmbientCtx: ambientCtx,
 		cfg:        cfg,
@@ -348,6 +350,7 @@ func MakeServer(
 		nil, /* maxHist */
 		0, noteworthySQLMemoryUsageBytes, st)
 	server.sqlMemoryPool.StartNoReserved(context.Background(), parentMemoryMonitor)
+	log.Infof(ctx2,"sql.NewServer")
 	server.SQLServer = sql.NewServer(executorConfig, server.sqlMemoryPool)
 
 	// TODO(knz,ben): Use a cluster setting for this.
@@ -411,6 +414,7 @@ func Match(rd io.Reader) bool {
 
 // Start makes the Server ready for serving connections.
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
+	fmt.Println("Start in pkg/sql/pgwire/server.go")
 	s.SQLServer.Start(ctx, stopper)
 }
 
@@ -723,6 +727,7 @@ func (s *Server) TestingEnableAuthLogging() {
 //
 // An error is returned if the initial handshake of the connection fails.
 func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType SocketType) (err error) {
+	log.Infof(ctx, "ServeConn created in server")
 	defer func() {
 		if err != nil {
 			s.metrics.ConnFailures.Inc(1)
