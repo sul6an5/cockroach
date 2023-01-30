@@ -21,6 +21,7 @@ sudo apt-get install git
 sudo apt-get install bash
 # install cmake
 sudo apt-get install cmake
+sudo apt-get upgrade cmake
 # install autoconf
 sudo apt-get install autoconf
 
