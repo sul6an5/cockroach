@@ -4,3 +4,4 @@ if [[ "" !=  "$PID" ]]; then
   kill -9 $PID
 fi
 rm -rf node*
+rm -rf tpcc-local*

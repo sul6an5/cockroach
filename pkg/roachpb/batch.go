@@ -132,7 +132,7 @@ func (ba BatchRequest) EarliestActiveTimestamp() hlc.Timestamp {
 
 // UpdateTxn updates the batch transaction from the supplied one in
 // a copy-on-write fashion, i.e. without mutating an existing
-// Transaction struct.
+// Transaction struƒct.
 func (ba *BatchRequest) UpdateTxn(o *Transaction) {
 	if o == nil {
 		return

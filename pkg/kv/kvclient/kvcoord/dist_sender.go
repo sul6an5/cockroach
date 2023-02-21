@@ -770,7 +770,7 @@ func (ds *DistSender) Send(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	ds.incrementBatchCounters(&ba)
-
+	log.Info(ctx, "DistSender")
 	// TODO(nvanbenschoten): This causes ba to escape to the heap. Either
 	// commit to passing BatchRequests by reference or return an updated
 	// value from this method instead.
@@ -822,18 +822,20 @@ func (ds *DistSender) Send(
 		// EndTxn request.
 		var withCommit, withParallelCommit bool
 		if etArg, ok := ba.GetArg(roachpb.EndTxn); ok {
-			log.Infof(ctx, "commt %v", etArg)
+			//log.Infof(ctx, "commt %v", etArg)
 			et := etArg.(*roachpb.EndTxnRequest)
 			withCommit = et.Commit
-			log.Infof(ctx, "withCommit %v", withCommit)
+			//log.Infof(ctx, "withCommit %v", withCommit)
 			withParallelCommit = et.IsParallelCommit()
 		}
 
 		var rpl *roachpb.BatchResponse
 		var pErr *roachpb.Error
 		if withParallelCommit {
+			log.Info(ctx, "withParallelCommit")
 			rpl, pErr = ds.divideAndSendParallelCommit(ctx, ba, rs, isReverse, 0 /* batchIdx */)
 		} else {
+			log.Info(ctx, "withCommit")
 			rpl, pErr = ds.divideAndSendBatchToRanges(ctx, ba, rs, isReverse, withCommit, 0 /* batchIdx */)
 		}
 
@@ -936,6 +938,7 @@ func (ds *DistSender) divideAndSendParallelCommit(
 	}
 	if swapIdx == -1 {
 		// No pre-commit QueryIntents. Nothing to split.
+		log.Infof(ctx, "divideAndSendBatchToRanges in divideAndSendParallelCommit swap -1")
 		return ds.divideAndSendBatchToRanges(ctx, ba, rs, isReverse, true /* withCommit */, batchIdx)
 	}
 
@@ -1357,97 +1360,116 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	// adjusted with the responses for the sub-batch. If a limit is exhausted, the
 	// loop breaks.
 	for ; ri.Valid(); ri.Seek(ctx, seekKey, scanDir) {
-		responseCh := make(chan response, 1)
-		responseChs = append(responseChs, responseCh)
+
+		//responseCh := make(chan response, 1)
+		//responseChs = append(responseChs, responseCh)
 
 		// Truncate the request to range descriptor.
 		curRangeRS, err := rs.Intersect(ri.Token().Desc())
 		if err != nil {
-			responseCh <- response{pErr: roachpb.NewError(err)}
+			log.Infof(ctx, "err %v", err)
+			//responseCh <- response{pErr: roachpb.NewError(err)}
 			return
 		}
+
 		curRangeBatch := ba
 		var positions []int
 		curRangeBatch.Requests, positions, seekKey, err = truncationHelper.Truncate(curRangeRS)
+
 		if len(positions) == 0 && err == nil {
 			// This shouldn't happen in the wild, but some tests exercise it.
 			err = errors.Newf("truncation resulted in empty batch on %s: %s", rs, ba)
 		}
 		if err != nil {
-			responseCh <- response{pErr: roachpb.NewError(err)}
+			log.Infof(ctx, "err %v", err)
 			return
 		}
+
+		for i, req := range curRangeBatch.Requests {
+
+			newBatch := curRangeBatch
+			newBatch.Requests = make([]roachpb.RequestUnion,0)
+			newBatch.Requests = append(newBatch.Requests, req)
+			log.Infof(ctx, "len(curRangeBatch.Requests) %", len(curRangeBatch.Requests))
+			var newpos []int
+			newPos1 := positions[i]
+			newpos = append(newpos,newPos1)
+			responseCh := make(chan response, 1)
+			responseChs = append(responseChs, responseCh)
+
+			lastRange := !ri.NeedAnother(rs)
+			// Send the next partial batch to the first range in the "rs" span.
+			// If we can reserve one of the limited goroutines available for parallel
+			// batch RPCs, send asynchronously.
+			if canParallelize && !lastRange && !ds.disableParallelBatches &&
+				ds.sendPartialBatchAsync(ctx, newBatch, rs, isReverse, withCommit, batchIdx, ri.Token(), responseCh, newpos) {
+				// Sent the batch asynchronously.
+			} else {
+				resp := ds.sendPartialBatch(
+					ctx, newBatch, rs, isReverse, withCommit, batchIdx, ri.Token(), newpos,
+				)
+				responseCh <- resp
+				if resp.pErr != nil {
+					return
+				}
+				// Update the transaction from the response. Note that this wouldn't happen
+				// on the asynchronous path, but if we have newer information it's good to
+				// use it.
+				if !lastRange {
+					ba.UpdateTxn(resp.reply.Txn)
+				}
+
+				mightStopEarly := ba.MaxSpanRequestKeys > 0 || ba.TargetBytes > 0 || ba.ReturnOnRangeBoundary
+				// Check whether we've received enough responses to exit query loop.
+				if mightStopEarly {
+					var replyKeys int64
+					var replyBytes int64
+					for _, r := range resp.reply.Responses {
+						h := r.GetInner().Header()
+						replyKeys += h.NumKeys
+						replyBytes += h.NumBytes
+						if h.ResumeSpan != nil {
+							couldHaveSkippedResponses = true
+							resumeReason = h.ResumeReason
+							return
+						}
+					}
+					// Update MaxSpanRequestKeys and TargetBytes, if applicable, since ba
+					// might be passed recursively to further divideAndSendBatchToRanges()
+					// calls.
+					if ba.MaxSpanRequestKeys > 0 {
+						ba.MaxSpanRequestKeys -= replyKeys
+						if ba.MaxSpanRequestKeys <= 0 {
+							couldHaveSkippedResponses = true
+							resumeReason = roachpb.RESUME_KEY_LIMIT
+							return
+						}
+					}
+					if ba.TargetBytes > 0 {
+						ba.TargetBytes -= replyBytes
+						if ba.TargetBytes <= 0 {
+							couldHaveSkippedResponses = true
+							resumeReason = roachpb.RESUME_BYTE_LIMIT
+							return
+						}
+					}
+					// If we hit a range boundary, return a partial result if requested. We
+					// do this after checking the limits, so that they take precedence.
+					if ba.Header.ReturnOnRangeBoundary && replyKeys > 0 && !lastRange {
+						couldHaveSkippedResponses = true
+						resumeReason = roachpb.RESUME_RANGE_BOUNDARY
+						return
+					}
+				}
+			}
+			batchIdx++
+		}
+		lastRange := !ri.NeedAnother(rs)
 		nextRS := rs
 		if scanDir == Ascending {
 			nextRS.Key = seekKey
 		} else {
 			nextRS.EndKey = seekKey
-		}
-
-		lastRange := !ri.NeedAnother(rs)
-		// Send the next partial batch to the first range in the "rs" span.
-		// If we can reserve one of the limited goroutines available for parallel
-		// batch RPCs, send asynchronously.
-		if canParallelize && !lastRange && !ds.disableParallelBatches &&
-			ds.sendPartialBatchAsync(ctx, curRangeBatch, rs, isReverse, withCommit, batchIdx, ri.Token(), responseCh, positions) {
-			// Sent the batch asynchronously.
-		} else {
-			resp := ds.sendPartialBatch(
-				ctx, curRangeBatch, rs, isReverse, withCommit, batchIdx, ri.Token(), positions,
-			)
-			responseCh <- resp
-			if resp.pErr != nil {
-				return
-			}
-			// Update the transaction from the response. Note that this wouldn't happen
-			// on the asynchronous path, but if we have newer information it's good to
-			// use it.
-			if !lastRange {
-				ba.UpdateTxn(resp.reply.Txn)
-			}
-
-			mightStopEarly := ba.MaxSpanRequestKeys > 0 || ba.TargetBytes > 0 || ba.ReturnOnRangeBoundary
-			// Check whether we've received enough responses to exit query loop.
-			if mightStopEarly {
-				var replyKeys int64
-				var replyBytes int64
-				for _, r := range resp.reply.Responses {
-					h := r.GetInner().Header()
-					replyKeys += h.NumKeys
-					replyBytes += h.NumBytes
-					if h.ResumeSpan != nil {
-						couldHaveSkippedResponses = true
-						resumeReason = h.ResumeReason
-						return
-					}
-				}
-				// Update MaxSpanRequestKeys and TargetBytes, if applicable, since ba
-				// might be passed recursively to further divideAndSendBatchToRanges()
-				// calls.
-				if ba.MaxSpanRequestKeys > 0 {
-					ba.MaxSpanRequestKeys -= replyKeys
-					if ba.MaxSpanRequestKeys <= 0 {
-						couldHaveSkippedResponses = true
-						resumeReason = roachpb.RESUME_KEY_LIMIT
-						return
-					}
-				}
-				if ba.TargetBytes > 0 {
-					ba.TargetBytes -= replyBytes
-					if ba.TargetBytes <= 0 {
-						couldHaveSkippedResponses = true
-						resumeReason = roachpb.RESUME_BYTE_LIMIT
-						return
-					}
-				}
-				// If we hit a range boundary, return a partial result if requested. We
-				// do this after checking the limits, so that they take precedence.
-				if ba.Header.ReturnOnRangeBoundary && replyKeys > 0 && !lastRange {
-					couldHaveSkippedResponses = true
-					resumeReason = roachpb.RESUME_RANGE_BOUNDARY
-					return
-				}
-			}
 		}
 
 		// The iteration is complete if the iterator's current range encompasses
@@ -1459,9 +1481,116 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 		if lastRange || !nextRS.Key.Less(nextRS.EndKey) {
 			return
 		}
-		batchIdx++
 		rs = nextRS
 	}
+
+	//for ; ri.Valid(); ri.Seek(ctx, seekKey, scanDir) {
+	//	responseCh := make(chan response, 1)
+	//	responseChs = append(responseChs, responseCh)
+	//
+	//	// Truncate the request to range descriptor.
+	//	curRangeRS, err := rs.Intersect(ri.Token().Desc())
+	//	if err != nil {
+	//		responseCh <- response{pErr: roachpb.NewError(err)}
+	//		return
+	//	}
+	//	curRangeBatch := ba
+	//	var positions []int
+	//	curRangeBatch.Requests, positions, seekKey, err = truncationHelper.Truncate(curRangeRS)
+	//	if len(positions) == 0 && err == nil {
+	//		// This shouldn't happen in the wild, but some tests exercise it.
+	//		err = errors.Newf("truncation resulted in empty batch on %s: %s", rs, ba)
+	//	}
+	//	if err != nil {
+	//		responseCh <- response{pErr: roachpb.NewError(err)}
+	//		return
+	//	}
+	//	nextRS := rs
+	//	if scanDir == Ascending {
+	//		nextRS.Key = seekKey
+	//	} else {
+	//		nextRS.EndKey = seekKey
+	//	}
+	//
+	//	lastRange := !ri.NeedAnother(rs)
+	//	// Send the next partial batch to the first range in the "rs" span.
+	//	// If we can reserve one of the limited goroutines available for parallel
+	//	// batch RPCs, send asynchronously.
+	//	if canParallelize && !lastRange && !ds.disableParallelBatches &&
+	//		ds.sendPartialBatchAsync(ctx, curRangeBatch, rs, isReverse, withCommit, batchIdx, ri.Token(), responseCh, positions) {
+	//		// Sent the batch asynchronously.
+	//	} else {
+	//		resp := ds.sendPartialBatch(
+	//			ctx, curRangeBatch, rs, isReverse, withCommit, batchIdx, ri.Token(), positions,
+	//		)
+	//		responseCh <- resp
+	//		if resp.pErr != nil {
+	//			return
+	//		}
+	//		// Update the transaction from the response. Note that this wouldn't happen
+	//		// on the asynchronous path, but if we have newer information it's good to
+	//		// use it.
+	//		if !lastRange {
+	//			ba.UpdateTxn(resp.reply.Txn)
+	//		}
+	//
+	//		mightStopEarly := ba.MaxSpanRequestKeys > 0 || ba.TargetBytes > 0 || ba.ReturnOnRangeBoundary
+	//		// Check whether we've received enough responses to exit query loop.
+	//		if mightStopEarly {
+	//			var replyKeys int64
+	//			var replyBytes int64
+	//			for _, r := range resp.reply.Responses {
+	//				h := r.GetInner().Header()
+	//				replyKeys += h.NumKeys
+	//				replyBytes += h.NumBytes
+	//				if h.ResumeSpan != nil {
+	//					couldHaveSkippedResponses = true
+	//					resumeReason = h.ResumeReason
+	//					return
+	//				}
+	//			}
+	//			// Update MaxSpanRequestKeys and TargetBytes, if applicable, since ba
+	//			// might be passed recursively to further divideAndSendBatchToRanges()
+	//			// calls.
+	//			if ba.MaxSpanRequestKeys > 0 {
+	//				ba.MaxSpanRequestKeys -= replyKeys
+	//				if ba.MaxSpanRequestKeys <= 0 {
+	//					couldHaveSkippedResponses = true
+	//					resumeReason = roachpb.RESUME_KEY_LIMIT
+	//					return
+	//				}
+	//			}
+	//			if ba.TargetBytes > 0 {
+	//				ba.TargetBytes -= replyBytes
+	//				if ba.TargetBytes <= 0 {
+	//					couldHaveSkippedResponses = true
+	//					resumeReason = roachpb.RESUME_BYTE_LIMIT
+	//					return
+	//				}
+	//			}
+	//			// If we hit a range boundary, return a partial result if requested. We
+	//			// do this after checking the limits, so that they take precedence.
+	//			if ba.Header.ReturnOnRangeBoundary && replyKeys > 0 && !lastRange {
+	//				couldHaveSkippedResponses = true
+	//				resumeReason = roachpb.RESUME_RANGE_BOUNDARY
+	//				return
+	//			}
+	//		}
+	//	}
+	//
+	//	// The iteration is complete if the iterator's current range encompasses
+	//	// the remaining span, OR if the next span has inverted. This can happen
+	//	// if this method is invoked re-entrantly due to ranges being split or
+	//	// merged. In that case the batch request has all the original requests
+	//	// but the span is a sub-span of the original, causing Truncate() to
+	//	// potentially return the next seek key which inverts the span.
+	//	if lastRange || !nextRS.Key.Less(nextRS.EndKey) {
+	//		return
+	//	}
+	//	batchIdx++
+	//	rs = nextRS
+	//}
+
 
 	// We've exited early. Return the range iterator error.
 	responseCh := make(chan response, 1)
@@ -1469,6 +1598,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	responseChs = append(responseChs, responseCh)
 	return
 }
+
 
 // sendPartialBatchAsync sends the partial batch asynchronously if
 // there aren't currently more than the allowed number of concurrent

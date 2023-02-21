@@ -524,6 +524,7 @@ func (b *batch) batchRequest(cfg *Config) roachpb.BatchRequest {
 	req := roachpb.BatchRequest{
 		// Preallocate the Requests slice.
 		Requests: make([]roachpb.RequestUnion, 0, len(b.reqs)),
+		//Requests: make([]roachpb.RequestUnion, 0, 1),
 	}
 	for _, r := range b.reqs {
 		req.Add(r.req)

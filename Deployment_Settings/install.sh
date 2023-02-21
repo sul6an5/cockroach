@@ -20,8 +20,13 @@ sudo apt-get install git
 # install bash
 sudo apt-get install bash
 # install cmake
-sudo apt-get install cmake
-sudo apt-get upgrade cmake
+wget 
+https://github.com/Kitware/CMake/releases/download/v3.20.0/cmake-3.20.0.tar.gz
+tar -zvxf cmake-3.20.0.tar.gz
+cd cmake-3.20.0
+./bootstrap
+make -j8
+cd ..
 # install autoconf
 sudo apt-get install autoconf
 

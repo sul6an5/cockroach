@@ -387,6 +387,57 @@ func (h *BatchTruncationHelper) Truncate(
 	return truncReqs, positions, seekKey, err
 }
 
+
+func (h *BatchTruncationHelper) TruncateReq(
+	rs roachpb.RSpan) ([]roachpb.RequestUnion, []int, roachpb.RKey, error) {
+	var truncReqs []roachpb.RequestUnion
+	var positions []int
+	var err error
+	if !h.foundLocalKey {
+		if h.scanDir == Ascending {
+			truncReqs, positions, err = h.truncateAsc(rs)
+		} else {
+			truncReqs, positions, err = h.truncateDesc(rs)
+		}
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if h.mustPreserveOrder {
+			truncReqs, positions = h.helper.restoreOrder(truncReqs, positions)
+		}
+	} else {
+		truncReqs, positions, err = truncateLegacy(h.requests, rs)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	// Only send the first request in the batch.
+	if len(truncReqs) > 0 {
+		truncReqs = truncReqs[:1]
+		positions = positions[:1]
+	}
+
+	var seekKey roachpb.RKey
+	if h.scanDir == Ascending {
+		// In next iteration, query next range.
+		// It's important that we use the EndKey of the current descriptor
+		// as opposed to the StartKey of the next one: if the former is stale,
+		// it's possible that the next range has since merged the subsequent
+		// one, and unless both descriptors are stale, the next descriptor's
+		// StartKey would move us to the beginning of the current range,
+		// resulting in a duplicate scan.
+		seekKey, err = h.next(rs.EndKey)
+	} else {
+		// In next iteration, query previous range.
+		// We use the StartKey of the current descriptor as opposed to the
+		// EndKey of the previous one since that doesn't have bugs when
+		// stale descriptors come into play.
+		seekKey, err = h.prev(rs.Key)
+	}
+	return truncReqs, positions, seekKey, err
+}
+
 // truncateAsc is the optimized strategy for Truncate() with the Ascending scan
 // direction when requests only use global keys.
 //
@@ -547,6 +598,75 @@ func (h *BatchTruncationHelper) truncateAsc(
 	}
 	return truncReqs, positions, nil
 }
+
+//func (h *BatchTruncationHelper) truncateAsc1(
+//	rsList []roachpb.RSpan,
+//) ([]roachpb.RequestUnion, []int, error) {
+//	var truncReqs []roachpb.RequestUnion
+//	var positions []int
+//	for i := h.startIdx; i < len(h.positions); i++ {
+//		pos := h.positions[i]
+//		if pos < 0 {
+//			// This request has already been fully processed, so there is no
+//			// need to look at it.
+//			continue
+//		}
+//		header := h.headers[i]
+//		processed := false
+//		for _, rs := range rsList {
+//			if header.EndKey.Less(rs.Key) {
+//				// This range ends before the request starts, so we can skip it.
+//				continue
+//			}
+//			if header.Key.Less(rs.EndKey) && !h.isRange[i] {
+//				// This is a point request, and the key is contained within this
+//				// range, so we include the request as is and mark it as "fully
+//				// processed".
+//				truncReqs = append(truncReqs, h.requests[i])
+//				positions = append(positions, pos)
+//				h.headers[i] = roachpb.RequestHeader{}
+//				h.positions[i] = -1
+//				processed = true
+//				break
+//			}
+//			if h.isRange[i] && header.Key.Less(rs.EndKey) && header.EndKey.Greater(rs.Key) {
+//				// We're dealing with a range-spanning request, and this range
+//				// overlaps with the request. We need to truncate the request to
+//				// fit within this range.
+//				inner := h.requests[i].GetInner()
+//				startKey := header.Key
+//				if startKey.Less(rs.Key) {
+//					startKey = rs.Key.AsRawKey()
+//				}
+//				endKey := header.EndKey
+//				if endKey.Greater(rs.EndKey) {
+//					endKey = rs.EndKey.AsRawKey()
+//				}
+//				newHeader := header
+//				newHeader.Key = startKey
+//				newHeader.EndKey = endKey
+//				shallowCopy := inner.ShallowCopy()
+//				shallowCopy.SetHeader(newHeader)
+//				truncReqs = append(truncReqs, roachpb.RequestUnion{})
+//				truncReqs[len(truncReqs)-1].MustSetInner(shallowCopy)
+//				positions = append(positions, pos)
+//				h.headers[i] = roachpb.RequestHeader{
+//					Key:    endKey,
+//					EndKey: header.EndKey,
+//				}
+//				processed = true
+//				break
+//			}
+//		}
+//		if !processed {
+//			// The request does not overlap with any of the provided ranges, so
+//			// we mark it as "fully processed".
+//			h.headers[i] = roachpb.RequestHeader{}
+//			h.positions[i] = -1
+//		}
+//	}
+//	return truncReqs, positions, nil
+//}
 
 // truncateDesc is the optimized strategy for Truncate() with the Descending
 // scan direction when requests only use global keys.
