@@ -356,7 +356,7 @@ CREATE TABLE pks (
 statement count 2
 INSERT INTO pks VALUES (1, 2, 3), (4, 5, 3)
 
-statement error duplicate key value violates unique constraint "i"\nDETAIL: Key \(k2,v\)=\(5,3\) already exists\.
+statement error duplicate key value violates unique constraint "i"\nDETAIL: Key \(k2, v\)=\(5, 3\) already exists\.
 UPDATE pks SET k2 = 5 where k1 = 1
 
 # Test updating only one of the columns of a multi-column primary key.
@@ -483,8 +483,8 @@ query T
 SELECT create_statement FROM [SHOW CREATE t29494]
 ----
 CREATE TABLE public.t29494 (
-   x INT8 NOT NULL,
-   CONSTRAINT t29494_pkey PRIMARY KEY (x ASC)
+  x INT8 NOT NULL,
+  CONSTRAINT t29494_pkey PRIMARY KEY (x ASC)
 )
 
 # Check that the new column is not usable in RETURNING

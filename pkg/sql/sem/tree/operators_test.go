@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/lib/pq/oid"
@@ -42,7 +42,7 @@ import (
 func TestOperatorVolatilityMatchesPostgres(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	csvPath := testutils.TestDataPath(t, "pg_operator_provolatile_dump.csv")
+	csvPath := datapathutils.TestDataPath(t, "pg_operator_provolatile_dump.csv")
 	f, err := os.Open(csvPath)
 	require.NoError(t, err)
 
@@ -137,25 +137,25 @@ func TestOperatorVolatilityMatchesPostgres(t *testing.T) {
 	// Check unary ops. We don't just go through the map so we process them in
 	// an orderly fashion.
 	for op := UnaryOperatorSymbol(0); op < NumUnaryOperatorSymbols; op++ {
-		for _, impl := range UnaryOps[op] {
-			o := impl.(*UnaryOp)
+		_ = UnaryOps[op].ForEachUnaryOp(func(o *UnaryOp) error {
 			check(op.String(), nil /* leftType */, o.Typ, o.Volatility)
-		}
+			return nil
+		})
 	}
 
 	// Check comparison ops.
 	for op := treecmp.ComparisonOperatorSymbol(0); op < treecmp.NumComparisonOperatorSymbols; op++ {
-		for _, impl := range CmpOps[op] {
-			o := impl.(*CmpOp)
+		_ = CmpOps[op].ForEachCmpOp(func(o *CmpOp) error {
 			check(op.String(), o.LeftType, o.RightType, o.Volatility)
-		}
+			return nil
+		})
 	}
 
 	// Check binary ops.
 	for op := treebin.BinaryOperatorSymbol(0); op < treebin.NumBinaryOperatorSymbols; op++ {
-		for _, impl := range BinOps[op] {
-			o := impl.(*BinOp)
+		_ = BinOps[op].ForEachBinOp(func(o *BinOp) error {
 			check(op.String(), o.LeftType, o.RightType, o.Volatility)
-		}
+			return nil
+		})
 	}
 }

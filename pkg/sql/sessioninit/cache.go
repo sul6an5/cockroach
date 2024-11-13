@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/password"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -24,13 +23,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
-	"github.com/cockroachdb/logtags"
 )
 
 // CacheEnabledSettingName is the name of the CacheEnabled cluster setting.
@@ -60,7 +57,7 @@ type Cache struct {
 	settingsCache map[SettingsCacheKey][]string
 	// populateCacheGroup is used to ensure that there is at most one in-flight
 	// request for populating each cache entry.
-	populateCacheGroup singleflight.Group
+	populateCacheGroup *singleflight.Group
 	stopper            *stop.Stopper
 }
 
@@ -68,10 +65,10 @@ type Cache struct {
 type AuthInfo struct {
 	// UserExists is set to true if the user has a row in system.users.
 	UserExists bool
-	// CanLoginSQL is set to false if the user has the NOLOGIN or NOSQLLOGIN role option.
-	CanLoginSQL bool
-	// CanLoginDBConsole is set to false if the user has NOLOGIN role option.
-	CanLoginDBConsole bool
+	// CanLoginSQLRoleOpt is set to false if the user has the NOLOGIN or NOSQLLOGIN role option.
+	CanLoginSQLRoleOpt bool
+	// CanLoginDBConsoleRoleOpt is set to false if the user has NOLOGIN role option.
+	CanLoginDBConsoleRoleOpt bool
 	// HashedPassword is the hashed password and can be nil.
 	HashedPassword password.PasswordHash
 	// ValidUntil is the VALID UNTIL role option.
@@ -94,8 +91,9 @@ type SettingsCacheEntry struct {
 // NewCache initializes a new sessioninit.Cache.
 func NewCache(account mon.BoundAccount, stopper *stop.Stopper) *Cache {
 	return &Cache{
-		boundAccount: account,
-		stopper:      stopper,
+		boundAccount:       account,
+		populateCacheGroup: singleflight.NewGroup("load-value", "key"),
+		stopper:            stopper,
 	}
 }
 
@@ -106,43 +104,28 @@ func NewCache(account mon.BoundAccount, stopper *stop.Stopper) *Cache {
 func (a *Cache) GetAuthInfo(
 	ctx context.Context,
 	settings *cluster.Settings,
-	ie sqlutil.InternalExecutor,
-	db *kv.DB,
-	f *descs.CollectionFactory,
+	db descs.DB,
 	username username.SQLUsername,
 	readFromSystemTables func(
 		ctx context.Context,
-		ie sqlutil.InternalExecutor,
+		db descs.DB,
 		username username.SQLUsername,
-		makePlanner func(opName string) (interface{}, func()),
-		settings *cluster.Settings,
 	) (AuthInfo, error),
-	makePlanner func(opName string) (interface{}, func()),
 ) (aInfo AuthInfo, err error) {
 	if !CacheEnabled.Get(&settings.SV) {
-		return readFromSystemTables(ctx, ie, username, makePlanner, settings)
+		return readFromSystemTables(ctx, db, username)
 	}
 
 	var usersTableDesc catalog.TableDescriptor
 	var roleOptionsTableDesc catalog.TableDescriptor
-	err = f.Txn(ctx, db, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+	err = db.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
 	) error {
-		_, usersTableDesc, err = descriptors.GetImmutableTableByName(
-			ctx,
-			txn,
-			UsersTableName,
-			tree.ObjectLookupFlagsWithRequired(),
-		)
+		_, usersTableDesc, err = descs.PrefixAndTable(ctx, txn.Descriptors().ByNameWithLeased(txn.KV()).Get(), UsersTableName)
 		if err != nil {
 			return err
 		}
-		_, roleOptionsTableDesc, err = descriptors.GetImmutableTableByName(
-			ctx,
-			txn,
-			RoleOptionsTableName,
-			tree.ObjectLookupFlagsWithRequired(),
-		)
+		_, roleOptionsTableDesc, err = descs.PrefixAndTable(ctx, txn.Descriptors().ByNameWithLeased(txn.KV()).Get(), RoleOptionsTableName)
 		return err
 	})
 	if err != nil {
@@ -167,7 +150,7 @@ func (a *Cache) GetAuthInfo(
 	val, err := a.loadValueOutsideOfCache(
 		ctx, fmt.Sprintf("authinfo-%s-%d-%d", username.Normalized(), usersTableVersion, roleOptionsTableVersion),
 		func(loadCtx context.Context) (interface{}, error) {
-			return readFromSystemTables(loadCtx, ie, username, makePlanner, settings)
+			return readFromSystemTables(loadCtx, db, username)
 		})
 	if err != nil {
 		return aInfo, err
@@ -210,25 +193,19 @@ func (a *Cache) readAuthInfoFromCache(
 func (a *Cache) loadValueOutsideOfCache(
 	ctx context.Context, requestKey string, fn func(loadCtx context.Context) (interface{}, error),
 ) (interface{}, error) {
-	ch, _ := a.populateCacheGroup.DoChan(requestKey, func() (interface{}, error) {
-		// Use a different context to fetch, so that it isn't possible for
-		// one query to timeout and cause all the goroutines that are waiting
-		// to get a timeout error.
-		loadCtx, cancel := a.stopper.WithCancelOnQuiesce(
-			logtags.WithTags(context.Background(), logtags.FromContext(ctx)),
-		)
-		defer cancel()
-		return fn(loadCtx)
-	})
-	select {
-	case res := <-ch:
-		if res.Err != nil {
-			return AuthInfo{}, res.Err
-		}
-		return res.Val, nil
-	case <-ctx.Done():
-		return AuthInfo{}, ctx.Err()
+	future, _ := a.populateCacheGroup.DoChan(ctx,
+		requestKey,
+		singleflight.DoOpts{
+			Stop:               a.stopper,
+			InheritCancelation: false,
+		},
+		fn,
+	)
+	res := future.WaitForResult(ctx)
+	if res.Err != nil {
+		return AuthInfo{}, res.Err
 	}
+	return res.Val, nil
 }
 
 // maybeWriteAuthInfoBackToCache tries to put the fetched AuthInfo into the
@@ -283,35 +260,28 @@ func (a *Cache) maybeWriteAuthInfoBackToCache(
 func (a *Cache) GetDefaultSettings(
 	ctx context.Context,
 	settings *cluster.Settings,
-	ie sqlutil.InternalExecutor,
-	db *kv.DB,
-	f *descs.CollectionFactory,
+	db descs.DB,
 	userName username.SQLUsername,
 	databaseName string,
 	readFromSystemTables func(
 		ctx context.Context,
-		ie sqlutil.InternalExecutor,
+		f descs.DB,
 		userName username.SQLUsername,
 		databaseID descpb.ID,
 	) ([]SettingsCacheEntry, error),
 ) (settingsEntries []SettingsCacheEntry, err error) {
 	var dbRoleSettingsTableDesc catalog.TableDescriptor
 	var databaseID descpb.ID
-	err = f.Txn(ctx, db, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+	err = db.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
 	) error {
-		_, dbRoleSettingsTableDesc, err = descriptors.GetImmutableTableByName(
-			ctx,
-			txn,
-			DatabaseRoleSettingsTableName,
-			tree.ObjectLookupFlagsWithRequired(),
-		)
+		_, dbRoleSettingsTableDesc, err = descs.PrefixAndTable(ctx, txn.Descriptors().ByNameWithLeased(txn.KV()).Get(), DatabaseRoleSettingsTableName)
 		if err != nil {
 			return err
 		}
 		databaseID = descpb.ID(0)
 		if databaseName != "" {
-			dbDesc, err := descriptors.GetImmutableDatabaseByName(ctx, txn, databaseName, tree.DatabaseLookupFlags{})
+			dbDesc, err := txn.Descriptors().ByNameWithLeased(txn.KV()).MaybeGet().Database(ctx, databaseName)
 			if err != nil {
 				return err
 			}
@@ -333,7 +303,7 @@ func (a *Cache) GetDefaultSettings(
 	if !CacheEnabled.Get(&settings.SV) {
 		settingsEntries, err = readFromSystemTables(
 			ctx,
-			ie,
+			db,
 			userName,
 			databaseID,
 		)
@@ -357,7 +327,7 @@ func (a *Cache) GetDefaultSettings(
 	val, err := a.loadValueOutsideOfCache(
 		ctx, fmt.Sprintf("defaultsettings-%s-%d-%d", userName.Normalized(), databaseID, dbRoleSettingsTableVersion),
 		func(loadCtx context.Context) (interface{}, error) {
-			return readFromSystemTables(loadCtx, ie, userName, databaseID)
+			return readFromSystemTables(loadCtx, db, userName, databaseID)
 		},
 	)
 	if err != nil {

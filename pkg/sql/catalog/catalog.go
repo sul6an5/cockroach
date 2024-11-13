@@ -29,6 +29,9 @@ type MutableDescriptor interface {
 	// descriptor should increment the version on the mutable copy from the
 	// outset.
 	MaybeIncrementVersion()
+	// ResetModificationTime zeroes the descriptor's modification time field.
+	// Only call this if you really know what you're doing.
+	ResetModificationTime()
 
 	// Accessors for the original state of the descriptor prior to the mutations.
 	OriginalName() string
@@ -56,6 +59,7 @@ type VirtualSchemas interface {
 	GetVirtualSchema(schemaName string) (VirtualSchema, bool)
 	GetVirtualSchemaByID(id descpb.ID) (VirtualSchema, bool)
 	GetVirtualObjectByID(id descpb.ID) (VirtualObject, bool)
+	Visit(func(desc Descriptor, comment string) error) error
 }
 
 // VirtualSchema represents a collection of VirtualObjects.
@@ -63,7 +67,7 @@ type VirtualSchema interface {
 	Desc() SchemaDescriptor
 	NumTables() int
 	VisitTables(func(object VirtualObject))
-	GetObjectByName(name string, flags tree.ObjectLookupFlags) (VirtualObject, error)
+	GetObjectByName(name string, kind tree.DesiredObjectKind) (VirtualObject, error)
 }
 
 // VirtualObject is a virtual schema object.

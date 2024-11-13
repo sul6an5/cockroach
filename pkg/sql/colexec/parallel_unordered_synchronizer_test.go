@@ -78,7 +78,8 @@ func TestParallelUnorderedSynchronizer(t *testing.T) {
 	inputs := make([]colexecargs.OpWithMetaInfo, numInputs)
 	for i := range inputs {
 		var source colexecop.Operator
-		batch := coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0 /* length */, rng.Float64())
+		args := coldatatestutils.RandomVecArgs{Rand: rng, NullProbability: rng.Float64()}
+		batch := coldatatestutils.RandomBatch(testAllocator, args, typs, coldata.BatchSize(), 0 /* length */)
 		if i < numInputs-1 {
 			s := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
 			s.ResetBatchesToReturn(numBatches)
@@ -246,50 +247,6 @@ func TestUnorderedSynchronizerNoLeaksOnError(t *testing.T) {
 	require.Equal(t, len(inputs), len(s.DrainMeta()))
 	// This is the crux of the test: assert that all inputs have finished.
 	require.Equal(t, len(inputs), int(atomic.LoadUint32(&s.numFinishedInputs)))
-}
-
-// TestParallelUnorderedSyncClosesInputs verifies that the parallel unordered
-// synchronizer closes the input trees if it encounters a panic during the
-// initialization.
-func TestParallelUnorderedSyncClosesInputs(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	const injectedPanicMsg = "injected panic"
-	inputs := make([]colexecargs.OpWithMetaInfo, 2)
-
-	// Create the first input that is responsible for tracking whether the
-	// closure occurred as expected.
-	closed := false
-	firstInput := &colexecop.CallbackOperator{
-		CloseCb: func(context.Context) error {
-			closed = true
-			return nil
-		},
-	}
-	inputs[0].Root = firstInput
-	inputs[0].ToClose = append(inputs[0].ToClose, firstInput)
-
-	// Create the second input that injects a panic into Init.
-	inputs[1].Root = &colexecop.CallbackOperator{
-		InitCb: func(context.Context) {
-			colexecerror.InternalError(errors.New(injectedPanicMsg))
-		},
-	}
-
-	// Create and initialize (but don't run) the synchronizer.
-	var wg sync.WaitGroup
-	s := NewParallelUnorderedSynchronizer(testAllocator, inputs, &wg)
-	err := colexecerror.CatchVectorizedRuntimeError(func() { s.Init(ctx) })
-	require.NotNil(t, err)
-	require.True(t, strings.Contains(err.Error(), injectedPanicMsg))
-
-	// In the production setting, the user of the synchronizer is still expected
-	// to close it, even if a panic is encountered in Init, so we do the same
-	// thing here and verify that the first input is properly closed.
-	require.NoError(t, s.Close(ctx))
-	require.True(t, closed)
 }
 
 func BenchmarkParallelUnorderedSynchronizer(b *testing.B) {

@@ -18,13 +18,14 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -75,7 +76,7 @@ func TestBoundedStalenessEnterpriseLicense(t *testing.T) {
 		},
 	}
 
-	defer utilccl.TestingDisableEnterprise()()
+	defer ccl.TestingDisableEnterprise()()
 	t.Run("disabled", func(t *testing.T) {
 		for _, testCase := range testCases {
 			t.Run(testCase.query, func(t *testing.T) {
@@ -87,7 +88,7 @@ func TestBoundedStalenessEnterpriseLicense(t *testing.T) {
 	})
 
 	t.Run("enabled", func(t *testing.T) {
-		defer utilccl.TestingEnableEnterprise()()
+		defer ccl.TestingEnableEnterprise()()
 		for _, testCase := range testCases {
 			t.Run(testCase.query, func(t *testing.T) {
 				r, err := tc.Conns[0].QueryContext(ctx, testCase.query, testCase.args...)
@@ -135,7 +136,7 @@ func (ev *boundedStalenessTraceEvent) EventOutput() string {
 // transaction as a result of a nearest_only bounded staleness restart.
 type boundedStalenessRetryEvent struct {
 	nodeIdx int
-	*roachpb.MinTimestampBoundUnsatisfiableError
+	*kvpb.MinTimestampBoundUnsatisfiableError
 	asOf eval.AsOfSystemTime
 }
 
@@ -203,6 +204,7 @@ func (bse *boundedStalenessEvents) validate(t *testing.T) {
 				require.True(
 					t,
 					ev.MinTimestampBound.Less(lastTxnRetry.MinTimestampBound),
+					"expected MinTimestampBound=%s to be less than previous retry's MinTimestampBound=%s",
 					ev.MinTimestampBound,
 					lastTxnRetry.MinTimestampBound,
 				)
@@ -223,7 +225,7 @@ func (bse *boundedStalenessEvents) onTxnRetry(
 	if bse.mu.stmt == "" {
 		return
 	}
-	var minTSErr *roachpb.MinTimestampBoundUnsatisfiableError
+	var minTSErr *kvpb.MinTimestampBoundUnsatisfiableError
 	if autoRetryReason != nil && errors.As(autoRetryReason, &minTSErr) {
 		ev := &boundedStalenessRetryEvent{
 			nodeIdx:                             nodeIdx,
@@ -261,7 +263,7 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderStress(t, "1μs staleness reads may actually succeed due to the slow environment")
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
 	ctx := context.Background()
 
@@ -296,7 +298,7 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 		return errorRegexp.ReplaceAllString(s, "$1 XXX")
 	}
 
-	datadriven.Walk(t, testutils.TestDataPath(t, "boundedstaleness"), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "boundedstaleness"), func(t *testing.T, path string) {
 		tc := testcluster.StartTestCluster(t, 3, clusterArgs)
 		defer tc.Stopper().Stop(ctx)
 

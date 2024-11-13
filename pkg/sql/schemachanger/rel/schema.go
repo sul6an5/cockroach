@@ -21,16 +21,18 @@ import (
 
 // Schema defines a mapping of entities to their attributes and decomposition.
 type Schema struct {
-	name                     string
-	attrs                    []Attr
-	attrTypes                []reflect.Type
-	attrToOrdinal            map[Attr]ordinal
-	entityTypes              []*entityTypeSchema
-	entityTypeSchemas        map[reflect.Type]*entityTypeSchema
-	typeOrdinal, selfOrdinal ordinal
-	stringAttrs              ordinalSet
-	rules                    []*RuleDef
-	rulesByName              map[string]*RuleDef
+	name                                  string
+	attrs                                 []Attr
+	attrTypes                             []reflect.Type
+	sliceOrdinals                         ordinalSet
+	attrToOrdinal                         map[Attr]ordinal
+	entityTypes                           []*entityTypeSchema
+	entityTypeSchemas                     map[reflect.Type]*entityTypeSchema
+	typeOrdinal, selfOrdinal              ordinal
+	sliceIndexOrdinal, sliceSourceOrdinal ordinal
+	stringAttrs                           ordinalSet
+	rules                                 []*RuleDef
+	rulesByName                           map[string]*RuleDef
 }
 
 type entityTypeSchemaSort Schema
@@ -77,6 +79,11 @@ type entityTypeSchema struct {
 
 	// typID is the rank of the type of this entity in the schema.
 	typID uintptr
+
+	// isSliceMemberType is true if this type exists to support containment
+	// operations over a slice type.
+	isSliceMemberType bool
+	sliceAttr         ordinal
 }
 
 type fieldInfo struct {
@@ -87,6 +94,8 @@ type fieldInfo struct {
 	value           func(unsafe.Pointer) interface{}
 	inline          func(unsafe.Pointer) (uintptr, bool)
 	fieldFlags
+
+	sliceMemberType reflect.Type
 }
 
 type fieldFlags int8
@@ -98,6 +107,7 @@ func (f fieldFlags) isInt() bool     { return f&intField != 0 }
 func (f fieldFlags) isUint() bool    { return f&uintField != 0 }
 func (f fieldFlags) isIntLike() bool { return f&(intField|uintField) != 0 }
 func (f fieldFlags) isString() bool  { return f&stringField != 0 }
+func (f fieldFlags) isSlice() bool   { return f&sliceField != 0 }
 
 const (
 	intField fieldFlags = 1 << iota
@@ -105,6 +115,7 @@ const (
 	stringField
 	structField
 	pointerField
+	sliceField
 )
 
 func buildSchema(name string, opts ...SchemaOption) *Schema {
@@ -145,6 +156,14 @@ type schemaBuilder struct {
 	m schemaMappings
 }
 
+func (sb *schemaBuilder) maybeInitializeSliceMemberAttributes() {
+	if sb.sliceIndexOrdinal != 0 {
+		return
+	}
+	sb.sliceIndexOrdinal = sb.maybeAddAttribute(sliceIndex, reflect.TypeOf((*int)(nil)).Elem())
+	sb.sliceSourceOrdinal = sb.maybeAddAttribute(sliceSource, reflect.TypeOf((*interface{})(nil)).Elem())
+}
+
 func (sb *schemaBuilder) maybeAddAttribute(a Attr, typ reflect.Type) ordinal {
 	// TODO(ajwerner): Validate that t is an okay type for an attribute
 	// to be.
@@ -182,7 +201,9 @@ func checkType(typ, exp reflect.Type) error {
 	return nil
 }
 
-func (sb *schemaBuilder) maybeAddTypeMapping(t reflect.Type, attributeMappings []attrMapping) {
+func (sb *schemaBuilder) maybeAddTypeMapping(
+	t reflect.Type, attributeMappings []attrMapping,
+) *entityTypeSchema {
 	isStructPointer := func(tt reflect.Type) bool {
 		return tt.Kind() == reflect.Ptr && tt.Elem().Kind() == reflect.Struct
 	}
@@ -194,7 +215,7 @@ func (sb *schemaBuilder) maybeAddTypeMapping(t reflect.Type, attributeMappings [
 	for _, am := range attributeMappings {
 		for _, sel := range am.selectors {
 			fieldInfos = append(fieldInfos,
-				sb.addTypeAttrMapping(am.a, t, sel))
+				sb.addTypeAttrMapping(am.a, t, sel, am.selectorTypes, am.isOneOfElement)...)
 		}
 	}
 	sort.Slice(fieldInfos, func(i, j int) bool {
@@ -221,6 +242,7 @@ func (sb *schemaBuilder) maybeAddTypeMapping(t reflect.Type, attributeMappings [
 	}
 	sb.entityTypeSchemas[t] = ts
 	sb.entityTypes = append(sb.entityTypes, ts)
+	return ts
 }
 
 func makeFieldFlags(t reflect.Type) (fieldFlags, bool) {
@@ -231,6 +253,8 @@ func makeFieldFlags(t reflect.Type) (fieldFlags, bool) {
 	}
 	kind := t.Kind()
 	switch {
+	case kind == reflect.Slice && !f.isPtr():
+		f |= sliceField
 	case kind == reflect.Struct && f.isPtr():
 		f |= structField
 	case kind == reflect.String:
@@ -245,110 +269,183 @@ func makeFieldFlags(t reflect.Type) (fieldFlags, bool) {
 	return f, true
 }
 
-func (sb *schemaBuilder) addTypeAttrMapping(a Attr, t reflect.Type, sel string) fieldInfo {
-	offset, cur := getOffsetAndTypeFromSelector(t, sel)
-
-	flags, ok := makeFieldFlags(cur)
-	if !ok {
-		panic(errors.Errorf(
-			"selector %q of %v has unsupported type %v",
-			sel, t, cur,
-		))
-	}
-	typ := cur
-	if flags.isPtr() && flags.isScalar() {
-		typ = cur.Elem()
-	}
-	ord := sb.maybeAddAttribute(a, typ)
-
-	f := fieldInfo{
-		fieldFlags: flags,
-		path:       sel,
-		attr:       ord,
-		typ:        typ,
-	}
-	makeValueGetter := func(t reflect.Type, offset uintptr) func(u unsafe.Pointer) reflect.Value {
-		return func(u unsafe.Pointer) reflect.Value {
-			return reflect.NewAt(t, unsafe.Pointer(uintptr(u)+offset))
+func (sb *schemaBuilder) addTypeAttrMapping(
+	a Attr, t reflect.Type, sel string, selOneOfTypes []reflect.Type, isOneOf bool,
+) (fields []fieldInfo) {
+	var offset uintptr
+	var oneOfType reflect.Type
+	if isOneOf {
+		offset, oneOfType = getOffsetAndTypeFromSelector(t, sel)
+	} else {
+		if len(selOneOfTypes) > 0 {
+			panic("selector type are only allowed for one of attributes.")
 		}
+		var cur reflect.Type
+		offset, cur = getOffsetAndTypeFromSelector(t, sel)
+		selOneOfTypes = []reflect.Type{cur}
 	}
-	getPtrValue := func(vg func(pointer unsafe.Pointer) reflect.Value) func(u unsafe.Pointer) interface{} {
-		return func(u unsafe.Pointer) interface{} {
-			got := vg(u)
-			if got.Elem().IsNil() {
-				return nil
-			}
-			return got.Elem().Interface()
+	for _, cur := range selOneOfTypes {
+		// For one of types, extract the value inside.
+		castType := cur
+		if isOneOf {
+			cur = cur.Elem().Field(0).Type
 		}
-	}
-	{
-		vg := makeValueGetter(cur, offset)
-		if f.isPtr() && f.isStruct() {
-			f.value = getPtrValue(vg)
-		} else if f.isPtr() && f.isScalar() {
-			f.value = func(u unsafe.Pointer) interface{} {
-				got := vg(u)
-				ge := got.Elem()
-				if ge.IsNil() {
-					return nil
-				}
-				return ge.Elem().Interface()
-			}
+		flags, ok := makeFieldFlags(cur)
+		if !ok {
+			panic(errors.Errorf(
+				"selector %q of %v has unsupported type %v",
+				sel, t, cur,
+			))
+		}
+		typ := cur
+		if flags.isPtr() && flags.isScalar() {
+			typ = cur.Elem()
+		}
+		var ord ordinal
+		var sliceMemberType reflect.Type
+		if !flags.isSlice() {
+			ord = sb.maybeAddAttribute(a, typ)
 		} else {
-			f.value = func(u unsafe.Pointer) interface{} {
-				return vg(u).Elem().Interface()
+			// We need to add the slice type and then return, or
+			// perhaps, add some annotation to the type that this
+			// is a slice, and it refers to xyz.
+			sb.maybeInitializeSliceMemberAttributes()
+			// Give the generated struct a field name based on the attribute name.
+			// We could use something generic like "Value" for all value fields of
+			// such structs, but this makes debugging a tad easier because you can
+			// look at the field names of the type in the debugger.
+			fieldName := "F_" + a.String()
+			sliceMemberType = makeSliceMemberType(t, typ, fieldName)
+			st := sb.maybeAddTypeMapping(sliceMemberType, []attrMapping{
+				{a: sliceSource, selectors: []string{"Source"}},
+				{a: sliceIndex, selectors: []string{"Index"}},
+				{a: a, selectors: []string{fieldName}},
+			})
+			st.isSliceMemberType = true
+			ord = sb.attrToOrdinal[a]
+			sb.sliceOrdinals = sb.sliceOrdinals.add(ord)
+			st.sliceAttr = ord
+		}
+		f := fieldInfo{
+			fieldFlags:      flags,
+			path:            sel,
+			attr:            ord,
+			typ:             typ,
+			sliceMemberType: sliceMemberType,
+		}
+		makeValueGetter := func(t reflect.Type, offset uintptr) func(u unsafe.Pointer) reflect.Value {
+			return func(u unsafe.Pointer) reflect.Value {
+				if !isOneOf {
+					return reflect.NewAt(t, unsafe.Pointer(uintptr(u)+offset))
+				} else {
+					oneOfValue := reflect.NewAt(oneOfType, unsafe.Pointer(uintptr(u)+offset))
+					innerElement := oneOfValue.Elem().Elem()
+					if innerElement.Type() == castType {
+						return innerElement.Elem().Field(0)
+					}
+					return reflect.Zero(cur)
+				}
 			}
 		}
-		switch {
-		case f.isPtr() && f.isInt():
-			f.inline = func(u unsafe.Pointer) (uintptr, bool) {
+		getPtrValue := func(vg func(pointer unsafe.Pointer) reflect.Value) func(u unsafe.Pointer) interface{} {
+			return func(u unsafe.Pointer) interface{} {
 				got := vg(u)
-				if got.Elem().IsNil() {
-					return 0, false
+				// Methods will return direct references without any indirection.
+				if isOneOf {
+					if got.IsNil() {
+						return nil
+					}
+					return got.Interface()
+				} else {
+					// Otherwise, we will have the pointer wrapped in another pointer.
+					if got.Elem().IsNil() {
+						return nil
+					}
+					return got.Elem().Interface()
 				}
-				return uintptr(got.Elem().Elem().Int()), true
-			}
-		case f.isPtr() && f.isUint():
-			f.inline = func(u unsafe.Pointer) (uintptr, bool) {
-				got := vg(u)
-				if got.Elem().IsNil() {
-					return 0, false
-				}
-				return uintptr(got.Elem().Elem().Uint()), true
-			}
-		case f.isInt():
-			f.inline = func(u unsafe.Pointer) (uintptr, bool) {
-				return uintptr(vg(u).Elem().Int()), true
-			}
-		case f.isUint():
-			f.inline = func(u unsafe.Pointer) (uintptr, bool) {
-				return uintptr(vg(u).Elem().Uint()), true
-			}
-		case f.isString(), f.isStruct():
-			f.inline = func(u unsafe.Pointer) (uintptr, bool) {
-				return 0, false
 			}
 		}
-	}
-	{
-		if f.isStruct() {
-			f.comparableValue = getPtrValue(makeValueGetter(cur, offset))
-		} else {
-			compType := getComparableType(typ)
-			if f.isPtr() && f.isScalar() {
-				compType = reflect.PtrTo(compType)
-			}
-			vg := makeValueGetter(compType, offset)
-			if f.isPtr() && f.isScalar() {
-				f.comparableValue = getPtrValue(vg)
+		{
+			vg := makeValueGetter(cur, offset)
+			if f.isPtr() && f.isStruct() {
+				f.value = getPtrValue(vg)
+			} else if f.isSlice() {
+				f.value = func(u unsafe.Pointer) interface{} {
+					got := vg(u)
+					ge := got.Elem()
+					if ge.IsNil() || ge.Len() == 0 {
+						return nil
+					}
+					return ge.Interface()
+				}
+			} else if f.isPtr() && f.isScalar() {
+				f.value = func(u unsafe.Pointer) interface{} {
+					got := vg(u)
+					ge := got.Elem()
+					if ge.IsNil() {
+						return nil
+					}
+					return ge.Elem().Interface()
+				}
 			} else {
-				f.comparableValue = func(u unsafe.Pointer) interface{} {
-					return vg(u).Interface()
+				f.value = func(u unsafe.Pointer) interface{} {
+					return vg(u).Elem().Interface()
+				}
+			}
+			switch {
+			case f.isSlice():
+				// f.inline is not defined
+			case f.isPtr() && f.isInt():
+				f.inline = func(u unsafe.Pointer) (uintptr, bool) {
+					got := vg(u)
+					if got.Elem().IsNil() {
+						return 0, false
+					}
+					return uintptr(got.Elem().Elem().Int()), true
+				}
+			case f.isPtr() && f.isUint():
+				f.inline = func(u unsafe.Pointer) (uintptr, bool) {
+					got := vg(u)
+					if got.Elem().IsNil() {
+						return 0, false
+					}
+					return uintptr(got.Elem().Elem().Uint()), true
+				}
+			case f.isInt():
+				f.inline = func(u unsafe.Pointer) (uintptr, bool) {
+					return uintptr(vg(u).Elem().Int()), true
+				}
+			case f.isUint():
+				f.inline = func(u unsafe.Pointer) (uintptr, bool) {
+					return uintptr(vg(u).Elem().Uint()), true
+				}
+			case f.isString(), f.isStruct():
+				f.inline = func(u unsafe.Pointer) (uintptr, bool) {
+					return 0, false
 				}
 			}
 		}
+		{
+			if f.isStruct() {
+				f.comparableValue = getPtrValue(makeValueGetter(cur, offset))
+			} else if !f.isSlice() {
+				compType := getComparableType(typ)
+				if f.isPtr() && f.isScalar() {
+					compType = reflect.PtrTo(compType)
+				}
+				vg := makeValueGetter(compType, offset)
+				if f.isPtr() && f.isScalar() {
+					f.comparableValue = getPtrValue(vg)
+				} else {
+					f.comparableValue = func(u unsafe.Pointer) interface{} {
+						return vg(u).Interface()
+					}
+				}
+			}
+		}
+		fields = append(fields, f)
 	}
-	return f
+	return fields
 }
 
 // getOffsetAndTypeFromSelector takes an entity (struct pointer) type and a
@@ -366,7 +463,22 @@ func getOffsetAndTypeFromSelector(
 		if !ok {
 			panic(errors.Errorf("%v.%s is not a field", structPointer, selector))
 		}
-		offset += sf.Offset
+		// If this field is accessed by embedding, ensure
+		// that all the offsets add up. Also, ensure that
+		// there is no pointer field which needs to be
+		// traversed.
+		for i := 0; i <= len(sf.Index); i++ {
+			f := cur.FieldByIndex(sf.Index[:i])
+			// Ensure that the value we are looking for is actually inside the
+			// struct. One can embed pointers, and, thus, go pointer chasing to
+			// access some field. This is not currently implemented.
+			//
+			// TODO(ajwerner): Support pointer chasing for embedded fields.
+			if i < len(sf.Index) && f.Type.Kind() != reflect.Struct {
+				panic(errors.Errorf("%v.%s references an embedded pointer %s", structPointer, selector, f.Name))
+			}
+			offset += f.Offset
+		}
 		cur = sf.Type
 	}
 	return offset, cur
@@ -386,4 +498,33 @@ func (sc *Schema) getOrdinal(attribute Attr) (ordinal, error) {
 		return 0, errors.Errorf("unknown attribute %s in schema %s", attribute, sc.name)
 	}
 	return ord, nil
+}
+
+// IsSliceAttr returns true if the Attr corresponds to a slice field.
+func (sc *Schema) IsSliceAttr(a Attr) bool {
+	ord, ok := sc.attrToOrdinal[a]
+	return ok && sc.sliceOrdinals.contains(ord)
+}
+
+// Give the struct field indexes constants so that they can be used
+// when setting the fields entity set inserts.
+const (
+	sliceMemberSourceFieldIndex = iota
+	sliceMemberIndexFieldIndex
+	sliceMemberValueFieldIndex
+)
+
+func makeSliceMemberType(srcType, sliceType reflect.Type, valueFieldName string) reflect.Type {
+	fields := [...]reflect.StructField{
+		sliceMemberSourceFieldIndex: {
+			Name: "Source", Type: srcType,
+		},
+		sliceMemberIndexFieldIndex: {
+			Name: "Index", Type: reflect.TypeOf((*int)(nil)).Elem(),
+		},
+		sliceMemberValueFieldIndex: {
+			Name: valueFieldName, Type: sliceType.Elem(),
+		},
+	}
+	return reflect.PtrTo(reflect.StructOf(fields[:]))
 }

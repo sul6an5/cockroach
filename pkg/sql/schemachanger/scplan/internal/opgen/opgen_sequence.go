@@ -11,6 +11,7 @@
 package opgen
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 )
@@ -20,8 +21,7 @@ func init() {
 	opRegistry.register((*scpb.Sequence)(nil),
 		toPublic(
 			scpb.Status_ABSENT,
-			equiv(scpb.Status_DROPPED),
-			to(scpb.Status_TXN_DROPPED,
+			to(scpb.Status_DROPPED,
 				emit(func(this *scpb.Sequence) *scop.NotImplemented {
 					return notImplemented(this)
 				}),
@@ -29,41 +29,30 @@ func init() {
 			to(scpb.Status_PUBLIC,
 				emit(func(this *scpb.Sequence) *scop.MarkDescriptorAsPublic {
 					return &scop.MarkDescriptorAsPublic{
-						DescID: this.SequenceID,
+						DescriptorID: this.SequenceID,
 					}
 				}),
 			),
 		),
 		toAbsent(scpb.Status_PUBLIC,
-			to(scpb.Status_TXN_DROPPED,
-				emit(func(this *scpb.Sequence, md *targetsWithElementMap) *scop.MarkDescriptorAsSyntheticallyDropped {
-					return &scop.MarkDescriptorAsSyntheticallyDropped{
-						DescID: this.SequenceID,
-					}
-				}),
-			),
 			to(scpb.Status_DROPPED,
 				revertible(false),
 				emit(func(this *scpb.Sequence) *scop.MarkDescriptorAsDropped {
 					return &scop.MarkDescriptorAsDropped{
-						DescID: this.SequenceID,
-					}
-				}),
-				emit(func(this *scpb.Sequence) *scop.RemoveAllTableComments {
-					return &scop.RemoveAllTableComments{
-						TableID: this.SequenceID,
+						DescriptorID: this.SequenceID,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.Sequence, md *targetsWithElementMap) *scop.LogEvent {
-					return newLogEventOp(this, md)
-				}),
-				emit(func(this *scpb.Sequence, md *targetsWithElementMap) *scop.CreateGcJobForTable {
-					return &scop.CreateGcJobForTable{
-						TableID:             this.SequenceID,
-						StatementForDropJob: statementForDropJob(this, md),
+				emit(func(this *scpb.Sequence, md *opGenContext) *scop.CreateGCJobForTable {
+					if !md.ActiveVersion.IsActive(clusterversion.V23_1) {
+						return &scop.CreateGCJobForTable{
+							TableID:             this.SequenceID,
+							DatabaseID:          databaseIDFromDroppedNamespaceTarget(md, this.SequenceID),
+							StatementForDropJob: statementForDropJob(this, md),
+						}
 					}
+					return nil
 				}),
 			),
 		),

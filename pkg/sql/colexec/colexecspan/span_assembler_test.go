@@ -25,8 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
@@ -36,7 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -84,14 +86,14 @@ func TestSpanAssembler(t *testing.T) {
 								codec := keys.SystemSQLCodec
 								if !useSystemTenant {
 									tenantName = "SecondaryTenant"
-									codec = keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+									codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 								}
 								t.Run(tenantName, func(t *testing.T) {
 									testTable, err := makeTable(useColFamilies)
 									if err != nil {
 										t.Fatal(err)
 									}
-									neededColumns := util.MakeFastIntSet(1, 2, 3, 4)
+									neededColumns := intsets.MakeFast(1, 2, 3, 4)
 
 									cols := make([]coldata.Vec, len(typs))
 									for i, typ := range typs {
@@ -115,7 +117,7 @@ func TestSpanAssembler(t *testing.T) {
 									builder.Init(&evalCtx, codec, testTable, testTable.GetPrimaryIndex())
 									splitter := span.MakeSplitter(testTable, testTable.GetPrimaryIndex(), neededColumns)
 
-									var fetchSpec descpb.IndexFetchSpec
+									var fetchSpec fetchpb.IndexFetchSpec
 									if err := rowenc.InitIndexFetchSpec(
 										&fetchSpec, codec, testTable, testTable.GetPrimaryIndex(), nil, /* fetchedColumnIDs */
 									); err != nil {
@@ -241,7 +243,7 @@ func makeTable(useColFamilies bool) (catalog.TableDescriptor, error) {
 			ID:                  1,
 			Unique:              true,
 			KeyColumnNames:      []string{"a", "b", "c"},
-			KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC, catpb.IndexColumn_ASC, catpb.IndexColumn_ASC},
+			KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
 			KeyColumnIDs:        []descpb.ColumnID{1, 2, 3},
 		},
 		Indexes: []descpb.IndexDescriptor{
@@ -250,7 +252,7 @@ func makeTable(useColFamilies bool) (catalog.TableDescriptor, error) {
 				ID:                  2,
 				Unique:              true,
 				KeyColumnNames:      []string{"c", "a", "b"},
-				KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC, catpb.IndexColumn_ASC, catpb.IndexColumn_ASC},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{3, 1, 2},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1, 2},
 			},

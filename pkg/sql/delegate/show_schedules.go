@@ -58,6 +58,11 @@ WHERE status='%s' AND created_by_type='%s' AND created_by_id=schedule_id
 	case tree.ScheduledSQLStatsCompactionExecutor:
 		whereExprs = append(whereExprs, fmt.Sprintf(
 			"executor_type = '%s'", tree.ScheduledSQLStatsCompactionExecutor.InternalName()))
+	case tree.ScheduledChangefeedExecutor:
+		whereExprs = append(whereExprs, fmt.Sprintf(
+			"executor_type = '%s'", tree.ScheduledChangefeedExecutor.InternalName()))
+		columnExprs = append(columnExprs, fmt.Sprintf(
+			"%s->>'changefeed_statement' AS command", commandColumn))
 	default:
 		// Strip out '@type' tag from the ExecutionArgs.args, and display what's left.
 		columnExprs = append(columnExprs, fmt.Sprintf("%s #-'{@type}' AS command", commandColumn))
@@ -72,7 +77,7 @@ WHERE status='%s' AND created_by_type='%s' AND created_by_id=schedule_id
 	if len(whereExprs) > 0 {
 		whereClause = fmt.Sprintf("WHERE (%s)", strings.Join(whereExprs, " AND "))
 	}
-	return parse(fmt.Sprintf(
+	return d.parse(fmt.Sprintf(
 		"SELECT %s FROM system.scheduled_jobs %s",
 		strings.Join(columnExprs, ","),
 		whereClause,

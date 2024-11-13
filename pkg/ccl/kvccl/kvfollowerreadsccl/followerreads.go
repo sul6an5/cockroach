@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -74,15 +75,13 @@ func getGlobalReadsLead(clock *hlc.Clock) time.Duration {
 // reads is enabled, returning a detailed error if not. It is not suitable for
 // use in hot paths since a new error may be instantiated on each call.
 func checkEnterpriseEnabled(logicalClusterID uuid.UUID, st *cluster.Settings) error {
-	org := sql.ClusterOrganization.Get(&st.SV)
-	return utilccl.CheckEnterpriseEnabled(st, logicalClusterID, org, "follower reads")
+	return utilccl.CheckEnterpriseEnabled(st, logicalClusterID, "follower reads")
 }
 
 // isEnterpriseEnabled is faster than checkEnterpriseEnabled, and suitable
 // for hot paths.
 func isEnterpriseEnabled(logicalClusterID uuid.UUID, st *cluster.Settings) bool {
-	org := sql.ClusterOrganization.Get(&st.SV)
-	return utilccl.IsEnterpriseEnabled(st, logicalClusterID, org, "follower reads")
+	return utilccl.IsEnterpriseEnabled(st, logicalClusterID, "follower reads")
 }
 
 func checkFollowerReadsEnabled(logicalClusterID uuid.UUID, st *cluster.Settings) bool {
@@ -134,7 +133,7 @@ func canSendToFollower(
 	st *cluster.Settings,
 	clock *hlc.Clock,
 	ctPolicy roachpb.RangeClosedTimestampPolicy,
-	ba roachpb.BatchRequest,
+	ba *kvpb.BatchRequest,
 ) bool {
 	return kvserver.BatchCanBeEvaluatedOnFollower(ba) &&
 		closedTimestampLikelySufficient(st, clock, ctPolicy, ba.RequiredFrontier()) &&
@@ -182,7 +181,7 @@ func (o *followerReadOracle) useClosestOracle(
 	txn *kv.Txn, ctPolicy roachpb.RangeClosedTimestampPolicy,
 ) bool {
 	// NOTE: this logic is almost identical to canSendToFollower, except that it
-	// operates on a *kv.Txn instead of a roachpb.BatchRequest. As a result, the
+	// operates on a *kv.Txn instead of a kvpb.BatchRequest. As a result, the
 	// function does not check batchCanBeEvaluatedOnFollower. This is because we
 	// assume that if a request is going to be executed in a distributed DistSQL
 	// flow (which is why it is consulting a replicaoracle.Oracle), then all of

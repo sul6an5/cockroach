@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/errors"
 )
@@ -24,6 +25,7 @@ type multiRegionTestClusterParams struct {
 	baseDir         string
 	replicationMode base.TestClusterReplicationMode
 	useDatabase     string
+	settings        *cluster.Settings
 }
 
 // MultiRegionTestClusterParamsOption is an option that can be passed to
@@ -55,43 +57,75 @@ func WithUseDatabase(db string) MultiRegionTestClusterParamsOption {
 	}
 }
 
+// WithSettings is used to configure the settings the cluster is created with.
+func WithSettings(settings *cluster.Settings) MultiRegionTestClusterParamsOption {
+	return func(params *multiRegionTestClusterParams) {
+		params.settings = settings
+	}
+}
+
 // TestingCreateMultiRegionCluster creates a test cluster with numServers number
 // of nodes and the provided testing knobs applied to each of the nodes. Every
 // node is placed in its own locality, named "us-east1", "us-east2", and so on.
 func TestingCreateMultiRegionCluster(
 	t testing.TB, numServers int, knobs base.TestingKnobs, opts ...MultiRegionTestClusterParamsOption,
 ) (*testcluster.TestCluster, *gosql.DB, func()) {
-	serverArgs := make(map[int]base.TestServerArgs)
 	regionNames := make([]string, numServers)
 	for i := 0; i < numServers; i++ {
 		// "us-east1", "us-east2"...
 		regionNames[i] = fmt.Sprintf("us-east%d", i+1)
 	}
 
+	return TestingCreateMultiRegionClusterWithRegionList(
+		t,
+		regionNames,
+		1, /* serversPerRegion */
+		knobs,
+		opts...)
+}
+
+// TestingCreateMultiRegionClusterWithRegionList creates a test cluster with
+// serversPerRegion number of nodes in each of the provided regions and the
+// provided testing knobs applied to each of the nodes. Every node is placed in
+// its own locality, named according to the given region names.
+func TestingCreateMultiRegionClusterWithRegionList(
+	t testing.TB,
+	regionNames []string,
+	serversPerRegion int,
+	knobs base.TestingKnobs,
+	opts ...MultiRegionTestClusterParamsOption,
+) (*testcluster.TestCluster, *gosql.DB, func()) {
+	serverArgs := make(map[int]base.TestServerArgs)
+
 	params := &multiRegionTestClusterParams{}
 	for _, opt := range opts {
 		opt(params)
 	}
 
-	for i := 0; i < numServers; i++ {
-		serverArgs[i] = base.TestServerArgs{
-			Knobs:         knobs,
-			ExternalIODir: params.baseDir,
-			UseDatabase:   params.useDatabase,
-			// Disabling this due to failures in the rtt_analysis tests. Ideally
-			// we could disable multi-tenancy just for those tests, but this function
-			// is used to create the MR cluster for all test cases. For
-			// bonus points, the code to re-enable this should also provide more
-			// flexibility in disabling the default test tenant by callers of this
-			// function. Re-enablement is tracked with #76378.
-			DisableDefaultTestTenant: true,
-			Locality: roachpb.Locality{
-				Tiers: []roachpb.Tier{{Key: "region", Value: regionNames[i]}},
-			},
+	totalServerCount := 0
+	for _, region := range regionNames {
+		for i := 0; i < serversPerRegion; i++ {
+			serverArgs[totalServerCount] = base.TestServerArgs{
+				Settings:      params.settings,
+				Knobs:         knobs,
+				ExternalIODir: params.baseDir,
+				UseDatabase:   params.useDatabase,
+				// Disabling this due to failures in the rtt_analysis tests. Ideally
+				// we could disable multi-tenancy just for those tests, but this function
+				// is used to create the MR cluster for all test cases. For
+				// bonus points, the code to re-enable this should also provide more
+				// flexibility in disabling the default test tenant by callers of this
+				// function. Re-enablement is tracked with #76378.
+				DisableDefaultTestTenant: true,
+				Locality: roachpb.Locality{
+					Tiers: []roachpb.Tier{{Key: "region", Value: region}},
+				},
+			}
+			totalServerCount++
 		}
 	}
 
-	tc := testcluster.StartTestCluster(t, numServers, base.TestClusterArgs{
+	tc := testcluster.StartTestCluster(t, totalServerCount, base.TestClusterArgs{
 		ReplicationMode:   params.replicationMode,
 		ServerArgsPerNode: serverArgs,
 	})

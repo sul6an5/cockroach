@@ -137,6 +137,18 @@ control is not returned to the shell until the server is ready to
 accept requests.`,
 	}
 
+	DisableInMemoryTenant = FlagInfo{
+		Name:        "disable-in-memory-tenant",
+		Description: `Do not start a secondary tenant in-memory.`,
+	}
+
+	// TODO(knz): Remove this once https://github.com/cockroachdb/cockroach/issues/84604
+	// is addressed.
+	SecondaryTenantPortOffset = FlagInfo{
+		Name:        "secondary-tenant-port-offset",
+		Description: "TCP port number offset to use for the secondary in-memory tenant.",
+	}
+
 	SQLMem = FlagInfo{
 		Name: "max-sql-memory",
 		Description: `
@@ -145,6 +157,20 @@ including prepared queries and intermediate data rows during query execution.
 Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB and 1GiB) or a
 percentage of physical memory (e.g. .25). If left unspecified, defaults to 25% of
 physical memory.`,
+	}
+
+	GoMemLimit = FlagInfo{
+		Name: "max-go-memory",
+		Description: `
+Soft memory limit set on the Go runtime (which is also configurable via the
+GOMEMLIMIT environment variable, but --max-go-memory has higher precedence if
+both are set). Notably, the pebble cache (as configured by --cache) is not under
+control of the Go runtime and should not be considered when determining this
+soft memory limit. Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB
+and 1GiB) or a percentage of physical memory (e.g. .25). If left unspecified,
+defaults to 2.25x of --max-sql-memory (subject to max-go-memory + 1.15x --cache
+not exceeding 90% of available RAM). Set to 0 to disable the soft memory limit
+(not recommended).`,
 	}
 
 	TSDBMem = FlagInfo{
@@ -288,6 +314,12 @@ This flag is incompatible with --execute / -e.`,
 Repeat the SQL statement(s) specified with --execute
 with the specified period. The client will stop watching
 if an execution of the SQL statement(s) fail.`,
+	}
+
+	NoLineEditor = FlagInfo{
+		Name: "no-line-editor",
+		Description: `
+Force disable the interactive line editor. Can help during testing.`,
 	}
 
 	EchoSQL = FlagInfo{
@@ -775,14 +807,21 @@ Note: that --external-io-disable-http or --external-io-disable-implicit-credenti
 	TenantScope = FlagInfo{
 		Name: "tenant-scope",
 		Description: `Assign a tenant scope to the certificate.
-This will allow for the certificate to only be used specifically for a particular
-tenant. This flag is optional, when omitted, the certificate is scoped to the
-system tenant.`,
+This will restrict the certificate to only be valid for the specified tenants.
+This flag is optional. When omitted, the certificate is not scoped; i.e.
+it can be used with all tenants.`,
 	}
 
 	GeneratePKCS8Key = FlagInfo{
 		Name:        "also-generate-pkcs8-key",
 		Description: `Also write the key in pkcs8 format to <certs-dir>/client.<username>.key.pk8.`,
+	}
+
+	DisableUsernameValidation = FlagInfo{
+		Name: "disable-username-validation",
+		Description: `Do not validate that the provided identity has a valid structure for
+a SQL identifier. If passed, and the identity is not a valid SQL identifier, the generated
+certificate can only be used if an identity map has been configured server-side.`,
 	}
 
 	Password = FlagInfo{
@@ -869,16 +908,34 @@ only tested and supported on Linux.
 	MaxOffset = FlagInfo{
 		Name: "max-offset",
 		Description: `
-Maximum allowed clock offset for the cluster. If observed clock offsets exceed
-this limit, servers will crash to minimize the likelihood of reading
-inconsistent data. Increasing this value will increase the time to recovery of
-failures as well as the frequency of uncertainty-based read restarts.
+Maximum clock offset for the cluster. If real clock skew exceeds this value,
+consistency guarantees can no longer be upheld, possibly resulting in stale
+reads and other anomalies. This value affects the frequency of uncertainty-based
+read restarts and write latencies for global tables.
 <PRE>
 
 </PRE>
-Note that this value must be the same on all nodes in the cluster. In order to
-change it, all nodes in the cluster must be stopped simultaneously and restarted
-with the new value.`,
+If a node detects that its clock offset from other nodes is too large, it will
+self-terminate to protect consistency guarantees. This check can be disabled
+via --disable-max-offset-check.
+<PRE>
+
+</PRE>
+This value should be the same on all nodes in the cluster. It is allowed to
+differ such that the max-offset value can be changed via a rolling restart of
+the cluster, in which case the real clock skew between nodes must be below the
+smallest max-offset value of any node.
+`,
+	}
+
+	DisableMaxOffsetCheck = FlagInfo{
+		Name: "disable-max-offset-check",
+		Description: `
+Normally, a node will self-terminate if it finds that its clock offset with the
+rest of the cluster exceeds --max-offset. This flag disables this check. The
+operator is responsible for ensuring that real clock skew never exceeds
+max-offset, to avoid read inconsistencies and other correctness anomalies.
+`,
 	}
 
 	Store = FlagInfo{
@@ -942,7 +999,7 @@ memory that the store may consume, for example:
 Optionally, to configure admission control enforcement to prevent disk
 bandwidth saturation, the "provisioned-rate" field can be specified with
 the "disk-name" and an optional "bandwidth". The bandwidth is used to override
-the value of the cluster setting, kv.store.admission.provisioned_bandwidth.
+the value of the cluster setting, kvadmission.store.provisioned_bandwidth.
 For example:
 <PRE>
 
@@ -965,6 +1022,25 @@ which use 'cockroach-data-tenant-X' for tenant 'X')
 Storage engine to use for all stores on this cockroach node. The only option is pebble. Deprecated;
 only present for backward compatibility.
 `,
+	}
+
+	SharedStorage = FlagInfo{
+		Name: "experimental-shared-storage",
+		Description: fmt.Sprintf(`
+Shared storage URL (with a cloud scheme, eg. s3://, gcs://) to use for all stores
+on this cockroach node. Cockroach can take advantage of this storage for faster
+replication from node to node, as well as to grow beyond locally-available disk
+space. The format of this URL is the same as that specified for bulk operations,
+for more on that see:
+
+<PRE>
+%s
+</PRE>
+
+This is an experimental option, and must be specified on every start of this
+node starting from the very first call to start. Passing this flag on an existing
+initialized node is not supported.
+`, docs.URL("use-cloud-storage-for-bulk-operations")),
 	}
 
 	Size = FlagInfo{
@@ -1189,6 +1265,26 @@ in the history of the cluster.`,
 as target of the decommissioning or recommissioning command.`,
 	}
 
+	NodeDecommissionChecks = FlagInfo{
+		Name: "checks",
+		Description: `
+Specifies how to evaluate readiness checks prior to node decommission.
+Takes any of the following values:
+<PRE>
+
+  - enabled  evaluate readiness prior to starting node decommission.
+  - strict   use strict readiness evaluation mode prior to node decommission.
+  - skip     skip readiness checks and immediately request node decommission.
+             Use when rerunning node decommission.
+</PRE>`,
+	}
+
+	NodeDecommissionDryRun = FlagInfo{
+		Name: "dry-run",
+		Description: `Only evaluate decommission readiness and check decommission
+status, without actually decommissioning the node.`,
+	}
+
 	NodeDrainSelf = FlagInfo{
 		Name: "self",
 		Description: `Use the node ID of the node connected to via --host
@@ -1266,6 +1362,16 @@ can also be specified (e.g. .25).`,
 		Description: `Run a demo workload against the pre-loaded database.`,
 	}
 
+	ExpandDemoSchema = FlagInfo{
+		Name:        "expand-schema",
+		Description: `Expand the workload schema up to the specified size.`,
+	}
+
+	DemoNameGenOpts = FlagInfo{
+		Name:        "name-gen-options",
+		Description: `Use the specified options for the name generation during schema expansion (JSON syntax).`,
+	}
+
 	DemoWorkloadMaxQPS = FlagInfo{
 		Name:        "workload-max-qps",
 		Description: "The maximum QPS when a workload is running.",
@@ -1311,6 +1417,13 @@ The SQL shell will be connected to the first tenant, and can be switched between
 and the system tenant using the \connect command.`,
 	}
 
+	DemoDisableServerController = FlagInfo{
+		Name: "disable-server-controller",
+		Description: `
+If set, the server controller will not be used to start secondary
+tenant servers.`,
+	}
+
 	DemoNoLicense = FlagInfo{
 		Name: "disable-demo-license",
 		Description: `
@@ -1334,6 +1447,12 @@ If set to false, overrides the default demo behavior of enabling rangefeeds.`,
 		Description: `
 Disable the creation of a default dataset in the demo shell.
 This makes 'cockroach demo' faster to start.`,
+	}
+
+	ConfigProfile = FlagInfo{
+		Name:        "config-profile",
+		EnvVar:      "COCKROACH_CONFIG_PROFILE",
+		Description: `Select a configuration profile to apply.`,
 	}
 
 	GeoLibsDir = FlagInfo{
@@ -1505,10 +1624,31 @@ this flag is applied.`,
 	ZipRedactLogs = FlagInfo{
 		Name: "redact-logs",
 		Description: `
-Redact text that may contain confidential data or PII from retrieved
-log entries. Note that this flag only operates on log entries;
-other items retrieved by the zip command may still consider
-confidential data or PII.
+DEPRECATED: Redact text that may contain confidential data or PII from 
+retrieved log entries.
+<PRE>
+
+</PRE>
+Note that this flag is being deprecated in favor of the --redact flag.
+Setting this flag will be interpreted in the same way as setting the
+--redact flag.
+`,
+	}
+
+	ZipRedact = FlagInfo{
+		Name: "redact",
+		Description: `
+Redact anything that may contain confidential data or PII from retrieved
+debug data. An exception is made for range key data, as this data is
+necessary to support CockroachDB.
+`,
+	}
+
+	ZipIncludeRangeInfo = FlagInfo{
+		Name: "include-range-info",
+		Description: `
+Include information about each individual range in nodes/*/ranges/*.json files.
+For large clusters, this can dramatically increase debug zip size/file count.
 `,
 	}
 
@@ -1604,46 +1744,55 @@ the --log flag.`,
 present in the body of the logging configuration.`,
 	}
 
-	DeprecatedStderrThreshold = FlagInfo{
-		Name:        "logtostderr",
-		Description: `Write log messages beyond the specified severity to stderr.`,
+	StderrThresholdOverride = FlagInfo{
+		Name: "logtostderr",
+		Description: `--logtostderr=XXX is an alias for --log='sinks: {stderr: {filter: XXX}}'.
+If no value is specified, the default value for the command is inferred: INFO for server
+commands, WARNING for client commands.`,
 	}
 
-	DeprecatedFileThreshold = FlagInfo{
+	FileThresholdOverride = FlagInfo{
 		Name:        "log-file-verbosity",
-		Description: `Write log messages beyond the specified severity to files.`,
+		Description: `--log-file-verbosity=XXX is an alias for --log='file-defaults: {filter: XXX}}'.`,
 	}
 
-	DeprecatedStderrNoColor = FlagInfo{
+	StderrNoColorOverride = FlagInfo{
 		Name:        "no-color",
-		Description: `Avoid color in the stderr output.`,
+		Description: `--no-color=XXX is an alias for --log='sinks: {stderr: {no-color: XXX}}'.`,
 	}
 
-	DeprecatedRedactableLogs = FlagInfo{
+	RedactableLogsOverride = FlagInfo{
 		Name:        "redactable-logs",
-		Description: `Request redaction markers.`,
+		Description: `--redactable-logs=XXX is an alias for --log='file-defaults: {redactable: XXX}}'.`,
 	}
 
-	DeprecatedLogFileMaxSize = FlagInfo{
+	LogFileMaxSizeOverride = FlagInfo{
 		Name:        "log-file-max-size",
-		Description: "Maximum size of a log file before switching to a new file.",
+		Description: "--log-file-max-size=XXX is an alias for --log='file-defaults: {max-file-size: XXX}'.",
 	}
 
-	DeprecatedLogGroupMaxSize = FlagInfo{
+	LogGroupMaxSizeOverride = FlagInfo{
 		Name:        "log-group-max-size",
-		Description: `Maximum size of a group of log files before old files are removed.`,
+		Description: `--log-group-max-size=XXX is an alias for --log='file-defaults: {max-group-size: XXX}'.`,
 	}
 
-	DeprecatedLogDir = FlagInfo{
+	LogDirOverride = FlagInfo{
 		Name:        "log-dir",
-		Description: `Override the logging directory.`,
+		Description: `--log-dir=XXX is an alias for --log='file-defaults: {dir: XXX}'.`,
 	}
 
-	DeprecatedSQLAuditLogDir = FlagInfo{
-		Name: "sql-audit-dir",
-		Description: `
-If non-empty, create a SQL audit log in this directory.
-`,
+	SQLAuditLogDirOverride = FlagInfo{
+		Name:        "sql-audit-dir",
+		Description: `--sql-audit-dir=XXX is an alias for --log='sinks: {file-groups: {sql-audit: {channels: SENSITIVE_ACCESS, dir: ...}}}'.`,
+	}
+
+	ObsServiceAddr = FlagInfo{
+		Name:   "obsservice-addr",
+		EnvVar: "",
+		Description: `Address of an OpenTelemetry OTLP sink such as the
+Observability Service or the OpenTelemetry Collector. If set, telemetry
+events are exported to this address. The special value "embed" causes
+the Cockroach node to run the Observability Service internally.`,
 	}
 
 	BuildTag = FlagInfo{
@@ -1767,8 +1916,7 @@ See start --help for more flag details and examples.
 	}
 
 	ConfirmActions = FlagInfo{
-		Name:      "confirm",
-		Shorthand: "p",
+		Name: "confirm",
 		Description: `
 Confirm action:
 <PRE>
@@ -1777,5 +1925,22 @@ n - assume no/abort to all prompts
 p - prompt interactively for a confirmation
 </PRE>
 `,
+	}
+
+	RecoverIgnoreInternalVersion = FlagInfo{
+		Name: "ignore-internal-version",
+		Description: `
+When set, staging and local store plan application commands will ignore internal
+cluster version. This option must only be used to bypass version check if
+cluster is stuck in the middle of upgrade and locally stored versions differ
+from node to node and previous application or staging attempt failed.
+`,
+	}
+
+	PrintKeyLength = FlagInfo{
+		Name: "print-key-max-length",
+		Description: `
+Maximum number of characters in printed keys and spans. If key representation
+exceeds this value, it is truncated. Set to 0 to disable truncation.`,
 	}
 )

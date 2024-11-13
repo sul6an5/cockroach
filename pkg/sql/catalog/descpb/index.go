@@ -13,9 +13,9 @@ package descpb
 import (
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	types "github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -46,7 +46,7 @@ func (desc *IndexDescriptor) ExplicitColumnStartIdx() int {
 // delegates filling in any IDs until later.
 func (desc *IndexDescriptor) FillColumns(elems tree.IndexElemList) error {
 	desc.KeyColumnNames = make([]string, 0, len(elems))
-	desc.KeyColumnDirections = make([]catpb.IndexColumn_Direction, 0, len(elems))
+	desc.KeyColumnDirections = make([]catenumpb.IndexColumn_Direction, 0, len(elems))
 	for _, c := range elems {
 		if c.Expr != nil {
 			return errors.AssertionFailedf("index elem expression should have been replaced with a column")
@@ -54,30 +54,14 @@ func (desc *IndexDescriptor) FillColumns(elems tree.IndexElemList) error {
 		desc.KeyColumnNames = append(desc.KeyColumnNames, string(c.Column))
 		switch c.Direction {
 		case tree.Ascending, tree.DefaultDirection:
-			desc.KeyColumnDirections = append(desc.KeyColumnDirections, catpb.IndexColumn_ASC)
+			desc.KeyColumnDirections = append(desc.KeyColumnDirections, catenumpb.IndexColumn_ASC)
 		case tree.Descending:
-			desc.KeyColumnDirections = append(desc.KeyColumnDirections, catpb.IndexColumn_DESC)
+			desc.KeyColumnDirections = append(desc.KeyColumnDirections, catenumpb.IndexColumn_DESC)
 		default:
 			return fmt.Errorf("invalid direction %s for column %s", c.Direction, c.Column)
 		}
 	}
 	return nil
-}
-
-// IsHelpfulOriginIndex returns whether the index may be a helpful index for
-// performing foreign key checks and cascades for a foreign key with the given
-// origin columns. Given the originColIDs for foreign key constraint, the index
-// could be useful for FK check if the first column covered by the index is
-// present in FK constraint columns.
-func (desc *IndexDescriptor) IsHelpfulOriginIndex(originColIDs ColumnIDs) bool {
-	isHelpfulOriginIndex := len(desc.KeyColumnIDs) > 0 && originColIDs.Contains(desc.KeyColumnIDs[0])
-	return !desc.IsPartial() && isHelpfulOriginIndex
-}
-
-// IsValidOriginIndex returns whether the index can serve as an origin index for a foreign
-// key constraint with the provided set of originColIDs.
-func (desc *IndexDescriptor) IsValidOriginIndex(originColIDs ColumnIDs) bool {
-	return !desc.IsPartial() && ColumnIDs(desc.KeyColumnIDs).HasPrefix(originColIDs)
 }
 
 // explicitColumnIDsWithoutShardColumn returns explicit column ids of the index
@@ -99,9 +83,9 @@ func (desc *IndexDescriptor) implicitColumnIDs() ColumnIDs {
 	return desc.KeyColumnIDs[:desc.Partitioning.NumImplicitColumns]
 }
 
-// IsValidReferencedUniqueConstraint  is part of the UniqueConstraint interface.
-// It returns whether the index can serve as a referenced index for a foreign
-// key constraint with the provided set of referencedColumnIDs.
+// IsValidReferencedUniqueConstraint returns whether the index can serve
+// as a referenced index for a foreign key constraint with the provided set
+// of referencedColumnIDs.
 func (desc *IndexDescriptor) IsValidReferencedUniqueConstraint(referencedColIDs ColumnIDs) bool {
 	explicitColumnIDs := desc.explicitColumnIDsWithoutShardColumn()
 	allColumnIDs := append(explicitColumnIDs, desc.implicitColumnIDs()...)

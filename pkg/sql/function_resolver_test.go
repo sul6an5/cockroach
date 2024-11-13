@@ -16,11 +16,11 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -56,15 +56,15 @@ CREATE SEQUENCE sq1;
 CREATE TABLE t2(a INT PRIMARY KEY);
 CREATE VIEW v AS SELECT a FROM t2;
 CREATE TYPE notmyworkday AS ENUM ('Monday', 'Tuesday');
-CREATE FUNCTION f(a notmyworkday) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$
+CREATE FUNCTION f(a notmyworkday) RETURNS INT VOLATILE LANGUAGE SQL AS $$
   SELECT a FROM t;
   SELECT b FROM t@t_idx_b;
   SELECT c FROM t@t_idx_c;
   SELECT a FROM v;
   SELECT nextval('sq1');
 $$;
-CREATE FUNCTION f() RETURNS VOID IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
-CREATE FUNCTION f(INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT a FROM t $$;
+CREATE FUNCTION f() RETURNS VOID VOLATILE LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION f(INT) RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT a FROM t $$;
 `)
 
 	var sessionData sessiondatapb.SessionData
@@ -74,10 +74,10 @@ CREATE FUNCTION f(INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT a FROM t 
 		require.NoError(t, protoutil.Unmarshal(sessionSerialized, &sessionData))
 	}
 
-	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
+	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn, username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
+			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
 		)
 		defer cleanup()
 		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
@@ -166,9 +166,9 @@ func TestResolveFunctionRespectSearchPath(t *testing.T) {
 	tDB.Exec(t, `
 CREATE SCHEMA sc1;
 CREATE SCHEMA sc2;
-CREATE FUNCTION sc1.f() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
-CREATE FUNCTION sc2.f() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 2 $$;
-CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$;
+CREATE FUNCTION sc1.f() RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION sc2.f() RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 2 $$;
+CREATE FUNCTION sc1.lower() RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 3 $$;
 `,
 	)
 
@@ -176,6 +176,7 @@ CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$
 		testName       string
 		funName        tree.UnresolvedName
 		searchPath     []string
+		expectUDF      []bool
 		expectedBody   []string
 		expectedSchema []string
 		expectedErr    string
@@ -206,6 +207,7 @@ CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$
 			testName:       "function with explicit schema skip first schema in path",
 			funName:        tree.UnresolvedName{NumParts: 2, Parts: tree.NameParts{"f", "sc2", "", ""}},
 			searchPath:     []string{"sc1", "sc2"},
+			expectUDF:      []bool{true},
 			expectedBody:   []string{"SELECT 2;"},
 			expectedSchema: []string{"sc2"},
 		},
@@ -213,8 +215,25 @@ CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$
 			testName:       "use functions from search path",
 			funName:        tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{"f", "", "", ""}},
 			searchPath:     []string{"sc1", "sc2"},
+			expectUDF:      []bool{true, true},
 			expectedBody:   []string{"SELECT 1;", "SELECT 2;"},
 			expectedSchema: []string{"sc1", "sc2"},
+		},
+		{
+			testName:       "builtin function schema is respected",
+			funName:        tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{"lower", "", "", ""}},
+			searchPath:     []string{"sc1", "sc2"},
+			expectUDF:      []bool{false, true},
+			expectedBody:   []string{"", "SELECT 3;"},
+			expectedSchema: []string{"pg_catalog", "sc1"},
+		},
+		{
+			testName:       "explicit builtin function schema",
+			funName:        tree.UnresolvedName{NumParts: 2, Parts: tree.NameParts{"lower", "pg_catalog", "", ""}},
+			searchPath:     []string{"sc1", "sc2"},
+			expectUDF:      []bool{false},
+			expectedBody:   []string{""},
+			expectedSchema: []string{"pg_catalog"},
 		},
 		{
 			testName:    "unsupported builtin function",
@@ -222,8 +241,6 @@ CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$
 			searchPath:  []string{"sc1", "sc2"},
 			expectedErr: `querytree\(\): unimplemented: this function is not yet supported`,
 		},
-		// TODO(Chengxiong): add test case for builtin function names when builtin
-		// OIDs are changed to fixed IDs.
 	}
 
 	var sessionData sessiondatapb.SessionData
@@ -233,10 +250,10 @@ CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$
 		require.NoError(t, protoutil.Unmarshal(sessionSerialized, &sessionData))
 	}
 
-	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
+	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn, username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
+			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
 		)
 		defer cleanup()
 		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
@@ -246,25 +263,31 @@ CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$
 		funcResolver := planner.(tree.FunctionReferenceResolver)
 
 		for _, tc := range testCases {
-			path := sessiondata.MakeSearchPath(tc.searchPath)
-			funcDef, err := funcResolver.ResolveFunction(ctx, &tc.funName, &path)
-			if tc.expectedErr != "" {
-				require.Regexp(t, tc.expectedErr, err.Error())
-				continue
-			}
-			require.NoError(t, err)
-
-			require.Equal(t, len(tc.expectedBody), len(funcDef.Overloads))
-			bodies := make([]string, len(funcDef.Overloads))
-			schemas := make([]string, len(funcDef.Overloads))
-			for i, o := range funcDef.Overloads {
-				_, overload, err := funcResolver.ResolveFunctionByOID(ctx, o.Oid)
+			t.Run(tc.testName, func(t *testing.T) {
+				path := sessiondata.MakeSearchPath(tc.searchPath)
+				funcDef, err := funcResolver.ResolveFunction(ctx, &tc.funName, &path)
+				if tc.expectedErr != "" {
+					require.Regexp(t, tc.expectedErr, err.Error())
+					return
+				}
 				require.NoError(t, err)
-				bodies[i] = overload.Body
-				schemas[i] = o.Schema
-			}
-			require.Equal(t, tc.expectedBody, bodies)
-			require.Equal(t, tc.expectedSchema, schemas)
+
+				require.Equal(t, len(tc.expectUDF), len(funcDef.Overloads))
+				require.Equal(t, len(tc.expectedBody), len(funcDef.Overloads))
+				bodies := make([]string, len(funcDef.Overloads))
+				schemas := make([]string, len(funcDef.Overloads))
+				isUDF := make([]bool, len(funcDef.Overloads))
+				for i, o := range funcDef.Overloads {
+					_, overload, err := funcResolver.ResolveFunctionByOID(ctx, o.Oid)
+					require.NoError(t, err)
+					bodies[i] = overload.Body
+					schemas[i] = o.Schema
+					isUDF[i] = o.IsUDF
+				}
+				require.Equal(t, tc.expectedBody, bodies)
+				require.Equal(t, tc.expectedSchema, schemas)
+				require.Equal(t, tc.expectUDF, isUDF)
+			})
 		}
 		return nil
 	})
@@ -280,15 +303,13 @@ func TestFuncExprTypeCheck(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 
-	// TODO(Chengxiong): add test cases with builtin function when builtin
-	// function OIDs are changed to fixed IDs.
 	tDB.Exec(t, `
 CREATE SCHEMA sc1;
 CREATE SCHEMA sc2;
-CREATE FUNCTION sc1.f(a INT, b INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
-CREATE FUNCTION sc1.f(a INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 2 $$;
-CREATE FUNCTION sc2.f(a INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$;
-CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ SELECT lower('HI') $$;
+CREATE FUNCTION sc1.f(a INT, b INT) RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION sc1.f(a INT) RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 2 $$;
+CREATE FUNCTION sc2.f(a INT) RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 3 $$;
+CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING VOLATILE LANGUAGE SQL AS $$ SELECT lower('HI') $$;
 `,
 	)
 
@@ -346,6 +367,7 @@ CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ 
 			exprStr:          "lower('HI')",
 			searchPath:       []string{"sc1", "sc2"},
 			expectedFuncBody: "",
+			expectedFuncOID:  827,
 			desiredType:      types.String,
 		},
 		{
@@ -365,10 +387,10 @@ CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ 
 		require.NoError(t, protoutil.Unmarshal(sessionSerialized, &sessionData))
 	}
 
-	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
+	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn, username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
+			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
 		)
 		defer cleanup()
 		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
@@ -404,11 +426,8 @@ CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ 
 					require.False(t, funcExpr.ResolvedOverload().IsUDF)
 				}
 				require.False(t, funcExpr.ResolvedOverload().UDFContainsOnlySignature)
-				if tc.expectedFuncOID > 0 {
-					require.Equal(t, tc.expectedFuncOID, int(funcExpr.ResolvedOverload().Oid))
-				} else {
-					require.False(t, funcdesc.IsOIDUserDefinedFunc(funcExpr.ResolvedOverload().Oid))
-				}
+				require.Equal(t, tc.expectedFuncOID, int(funcExpr.ResolvedOverload().Oid))
+				require.Equal(t, funcExpr.ResolvedOverload().IsUDF, funcdesc.IsOIDUserDefinedFunc(funcExpr.ResolvedOverload().Oid))
 				require.Equal(t, tc.expectedFuncBody, funcExpr.ResolvedOverload().Body)
 			})
 		}

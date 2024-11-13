@@ -11,33 +11,38 @@
 import React from "react";
 import { assert } from "chai";
 import { mount, ReactWrapper } from "enzyme";
-import Long from "long";
 import { MemoryRouter } from "react-router-dom";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { Button } from "@cockroachlabs/ui-components";
 
 import { DiagnosticsView } from "./diagnosticsView";
-import { Table } from "src/table";
 import { TestStoreProvider } from "src/test-utils";
-
-type IStatementDiagnosticsReport =
-  cockroach.server.serverpb.IStatementDiagnosticsReport;
+import { StatementDiagnosticsReport } from "../../api";
+import moment from "moment-timezone";
+import { SortedTable } from "src/sortedtable";
 
 const activateDiagnosticsRef = { current: { showModalFor: jest.fn() } };
+const ts = {
+  windowSize: moment.duration(20, "day"),
+  sampleSize: moment.duration(5, "minutes"),
+  fixedWindowEnd: moment.utc("2023.01.5"),
+  key: "Custom",
+};
+const mockSetTimeScale = jest.fn();
 
 function generateDiagnosticsRequest(
-  extendObject: Partial<IStatementDiagnosticsReport> = {},
-): IStatementDiagnosticsReport {
-  const diagnosticsRequest = {
+  extendObject: Partial<StatementDiagnosticsReport> = {},
+): StatementDiagnosticsReport {
+  const requestedAt = moment("2023-01-01 00:00:00");
+  const report: StatementDiagnosticsReport = {
+    id: "124354678574635",
     statement_fingerprint: "SELECT * FROM table",
     completed: true,
-    requested_at: {
-      seconds: Long.fromNumber(Date.now()),
-      nanos: Math.random() * 1000000,
-    },
+    requested_at: moment(requestedAt),
+    min_execution_latency: moment.duration(10),
+    expires_at: moment("2023-01-01 00:00:10"),
   };
-  Object.assign(diagnosticsRequest, extendObject);
-  return diagnosticsRequest;
+  Object.assign(report, extendObject);
+  return report;
 }
 
 describe("DiagnosticsView", () => {
@@ -54,6 +59,8 @@ describe("DiagnosticsView", () => {
             hasData={false}
             diagnosticsReports={[]}
             dismissAlertMessage={() => {}}
+            currentScale={ts}
+            onChangeTimeScale={mockSetTimeScale}
           />
         </MemoryRouter>,
       );
@@ -70,7 +77,7 @@ describe("DiagnosticsView", () => {
 
   describe("With tracing data", () => {
     beforeEach(() => {
-      const diagnosticsRequests: IStatementDiagnosticsReport[] = [
+      const diagnosticsRequests: StatementDiagnosticsReport[] = [
         generateDiagnosticsRequest(),
         generateDiagnosticsRequest(),
       ];
@@ -83,13 +90,15 @@ describe("DiagnosticsView", () => {
             hasData={true}
             diagnosticsReports={diagnosticsRequests}
             dismissAlertMessage={() => {}}
+            currentScale={ts}
+            onChangeTimeScale={mockSetTimeScale}
           />
         </TestStoreProvider>,
       );
     });
 
     it("renders Table component when diagnostics data is provided", () => {
-      assert.isTrue(wrapper.find(Table).exists());
+      assert.isTrue(wrapper.find(SortedTable).exists());
     });
 
     it("opens the statement diagnostics modal when Activate button is clicked", () => {
@@ -103,7 +112,7 @@ describe("DiagnosticsView", () => {
     });
 
     it("Activate button is hidden if diagnostics is requested and waiting query", () => {
-      const diagnosticsRequests: IStatementDiagnosticsReport[] = [
+      const diagnosticsRequests: StatementDiagnosticsReport[] = [
         generateDiagnosticsRequest({ completed: false }),
         generateDiagnosticsRequest(),
       ];
@@ -115,6 +124,8 @@ describe("DiagnosticsView", () => {
             hasData={true}
             diagnosticsReports={diagnosticsRequests}
             dismissAlertMessage={() => {}}
+            currentScale={ts}
+            onChangeTimeScale={mockSetTimeScale}
           />
         </TestStoreProvider>,
       );
@@ -125,7 +136,7 @@ describe("DiagnosticsView", () => {
     });
 
     it("Cancel request button shows if diagnostics is requested and waiting query", () => {
-      const diagnosticsRequests: IStatementDiagnosticsReport[] = [
+      const diagnosticsRequests: StatementDiagnosticsReport[] = [
         generateDiagnosticsRequest({ completed: false }),
         generateDiagnosticsRequest(),
       ];
@@ -137,6 +148,8 @@ describe("DiagnosticsView", () => {
             hasData={true}
             diagnosticsReports={diagnosticsRequests}
             dismissAlertMessage={() => {}}
+            currentScale={ts}
+            onChangeTimeScale={mockSetTimeScale}
           />
         </TestStoreProvider>,
       );

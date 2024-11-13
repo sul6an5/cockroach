@@ -22,6 +22,7 @@ import { nodeIDAttr } from "src/util/constants";
 import EncryptionStatus from "src/views/reports/containers/stores/encryption";
 import { Loading } from "@cockroachlabs/cluster-ui";
 import { getMatchParamByName } from "src/util/query";
+import { BackToAdvanceDebug } from "../util";
 
 interface StoresOwnProps {
   stores: protos.cockroach.server.serverpb.IStoreDetails[];
@@ -111,6 +112,7 @@ export class Stores extends React.Component<StoresProps, {}> {
     return (
       <div className="section">
         <Helmet title="Stores | Debug" />
+        <BackToAdvanceDebug history={this.props.history} />
         <h1 className="base-heading">Stores</h1>
         <h2 className="base-heading">{header} stores</h2>
         <Loading
@@ -129,10 +131,11 @@ function selectStoresState(state: AdminUIState, props: StoresProps) {
   return state.cachedData.stores[nodeIDKey];
 }
 
-const selectStoresLoading = createSelector(
-  selectStoresState,
-  stores => _.isEmpty(stores) || _.isEmpty(stores.data),
-);
+const selectStoresLoading = createSelector(selectStoresState, stores => {
+  return (
+    _.isEmpty(stores) || (_.isEmpty(stores.data) && _.isNil(stores.lastError))
+  );
+});
 
 const selectSortedStores = createSelector(
   selectStoresLoading,
@@ -141,7 +144,7 @@ const selectSortedStores = createSelector(
     if (loading) {
       return null;
     }
-    return _.sortBy(stores.data.stores, store => store.store_id);
+    return _.sortBy(stores.data?.stores, store => store.store_id);
   },
 );
 

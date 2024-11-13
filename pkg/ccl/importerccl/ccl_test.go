@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -88,7 +89,7 @@ func TestImportMultiRegion(t *testing.T) {
 	tdb.Exec(t, `CREATE DATABASE foo`)
 	tdb.Exec(t, `CREATE DATABASE multi_region PRIMARY REGION "us-east1" REGIONS "us-east1", "us-east2"`)
 
-	simpleOcf := fmt.Sprintf("nodelocal://0/avro/%s", "simple.ocf")
+	simpleOcf := fmt.Sprintf("nodelocal://1/avro/%s", "simple.ocf")
 
 	var data string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -105,7 +106,7 @@ func TestImportMultiRegion(t *testing.T) {
 	}{
 		{
 			desc:      "pgdump",
-			importSQL: `IMPORT PGDUMP 'nodelocal://0/pgdump/views_and_sequences.sql' WITH ignore_unsupported_statements`,
+			importSQL: `IMPORT PGDUMP 'nodelocal://1/pgdump/views_and_sequences.sql' WITH ignore_unsupported_statements`,
 			expected: map[string]string{
 				"tbl": "REGIONAL BY TABLE IN PRIMARY REGION",
 				"s":   "REGIONAL BY TABLE IN PRIMARY REGION",
@@ -114,7 +115,7 @@ func TestImportMultiRegion(t *testing.T) {
 		},
 		{
 			desc:      "mysqldump",
-			importSQL: `IMPORT MYSQLDUMP 'nodelocal://0/mysqldump/views_and_sequences.sql'`,
+			importSQL: `IMPORT MYSQLDUMP 'nodelocal://1/mysqldump/views_and_sequences.sql'`,
 			expected: map[string]string{
 				"tbl":          "REGIONAL BY TABLE IN PRIMARY REGION",
 				"tbl_auto_inc": "REGIONAL BY TABLE IN PRIMARY REGION",
@@ -342,23 +343,23 @@ CREATE TABLE destination_fake_rbr (crdb_region public.crdb_internal_region NOT N
 	require.NoError(t, err)
 
 	// Export the data.
-	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://0/original_rbr_full'
+	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://1/original_rbr_full'
  FROM SELECT crdb_region, i from original_rbr;`)
 	require.NoError(t, err)
 
-	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://0/original_rbr_default'
+	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://1/original_rbr_default'
 FROM TABLE original_rbr;`)
 	require.NoError(t, err)
 
 	// Import the data back into the destination table.
 	_, err = sqlDB.Exec(`IMPORT into destination (i) CSV DATA
- ('nodelocal://0/original_rbr_default/export*.csv')`)
+ ('nodelocal://1/original_rbr_default/export*.csv')`)
 	require.NoError(t, err)
 	validateNumRows(sqlDB, `destination`, 5)
 
 	// Import the full export to the fake RBR table.
 	_, err = sqlDB.Exec(`IMPORT into destination_fake_rbr (crdb_region, i) CSV DATA
- ('nodelocal://0/original_rbr_full/export*.csv')`)
+ ('nodelocal://1/original_rbr_full/export*.csv')`)
 	require.NoError(t, err)
 	validateNumRows(sqlDB, `destination_fake_rbr`, 5)
 
@@ -390,7 +391,7 @@ func TestExportInsideTenant(t *testing.T) {
 	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
 	defer srv.Stopper().Stop(context.Background())
 
-	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
 	defer conn10.Close()
 	tenant10 := sqlutils.MakeSQLRunner(conn10)
 
@@ -425,12 +426,12 @@ func TestImportInTenant(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
 	// Setup a few tenants, each with a different table.
-	_, conn10 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	_, conn10 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
 	defer conn10.Close()
 	t10 := sqlutils.MakeSQLRunner(conn10)
 
 	// Setup a few tenants, each with a different table.
-	_, conn11 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(11)})
+	_, conn11 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(11)})
 	defer conn11.Close()
 	t11 := sqlutils.MakeSQLRunner(conn11)
 
@@ -467,21 +468,21 @@ func TestImportInMultiServerTenant(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	baseDir := testutils.TestDataPath(t)
+	baseDir := datapathutils.TestDataPath(t)
 	args := base.TestServerArgs{ExternalIODir: baseDir}
 	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{ServerArgs: args})
 	defer tc.Stopper().Stop(ctx)
 
 	// Setup a SQL server on a tenant.
 	_, conn1 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
-		TenantID: roachpb.MakeTenantID(10),
+		TenantID: roachpb.MustMakeTenantID(10),
 	})
 	defer conn1.Close()
 	t1 := sqlutils.MakeSQLRunner(conn1)
 
 	// Setup another SQL server on the same tenant.
 	_, conn2 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
-		TenantID:            roachpb.MakeTenantID(10),
+		TenantID:            roachpb.MustMakeTenantID(10),
 		DisableCreateTenant: true,
 	})
 	defer conn2.Close()

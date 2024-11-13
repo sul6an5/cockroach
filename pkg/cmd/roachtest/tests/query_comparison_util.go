@@ -28,22 +28,33 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
 type queryComparisonTest struct {
-	name string
-	run  func(*sqlsmith.Smither, *rand.Rand, queryComparisonHelper) error
+	name      string
+	setupName string
+	run       func(*sqlsmith.Smither, *rand.Rand, queryComparisonHelper) error
 }
 
 func runQueryComparison(
 	ctx context.Context, t test.Test, c cluster.Cluster, qct *queryComparisonTest,
 ) {
 	roundTimeout := 10 * time.Minute
+
+	// A cluster context with a slightly longer timeout than the test timeout is
+	// used so cluster creation or cleanup commands should never time out and
+	// result in "context deadline exceeded" Github issues being created.
+	var clusterCancel context.CancelFunc
+	var clusterCtx context.Context
+	clusterCtx, clusterCancel = context.WithTimeout(ctx, t.Spec().(*registry.TestSpec).Timeout-2*time.Minute)
+	defer clusterCancel()
+
 	// Run 10 minute iterations of query comparison in a loop for about the entire
 	// test, giving 5 minutes at the end to allow the test to shut down cleanly.
 	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, t.Spec().(*registry.TestSpec).Timeout-5*time.Minute)
+	ctx, cancel = context.WithTimeout(clusterCtx, t.Spec().(*registry.TestSpec).Timeout-5*time.Minute)
 	defer cancel()
 	done := ctx.Done()
 	shouldExit := func() bool {
@@ -55,13 +66,13 @@ func runQueryComparison(
 		}
 	}
 
-	c.Put(ctx, t.Cockroach(), "./cockroach")
+	c.Put(clusterCtx, t.Cockroach(), "./cockroach")
 
 	for i := 0; ; i++ {
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 		if shouldExit() {
 			return
 		}
+		c.Start(clusterCtx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
 		runOneRoundQueryComparison(ctx, i, roundTimeout, t, c, qct)
 		// If this iteration was interrupted because the timeout of ctx has been
@@ -70,8 +81,8 @@ func runQueryComparison(
 		if shouldExit() {
 			return
 		}
-		c.Stop(ctx, t.L(), option.DefaultStopOpts())
-		c.Wipe(ctx)
+		c.Stop(clusterCtx, t.L(), option.DefaultStopOpts())
+		c.Wipe(clusterCtx)
 	}
 }
 
@@ -137,8 +148,9 @@ func runOneRoundQueryComparison(
 
 	rnd, seed := randutil.NewTestRand()
 	t.L().Printf("seed: %d", seed)
+	t.L().Printf("setupName: %s", qct.setupName)
 
-	setup := sqlsmith.Setups[sqlsmith.RandTableSetupName](rnd)
+	setup := sqlsmith.Setups[qct.setupName](rnd)
 
 	t.Status("executing setup")
 	t.L().Printf("setup:\n%s", strings.Join(setup, "\n"))
@@ -167,9 +179,14 @@ func runOneRoundQueryComparison(
 	}
 	logStmt(setUnconstrainedStmt)
 
+	isMultiRegion := qct.setupName == sqlsmith.SeedMultiRegionSetupName
+	if isMultiRegion {
+		setupMultiRegionDatabase(t, conn, logStmt)
+	}
+
 	// Initialize a smither that generates only INSERT and UPDATE statements with
 	// the InsUpdOnly option.
-	mutatingSmither := newMutatingSmither(conn, rnd, t, true /* disableDelete */)
+	mutatingSmither := newMutatingSmither(conn, rnd, t, true /* disableDelete */, isMultiRegion)
 	defer mutatingSmither.Close()
 
 	// Initialize a smither that generates only deterministic SELECT statements.
@@ -177,11 +194,8 @@ func runOneRoundQueryComparison(
 		sqlsmith.DisableMutations(), sqlsmith.DisableNondeterministicFns(), sqlsmith.DisableLimits(),
 		sqlsmith.UnlikelyConstantPredicate(), sqlsmith.FavorCommonData(),
 		sqlsmith.UnlikelyRandomNulls(), sqlsmith.DisableCrossJoins(),
-		sqlsmith.DisableIndexHints(), sqlsmith.DisableWith(),
+		sqlsmith.DisableIndexHints(), sqlsmith.DisableWith(), sqlsmith.DisableDecimals(),
 		sqlsmith.LowProbabilityWhereClauseWithJoinTables(),
-		// TODO(mgartner): Re-enable aggregate functions when we can guarantee
-		// they are deterministic.
-		sqlsmith.DisableAggregateFuncs(),
 		sqlsmith.SetComplexity(.3),
 		sqlsmith.SetScalarComplexity(.1),
 	)
@@ -193,6 +207,7 @@ func runOneRoundQueryComparison(
 	t.Status("running ", qct.name)
 	until := time.After(roundTimeout)
 	done := ctx.Done()
+
 	for i := 1; ; i++ {
 		select {
 		case <-until:
@@ -208,7 +223,7 @@ func runOneRoundQueryComparison(
 			t.Status("running ", qct.name, ": ", i, " initial mutations completed")
 			// Initialize a new mutating smither that generates INSERT, UPDATE and
 			// DELETE statements with the MutationsOnly option.
-			mutatingSmither = newMutatingSmither(conn, rnd, t, false /* disableDelete */)
+			mutatingSmither = newMutatingSmither(conn, rnd, t, false /* disableDelete */, isMultiRegion)
 			defer mutatingSmither.Close()
 		}
 
@@ -240,21 +255,25 @@ func runOneRoundQueryComparison(
 }
 
 func newMutatingSmither(
-	conn *gosql.DB, rnd *rand.Rand, t test.Test, disableDelete bool,
+	conn *gosql.DB, rnd *rand.Rand, t test.Test, disableDelete bool, isMultiRegion bool,
 ) (mutatingSmither *sqlsmith.Smither) {
-	var allowedMutations func() sqlsmith.SmitherOption
-	if disableDelete {
-		allowedMutations = sqlsmith.InsUpdOnly
-	} else {
-		allowedMutations = sqlsmith.MutationsOnly
-	}
-	var err error
-	mutatingSmither, err = sqlsmith.NewSmither(conn, rnd, allowedMutations(),
+	var smitherOpts []sqlsmith.SmitherOption
+	smitherOpts = append(smitherOpts,
 		sqlsmith.FavorCommonData(), sqlsmith.UnlikelyRandomNulls(),
 		sqlsmith.DisableInsertSelect(), sqlsmith.DisableCrossJoins(),
 		sqlsmith.SetComplexity(.05),
-		sqlsmith.SetScalarComplexity(.01),
-	)
+		sqlsmith.SetScalarComplexity(.01))
+	if disableDelete {
+		smitherOpts = append(smitherOpts, sqlsmith.InsUpdOnly())
+	} else {
+		smitherOpts = append(smitherOpts, sqlsmith.MutationsOnly())
+	}
+	if isMultiRegion {
+		smitherOpts = append(smitherOpts, sqlsmith.EnableAlters())
+		smitherOpts = append(smitherOpts, sqlsmith.MultiRegionDDLs())
+	}
+	var err error
+	mutatingSmither, err = sqlsmith.NewSmither(conn, rnd, smitherOpts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,10 +300,22 @@ type queryComparisonHelper struct {
 	statementsAndExplains []sqlAndOutput
 }
 
-// runQuery runs the given query and returns the output. As a side effect, it
-// also saves the query, the query plan, and the output of running the query so
-// they can be logged in case of failure.
+// runQuery runs the given query and returns the output. If the stmt doesn't
+// result in an error, as a side effect, it also saves the query, the query
+// plan, and the output of running the query so they can be logged in case of
+// failure.
 func (h *queryComparisonHelper) runQuery(stmt string) ([][]string, error) {
+	// Log this statement with a timestamp but commented out. This will help in
+	// cases when the stmt will get stuck and the whole test will time out (in
+	// such a scenario, since the stmt didn't execute successfully, it won't get
+	// logged by the caller).
+	h.logStmt(fmt.Sprintf("-- %s: %s", timeutil.Now(),
+		// Remove all newline symbols to log this stmt as a single line. This
+		// way this auxiliary logging takes up less space (if the stmt executes
+		// successfully, it'll still get logged with the nice formatting).
+		strings.ReplaceAll(stmt, "\n", "")),
+	)
+
 	runQueryImpl := func(stmt string) ([][]string, error) {
 		rows, err := h.conn.Query(stmt)
 		if err != nil {
@@ -305,11 +336,14 @@ func (h *queryComparisonHelper) runQuery(stmt string) ([][]string, error) {
 	}
 
 	// Now run the query and save the output.
-	h.statements = append(h.statements, stmt)
 	rows, err := runQueryImpl(stmt)
 	if err != nil {
 		return nil, err
 	}
+	// Only save the stmt on success - this makes it easier to reproduce the
+	// log. The caller still can include it into the statements later if
+	// necessary.
+	h.statements = append(h.statements, stmt)
 	h.statementsAndExplains = append(h.statementsAndExplains, sqlAndOutput{sql: stmt, output: rows})
 	return rows, nil
 }

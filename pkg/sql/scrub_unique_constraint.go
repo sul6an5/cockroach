@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -29,7 +28,7 @@ import (
 type sqlUniqueConstraintCheckOperation struct {
 	tableName  *tree.TableName
 	tableDesc  catalog.TableDescriptor
-	constraint *descpb.ConstraintDetail
+	constraint catalog.UniqueConstraint
 	cols       []catid.ColumnID
 	name       string
 	asOf       hlc.Timestamp
@@ -45,31 +44,43 @@ type sqlUniqueConstraintCheckOperation struct {
 	run sqlCheckConstraintCheckRun
 }
 
-func newSQLUniqueConstraintCheckOperation(
+func newSQLUniqueWithIndexConstraintCheckOperation(
 	tableName *tree.TableName,
 	tableDesc catalog.TableDescriptor,
-	constraint descpb.ConstraintDetail,
+	constraint catalog.UniqueWithIndexConstraint,
 	asOf hlc.Timestamp,
 ) *sqlUniqueConstraintCheckOperation {
 	op := sqlUniqueConstraintCheckOperation{
 		tableName:  tableName,
 		tableDesc:  tableDesc,
-		constraint: &constraint,
+		constraint: constraint,
 		asOf:       asOf,
+		cols:       constraint.IndexDesc().KeyColumnIDs,
+		name:       constraint.GetName(),
+		predicate:  constraint.GetPredicate(),
 	}
-	if constraint.UniqueWithoutIndexConstraint != nil {
-		op.cols = constraint.UniqueWithoutIndexConstraint.ColumnIDs
-		op.name = constraint.UniqueWithoutIndexConstraint.Name
-		op.predicate = constraint.UniqueWithoutIndexConstraint.Predicate
-	} else if constraint.Index != nil {
-		op.cols = constraint.Index.KeyColumnIDs
-		// Partitioning columns are prepended to the index but are not part of the
-		// unique constraint, so we ignore them.
-		if constraint.Index.Partitioning.NumImplicitColumns > 0 {
-			op.cols = op.cols[constraint.Index.Partitioning.NumImplicitColumns:]
-		}
-		op.name = constraint.Index.Name
-		op.predicate = constraint.Index.Predicate
+	// Partitioning columns are prepended to the index but are not part of the
+	// unique constraint, so we ignore them.
+	if n := constraint.GetPartitioning().NumImplicitColumns(); n > 0 {
+		op.cols = op.cols[n:]
+	}
+	return &op
+}
+
+func newSQLUniqueWithoutIndexConstraintCheckOperation(
+	tableName *tree.TableName,
+	tableDesc catalog.TableDescriptor,
+	constraint catalog.UniqueWithoutIndexConstraint,
+	asOf hlc.Timestamp,
+) *sqlUniqueConstraintCheckOperation {
+	op := sqlUniqueConstraintCheckOperation{
+		tableName:  tableName,
+		tableDesc:  tableDesc,
+		constraint: constraint,
+		asOf:       asOf,
+		cols:       constraint.UniqueWithoutIndexDesc().ColumnIDs,
+		name:       constraint.GetName(),
+		predicate:  constraint.GetPredicate(),
 	}
 	return &op
 }
@@ -96,7 +107,7 @@ func (o *sqlUniqueConstraintCheckOperation) Start(params runParams) error {
 	keyCols := make([]string, len(o.cols))
 	matchers := make([]string, len(o.cols))
 	for i := 0; i < len(o.cols); i++ {
-		col, err := o.tableDesc.FindColumnWithID(o.cols[i])
+		col, err := catalog.MustFindColumnByID(o.tableDesc, o.cols[i])
 		if err != nil {
 			return err
 		}
@@ -110,11 +121,11 @@ func (o *sqlUniqueConstraintCheckOperation) Start(params runParams) error {
 	}
 	asOf := ""
 	if o.asOf != hlc.MaxTimestamp {
-		asOf = fmt.Sprintf("AS OF SYSTEM TIME %[1]d",
-			o.asOf.WallTime)
+		asOf = fmt.Sprintf("AS OF SYSTEM TIME '%s'", o.asOf.AsOfSystemTime())
 	}
 	tableName := fmt.Sprintf("%s.%s", o.tableName.Catalog(), o.tableName.Table())
-	dup, _, err := duplicateRowQuery(o.tableDesc, o.cols, o.predicate, false /* limitResults */)
+	dup, _, err := duplicateRowQuery(o.tableDesc, o.cols, o.predicate,
+		0 /* indexIDForValidation */, false /* limitResults */)
 	if err != nil {
 		return err
 	}
@@ -131,7 +142,7 @@ ON %[4]s
 		asOf,                            // 5
 	)
 
-	rows, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryBuffered(
+	rows, err := params.p.InternalSQLTxn().QueryBuffered(
 		ctx, "scrub-unique", params.p.txn, sel,
 	)
 	if err != nil {

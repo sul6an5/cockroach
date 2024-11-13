@@ -12,11 +12,11 @@ CREATE OR REPLACE FUNCTION f(IN a INT8 DEFAULT (7))
 CREATE OR REPLACE FUNCTION f(IN a INT8 DEFAULT _)
 	RETURNS INT8
 	LANGUAGE SQL
-	AS $$SELECT 1$$ -- literals removed
+	AS $$_$$ -- literals removed
 CREATE OR REPLACE FUNCTION _(IN _ INT8 DEFAULT 7)
 	RETURNS INT8
 	LANGUAGE SQL
-	AS $$SELECT 1$$ -- identifiers removed
+	AS $$_$$ -- identifiers removed
 
 parse
 CREATE OR REPLACE FUNCTION f(IN a INT=7) RETURNS INT CALLED ON NULL INPUT IMMUTABLE LEAKPROOF LANGUAGE SQL AS 'SELECT 1'
@@ -41,14 +41,14 @@ CREATE OR REPLACE FUNCTION f(IN a INT8 DEFAULT _)
 	IMMUTABLE
 	LEAKPROOF
 	LANGUAGE SQL
-	AS $$SELECT 1$$ -- literals removed
+	AS $$_$$ -- literals removed
 CREATE OR REPLACE FUNCTION _(IN _ INT8 DEFAULT 7)
 	RETURNS INT8
 	CALLED ON NULL INPUT
 	IMMUTABLE
 	LEAKPROOF
 	LANGUAGE SQL
-	AS $$SELECT 1$$ -- identifiers removed
+	AS $$_$$ -- identifiers removed
 
 parse
 CREATE OR REPLACE FUNCTION f(IN a INT=7) RETURNS INT AS 'SELECT 1' CALLED ON NULL INPUT IMMUTABLE LEAKPROOF LANGUAGE SQL
@@ -73,14 +73,14 @@ CREATE OR REPLACE FUNCTION f(IN a INT8 DEFAULT _)
 	IMMUTABLE
 	LEAKPROOF
 	LANGUAGE SQL
-	AS $$SELECT 1$$ -- literals removed
+	AS $$_$$ -- literals removed
 CREATE OR REPLACE FUNCTION _(IN _ INT8 DEFAULT 7)
 	RETURNS INT8
 	CALLED ON NULL INPUT
 	IMMUTABLE
 	LEAKPROOF
 	LANGUAGE SQL
-	AS $$SELECT 1$$ -- identifiers removed
+	AS $$_$$ -- identifiers removed
 
 parse
 CREATE OR REPLACE FUNCTION f(a INT DEFAULT 10) RETURNS INT RETURNS NULL ON NULL INPUT LANGUAGE SQL AS 'SELECT 1'
@@ -99,12 +99,12 @@ CREATE OR REPLACE FUNCTION f(IN a INT8 DEFAULT _)
 	RETURNS INT8
 	RETURNS NULL ON NULL INPUT
 	LANGUAGE SQL
-	AS $$SELECT 1$$ -- literals removed
+	AS $$_$$ -- literals removed
 CREATE OR REPLACE FUNCTION _(IN _ INT8 DEFAULT 10)
 	RETURNS INT8
 	RETURNS NULL ON NULL INPUT
 	LANGUAGE SQL
-	AS $$SELECT 1$$ -- identifiers removed
+	AS $$_$$ -- identifiers removed
 
 parse
 CREATE OR REPLACE FUNCTION f(a INT) RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 1; SELECT a; END
@@ -125,6 +125,28 @@ CREATE OR REPLACE FUNCTION _(IN _ INT8)
 	RETURNS INT8
 	LANGUAGE SQL
 	BEGIN ATOMIC SELECT 1; SELECT _; END -- identifiers removed
+
+
+parse
+CREATE OR REPLACE FUNCTION f(a "cool Type") RETURNS "Hot Type 🔥" LANGUAGE SQL BEGIN ATOMIC SELECT NULL:::"Hot Type 🔥"; END
+----
+CREATE OR REPLACE FUNCTION f(IN a "cool Type")
+	RETURNS "Hot Type 🔥"
+	LANGUAGE SQL
+	BEGIN ATOMIC SELECT NULL:::"Hot Type 🔥"; END -- normalized!
+CREATE OR REPLACE FUNCTION f(IN a "cool Type")
+	RETURNS "Hot Type 🔥"
+	LANGUAGE SQL
+	BEGIN ATOMIC SELECT ((NULL):::"Hot Type 🔥"); END -- fully parenthesized
+CREATE OR REPLACE FUNCTION f(IN a "cool Type")
+	RETURNS "Hot Type 🔥"
+	LANGUAGE SQL
+	BEGIN ATOMIC SELECT _:::"Hot Type 🔥"; END -- literals removed
+CREATE OR REPLACE FUNCTION _(IN _ _)
+	RETURNS _
+	LANGUAGE SQL
+	BEGIN ATOMIC SELECT NULL:::_; END -- identifiers removed
+
 
 parse
 CREATE OR REPLACE FUNCTION f(a INT) RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 1; SELECT $1; END
@@ -177,11 +199,11 @@ CREATE OR REPLACE FUNCTION _(IN _ INT8)
 error
 CREATE OR REPLACE FUNCTION f(a INT) RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 1 END
 ----
-at or near "end": syntax error
+at or near "EOF": syntax error
 DETAIL: source SQL:
 CREATE OR REPLACE FUNCTION f(a INT) RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 1 END
-                                                                                   ^
-HINT: try \h CREATE
+                                                                                      ^
+HINT: try \h CREATE FUNCTION
 
 error
 CREATE OR REPLACE FUNCTION f(a INT) RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 1; CREATE OR REPLACE FUNCTION g() RETURNS INT BEGIN ATOMIC SELECT 2; END;
@@ -190,7 +212,7 @@ at or near "EOF": syntax error
 DETAIL: source SQL:
 CREATE OR REPLACE FUNCTION f(a INT) RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 1; CREATE OR REPLACE FUNCTION g() RETURNS INT BEGIN ATOMIC SELECT 2; END;
                                                                                                                                                           ^
-HINT: try \h CREATE
+HINT: try \h CREATE FUNCTION
 
 error
 CREATE OR REPLACE FUNCTION f(OUT a int = 7) RETURNS INT AS 'SELECT 1' LANGUAGE SQL
@@ -258,23 +280,12 @@ We appreciate your feedback.
 error
 CREATE OR REPLACE FUNCTION f(VARIADIC a int = 7) RETURNS INT AS 'SELECT 1' LANGUAGE SQL
 ----
-----
 at or near "variadic": syntax error: unimplemented: this syntax
 DETAIL: source SQL:
 CREATE OR REPLACE FUNCTION f(VARIADIC a int = 7) RETURNS INT AS 'SELECT 1' LANGUAGE SQL
                              ^
 HINT: You have attempted to use a feature that is not yet implemented.
-
-Please check the public issue tracker to check whether this problem is
-already tracked. If you cannot find it there, please report the error
-with details by creating a new issue.
-
-If you would rather not post publicly, please contact us directly
-using the support form.
-
-We appreciate your feedback.
-----
-----
+See: https://go.crdb.dev/issue-v/88947/
 
 error
 CREATE OR REPLACE FUNCTION f(a int = 7) RETURNS INT TRANSFORM AS 'SELECT 1' LANGUAGE SQL
@@ -506,3 +517,51 @@ using the support form.
 We appreciate your feedback.
 ----
 ----
+
+parse
+CREATE FUNCTION populate() RETURNS integer AS $$
+DECLARE
+    -- declarations
+BEGIN
+    PERFORM my_function();
+END;
+$$ LANGUAGE plpgsql
+----
+CREATE FUNCTION populate()
+	RETURNS INT8
+	LANGUAGE plpgsql
+	AS $$
+DECLARE
+    -- declarations
+BEGIN
+    PERFORM my_function();
+END;
+$$ -- normalized!
+CREATE FUNCTION populate()
+	RETURNS INT8
+	LANGUAGE plpgsql
+	AS $$
+DECLARE
+    -- declarations
+BEGIN
+    PERFORM my_function();
+END;
+$$ -- fully parenthesized
+CREATE FUNCTION populate()
+	RETURNS INT8
+	LANGUAGE plpgsql
+	AS $$_$$ -- literals removed
+CREATE FUNCTION _()
+	RETURNS INT8
+	LANGUAGE plpgsql
+	AS $$_$$ -- identifiers removed
+
+error
+CREATE FUNCTION f() RETURNS TABLE 'SELECT 1' LANGUAGE SQL
+----
+at or near "table": syntax error: unimplemented: this syntax
+DETAIL: source SQL:
+CREATE FUNCTION f() RETURNS TABLE 'SELECT 1' LANGUAGE SQL
+                            ^
+HINT: You have attempted to use a feature that is not yet implemented.
+See: https://go.crdb.dev/issue-v/100226/

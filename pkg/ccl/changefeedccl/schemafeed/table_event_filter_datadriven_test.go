@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -61,7 +61,7 @@ func TestDataDriven(t *testing.T) {
 
 	defer log.Scope(t).Close(t)
 
-	testData := testutils.TestDataPath(t, "")
+	testData := datapathutils.TestDataPath(t, "")
 	datadriven.Walk(t, testData, func(t *testing.T, path string) {
 		ctx := context.Background()
 		ts, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
@@ -154,7 +154,7 @@ func TestDataDriven(t *testing.T) {
 						ev.After.GetName(), ev.Before.GetVersion(), ev.After.GetVersion(),
 						schemafeed.ClassifyEvent(ev),
 					)
-					if _, noColumnChanges := schemafeed.IsPrimaryIndexChange(ev); noColumnChanges {
+					if _, noColumnChanges := schemafeed.IsPrimaryIndexChange(ev, changefeedbase.Targets{}); noColumnChanges {
 						buf.WriteString(" (no column changes)")
 					}
 				}

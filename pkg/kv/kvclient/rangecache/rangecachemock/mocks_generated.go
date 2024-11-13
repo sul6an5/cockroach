@@ -8,6 +8,7 @@ import (
 	context "context"
 	reflect "reflect"
 
+	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
 	gomock "github.com/golang/mock/gomock"
 )
@@ -51,9 +52,9 @@ func (mr *MockRangeDescriptorDBMockRecorder) FirstRange() *gomock.Call {
 }
 
 // RangeLookup mocks base method.
-func (m *MockRangeDescriptorDB) RangeLookup(arg0 context.Context, arg1 roachpb.RKey, arg2 bool) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error) {
+func (m *MockRangeDescriptorDB) RangeLookup(arg0 context.Context, arg1 roachpb.RKey, arg2 kvpb.ReadConsistencyType, arg3 bool) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RangeLookup", arg0, arg1, arg2)
+	ret := m.ctrl.Call(m, "RangeLookup", arg0, arg1, arg2, arg3)
 	ret0, _ := ret[0].([]roachpb.RangeDescriptor)
 	ret1, _ := ret[1].([]roachpb.RangeDescriptor)
 	ret2, _ := ret[2].(error)
@@ -61,7 +62,7 @@ func (m *MockRangeDescriptorDB) RangeLookup(arg0 context.Context, arg1 roachpb.R
 }
 
 // RangeLookup indicates an expected call of RangeLookup.
-func (mr *MockRangeDescriptorDBMockRecorder) RangeLookup(arg0, arg1, arg2 interface{}) *gomock.Call {
+func (mr *MockRangeDescriptorDBMockRecorder) RangeLookup(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RangeLookup", reflect.TypeOf((*MockRangeDescriptorDB)(nil).RangeLookup), arg0, arg1, arg2)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RangeLookup", reflect.TypeOf((*MockRangeDescriptorDB)(nil).RangeLookup), arg0, arg1, arg2, arg3)
 }

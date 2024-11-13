@@ -9,9 +9,8 @@
 // licenses/APL.txt.
 
 import React from "react";
-import _ from "lodash";
 
-import { LineGraph } from "src/views/cluster/components/linegraph";
+import LineGraph from "src/views/cluster/components/linegraph";
 import { Axis, Metric } from "src/views/shared/components/metricQuery";
 import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
@@ -31,7 +30,8 @@ import { cockroach } from "src/js/protos";
 import TimeSeriesQueryAggregator = cockroach.ts.tspb.TimeSeriesQueryAggregator;
 
 export default function (props: GraphDashboardProps) {
-  const { nodeIDs, nodesSummary, storeSources } = props;
+  const { nodeIDs, storeSources, nodeDisplayNameByID, storeIDsByNodeID } =
+    props;
 
   return [
     <LineGraph title="Ranges" sources={storeSources}>
@@ -57,12 +57,12 @@ export default function (props: GraphDashboardProps) {
       tooltip={`The number of replicas on each node.`}
     >
       <Axis label="replicas">
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.replicas"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -74,28 +74,48 @@ export default function (props: GraphDashboardProps) {
           receives and coordinates all read and write requests for its range.`}
     >
       <Axis label="leaseholders">
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.replicas.leaseholders"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
     </LineGraph>,
 
     <LineGraph
-      title="Average Queries per Node"
-      tooltip={`Exponentially weighted moving average of the number of KV batch requests processed by leaseholder replicas on each node per second. Tracks roughly the last 30 minutes of requests. Used for load-based rebalancing decisions.`}
+      title="Average Replica Queries per Node"
+      tooltip={`Moving average of the number of KV batch requests processed by
+         leaseholder replicas on each node per second. Tracks roughly the last
+         30 minutes of requests. Used for load-based rebalancing decisions.`}
     >
       <Axis label="queries">
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.rebalancing.queriespersecond"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
+          />
+        ))}
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Average Replica CPU per Node"
+      tooltip={`Moving average of all replica CPU usage on each node per second.
+         Tracks roughly the last 30 minutes of usage. Used for load-based
+         rebalancing decisions.`}
+    >
+      <Axis units={AxisUnits.Duration} label="CPU time">
+        {nodeIDs.map(nid => (
+          <Metric
+            key={nid}
+            name="cr.store.rebalancing.cpunanospersecond"
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -106,12 +126,12 @@ export default function (props: GraphDashboardProps) {
       tooltip={<LogicalBytesGraphTooltip />}
     >
       <Axis units={AxisUnits.Bytes} label="logical store size">
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.totalbytes"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -180,20 +200,20 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph title="Snapshot Data Received" sources={storeSources}>
       <Axis label="bytes" units={AxisUnits.Bytes}>
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <>
             <Metric
               key={nid}
               name="cr.store.range.snapshots.rebalancing.rcvd-bytes"
-              title={nodeDisplayName(nodesSummary, nid) + "-rebalancing"}
-              sources={storeIDsForNode(nodesSummary, nid)}
+              title={nodeDisplayName(nodeDisplayNameByID, nid) + "-rebalancing"}
+              sources={storeIDsForNode(storeIDsByNodeID, nid)}
               nonNegativeRate
             />
             <Metric
               key={nid}
               name="cr.store.range.snapshots.recovery.rcvd-bytes"
-              title={nodeDisplayName(nodesSummary, nid) + "-recovery"}
-              sources={storeIDsForNode(nodesSummary, nid)}
+              title={nodeDisplayName(nodeDisplayNameByID, nid) + "-recovery"}
+              sources={storeIDsForNode(storeIDsByNodeID, nid)}
               nonNegativeRate
             />
           </>
@@ -206,12 +226,12 @@ export default function (props: GraphDashboardProps) {
       tooltip={ReceiverSnapshotsQueuedTooltip}
     >
       <Axis label="snapshots" units={AxisUnits.Count}>
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.range.snapshots.recv-queue"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -222,12 +242,12 @@ export default function (props: GraphDashboardProps) {
       tooltip={CircuitBreakerTrippedReplicasTooltip}
     >
       <Axis label="replicas">
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.kv.replica_circuit_breaker.num_tripped_replicas"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
             downsampler={TimeSeriesQueryAggregator.SUM}
           />
         ))}
@@ -239,12 +259,12 @@ export default function (props: GraphDashboardProps) {
       tooltip={CircuitBreakerTrippedEventsTooltip}
     >
       <Axis label="events">
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.kv.replica_circuit_breaker.num_tripped_events"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
             nonNegativeRate
           />
         ))}
@@ -256,12 +276,12 @@ export default function (props: GraphDashboardProps) {
       tooltip={PausedFollowersTooltip}
     >
       <Axis label="replicas">
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.admission.raft.paused_replicas"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
             nonNegativeRate
           />
         ))}
@@ -340,14 +360,15 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
     <LineGraph title="Decommissioning Errors" sources={storeSources}>
       <Axis label="replicas" units={AxisUnits.Count}>
-        {_.map(nodeIDs, nid => (
+        {nodeIDs.map(nid => (
           <Metric
             key={nid}
             name="cr.store.queue.replicate.replacedecommissioningreplica.error"
             title={
-              nodeDisplayName(nodesSummary, nid) + " - Replaced Errors / Sec"
+              nodeDisplayName(nodeDisplayNameByID, nid) +
+              " - Replaced Errors / Sec"
             }
-            sources={storeIDsForNode(nodesSummary, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
             nonNegativeRate
           />
         ))}

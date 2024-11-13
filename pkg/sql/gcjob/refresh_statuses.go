@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -103,8 +103,8 @@ func updateStatusForGCElements(
 	protectedtsCache := execCfg.ProtectedTimestampProvider
 	earliestDeadline := timeutil.Unix(0, int64(math.MaxInt64))
 
-	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		table, err := col.Direct().MustGetTableDescByID(ctx, txn, tableID)
+	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		table, err := col.ByID(txn.KV()).Get().Table(ctx, tableID)
 		if err != nil {
 			return err
 		}
@@ -138,9 +138,12 @@ func updateStatusForGCElements(
 
 		return nil
 	}); err != nil {
-		if errors.Is(err, catalog.ErrDescriptorNotFound) {
+		if isMissingDescriptorError(err) {
 			log.Warningf(ctx, "table %d not found, marking as GC'd", tableID)
 			markTableGCed(ctx, tableID, progress, jobspb.SchemaChangeGCProgress_CLEARED)
+			for indexID := range indexDropTimes {
+				markIndexGCed(ctx, indexID, progress, jobspb.SchemaChangeGCProgress_CLEARED)
+			}
 			return false, true, maxDeadline
 		}
 		log.Warningf(ctx, "error while calculating GC time for table %d, err: %+v", tableID, err)
@@ -410,8 +413,8 @@ func isTenantProtected(
 
 	isProtected := false
 	ptsProvider := execCfg.ProtectedTimestampProvider
-	if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		ptsState, err := ptsProvider.GetState(ctx, txn)
+	if err := execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		ptsState, err := ptsProvider.WithTxn(txn).GetState(ctx)
 		if err != nil {
 			return errors.Wrap(err, "failed to get protectedts State")
 		}
@@ -457,8 +460,8 @@ func refreshTenant(
 		return true, time.Time{}, nil
 	}
 
-	// Read the tenant's GC TTL to check if the tenant's data has expired.
 	tenID := details.Tenant.ID
+	// Read the tenant's GC TTL to check if the tenant's data has expired.
 	cfg := execCfg.SystemConfig.GetSystemConfig()
 	tenantTTLSeconds := execCfg.DefaultZoneConfig.GC.TTLSeconds
 	zoneCfg, err := cfg.GetZoneConfigForObject(keys.SystemSQLCodec, keys.TenantsRangesID)
@@ -474,7 +477,7 @@ func refreshTenant(
 		// If the tenant's GC TTL has elapsed, check if there are any protected timestamp records
 		// that apply to the tenant keyspace.
 		atTime := hlc.Timestamp{WallTime: dropTime}
-		isProtected, err := isTenantProtected(ctx, atTime, roachpb.MakeTenantID(tenID), execCfg)
+		isProtected, err := isTenantProtected(ctx, atTime, roachpb.MustMakeTenantID(tenID), execCfg)
 		if err != nil {
 			return false, time.Time{}, err
 		}

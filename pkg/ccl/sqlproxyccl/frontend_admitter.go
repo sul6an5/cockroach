@@ -10,8 +10,10 @@ package sqlproxyccl
 
 import (
 	"crypto/tls"
+	"io"
 	"net"
 
+	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgproto3/v2"
 )
 
@@ -32,6 +34,10 @@ type FrontendAdmitInfo struct {
 	CancelRequest *proxyCancelRequest
 }
 
+// noStartupMessage is an error used to indicate that there were no data packets
+// read at all when trying to read a startup message from the connection.
+var noStartupMessage = errors.New("no startup message")
+
 // FrontendAdmit is the default implementation of a frontend admitter. It can
 // upgrade to an optional SSL connection, and will handle and verify the startup
 // message received from the PG SQL client. The connection returned should never
@@ -48,9 +54,24 @@ var FrontendAdmit = func(
 	// Read first message from client.
 	m, err := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn).ReceiveStartupMessage()
 	if err != nil {
-		return &FrontendAdmitInfo{
-			Conn: conn, Err: newErrorf(codeClientReadFailed, "while receiving startup message"),
+		var startupErr error
+		// ReceiveStartupMessage returns io.EOF if the first four bytes cannot
+		// be read at all. All other read errors will be converted to
+		// io.ErrUnexpectedEOF.
+		//
+		// The io.EOF case usually happens with TCP probes (i.e. an opened
+		// connection without any bytes). For this special case, we will return
+		// noStartupMessage.
+		//
+		// See: https://github.com/jackc/pgproto3/blob/0c0f7b03fb4967dfff8de06d07a9fe20baf83449/backend.go#L60-L63
+		if errors.Is(err, io.EOF) {
+			startupErr = noStartupMessage
+		} else {
+			startupErr = withCode(
+				errors.Wrap(err, "while receiving startup message"), codeClientReadFailed,
+			)
 		}
+		return &FrontendAdmitInfo{Conn: conn, Err: startupErr}
 	}
 
 	// CancelRequest is unencrypted and unauthenticated, regardless of whether
@@ -75,12 +96,14 @@ var FrontendAdmit = func(
 	if incomingTLSConfig != nil {
 		if _, ok := m.(*pgproto3.SSLRequest); !ok {
 			code := codeUnexpectedInsecureStartupMessage
-			return &FrontendAdmitInfo{Conn: conn, Err: newErrorf(code, "unsupported startup message: %T", m)}
+			return &FrontendAdmitInfo{Conn: conn, Err: withCode(
+				errors.Newf("unsupported startup message: %T", m), code)}
 		}
 
 		_, err = conn.Write([]byte{pgAcceptSSLRequest})
 		if err != nil {
-			return &FrontendAdmitInfo{Conn: conn, Err: newErrorf(codeClientWriteFailed, "acking SSLRequest: %v", err)}
+			return &FrontendAdmitInfo{Conn: conn, Err: withCode(
+				errors.Wrap(err, "acking SSLRequest"), codeClientWriteFailed)}
 		}
 
 		cfg := incomingTLSConfig.Clone()
@@ -96,8 +119,29 @@ var FrontendAdmit = func(
 		if err != nil {
 			return &FrontendAdmitInfo{
 				Conn: conn,
-				Err:  newErrorf(codeClientReadFailed, "receiving post-TLS startup message: %v", err),
+				Err: withCode(errors.Wrap(err,
+					"receiving post-TLS startup message"), codeClientReadFailed),
 			}
+		}
+	}
+
+	// CancelRequest is unencrypted and unauthenticated, regardless of whether
+	// the server requires TLS connections.
+	// The PostgreSQL protocol definition says that cancel payloads
+	// must be sent *prior to upgrading the connection to use TLS*.
+	// Yet, we've found clients in the wild that send the cancel
+	// after the TLS handshake, for example at
+	// https://github.com/cockroachlabs/support/issues/600.
+	if c, ok := m.(*pgproto3.CancelRequest); ok {
+		// Craft a proxyCancelRequest in case we need to forward the request.
+		cr := &proxyCancelRequest{
+			ProxyIP:   decodeIP(c.ProcessID),
+			SecretKey: c.SecretKey,
+			ClientIP:  conn.RemoteAddr().(*net.TCPAddr).IP,
+		}
+		return &FrontendAdmitInfo{
+			Conn:          conn,
+			CancelRequest: cr,
 		}
 	}
 
@@ -109,11 +153,10 @@ var FrontendAdmit = func(
 		if _, ok := startup.Parameters[sessionRevivalTokenStartupParam]; ok {
 			return &FrontendAdmitInfo{
 				Conn: conn,
-				Err: newErrorf(
-					codeUnexpectedStartupMessage,
+				Err: withCode(errors.Newf(
 					"parameter %s is not allowed",
-					sessionRevivalTokenStartupParam,
-				),
+					sessionRevivalTokenStartupParam),
+					codeUnexpectedStartupMessage),
 			}
 		}
 		return &FrontendAdmitInfo{Conn: conn, Msg: startup, SniServerName: sniServerName}
@@ -122,6 +165,7 @@ var FrontendAdmit = func(
 	code := codeUnexpectedStartupMessage
 	return &FrontendAdmitInfo{
 		Conn: conn,
-		Err:  newErrorf(code, "unsupported post-TLS startup message: %T", m),
+		Err: withCode(errors.Newf(
+			"unsupported post-TLS startup message: %T", m), code),
 	}
 }

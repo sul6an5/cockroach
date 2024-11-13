@@ -13,9 +13,17 @@ package evalcatalog
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/redact"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 )
 
 // UpdatableCommand matches update operations in postgres.
@@ -33,13 +41,59 @@ var (
 	allUpdatableEvents = tree.NewDInt((1 << UpdateCommand) | (1 << InsertCommand) | (1 << DeleteCommand))
 )
 
+// RedactDescriptor takes an encoded protobuf descriptor and returns the
+// encoded protobuf after redaction.
+func (b *Builtins) RedactDescriptor(_ context.Context, encodedDescriptor []byte) ([]byte, error) {
+	var descProto descpb.Descriptor
+	if err := protoutil.Unmarshal(encodedDescriptor, &descProto); err != nil {
+		return nil, err
+	}
+	if errs := redact.Redact(&descProto); len(errs) != 0 {
+		var ret error
+		for _, err := range errs {
+			ret = errors.CombineErrors(ret, err)
+		}
+		return nil, ret
+	}
+	return protoutil.Marshal(&descProto)
+}
+
+// DescriptorWithPostDeserializationChanges expects an encoded protobuf
+// descriptor, decodes it, puts it into a catalog.DescriptorBuilder,
+// calls RunPostDeserializationChanges, and re-encodes it.
+func (b *Builtins) DescriptorWithPostDeserializationChanges(
+	_ context.Context, encodedDescriptor []byte,
+) ([]byte, error) {
+	// Use the largest-possible timestamp as a sentinel value when decoding the
+	// descriptor bytes. This will be used to set the modification time field in
+	// the built descriptor without triggering any errors. We need to remove it
+	// before re-encoding the descriptor, because it's nonsensical and it's what
+	// the descriptor collection does anyway when persisting a descriptor to
+	// storage.
+	var mvccTimestampSentinel = hlc.MaxTimestamp
+	db, err := descbuilder.FromBytesAndMVCCTimestamp(encodedDescriptor, mvccTimestampSentinel)
+	if err != nil {
+		return nil, err
+	}
+	if db == nil {
+		return nil, pgerror.New(pgcode.InvalidBinaryRepresentation, "empty descriptor")
+	}
+	if err := db.RunPostDeserializationChanges(); err != nil {
+		return nil, err
+	}
+	mut := db.BuildCreatedMutable()
+	// Strip the sentinel value from the descriptor.
+	if mvccTimestampSentinel.Equal(mut.GetModificationTime()) {
+		mut.ResetModificationTime()
+	}
+	return protoutil.Marshal(mut.DescriptorProto())
+}
+
 // PGRelationIsUpdatable is part of the eval.CatalogBuiltins interface.
 func (b *Builtins) PGRelationIsUpdatable(
 	ctx context.Context, oidArg *tree.DOid,
 ) (*tree.DInt, error) {
-	tableDesc, err := b.dc.GetImmutableTableByID(
-		ctx, b.txn, descpb.ID(oidArg.Oid), tree.ObjectLookupFlagsWithRequired(),
-	)
+	tableDesc, err := b.dc.ByIDWithLeased(b.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(oidArg.Oid))
 	if err != nil {
 		// For postgres compatibility, it is expected that rather returning
 		// an error this return nonUpdatableEvents (Zero) because there could
@@ -69,7 +123,7 @@ func (b *Builtins) PGColumnIsUpdatable(
 		return tree.DBoolFalse, nil
 	}
 	attNum := descpb.PGAttributeNum(attNumArg)
-	tableDesc, err := b.dc.GetImmutableTableByID(ctx, b.txn, descpb.ID(oidArg.Oid), tree.ObjectLookupFlagsWithRequired())
+	tableDesc, err := b.dc.ByIDWithLeased(b.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(oidArg.Oid))
 	if err != nil {
 		if sqlerrors.IsUndefinedRelationError(err) {
 			// For postgres compatibility, it is expected that rather returning
@@ -83,15 +137,11 @@ func (b *Builtins) PGColumnIsUpdatable(
 		return tree.DBoolFalse, nil
 	}
 
-	column, err := tableDesc.FindColumnWithPGAttributeNum(attNum)
-	if err != nil {
-		if sqlerrors.IsUndefinedColumnError(err) {
-			// When column does not exist postgres returns true.
-			return tree.DBoolTrue, nil
-		}
-		return nil, err
+	column := catalog.FindColumnByPGAttributeNum(tableDesc, attNum)
+	if column == nil {
+		// When column does not exist postgres returns true.
+		return tree.DBoolTrue, nil
 	}
-
 	// pg_column_is_updatable was created for compatibility. This
 	// will return true if is a table (not virtual) and column is not
 	// a computed column.

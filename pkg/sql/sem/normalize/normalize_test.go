@@ -137,21 +137,8 @@ func TestNormalizeExpr(t *testing.T) {
 		{`a<1`, `a < 1`},
 		{`1>a`, `a < 1`},
 		{`a<NULL`, `NULL`},
-		{`(a+1)=2`, `a = 1`},
-		{`(a-1)>=2`, `a >= 3`},
-		{`(1+a)<=2`, `a <= 1`},
-		{`(1-a)>2`, `a < -1`},
-		{`2<(a+1)`, `a > 1`},
-		{`2>(a-1)`, `a < 3`},
-		{`2<(1+a)`, `a > 1`},
-		{`2>(1-a)`, `a > -1`},
-		{`(a+(1+1))=2`, `a = 0`},
-		{`((a+1)+1)=2`, `a = 0`},
-		{`a+1+1=2`, `a = 0`},
 		{`1+1>=(b+c)`, `(b + c) <= 2`},
 		{`b+c<=1+1`, `(b + c) <= 2`},
-		{`a/2=1`, `a = 2`},
-		{`1=a/2`, `a = 2`},
 		{`s=lower('FOO')`, `s = 'foo'`},
 		{`lower(s)='foo'`, `lower(s) = 'foo'`},
 		{`random()`, `random()`},
@@ -226,21 +213,6 @@ func TestNormalizeExpr(t *testing.T) {
 		{`('a' || left('b', random()::INT8)) COLLATE en`, `('a' || left('b', random()::INT8)) COLLATE en`},
 		{`NULL COLLATE en`, `CAST(NULL AS STRING) COLLATE en`},
 		{`(1.0 + random()) IS OF (INT8)`, `(1.0 + random()) IS OF (INT8)`},
-		// #14687: ensure that negative divisors flip the inequality when rotating.
-		{`1 < a / -2`, `a < -2`},
-		{`1 <= a / -2`, `a <= -2`},
-		{`1 > a / -2`, `a > -2`},
-		{`1 >= a / -2`, `a >= -2`},
-		{`1 = a / -2`, `a = -2`},
-		{`1 < a / 2`, `a > 2`},
-		{`1 <= a / 2`, `a >= 2`},
-		{`1 > a / 2`, `a < 2`},
-		{`1 >= a / 2`, `a <= 2`},
-		{`1 = a / 2`, `a = 2`},
-		{`a - 1 < 9223372036854775807`, `(a - 1) < 9223372036854775807`},
-		{`a - 1 < 9223372036854775806`, `a < 9223372036854775807`},
-		{`-1 + a < 9223372036854775807`, `(-1 + a) < 9223372036854775807`},
-		{`-1 + a < 9223372036854775806`, `a < 9223372036854775807`},
 		{`j->'s' = jv`, `(j->'s') = jv`},
 		{`j->s = jv`, `(j->s) = jv`},
 		{`j->2 = '"jv"'::JSONB`, `(j->2) = '"jv"'`},
@@ -263,9 +235,9 @@ func TestNormalizeExpr(t *testing.T) {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
 			rOrig := typedExpr.String()
-			ctx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-			defer ctx.Mon.Stop(context.Background())
-			r, err := normalize.Expr(ctx, typedExpr)
+			evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+			defer evalCtx.Stop(context.Background())
+			r, err := normalize.Expr(context.Background(), evalCtx, typedExpr)
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
@@ -273,7 +245,7 @@ func TestNormalizeExpr(t *testing.T) {
 				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
 			}
 			// Normalizing again should be a no-op.
-			r2, err := normalize.Expr(ctx, r)
+			r2, err := normalize.Expr(context.Background(), evalCtx, r)
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}

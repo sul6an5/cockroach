@@ -13,15 +13,17 @@ package delegate
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
 // delegateShowGrants implements SHOW GRANTS which returns grant details for the
@@ -64,7 +66,7 @@ SELECT type_catalog AS database_name,
 FROM "".information_schema.type_privileges`
 	const systemPrivilegeQuery = `
 SELECT a.username AS grantee,
-       privilege,
+       privilege AS privilege_type,
        a.privilege
        IN (
           SELECT unnest(grant_options)
@@ -79,15 +81,15 @@ SELECT a.username AS grantee,
 	const externalConnectionPrivilegeQuery = `
 SELECT *
   FROM (
-        SELECT name,
+        SELECT name AS connection_name,
                a.username AS grantee,
-               privilege,
+               privilege AS privilege_type,
                a.privilege
                IN (
                   SELECT unnest(grant_options)
                     FROM system.privileges
                    WHERE username = a.username
-                ) AS grantable
+                ) AS is_grantable
           FROM (
                 SELECT regexp_extract(
                         path,
@@ -100,6 +102,34 @@ SELECT *
                ) AS a
        )
 `
+	// Query grants data for user-defined functions. Builtin functions are not
+	// included.
+	udfQuery := fmt.Sprintf(`
+WITH fn_grants AS (
+  SELECT routine_catalog as database_name,
+         routine_schema as schema_name,
+         reverse(split_part(reverse(specific_name), '_', 1))::OID as function_id,
+         routine_name as function_name,
+         grantee,
+         privilege_type,
+         is_grantable::boolean
+  FROM "".information_schema.role_routine_grants
+  WHERE reverse(split_part(reverse(specific_name), '_', 1))::INT > %d
+)
+SELECT database_name,
+       schema_name,
+       function_id,
+       concat(
+				 function_name,
+         '(',
+				 pg_get_function_identity_arguments(function_id),
+         ')'
+			 ) as function_signature,
+       grantee,
+       privilege_type,
+       is_grantable
+  FROM fn_grants
+`, oidext.CockroachPredefinedOIDMax)
 
 	var source bytes.Buffer
 	var cond bytes.Buffer
@@ -217,6 +247,31 @@ SELECT *
 				strings.Join(params, ","),
 			)
 		}
+	} else if n.Targets != nil && len(n.Targets.Functions) > 0 {
+		fmt.Fprint(&source, udfQuery)
+		orderBy = "1,2,3,4,5,6"
+		fnResolved := intsets.MakeFast()
+		for _, fn := range n.Targets.Functions {
+			un := fn.FuncName.ToUnresolvedObjectName().ToUnresolvedName()
+			fd, err := d.catalog.ResolveFunction(d.ctx, un, &d.evalCtx.SessionData().SearchPath)
+			if err != nil {
+				return nil, err
+			}
+			paramTypes, err := fn.ParamTypes(d.ctx, d.catalog)
+			if err != nil {
+				return nil, err
+			}
+			ol, err := fd.MatchOverload(paramTypes, fn.FuncName.Schema(), &d.evalCtx.SessionData().SearchPath)
+			if err != nil {
+				return nil, err
+			}
+			fnResolved.Add(int(ol.Oid))
+		}
+		params = make([]string, fnResolved.Len())
+		for i, fnID := range fnResolved.Ordered() {
+			params[i] = strconv.Itoa(fnID)
+		}
+		fmt.Fprintf(&cond, `WHERE function_id IN (%s)`, strings.Join(params, ","))
 	} else if n.Targets != nil && n.Targets.System {
 		orderBy = "1,2,3"
 		fmt.Fprint(&source, systemPrivilegeQuery)
@@ -284,6 +339,10 @@ SELECT *
 				`SELECT database_name, schema_name, type_name AS relation_name, grantee, privilege_type, is_grantable FROM (`)
 			source.WriteString(typePrivQuery)
 			source.WriteByte(')')
+			source.WriteString(` UNION ALL ` +
+				`SELECT database_name, schema_name, function_signature AS relation_name, grantee, privilege_type, is_grantable FROM (`)
+			source.WriteString(udfQuery)
+			source.WriteByte(')')
 			// If the current database is set, restrict the command to it.
 			if currDB := d.evalCtx.SessionData().Database; currDB != "" {
 				fmt.Fprintf(&cond, ` WHERE database_name = %s`, lexbase.EscapeSQLString(currDB))
@@ -318,14 +377,21 @@ SELECT *
 		if err != nil {
 			return nil, err
 		}
-		userExists, err := d.catalog.RoleExists(d.ctx, user)
-		if err != nil {
-			return nil, err
+		// The `public` role is a pseudo-role, so we check it separately. RoleExists
+		// should not return true for `public` since other operations like GRANT and
+		// REVOKE should fail with a "role `public` does not exist" error if they
+		// are used with `public`.
+		userExists := user.IsPublicRole()
+		if !userExists {
+			userExists, err = d.catalog.RoleExists(d.ctx, user)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if !userExists {
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %q does not exist", user)
+			return nil, sqlerrors.NewUndefinedUserError(user)
 		}
 	}
 
-	return parse(query)
+	return d.parse(query)
 }

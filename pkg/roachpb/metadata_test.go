@@ -186,6 +186,79 @@ func TestLocalityConversions(t *testing.T) {
 	}
 }
 
+func TestLocalityMatches(t *testing.T) {
+	var empty Locality
+	var l Locality
+	require.NoError(t, l.Set("a=b,c=d,e=f"))
+	for _, tc := range []struct {
+		filter string
+		miss   string
+	}{
+		{filter: "", miss: ""},
+		{filter: "a=b", miss: ""},
+		{filter: "a=b,c=d,e=f", miss: ""},
+		{filter: "c=d,e=f,a=b", miss: ""},
+		{filter: "a=z", miss: "a=z"},
+		{filter: "a=b,c=x,e=f", miss: "c=x"},
+		{filter: "a=b,x=y", miss: "x=y"},
+	} {
+		t.Run(fmt.Sprintf("%s-miss-%s", tc.filter, tc.miss), func(t *testing.T) {
+			var filter Locality
+			if tc.filter != "" {
+				require.NoError(t, filter.Set(tc.filter))
+			}
+			matches, miss := l.Matches(filter)
+			if tc.miss == "" {
+				require.True(t, matches)
+			} else {
+				require.False(t, matches)
+				require.Equal(t, tc.miss, miss.String())
+			}
+
+			emptyMatches, _ := empty.Matches(filter)
+			require.Equal(t, tc.filter == "", emptyMatches)
+		})
+	}
+}
+
+func TestLocalitySharedPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		a        string
+		b        string
+		expected int
+	}{
+		// Test basic match and mismatch cases.
+		{"a=b", "a=b", 1},
+		{"a=b,c=d", "a=b,c=d", 2},
+		{"a=b", "a=b,c=d", 1},
+		{"", "", 0},
+
+		// Test cases with differing lengths.
+		{"a=b", "x=y", 0},
+		{"a=b,x=y", "", 0},
+		{"a=b,x=y", "a=c", 0},
+		{"a=b,x=y", "a=c,x=y", 0},
+
+		// Test cases where the mismatch occurs in different positions.
+		{"a=b,c=d,e=f", "a=z,c=d,e=f", 0},
+		{"a=b,c=d,e=f", "a=b,c=z,e=f", 1},
+		{"a=b,c=d,e=f", "a=b,c=d,e=z", 2},
+		{"a=b,c=d,e=f", "a=b,c=d,e=f", 3},
+	} {
+		t.Run(fmt.Sprintf("%s_=_%s", tc.a, tc.b), func(t *testing.T) {
+			var a, b Locality
+			if tc.a != "" {
+				require.NoError(t, a.Set(tc.a))
+			}
+			if tc.b != "" {
+				require.NoError(t, b.Set(tc.b))
+			}
+			require.Equal(t, tc.expected, a.SharedPrefix(b))
+			require.Equal(t, tc.expected, b.SharedPrefix(a))
+		})
+	}
+}
+
 func TestDiversityScore(t *testing.T) {
 	// Keys are not considered for score, just the order, so we don't need to
 	// specify them.

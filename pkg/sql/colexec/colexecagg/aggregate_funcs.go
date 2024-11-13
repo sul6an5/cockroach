@@ -11,6 +11,7 @@
 package colexecagg
 
 import (
+	"context"
 	"unsafe"
 
 	"github.com/cockroachdb/apd/v3"
@@ -219,6 +220,7 @@ const (
 
 // NewAggregateFuncsAlloc returns a new AggregateFuncsAlloc.
 func NewAggregateFuncsAlloc(
+	ctx context.Context,
 	args *NewAggregatorArgs,
 	aggregations []execinfrapb.AggregatorSpec_Aggregation,
 	allocSize int64,
@@ -380,12 +382,12 @@ func NewAggregateFuncsAlloc(
 			switch aggKind {
 			case HashAggKind:
 				funcAllocs[i] = newDefaultHashAggAlloc(
-					args.Allocator, args.Constructors[i], args.EvalCtx, inputArgsConverter,
+					ctx, args.Allocator, args.Constructors[i], args.EvalCtx, inputArgsConverter,
 					len(aggFn.ColIdx), args.ConstArguments[i], args.OutputTypes[i], allocSize,
 				)
 			case OrderedAggKind:
 				funcAllocs[i] = newDefaultOrderedAggAlloc(
-					args.Allocator, args.Constructors[i], args.EvalCtx, inputArgsConverter,
+					ctx, args.Allocator, args.Constructors[i], args.EvalCtx, inputArgsConverter,
 					len(aggFn.ColIdx), args.ConstArguments[i], args.OutputTypes[i], allocSize,
 				)
 			case WindowAggKind:
@@ -443,6 +445,7 @@ type aggAllocBase struct {
 //
 // evalCtx will not be mutated.
 func ProcessAggregations(
+	ctx context.Context,
 	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 	aggregations []execinfrapb.AggregatorSpec_Aggregation,
@@ -458,7 +461,7 @@ func ProcessAggregations(
 	outputTypes = make([]*types.T, len(aggregations))
 	for i, aggFn := range aggregations {
 		constructors[i], constArguments[i], outputTypes[i], err = execagg.GetAggregateConstructor(
-			evalCtx, semaCtx, &aggFn, inputTypes,
+			ctx, evalCtx, semaCtx, &aggFn, inputTypes,
 		)
 		if err != nil {
 			return

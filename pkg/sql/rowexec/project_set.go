@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -41,7 +42,7 @@ type projectSetProcessor struct {
 	// funcs contains a valid pointer to a SRF FuncExpr for every entry
 	// in `exprHelpers` that is actually a SRF function application.
 	// The size of the slice is the same as `exprHelpers` though.
-	funcs []*tree.FuncExpr
+	funcs []tree.TypedExpr
 
 	// mustBeStreaming indicates whether at least one function in funcs is of
 	// "streaming" nature.
@@ -73,30 +74,30 @@ var _ execopnode.OpNode = &projectSetProcessor{}
 const projectSetProcName = "projectSet"
 
 func newProjectSetProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.ProjectSetSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*projectSetProcessor, error) {
 	outputTypes := append(input.OutputTypes(), spec.GeneratedColumns...)
 	ps := &projectSetProcessor{
 		input:       input,
 		spec:        spec,
 		exprHelpers: make([]*execinfrapb.ExprHelper, len(spec.Exprs)),
-		funcs:       make([]*tree.FuncExpr, len(spec.Exprs)),
+		funcs:       make([]tree.TypedExpr, len(spec.Exprs)),
 		rowBuffer:   make(rowenc.EncDatumRow, len(outputTypes)),
 		gens:        make([]eval.ValueGenerator, len(spec.Exprs)),
 		done:        make([]bool, len(spec.Exprs)),
 	}
 	if err := ps.Init(
+		ctx,
 		ps,
 		post,
 		outputTypes,
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ps.input},
@@ -113,14 +114,19 @@ func newProjectSetProcessor(
 	semaCtx := ps.FlowCtx.NewSemaContext(ps.FlowCtx.Txn)
 	for i, expr := range ps.spec.Exprs {
 		var helper execinfrapb.ExprHelper
-		err := helper.Init(expr, ps.input.OutputTypes(), semaCtx, ps.EvalCtx)
+		err := helper.Init(ctx, expr, ps.input.OutputTypes(), semaCtx, ps.EvalCtx)
 		if err != nil {
 			return nil, err
 		}
-		if tFunc, ok := helper.Expr.(*tree.FuncExpr); ok && tFunc.IsGeneratorApplication() {
+		if tFunc, ok := helper.Expr.(*tree.FuncExpr); ok && tFunc.IsGeneratorClass() {
 			// Expr is a set-generating function.
 			ps.funcs[i] = tFunc
 			ps.mustBeStreaming = ps.mustBeStreaming || tFunc.IsVectorizeStreaming()
+		}
+		if tRoutine, ok := helper.Expr.(*tree.RoutineExpr); ok {
+			// A routine in the context of a project-set is a set-returning
+			// routine.
+			ps.funcs[i] = tRoutine
 		}
 		ps.exprHelpers[i] = &helper
 	}
@@ -136,7 +142,7 @@ func (ps *projectSetProcessor) MustBeStreaming() bool {
 func (ps *projectSetProcessor) Start(ctx context.Context) {
 	ctx = ps.StartInternal(ctx, projectSetProcName)
 	ps.input.Start(ctx)
-	ps.cancelChecker.Reset(ctx)
+	ps.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 }
 
 // nextInputRow returns the next row or metadata from ps.input. It also
@@ -159,7 +165,7 @@ func (ps *projectSetProcessor) nextInputRow() (
 			// First, make sure to close its ValueGenerator from the previous
 			// input row (if it exists).
 			if ps.gens[i] != nil {
-				ps.gens[i].Close(ps.Ctx)
+				ps.gens[i].Close(ps.Ctx())
 				ps.gens[i] = nil
 			}
 
@@ -167,7 +173,25 @@ func (ps *projectSetProcessor) nextInputRow() (
 			ps.exprHelpers[i].Row = row
 
 			ps.EvalCtx.IVarContainer = ps.exprHelpers[i]
-			gen, err := eval.GetGenerator(ps.EvalCtx, fn)
+
+			var gen eval.ValueGenerator
+			var err error
+			switch t := fn.(type) {
+			case *tree.FuncExpr:
+				gen, err = eval.GetFuncGenerator(ps.Ctx(), ps.EvalCtx, t)
+			case *tree.RoutineExpr:
+				gen, err = eval.GetRoutineGenerator(ps.Ctx(), ps.EvalCtx, t)
+				if err == nil && gen == nil && t.MultiColOutput && !t.Generator {
+					// If the routine will return multiple output columns, we expect the
+					// routine to return nulls for each column type instead of no rows, so
+					// we can't use the empty generator. Set-returning routines
+					// (i.e., Generators), have different behavior and are handled
+					// separately.
+					gen, err = builtins.NullGenerator(t.ResolvedType())
+				}
+			default:
+				return nil, nil, errors.AssertionFailedf("unexpected expression in project-set: %T", fn)
+			}
 			if err != nil {
 				return nil, nil, err
 			}
@@ -182,7 +206,7 @@ func (ps *projectSetProcessor) nextInputRow() (
 			// Store the generator before Start so that it'll be closed even if
 			// Start returns an error.
 			ps.gens[i] = gen
-			if err := gen.Start(ps.Ctx, ps.FlowCtx.Txn); err != nil {
+			if err := gen.Start(ps.Ctx(), ps.FlowCtx.Txn); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -203,7 +227,7 @@ func (ps *projectSetProcessor) nextGeneratorValues() (newValAvail bool, err erro
 			numCols := int(ps.spec.NumColsPerGen[i])
 			if !ps.done[i] {
 				// Yes; check whether this source still has some values available.
-				hasVals, err := gen.Next(ps.Ctx)
+				hasVals, err := gen.Next(ps.Ctx())
 				if err != nil {
 					return false, err
 				}
@@ -235,7 +259,7 @@ func (ps *projectSetProcessor) nextGeneratorValues() (newValAvail bool, err erro
 			// Do we still need to produce the scalar value? (first row)
 			if !ps.done[i] {
 				// Yes. Produce it once, then indicate it's "done".
-				value, err := ps.exprHelpers[i].Eval(ps.rowBuffer)
+				value, err := ps.exprHelpers[i].Eval(ps.Ctx(), ps.rowBuffer)
 				if err != nil {
 					return false, err
 				}
@@ -318,7 +342,7 @@ func (ps *projectSetProcessor) close() {
 	// InternalClose().
 	for i, gen := range ps.gens {
 		if gen != nil {
-			gen.Close(ps.Ctx)
+			gen.Close(ps.Ctx())
 			ps.gens[i] = nil
 		}
 	}

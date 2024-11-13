@@ -11,18 +11,21 @@
 package norm
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins" // register all builtins in builtins:init() for memo package
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -66,6 +69,7 @@ type AppliedRuleFunc func(ruleName opt.RuleName, source, target opt.Expr)
 // Optgen DSL, the factory always calls the `onConstruct` method as its last
 // step, in order to allow any custom manual code to execute.
 type Factory struct {
+	ctx     context.Context
 	evalCtx *eval.Context
 
 	// mem is the Memo data structure that the factory builds.
@@ -99,7 +103,7 @@ type Factory struct {
 
 	// disabledRules is a set of rules that are not allowed to run, used when
 	// rules are disabled during testing to prevent rule cycles.
-	disabledRules util.FastIntSet
+	disabledRules intsets.Fast
 }
 
 // maxConstructorStackDepth is the maximum allowed depth of a constructor call
@@ -123,17 +127,18 @@ func init() {
 //
 // By default, a factory only constant-folds immutable operators; this can be
 // changed using FoldingControl().AllowStableFolds().
-func (f *Factory) Init(evalCtx *eval.Context, catalog cat.Catalog) {
+func (f *Factory) Init(ctx context.Context, evalCtx *eval.Context, catalog cat.Catalog) {
 	// Initialize (or reinitialize) the memo.
 	mem := f.mem
 	if mem == nil {
 		mem = &memo.Memo{}
 	}
-	mem.Init(evalCtx)
+	mem.Init(ctx, evalCtx)
 
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*f = Factory{
+		ctx:     ctx,
 		mem:     mem,
 		evalCtx: evalCtx,
 		catalog: catalog,
@@ -162,7 +167,16 @@ func (f *Factory) DetachMemo() *memo.Memo {
 	m := f.mem
 	f.mem = nil
 	m.Detach()
-	f.Init(f.evalCtx, nil /* catalog */)
+	f.Init(f.ctx, f.evalCtx, nil /* catalog */)
+	return m
+}
+
+// ReleaseMemo is just like DetachMemo but it doesn't call Detach on the memo
+// preserving any statistics information for explain purposes (distinct, null
+// count etc).
+func (f *Factory) ReleaseMemo() *memo.Memo {
+	m := f.mem
+	f.mem = nil
 	return m
 }
 
@@ -171,6 +185,24 @@ func (f *Factory) DetachMemo() *memo.Memo {
 // are applied).
 func (f *Factory) DisableOptimizations() {
 	f.NotifyOnMatchedRule(func(opt.RuleName) bool { return false })
+}
+
+// DisableOptimizationRules disables a specific set of transformation rules.
+func (f *Factory) DisableOptimizationRules(disabledRules intsets.Fast) {
+	f.NotifyOnMatchedRule(func(rule opt.RuleName) bool {
+		return !disabledRules.Contains(int(rule))
+	})
+}
+
+// DisableOptimizationRulesTemporarily disables a specific set transformation
+// rules during the execution of the given function fn. A MatchedRuleFunc
+// previously set by NotifyOnMatchedRule is not invoked during execution of fn,
+// but will be invoked for future rule matches after fn returns.
+func (f *Factory) DisableOptimizationRulesTemporarily(disabledRules intsets.Fast, fn func()) {
+	originalMatchedRule := f.matchedRule
+	f.DisableOptimizationRules(disabledRules)
+	fn()
+	f.matchedRule = originalMatchedRule
 }
 
 // DisableOptimizationsTemporarily disables all transformation rules during the
@@ -204,7 +236,7 @@ func (f *Factory) NotifyOnAppliedRule(appliedRule AppliedRuleFunc) {
 // disabled during testing. SetDisabledRules does not prevent rules from
 // matching - rather, it notifies the Factory that rules have been prevented
 // from matching using NotifyOnMatchedRule.
-func (f *Factory) SetDisabledRules(disabledRules util.FastIntSet) {
+func (f *Factory) SetDisabledRules(disabledRules intsets.Fast) {
 	f.disabledRules = disabledRules
 }
 
@@ -317,11 +349,33 @@ func (f *Factory) AssignPlaceholders(from *memo.Memo) (err error) {
 	var replaceFn ReplaceFunc
 	replaceFn = func(e opt.Expr) opt.Expr {
 		if placeholder, ok := e.(*memo.PlaceholderExpr); ok {
-			d, err := eval.Expr(f.evalCtx, e.(*memo.PlaceholderExpr).Value)
+			d, err := eval.Expr(f.ctx, f.evalCtx, e.(*memo.PlaceholderExpr).Value)
 			if err != nil {
 				panic(err)
 			}
 			return f.ConstructConstVal(d, placeholder.DataType())
+		}
+		// A recursive CTE may have the stats change on its Initial expression
+		// after placeholder assignment, if that happens we need to
+		// propagate that change to the Binding expression and rebuild
+		// everything.
+		if rcte, ok := e.(*memo.RecursiveCTEExpr); ok {
+			newInitial := f.CopyAndReplaceDefault(rcte.Initial, replaceFn).(memo.RelExpr)
+			if newInitial != rcte.Initial {
+				newBinding := f.ConstructFakeRel(&memo.FakeRelPrivate{
+					Props: MakeBindingPropsForRecursiveCTE(
+						props.AnyCardinality, rcte.Binding.Relational().OutputCols,
+						newInitial.Relational().Statistics().RowCount)})
+				if id := rcte.WithBindingID(); id != 0 {
+					f.Metadata().AddWithBinding(id, newBinding)
+				}
+				return f.ConstructRecursiveCTE(
+					newBinding,
+					newInitial,
+					f.invokeReplace(rcte.Recursive, replaceFn).(memo.RelExpr),
+					&rcte.RecursiveCTEPrivate,
+				)
+			}
 		}
 		return f.CopyAndReplaceDefault(e, replaceFn)
 	}
@@ -354,7 +408,7 @@ func (f *Factory) onMaxConstructorStackDepthExceeded() {
 	if buildutil.CrdbTestBuild {
 		panic(err)
 	}
-	errorutil.SendReport(f.evalCtx.Ctx(), &f.evalCtx.Settings.SV, err)
+	errorutil.SendReport(f.ctx, &f.evalCtx.Settings.SV, err)
 }
 
 // onConstructRelational is called as a final step by each factory method that

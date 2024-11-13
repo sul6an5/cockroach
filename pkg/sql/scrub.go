@@ -16,11 +16,10 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
@@ -154,22 +153,23 @@ func (n *scrubNode) Close(ctx context.Context) {
 func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tree.Name) error {
 	// Check that the database exists.
 	database := string(*name)
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
-		database, tree.DatabaseLookupFlags{Required: true})
+	db, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, database)
 	if err != nil {
 		return err
 	}
 
-	schemas, err := p.Descriptors().GetSchemasForDatabase(ctx, p.txn, dbDesc)
+	schemas, err := p.Descriptors().GetSchemasForDatabase(ctx, p.txn, db)
 	if err != nil {
 		return err
 	}
 
 	var tbNames tree.TableNames
 	for _, schema := range schemas {
-		toAppend, _, err := resolver.GetObjectNamesAndIDs(
-			ctx, p.txn, p, p.ExecCfg().Codec, dbDesc, schema, true, /*explicitPrefix*/
-		)
+		sc, err := p.byNameGetterBuilder().Get().Schema(ctx, db, schema)
+		if err != nil {
+			return err
+		}
+		toAppend, _, err := p.GetObjectNamesAndIDs(ctx, db, sc)
 		if err != nil {
 			return err
 		}
@@ -178,12 +178,21 @@ func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tr
 
 	for i := range tbNames {
 		tableName := &tbNames[i]
-		_, objDesc, err := p.Accessor().GetObjectDesc(
-			ctx, p.txn, tableName.Catalog(), tableName.Schema(), tableName.Table(),
-			p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/),
+		flags := tree.ObjectLookupFlags{DesiredObjectKind: tree.TableObject}
+		_, _, objDesc, err := p.LookupObject(
+			ctx, flags, tableName.Catalog(), tableName.Schema(), tableName.Table(),
 		)
+		// Skip over descriptors that are not tables (like types).
+		// Note: We are asking for table objects above, so It's valid to only
+		// get a prefix, and no descriptor.
+		if errors.Is(err, catalog.ErrDescriptorWrongType) {
+			continue
+		}
 		if err != nil {
 			return err
+		}
+		if objDesc == nil || objDesc.DescriptorType() != catalog.Table {
+			continue
 		}
 		tableDesc := objDesc.(catalog.TableDescriptor)
 		// Skip non-tables and don't throw an error if we encounter one.
@@ -406,53 +415,40 @@ func createConstraintCheckOperations(
 	tableName *tree.TableName,
 	asOf hlc.Timestamp,
 ) (results []checkOperation, err error) {
-	constraints, err := tableDesc.GetConstraintInfoWithLookup(func(id descpb.ID) (catalog.TableDescriptor, error) {
-		return p.Descriptors().GetImmutableTableByID(ctx, p.Txn(), id, tree.ObjectLookupFlagsWithRequired())
-	})
-	if err != nil {
-		return nil, err
-	}
-
+	var constraints []catalog.Constraint
 	// Keep only the constraints specified by the constraints in
 	// constraintNames.
 	if constraintNames != nil {
-		wantedConstraints := make(map[string]descpb.ConstraintDetail)
 		for _, constraintName := range constraintNames {
-			if v, ok := constraints[string(constraintName)]; ok {
-				wantedConstraints[string(constraintName)] = v
-			} else {
-				return nil, pgerror.Newf(pgcode.UndefinedObject,
-					"constraint %q of relation %q does not exist", constraintName, tableDesc.GetName())
+			c := catalog.FindConstraintByName(tableDesc, string(constraintName))
+			if c == nil {
+				return nil, sqlerrors.NewUndefinedConstraintError(string(constraintName), tableDesc.GetName())
 			}
+			constraints = append(constraints, c)
 		}
-		constraints = wantedConstraints
+	} else {
+		constraints = tableDesc.EnforcedConstraints()
 	}
 
 	// Populate results with all constraints on the table.
 	for _, constraint := range constraints {
-		switch constraint.Kind {
-		case descpb.ConstraintTypeCheck:
-			results = append(results, newSQLCheckConstraintCheckOperation(
-				tableName,
-				tableDesc,
-				constraint.CheckConstraint,
-				asOf,
-			))
-		case descpb.ConstraintTypeFK:
-			results = append(results, newSQLForeignKeyCheckOperation(
-				tableName,
-				tableDesc,
-				constraint,
-				asOf,
-			))
-		case descpb.ConstraintTypePK, descpb.ConstraintTypeUnique:
-			results = append(results, newSQLUniqueConstraintCheckOperation(
-				tableName,
-				tableDesc,
-				constraint,
-				asOf,
-			))
+		var op checkOperation
+		if ck := constraint.AsCheck(); ck != nil {
+			op = newSQLCheckConstraintCheckOperation(tableName, tableDesc, ck, asOf)
+		} else if fk := constraint.AsForeignKey(); fk != nil {
+			referencedTable, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Table(ctx, fk.GetReferencedTableID())
+			if err != nil {
+				return nil, err
+			}
+			op = newSQLForeignKeyCheckOperation(tableName, tableDesc, fk, referencedTable, asOf)
+		} else if uwi := constraint.AsUniqueWithIndex(); uwi != nil {
+			op = newSQLUniqueWithIndexConstraintCheckOperation(tableName, tableDesc, uwi, asOf)
+		} else if uwoi := constraint.AsUniqueWithoutIndex(); uwoi != nil {
+			op = newSQLUniqueWithoutIndexConstraintCheckOperation(tableName, tableDesc, uwoi, asOf)
+		} else {
+			return nil, errors.AssertionFailedf("unknown constraint type %T", constraint)
 		}
+		results = append(results, op)
 	}
 	return results, nil
 }

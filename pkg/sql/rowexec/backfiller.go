@@ -17,13 +17,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -69,7 +69,6 @@ type backfiller struct {
 	filter backfill.MutationFilter
 
 	spec        execinfrapb.BackfillerSpec
-	output      execinfra.RowReceiver
 	out         execinfra.ProcOutputHelper
 	flowCtx     *execinfra.FlowCtx
 	processorID int32
@@ -87,21 +86,21 @@ func (*backfiller) MustBeStreaming() bool {
 }
 
 // Run is part of the execinfra.Processor interface.
-func (b *backfiller) Run(ctx context.Context) {
+func (b *backfiller) Run(ctx context.Context, output execinfra.RowReceiver) {
 	opName := fmt.Sprintf("%sBackfiller", b.name)
 	ctx = logtags.AddTag(ctx, opName, int(b.spec.Table.ID))
 	ctx, span := execinfra.ProcessorSpan(ctx, opName)
 	defer span.Finish()
 	meta := b.doRun(ctx)
-	execinfra.SendTraceData(ctx, b.output)
-	if emitHelper(ctx, b.output, &b.out, nil /* row */, meta, func(ctx context.Context) {}) {
-		b.output.ProducerDone()
+	execinfra.SendTraceData(ctx, output)
+	if emitHelper(ctx, output, &b.out, nil /* row */, meta, func(context.Context, execinfra.RowReceiver) {}) {
+		output.ProducerDone()
 	}
 }
 
 func (b *backfiller) doRun(ctx context.Context) *execinfrapb.ProducerMetadata {
 	semaCtx := tree.MakeSemaContext()
-	if err := b.out.Init(&execinfrapb.PostProcessSpec{}, nil, &semaCtx, b.flowCtx.NewEvalCtx()); err != nil {
+	if err := b.out.Init(ctx, &execinfrapb.PostProcessSpec{}, nil, &semaCtx, b.flowCtx.NewEvalCtx()); err != nil {
 		return &execinfrapb.ProducerMetadata{Err: err}
 	}
 	finishedSpans, err := b.mainLoop(ctx)
@@ -194,14 +193,14 @@ func (b *backfiller) mainLoop(ctx context.Context) (roachpb.Spans, error) {
 func GetResumeSpans(
 	ctx context.Context,
 	jobsRegistry *jobs.Registry,
-	txn *kv.Txn,
+	txn isql.Txn,
 	codec keys.SQLCodec,
 	col *descs.Collection,
 	tableID descpb.ID,
 	mutationID descpb.MutationID,
 	filter backfill.MutationFilter,
 ) ([]roachpb.Span, *jobs.Job, int, error) {
-	tableDesc, err := col.Direct().MustGetTableDescByID(ctx, txn, tableID)
+	tableDesc, err := col.ByID(txn.KV()).Get().Table(ctx, tableID)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -268,12 +267,17 @@ func GetResumeSpans(
 
 // SetResumeSpansInJob adds a list of resume spans into a job details field.
 func SetResumeSpansInJob(
-	ctx context.Context, spans []roachpb.Span, mutationIdx int, txn *kv.Txn, job *jobs.Job,
+	ctx context.Context, spans []roachpb.Span, mutationIdx int, txn isql.Txn, job *jobs.Job,
 ) error {
 	details, ok := job.Details().(jobspb.SchemaChangeDetails)
 	if !ok {
 		return errors.Errorf("expected SchemaChangeDetails job type, got %T", job.Details())
 	}
 	details.ResumeSpanList[mutationIdx].ResumeSpans = spans
-	return job.SetDetails(ctx, txn, details)
+	return job.WithTxn(txn).SetDetails(ctx, details)
+}
+
+// Resume is part of the execinfra.Processor interface.
+func (b *backfiller) Resume(output execinfra.RowReceiver) {
+	panic("not implemented")
 }

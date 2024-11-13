@@ -13,72 +13,52 @@ package opgen
 import (
 	"reflect"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
 
-func newLogEventBase(e scpb.Element, md *targetsWithElementMap) scop.EventBase {
-	idx, ok := md.elementToTarget[e]
-	if !ok {
-		panic(errors.AssertionFailedf(
-			"could not find element %s in target state", screl.ElementString(e),
-		))
-	}
-	t := md.Targets[idx]
-	return scop.EventBase{
-		TargetMetadata: *protoutil.Clone(&t.Metadata).(*scpb.TargetMetadata),
-		Authorization:  *protoutil.Clone(&md.Authorization).(*scpb.Authorization),
-		Statement:      md.Statements[t.Metadata.StatementID].RedactedStatement,
-		StatementTag:   md.Statements[t.Metadata.StatementID].StatementTag,
-	}
-}
-
-func newLogEventOp(e scpb.Element, md *targetsWithElementMap) *scop.LogEvent {
-	idx, ok := md.elementToTarget[e]
-	if !ok {
-		panic(errors.AssertionFailedf(
-			"could not find element %s in target state", screl.ElementString(e),
-		))
-	}
-	t := md.Targets[idx]
-	return &scop.LogEvent{
-		EventBase:    newLogEventBase(e, md),
-		Element:      *protoutil.Clone(&t.ElementProto).(*scpb.ElementProto),
-		TargetStatus: t.TargetStatus,
-	}
-}
-
-func statementForDropJob(e scpb.Element, md *targetsWithElementMap) scop.StatementForDropJob {
+func statementForDropJob(e scpb.Element, md *opGenContext) scop.StatementForDropJob {
 	stmtID := md.Targets[md.elementToTarget[e]].Metadata.StatementID
+	stmt := redact.RedactableString(md.Statements[stmtID].RedactedStatement).StripMarkers()
+	switch e.(type) {
+	case *scpb.PrimaryIndex:
+		stmt = "removed primary index; " + stmt
+	case *scpb.SecondaryIndex:
+		stmt = "removed secondary index; " + stmt
+	case *scpb.TemporaryIndex:
+		stmt = "removed temporary index; " + stmt
+	}
 	return scop.StatementForDropJob{
 		// Using the redactable string but with stripped markers gives us a
 		// normalized and fully-qualified string value for display use.
-		Statement: redact.RedactableString(
-			md.Statements[stmtID].RedactedStatement,
-		).StripMarkers(),
+		Statement:   stmt,
 		StatementID: stmtID,
 		Rollback:    md.InRollback,
 	}
 }
 
-// targetsWithElementMap is one of the available arguments to an opgen
+// opGenContext is one of the available arguments to an opgen
 // function. It allows access to the fields of the TargetState and, via
 // a lookup map, the fields of the element itself.
 //
 // This map allows opgen functions to find their target without an O(N)
 // lookup.
-type targetsWithElementMap struct {
+type opGenContext struct {
 	scpb.TargetState
+	ActiveVersion   clusterversion.ClusterVersion
 	elementToTarget map[scpb.Element]int
 	InRollback      bool
 }
 
-func makeTargetsWithElementMap(cs scpb.CurrentState) targetsWithElementMap {
-	md := targetsWithElementMap{
+func makeOpgenContext(
+	activeVersion clusterversion.ClusterVersion, cs scpb.CurrentState,
+) opGenContext {
+	md := opGenContext{
+		ActiveVersion:   activeVersion,
 		InRollback:      cs.InRollback,
 		TargetState:     cs.TargetState,
 		elementToTarget: make(map[scpb.Element]int),
@@ -98,7 +78,7 @@ func makeTargetsWithElementMap(cs scpb.CurrentState) targetsWithElementMap {
 
 // opsFunc are a fully-compiled and checked set of functions to emit operations
 // given an element value.
-type opsFunc func(element scpb.Element, md *targetsWithElementMap) []scop.Op
+type opsFunc func(element scpb.Element, md *opGenContext) []scop.Op
 
 func makeOpsFunc(el scpb.Element, fns []interface{}) (opsFunc, scop.Type, error) {
 	var opType scop.Type
@@ -115,7 +95,7 @@ func makeOpsFunc(el scpb.Element, fns []interface{}) (opsFunc, scop.Type, error)
 		opType = typ
 		funcValues = append(funcValues, reflect.ValueOf(fn))
 	}
-	return func(element scpb.Element, md *targetsWithElementMap) []scop.Op {
+	return func(element scpb.Element, md *opGenContext) []scop.Op {
 		ret := make([]scop.Op, 0, len(funcValues))
 		in := []reflect.Value{reflect.ValueOf(element)}
 		inWithMeta := []reflect.Value{reflect.ValueOf(element), reflect.ValueOf(md)}
@@ -135,10 +115,11 @@ func makeOpsFunc(el scpb.Element, fns []interface{}) (opsFunc, scop.Type, error)
 }
 
 var (
-	opInterfaceType           = reflect.TypeOf((*scop.Op)(nil)).Elem()
-	mutationOpInterfaceType   = reflect.TypeOf((*scop.MutationOp)(nil)).Elem()
-	validationOpInterfaceType = reflect.TypeOf((*scop.ValidationOp)(nil)).Elem()
-	backfillOpInterfaceType   = reflect.TypeOf((*scop.BackfillOp)(nil)).Elem()
+	opInterfaceType                  = reflect.TypeOf((*scop.Op)(nil)).Elem()
+	immediateMutationOpInterfaceType = reflect.TypeOf((*scop.ImmediateMutationOp)(nil)).Elem()
+	deferredMutationOpInterfaceType  = reflect.TypeOf((*scop.DeferredMutationOp)(nil)).Elem()
+	validationOpInterfaceType        = reflect.TypeOf((*scop.ValidationOp)(nil)).Elem()
+	backfillOpInterfaceType          = reflect.TypeOf((*scop.BackfillOp)(nil)).Elem()
 )
 
 func checkOpFunc(el scpb.Element, fn interface{}) (opType scop.Type, _ error) {
@@ -152,7 +133,7 @@ func checkOpFunc(el scpb.Element, fn interface{}) (opType scop.Type, _ error) {
 	elType := reflect.TypeOf(el)
 	if !(fnT.NumIn() == 1 && fnT.In(0) == elType) &&
 		!(fnT.NumIn() == 2 && fnT.In(0) == elType &&
-			fnT.In(1) == reflect.TypeOf((*targetsWithElementMap)(nil))) {
+			fnT.In(1) == reflect.TypeOf((*opGenContext)(nil))) {
 		return 0, errors.Errorf(
 			"expected %v to be a func with one argument of type %s", fnT, elType,
 		)
@@ -171,7 +152,7 @@ func checkOpFunc(el scpb.Element, fn interface{}) (opType scop.Type, _ error) {
 		return 0, returnTypeError()
 	}
 	switch {
-	case out.Implements(mutationOpInterfaceType):
+	case out.Implements(immediateMutationOpInterfaceType), out.Implements(deferredMutationOpInterfaceType):
 		opType = scop.MutationType
 	case out.Implements(validationOpInterfaceType):
 		opType = scop.ValidationType

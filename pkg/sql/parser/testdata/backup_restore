@@ -67,7 +67,7 @@ BACKUP TABLE foo INTO $1 IN $2
 ----
 BACKUP TABLE foo INTO $1 IN $2
 BACKUP TABLE (foo) INTO ($1) IN ($2) -- fully parenthesized
-BACKUP TABLE foo INTO $1 IN $2 -- literals removed
+BACKUP TABLE foo INTO $1 IN $1 -- literals removed
 BACKUP TABLE _ INTO $1 IN $2 -- identifiers removed
 
 parse
@@ -103,12 +103,30 @@ SHOW BACKUP '_' -- literals removed
 SHOW BACKUP 'bar' -- identifiers removed
 
 parse
-SHOW BACKUP 'bar' WITH foo = 'bar'
+SHOW BACKUP 'bar' WITH ENCRYPTION_PASSPHRASE = 'secret', CHECK_FILES
 ----
-SHOW BACKUP 'bar' WITH foo = 'bar'
-SHOW BACKUP ('bar') WITH foo = ('bar') -- fully parenthesized
-SHOW BACKUP '_' WITH foo = '_' -- literals removed
-SHOW BACKUP 'bar' WITH _ = 'bar' -- identifiers removed
+SHOW BACKUP 'bar' WITH check_files, encryption_passphrase = '*****' -- normalized!
+SHOW BACKUP ('bar') WITH check_files, encryption_passphrase = '*****' -- fully parenthesized
+SHOW BACKUP '_' WITH check_files, encryption_passphrase = '*****' -- literals removed
+SHOW BACKUP 'bar' WITH check_files, encryption_passphrase = '*****' -- identifiers removed
+SHOW BACKUP 'bar' WITH check_files, encryption_passphrase = 'secret' -- passwords exposed
+
+parse
+SHOW BACKUP FROM LATEST IN 'bar' WITH incremental_location = 'baz'
+----
+SHOW BACKUP FROM 'latest' IN 'bar' WITH incremental_location = 'baz' -- normalized!
+SHOW BACKUP FROM ('latest') IN ('bar') WITH incremental_location = ('baz') -- fully parenthesized
+SHOW BACKUP FROM '_' IN '_' WITH incremental_location = '_' -- literals removed
+SHOW BACKUP FROM 'latest' IN 'bar' WITH incremental_location = 'baz' -- identifiers removed
+
+parse
+SHOW BACKUP FROM LATEST IN ('bar','bar1') WITH KMS = ('foo', 'bar'), incremental_location=('hi','hello')
+----
+SHOW BACKUP FROM 'latest' IN ('bar', 'bar1') WITH incremental_location = ('hi', 'hello'), kms = ('foo', 'bar') -- normalized!
+SHOW BACKUP FROM ('latest') IN (('bar'), ('bar1')) WITH incremental_location = (('hi'), ('hello')), kms = (('foo'), ('bar')) -- fully parenthesized
+SHOW BACKUP FROM '_' IN ('_', '_') WITH incremental_location = ('_', '_'), kms = ('_', '_') -- literals removed
+SHOW BACKUP FROM 'latest' IN ('bar', 'bar1') WITH incremental_location = ('hi', 'hello'), kms = ('foo', 'bar') -- identifiers removed
+
 
 parse
 EXPLAIN SHOW BACKUP 'bar'
@@ -135,12 +153,28 @@ SHOW BACKUP FILES '_' -- literals removed
 SHOW BACKUP FILES 'bar' -- identifiers removed
 
 parse
-SHOW BACKUP FILES 'bar' WITH foo = 'bar'
+SHOW BACKUP CONNECTION 'bar'
 ----
-SHOW BACKUP FILES 'bar' WITH foo = 'bar'
-SHOW BACKUP FILES ('bar') WITH foo = ('bar') -- fully parenthesized
-SHOW BACKUP FILES '_' WITH foo = '_' -- literals removed
-SHOW BACKUP FILES 'bar' WITH _ = 'bar' -- identifiers removed
+SHOW BACKUP CONNECTION 'bar'
+SHOW BACKUP CONNECTION ('bar') -- fully parenthesized
+SHOW BACKUP CONNECTION '_' -- literals removed
+SHOW BACKUP CONNECTION 'bar' -- identifiers removed
+
+parse
+SHOW BACKUP CONNECTION 'bar' WITH TRANSFER = '1KiB', TIME = '1h', CONCURRENTLY = 3
+----
+SHOW BACKUP CONNECTION 'bar' WITH CONCURRENTLY = 3, TIME = '1h', TRANSFER = '1KiB' -- normalized!
+SHOW BACKUP CONNECTION ('bar') WITH CONCURRENTLY = (3), TIME = ('1h'), TRANSFER = ('1KiB') -- fully parenthesized
+SHOW BACKUP CONNECTION '_' WITH CONCURRENTLY = _, TIME = '_', TRANSFER = '_' -- literals removed
+SHOW BACKUP CONNECTION 'bar' WITH CONCURRENTLY = 3, TIME = '1h', TRANSFER = '1KiB' -- identifiers removed
+
+parse
+SHOW BACKUP CONNECTION 'bar' WITH TRANSFER = $1, CONCURRENTLY = $2, TIME = $3
+----
+SHOW BACKUP CONNECTION 'bar' WITH CONCURRENTLY = $2, TIME = $3, TRANSFER = $1 -- normalized!
+SHOW BACKUP CONNECTION ('bar') WITH CONCURRENTLY = ($2), TIME = ($3), TRANSFER = ($1) -- fully parenthesized
+SHOW BACKUP CONNECTION '_' WITH CONCURRENTLY = $1, TIME = $1, TRANSFER = $1 -- literals removed
+SHOW BACKUP CONNECTION 'bar' WITH CONCURRENTLY = $2, TIME = $3, TRANSFER = $1 -- identifiers removed
 
 parse
 SHOW BACKUPS IN 'bar'
@@ -167,12 +201,12 @@ SHOW BACKUP '_' IN '_' -- literals removed
 SHOW BACKUP 'foo' IN 'bar' -- identifiers removed
 
 parse
-SHOW BACKUP FROM $1 IN $2 WITH foo = 'bar'
+SHOW BACKUP FROM $1 IN $2 WITH privileges
 ----
-SHOW BACKUP FROM $1 IN $2 WITH foo = 'bar'
-SHOW BACKUP FROM ($1) IN ($2) WITH foo = ('bar') -- fully parenthesized
-SHOW BACKUP FROM $1 IN $2 WITH foo = '_' -- literals removed
-SHOW BACKUP FROM $1 IN $2 WITH _ = 'bar' -- identifiers removed
+SHOW BACKUP FROM $1 IN $2 WITH privileges
+SHOW BACKUP FROM ($1) IN ($2) WITH privileges -- fully parenthesized
+SHOW BACKUP FROM $1 IN $1 WITH privileges -- literals removed
+SHOW BACKUP FROM $1 IN $2 WITH privileges -- identifiers removed
 
 parse
 SHOW BACKUP FILES FROM 'foo' IN 'bar'
@@ -199,12 +233,13 @@ SHOW BACKUP SCHEMAS FROM '_' IN '_' -- literals removed
 SHOW BACKUP SCHEMAS FROM 'foo' IN 'bar' -- identifiers removed
 
 parse
-SHOW BACKUP $1 IN $2 WITH foo = 'bar'
+SHOW BACKUP $1 IN $2 WITH ENCRYPTION_PASSPHRASE = 'secret', ENCRYPTION_INFO_DIR = 'long_live_backupper'
 ----
-SHOW BACKUP $1 IN $2 WITH foo = 'bar'
-SHOW BACKUP ($1) IN ($2) WITH foo = ('bar') -- fully parenthesized
-SHOW BACKUP $1 IN $2 WITH foo = '_' -- literals removed
-SHOW BACKUP $1 IN $2 WITH _ = 'bar' -- identifiers removed
+SHOW BACKUP $1 IN $2 WITH encryption_passphrase = '*****', encryption_info_dir = 'long_live_backupper' -- normalized!
+SHOW BACKUP ($1) IN ($2) WITH encryption_passphrase = '*****', encryption_info_dir = ('long_live_backupper') -- fully parenthesized
+SHOW BACKUP $1 IN $1 WITH encryption_passphrase = '*****', encryption_info_dir = '_' -- literals removed
+SHOW BACKUP $1 IN $2 WITH encryption_passphrase = '*****', encryption_info_dir = 'long_live_backupper' -- identifiers removed
+SHOW BACKUP $1 IN $2 WITH encryption_passphrase = 'secret', encryption_info_dir = 'long_live_backupper' -- passwords exposed
 
 parse
 BACKUP TABLE foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'
@@ -227,7 +262,7 @@ BACKUP TABLE foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'
 ----
 BACKUP TABLE foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'
 BACKUP TABLE (foo) TO ($1) INCREMENTAL FROM ('bar'), ($2), ('baz') -- fully parenthesized
-BACKUP TABLE foo TO $1 INCREMENTAL FROM '_', $2, '_' -- literals removed
+BACKUP TABLE foo TO $1 INCREMENTAL FROM '_', $1, '_' -- literals removed
 BACKUP TABLE _ TO $1 INCREMENTAL FROM 'bar', $2, 'baz' -- identifiers removed
 
 parse
@@ -235,7 +270,7 @@ BACKUP foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'
 ----
 BACKUP TABLE foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz' -- normalized!
 BACKUP TABLE (foo) TO ($1) INCREMENTAL FROM ('bar'), ($2), ('baz') -- fully parenthesized
-BACKUP TABLE foo TO $1 INCREMENTAL FROM '_', $2, '_' -- literals removed
+BACKUP TABLE foo TO $1 INCREMENTAL FROM '_', $1, '_' -- literals removed
 BACKUP TABLE _ TO $1 INCREMENTAL FROM 'bar', $2, 'baz' -- identifiers removed
 
 parse
@@ -301,7 +336,7 @@ BACKUP DATABASE foo TO ($1, $2)
 ----
 BACKUP DATABASE foo TO ($1, $2)
 BACKUP DATABASE foo TO (($1), ($2)) -- fully parenthesized
-BACKUP DATABASE foo TO ($1, $2) -- literals removed
+BACKUP DATABASE foo TO ($1, $1) -- literals removed
 BACKUP DATABASE _ TO ($1, $2) -- identifiers removed
 
 parse
@@ -309,17 +344,17 @@ BACKUP DATABASE foo TO ($1, $2) INCREMENTAL FROM 'baz'
 ----
 BACKUP DATABASE foo TO ($1, $2) INCREMENTAL FROM 'baz'
 BACKUP DATABASE foo TO (($1), ($2)) INCREMENTAL FROM ('baz') -- fully parenthesized
-BACKUP DATABASE foo TO ($1, $2) INCREMENTAL FROM '_' -- literals removed
+BACKUP DATABASE foo TO ($1, $1) INCREMENTAL FROM '_' -- literals removed
 BACKUP DATABASE _ TO ($1, $2) INCREMENTAL FROM 'baz' -- identifiers removed
 
 parse
-BACKUP foo TO 'bar' WITH ENCRYPTION_PASSPHRASE = 'secret', revision_history
+BACKUP foo TO 'bar' WITH ENCRYPTION_PASSPHRASE = 'secret', revision_history, execution locality = 'a=b'
 ----
-BACKUP TABLE foo TO 'bar' WITH revision_history = true, encryption_passphrase = '*****' -- normalized!
-BACKUP TABLE (foo) TO ('bar') WITH revision_history = (true), encryption_passphrase = '*****' -- fully parenthesized
-BACKUP TABLE foo TO '_' WITH revision_history = _, encryption_passphrase = '*****' -- literals removed
-BACKUP TABLE _ TO 'bar' WITH revision_history = true, encryption_passphrase = '*****' -- identifiers removed
-BACKUP TABLE foo TO 'bar' WITH revision_history = true, encryption_passphrase = 'secret' -- passwords exposed
+BACKUP TABLE foo TO 'bar' WITH revision_history = true, encryption_passphrase = '*****', execution locality = 'a=b' -- normalized!
+BACKUP TABLE (foo) TO ('bar') WITH revision_history = (true), encryption_passphrase = '*****', execution locality = ('a=b') -- fully parenthesized
+BACKUP TABLE foo TO '_' WITH revision_history = _, encryption_passphrase = '*****', execution locality = '_' -- literals removed
+BACKUP TABLE _ TO 'bar' WITH revision_history = true, encryption_passphrase = '*****', execution locality = 'a=b' -- identifiers removed
+BACKUP TABLE foo TO 'bar' WITH revision_history = true, encryption_passphrase = 'secret', execution locality = 'a=b' -- passwords exposed
 
 parse
 BACKUP foo TO 'bar' WITH KMS = ('foo', 'bar'), revision_history
@@ -345,6 +380,16 @@ BACKUP TABLE foo TO 'bar' WITH revision_history = true, detached, kms = ('foo', 
 BACKUP TABLE (foo) TO ('bar') WITH revision_history = (true), detached, kms = (('foo'), ('bar')) -- fully parenthesized
 BACKUP TABLE foo TO '_' WITH revision_history = _, detached, kms = ('_', '_') -- literals removed
 BACKUP TABLE _ TO 'bar' WITH revision_history = true, detached, kms = ('foo', 'bar') -- identifiers removed
+
+
+# Regression test for #95235.
+parse
+BACKUP foo TO 'bar' WITH OPTIONS (detached = false)
+----
+BACKUP TABLE foo TO 'bar' WITH detached = FALSE -- normalized!
+BACKUP TABLE (foo) TO ('bar') WITH detached = FALSE -- fully parenthesized
+BACKUP TABLE foo TO '_' WITH detached = FALSE -- literals removed
+BACKUP TABLE _ TO 'bar' WITH detached = FALSE -- identifiers removed
 
 parse
 BACKUP TENANT 36 TO 'bar'
@@ -400,7 +445,7 @@ RESTORE TABLE foo FROM $2 IN $1
 ----
 RESTORE TABLE foo FROM $2 IN $1
 RESTORE TABLE (foo) FROM ($2) IN ($1) -- fully parenthesized
-RESTORE TABLE foo FROM $2 IN $1 -- literals removed
+RESTORE TABLE foo FROM $1 IN $1 -- literals removed
 RESTORE TABLE _ FROM $2 IN $1 -- identifiers removed
 
 parse
@@ -408,7 +453,7 @@ RESTORE TABLE foo FROM $1, $2, 'bar'
 ----
 RESTORE TABLE foo FROM $1, $2, 'bar'
 RESTORE TABLE (foo) FROM ($1), ($2), ('bar') -- fully parenthesized
-RESTORE TABLE foo FROM $1, $2, '_' -- literals removed
+RESTORE TABLE foo FROM $1, $1, '_' -- literals removed
 RESTORE TABLE _ FROM $1, $2, 'bar' -- identifiers removed
 
 parse
@@ -416,7 +461,7 @@ RESTORE foo FROM $1, $2, 'bar'
 ----
 RESTORE TABLE foo FROM $1, $2, 'bar' -- normalized!
 RESTORE TABLE (foo) FROM ($1), ($2), ('bar') -- fully parenthesized
-RESTORE TABLE foo FROM $1, $2, '_' -- literals removed
+RESTORE TABLE foo FROM $1, $1, '_' -- literals removed
 RESTORE TABLE _ FROM $1, $2, 'bar' -- identifiers removed
 
 parse
@@ -424,7 +469,7 @@ RESTORE TABLE foo FROM 'abc' IN $1, $2, 'bar'
 ----
 RESTORE TABLE foo FROM 'abc' IN $1, $2, 'bar'
 RESTORE TABLE (foo) FROM ('abc') IN ($1), ($2), ('bar') -- fully parenthesized
-RESTORE TABLE foo FROM '_' IN $1, $2, '_' -- literals removed
+RESTORE TABLE foo FROM '_' IN $1, $1, '_' -- literals removed
 RESTORE TABLE _ FROM 'abc' IN $1, $2, 'bar' -- identifiers removed
 
 parse
@@ -432,7 +477,7 @@ RESTORE TABLE foo FROM $4 IN $1, $2, 'bar'
 ----
 RESTORE TABLE foo FROM $4 IN $1, $2, 'bar'
 RESTORE TABLE (foo) FROM ($4) IN ($1), ($2), ('bar') -- fully parenthesized
-RESTORE TABLE foo FROM $4 IN $1, $2, '_' -- literals removed
+RESTORE TABLE foo FROM $1 IN $1, $1, '_' -- literals removed
 RESTORE TABLE _ FROM $4 IN $1, $2, 'bar' -- identifiers removed
 
 parse
@@ -547,7 +592,7 @@ RESTORE DATABASE foo FROM ($1, $2)
 ----
 RESTORE DATABASE foo FROM ($1, $2)
 RESTORE DATABASE foo FROM (($1), ($2)) -- fully parenthesized
-RESTORE DATABASE foo FROM ($1, $2) -- literals removed
+RESTORE DATABASE foo FROM ($1, $1) -- literals removed
 RESTORE DATABASE _ FROM ($1, $2) -- identifiers removed
 
 parse
@@ -555,7 +600,7 @@ RESTORE DATABASE foo FROM ($1), ($2)
 ----
 RESTORE DATABASE foo FROM $1, $2 -- normalized!
 RESTORE DATABASE foo FROM ($1), ($2) -- fully parenthesized
-RESTORE DATABASE foo FROM $1, $2 -- literals removed
+RESTORE DATABASE foo FROM $1, $1 -- literals removed
 RESTORE DATABASE _ FROM $1, $2 -- identifiers removed
 
 parse
@@ -563,7 +608,7 @@ RESTORE DATABASE foo FROM ($1), ($2, $3)
 ----
 RESTORE DATABASE foo FROM $1, ($2, $3) -- normalized!
 RESTORE DATABASE foo FROM ($1), (($2), ($3)) -- fully parenthesized
-RESTORE DATABASE foo FROM $1, ($2, $3) -- literals removed
+RESTORE DATABASE foo FROM $1, ($1, $1) -- literals removed
 RESTORE DATABASE _ FROM $1, ($2, $3) -- identifiers removed
 
 parse
@@ -571,7 +616,7 @@ RESTORE DATABASE foo FROM ($1, $2), $3
 ----
 RESTORE DATABASE foo FROM ($1, $2), $3
 RESTORE DATABASE foo FROM (($1), ($2)), ($3) -- fully parenthesized
-RESTORE DATABASE foo FROM ($1, $2), $3 -- literals removed
+RESTORE DATABASE foo FROM ($1, $1), $1 -- literals removed
 RESTORE DATABASE _ FROM ($1, $2), $3 -- identifiers removed
 
 parse
@@ -579,7 +624,7 @@ RESTORE DATABASE foo FROM $1, ($2, $3)
 ----
 RESTORE DATABASE foo FROM $1, ($2, $3)
 RESTORE DATABASE foo FROM ($1), (($2), ($3)) -- fully parenthesized
-RESTORE DATABASE foo FROM $1, ($2, $3) -- literals removed
+RESTORE DATABASE foo FROM $1, ($1, $1) -- literals removed
 RESTORE DATABASE _ FROM $1, ($2, $3) -- identifiers removed
 
 parse
@@ -587,7 +632,7 @@ RESTORE DATABASE foo FROM ($1, $2), ($3, $4)
 ----
 RESTORE DATABASE foo FROM ($1, $2), ($3, $4)
 RESTORE DATABASE foo FROM (($1), ($2)), (($3), ($4)) -- fully parenthesized
-RESTORE DATABASE foo FROM ($1, $2), ($3, $4) -- literals removed
+RESTORE DATABASE foo FROM ($1, $1), ($1, $1) -- literals removed
 RESTORE DATABASE _ FROM ($1, $2), ($3, $4) -- identifiers removed
 
 parse
@@ -595,7 +640,7 @@ RESTORE DATABASE foo FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'
 ----
 RESTORE DATABASE foo FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'
 RESTORE DATABASE foo FROM (($1), ($2)), (($3), ($4)) AS OF SYSTEM TIME ('1') -- fully parenthesized
-RESTORE DATABASE foo FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '_' -- literals removed
+RESTORE DATABASE foo FROM ($1, $1), ($1, $1) AS OF SYSTEM TIME '_' -- literals removed
 RESTORE DATABASE _ FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1' -- identifiers removed
 
 parse
@@ -603,7 +648,7 @@ RESTORE FROM ($1, $2)
 ----
 RESTORE FROM ($1, $2)
 RESTORE FROM (($1), ($2)) -- fully parenthesized
-RESTORE FROM ($1, $2) -- literals removed
+RESTORE FROM ($1, $1) -- literals removed
 RESTORE FROM ($1, $2) -- identifiers removed
 
 parse
@@ -611,7 +656,7 @@ RESTORE FROM ($1, $2), $3
 ----
 RESTORE FROM ($1, $2), $3
 RESTORE FROM (($1), ($2)), ($3) -- fully parenthesized
-RESTORE FROM ($1, $2), $3 -- literals removed
+RESTORE FROM ($1, $1), $1 -- literals removed
 RESTORE FROM ($1, $2), $3 -- identifiers removed
 
 parse
@@ -619,7 +664,7 @@ RESTORE FROM $1, ($2, $3)
 ----
 RESTORE FROM $1, ($2, $3)
 RESTORE FROM ($1), (($2), ($3)) -- fully parenthesized
-RESTORE FROM $1, ($2, $3) -- literals removed
+RESTORE FROM $1, ($1, $1) -- literals removed
 RESTORE FROM $1, ($2, $3) -- identifiers removed
 
 parse
@@ -627,7 +672,7 @@ RESTORE FROM ($1, $2), ($3, $4)
 ----
 RESTORE FROM ($1, $2), ($3, $4)
 RESTORE FROM (($1), ($2)), (($3), ($4)) -- fully parenthesized
-RESTORE FROM ($1, $2), ($3, $4) -- literals removed
+RESTORE FROM ($1, $1), ($1, $1) -- literals removed
 RESTORE FROM ($1, $2), ($3, $4) -- identifiers removed
 
 parse
@@ -635,7 +680,7 @@ RESTORE FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'
 ----
 RESTORE FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'
 RESTORE FROM (($1), ($2)), (($3), ($4)) AS OF SYSTEM TIME ('1') -- fully parenthesized
-RESTORE FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '_' -- literals removed
+RESTORE FROM ($1, $1), ($1, $1) AS OF SYSTEM TIME '_' -- literals removed
 RESTORE FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1' -- identifiers removed
 
 parse
@@ -643,7 +688,7 @@ RESTORE FROM $1, $2, 'bar'
 ----
 RESTORE FROM $1, $2, 'bar'
 RESTORE FROM ($1), ($2), ('bar') -- fully parenthesized
-RESTORE FROM $1, $2, '_' -- literals removed
+RESTORE FROM $1, $1, '_' -- literals removed
 RESTORE FROM $1, $2, 'bar' -- identifiers removed
 
 parse
@@ -651,7 +696,7 @@ RESTORE FROM $4 IN $1, $2, 'bar'
 ----
 RESTORE FROM $4 IN $1, $2, 'bar'
 RESTORE FROM ($4) IN ($1), ($2), ('bar') -- fully parenthesized
-RESTORE FROM $4 IN $1, $2, '_' -- literals removed
+RESTORE FROM $1 IN $1, $1, '_' -- literals removed
 RESTORE FROM $4 IN $1, $2, 'bar' -- identifiers removed
 
 parse
@@ -659,7 +704,7 @@ RESTORE FROM $4 IN $1, $2, 'bar' AS OF SYSTEM TIME '1' WITH skip_missing_foreign
 ----
 RESTORE FROM $4 IN $1, $2, 'bar' AS OF SYSTEM TIME '1' WITH skip_missing_foreign_keys
 RESTORE FROM ($4) IN ($1), ($2), ('bar') AS OF SYSTEM TIME ('1') WITH skip_missing_foreign_keys -- fully parenthesized
-RESTORE FROM $4 IN $1, $2, '_' AS OF SYSTEM TIME '_' WITH skip_missing_foreign_keys -- literals removed
+RESTORE FROM $1 IN $1, $1, '_' AS OF SYSTEM TIME '_' WITH skip_missing_foreign_keys -- literals removed
 RESTORE FROM $4 IN $1, $2, 'bar' AS OF SYSTEM TIME '1' WITH skip_missing_foreign_keys -- identifiers removed
 
 parse
@@ -680,70 +725,47 @@ RESTORE FROM 'a' WITH into_db = 'foo', skip_missing_foreign_keys, skip_localitie
 
 parse
 RESTORE foo FROM 'bar' WITH OPTIONS (encryption_passphrase='secret', into_db='baz', debug_pause_on='error',
-skip_missing_foreign_keys, skip_missing_sequences, skip_missing_sequence_owners, skip_missing_views, detached, skip_localities_check)
+skip_missing_foreign_keys, skip_missing_sequences, skip_missing_sequence_owners, skip_missing_views, skip_missing_udfs, detached, skip_localities_check)
 ----
-RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- normalized!
-RESTORE TABLE (foo) FROM ('bar') WITH encryption_passphrase = ('secret'), into_db = ('baz'), debug_pause_on = ('error'), skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- fully parenthesized
-RESTORE TABLE foo FROM '_' WITH encryption_passphrase = '_', into_db = '_', debug_pause_on = '_', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- literals removed
-RESTORE TABLE _ FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- identifiers removed
+RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- normalized!
+RESTORE TABLE (foo) FROM ('bar') WITH encryption_passphrase = '*****', into_db = ('baz'), debug_pause_on = ('error'), skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- fully parenthesized
+RESTORE TABLE foo FROM '_' WITH encryption_passphrase = '*****', into_db = '_', debug_pause_on = '_', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- literals removed
+RESTORE TABLE _ FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- identifiers removed
+RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- passwords exposed
 
 parse
 RESTORE foo FROM 'bar' WITH ENCRYPTION_PASSPHRASE = 'secret', INTO_DB=baz, DEBUG_PAUSE_ON='error',
-SKIP_MISSING_FOREIGN_KEYS, SKIP_MISSING_SEQUENCES, SKIP_MISSING_SEQUENCE_OWNERS, SKIP_MISSING_VIEWS, SKIP_LOCALITIES_CHECK
+SKIP_MISSING_FOREIGN_KEYS, SKIP_MISSING_SEQUENCES, SKIP_MISSING_SEQUENCE_OWNERS, SKIP_MISSING_VIEWS, SKIP_LOCALITIES_CHECK, SKIP_MISSING_UDFS
 ----
-RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- normalized!
-RESTORE TABLE (foo) FROM ('bar') WITH encryption_passphrase = ('secret'), into_db = ('baz'), debug_pause_on = ('error'), skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- fully parenthesized
-RESTORE TABLE foo FROM '_' WITH encryption_passphrase = '_', into_db = '_', debug_pause_on = '_', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- literals removed
-RESTORE TABLE _ FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- identifiers removed
-
+RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- normalized!
+RESTORE TABLE (foo) FROM ('bar') WITH encryption_passphrase = '*****', into_db = ('baz'), debug_pause_on = ('error'), skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- fully parenthesized
+RESTORE TABLE foo FROM '_' WITH encryption_passphrase = '*****', into_db = '_', debug_pause_on = '_', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- literals removed
+RESTORE TABLE _ FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- identifiers removed
+RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- passwords exposed
 
 parse
 RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1'
 ----
 RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1'
 RESTORE TENANT 36 FROM (($1), ($2)) AS OF SYSTEM TIME ('1') -- fully parenthesized
-RESTORE TENANT _ FROM ($1, $2) AS OF SYSTEM TIME '_' -- literals removed
+RESTORE TENANT _ FROM ($1, $1) AS OF SYSTEM TIME '_' -- literals removed
 RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1' -- identifiers removed
+
+parse
+RESTORE TENANT 36 FROM ($1, $2) WITH tenant_name = 'tenant-5'
+----
+RESTORE TENANT 36 FROM ($1, $2) WITH tenant_name = 'tenant-5'
+RESTORE TENANT 36 FROM (($1), ($2)) WITH tenant_name = ('tenant-5') -- fully parenthesized
+RESTORE TENANT _ FROM ($1, $1) WITH tenant_name = '_' -- literals removed
+RESTORE TENANT 36 FROM ($1, $2) WITH tenant_name = 'tenant-5' -- identifiers removed
 
 parse
 RESTORE TENANT 36 FROM ($1, $2) WITH tenant = '5'
 ----
 RESTORE TENANT 36 FROM ($1, $2) WITH tenant = '5'
 RESTORE TENANT 36 FROM (($1), ($2)) WITH tenant = ('5') -- fully parenthesized
-RESTORE TENANT _ FROM ($1, $2) WITH tenant = '_' -- literals removed
+RESTORE TENANT _ FROM ($1, $1) WITH tenant = '_' -- literals removed
 RESTORE TENANT 36 FROM ($1, $2) WITH tenant = '5' -- identifiers removed
-
-parse
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS TENANT 321
-----
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS TENANT 321
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM ('bar') AS TENANT 321 -- fully parenthesized
-RESTORE TENANT _ FROM REPLICATION STREAM FROM '_' AS TENANT _ -- literals removed
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS TENANT 321 -- identifiers removed
-
-parse
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1
-----
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM ($1) -- fully parenthesized
-RESTORE TENANT _ FROM REPLICATION STREAM FROM $1 -- literals removed
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1 -- identifiers removed
-
-parse
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar'
-----
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar'
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM ('bar') -- fully parenthesized
-RESTORE TENANT _ FROM REPLICATION STREAM FROM '_' -- literals removed
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' -- identifiers removed
-
-parse
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1
-----
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM ($1) -- fully parenthesized
-RESTORE TENANT _ FROM REPLICATION STREAM FROM $1 -- literals removed
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1 -- identifiers removed
 
 parse
 BACKUP TABLE foo TO 'bar' WITH revision_history, detached
@@ -754,12 +776,12 @@ BACKUP TABLE foo TO '_' WITH revision_history = _, detached -- literals removed
 BACKUP TABLE _ TO 'bar' WITH revision_history = true, detached -- identifiers removed
 
 parse
-BACKUP TABLE foo TO 'bar' WITH revision_history = $1, detached
+BACKUP TABLE foo TO 'bar' WITH revision_history = $1, detached, execution locality = $2
 ----
-BACKUP TABLE foo TO 'bar' WITH revision_history = $1, detached
-BACKUP TABLE (foo) TO ('bar') WITH revision_history = ($1), detached -- fully parenthesized
-BACKUP TABLE foo TO '_' WITH revision_history = $1, detached -- literals removed
-BACKUP TABLE _ TO 'bar' WITH revision_history = $1, detached -- identifiers removed
+BACKUP TABLE foo TO 'bar' WITH revision_history = $1, detached, execution locality = $2
+BACKUP TABLE (foo) TO ('bar') WITH revision_history = ($1), detached, execution locality = ($2) -- fully parenthesized
+BACKUP TABLE foo TO '_' WITH revision_history = $1, detached, execution locality = $1 -- literals removed
+BACKUP TABLE _ TO 'bar' WITH revision_history = $1, detached, execution locality = $2 -- identifiers removed
 
 parse
 RESTORE TABLE foo FROM 'bar' WITH skip_missing_foreign_keys, skip_missing_sequences, detached
@@ -768,6 +790,46 @@ RESTORE TABLE foo FROM 'bar' WITH skip_missing_foreign_keys, skip_missing_sequen
 RESTORE TABLE (foo) FROM ('bar') WITH skip_missing_foreign_keys, skip_missing_sequences, detached -- fully parenthesized
 RESTORE TABLE foo FROM '_' WITH skip_missing_foreign_keys, skip_missing_sequences, detached -- literals removed
 RESTORE TABLE _ FROM 'bar' WITH skip_missing_foreign_keys, skip_missing_sequences, detached -- identifiers removed
+
+parse
+BACKUP INTO 'bar' WITH include_all_secondary_tenants = $1, detached
+----
+BACKUP INTO 'bar' WITH detached, include_all_secondary_tenants = $1 -- normalized!
+BACKUP INTO ('bar') WITH detached, include_all_secondary_tenants = ($1) -- fully parenthesized
+BACKUP INTO '_' WITH detached, include_all_secondary_tenants = $1 -- literals removed
+BACKUP INTO 'bar' WITH detached, include_all_secondary_tenants = $1 -- identifiers removed
+
+parse
+BACKUP INTO 'bar' WITH include_all_secondary_tenants, detached
+----
+BACKUP INTO 'bar' WITH detached, include_all_secondary_tenants = true -- normalized!
+BACKUP INTO ('bar') WITH detached, include_all_secondary_tenants = (true) -- fully parenthesized
+BACKUP INTO '_' WITH detached, include_all_secondary_tenants = _ -- literals removed
+BACKUP INTO 'bar' WITH detached, include_all_secondary_tenants = true -- identifiers removed
+
+parse
+RESTORE FROM LATEST IN 'bar' WITH include_all_secondary_tenants = $1, detached
+----
+RESTORE FROM 'latest' IN 'bar' WITH detached, include_all_secondary_tenants = $1 -- normalized!
+RESTORE FROM ('latest') IN ('bar') WITH detached, include_all_secondary_tenants = ($1) -- fully parenthesized
+RESTORE FROM '_' IN '_' WITH detached, include_all_secondary_tenants = $1 -- literals removed
+RESTORE FROM 'latest' IN 'bar' WITH detached, include_all_secondary_tenants = $1 -- identifiers removed
+
+parse
+RESTORE FROM LATEST IN 'bar' WITH include_all_secondary_tenants, detached
+----
+RESTORE FROM 'latest' IN 'bar' WITH detached, include_all_secondary_tenants = true -- normalized!
+RESTORE FROM ('latest') IN ('bar') WITH detached, include_all_secondary_tenants = (true) -- fully parenthesized
+RESTORE FROM '_' IN '_' WITH detached, include_all_secondary_tenants = _ -- literals removed
+RESTORE FROM 'latest' IN 'bar' WITH detached, include_all_secondary_tenants = true -- identifiers removed
+
+parse
+RESTORE FROM LATEST IN 'bar' WITH unsafe_restore_incompatible_version, detached
+----
+RESTORE FROM 'latest' IN 'bar' WITH detached, unsafe_restore_incompatible_version -- normalized!
+RESTORE FROM ('latest') IN ('bar') WITH detached, unsafe_restore_incompatible_version -- fully parenthesized
+RESTORE FROM '_' IN '_' WITH detached, unsafe_restore_incompatible_version -- literals removed
+RESTORE FROM 'latest' IN 'bar' WITH detached, unsafe_restore_incompatible_version -- identifiers removed
 
 error
 BACKUP foo TO 'bar' WITH key1, key2 = 'value'
@@ -809,6 +871,14 @@ at or near "true": syntax error: detached option specified multiple times
 DETAIL: source SQL:
 BACKUP foo TO 'bar' WITH detached=true, revision_history, detached=true
                                                                    ^
+
+error
+BACKUP TO 'bar' WITH include_all_secondary_tenants=false, include_all_secondary_tenants
+----
+at or near "EOF": syntax error: include_all_secondary_tenants specified multiple times
+DETAIL: source SQL:
+BACKUP TO 'bar' WITH include_all_secondary_tenants=false, include_all_secondary_tenants
+                                                                                       ^
 
 error
 BACKUP foo TO 'bar' WITH detached=$1, revision_history
@@ -853,6 +923,30 @@ RESTORE foo FROM 'bar' WITH detached, skip_missing_views, detached
                                                           ^
 
 error
+RESTORE foo FROM 'bar' WITH skip_missing_udfs, skip_missing_views, skip_missing_udfs
+----
+at or near "skip_missing_udfs": syntax error: skip_missing_udfs specified multiple times
+DETAIL: source SQL:
+RESTORE foo FROM 'bar' WITH skip_missing_udfs, skip_missing_views, skip_missing_udfs
+                                                                   ^
+
+error
+RESTORE FROM 'bar' WITH include_all_secondary_tenants=false, include_all_secondary_tenants
+----
+at or near "EOF": syntax error: include_all_secondary_tenants specified multiple times
+DETAIL: source SQL:
+RESTORE FROM 'bar' WITH include_all_secondary_tenants=false, include_all_secondary_tenants
+                                                                                          ^
+
+error
+RESTORE FROM 'bar' WITH unsafe_restore_incompatible_version, unsafe_restore_incompatible_version
+----
+at or near "unsafe_restore_incompatible_version": syntax error: unsafe_restore_incompatible_version specified multiple times
+DETAIL: source SQL:
+RESTORE FROM 'bar' WITH unsafe_restore_incompatible_version, unsafe_restore_incompatible_version
+                                                             ^
+
+error
 BACKUP ROLE foo, bar TO 'baz'
 ----
 at or near "foo": syntax error
@@ -869,3 +963,12 @@ DETAIL: source SQL:
 RESTORE ROLE foo, bar FROM 'baz'
              ^
 HINT: try \h RESTORE
+
+# Regression test for #95612
+parse
+BACKUP INTO LATEST IN UNLOGGED WITH OPTIONS ( DETACHED = FALSE )
+----
+BACKUP INTO LATEST IN 'unlogged' WITH detached = FALSE -- normalized!
+BACKUP INTO LATEST IN ('unlogged') WITH detached = FALSE -- fully parenthesized
+BACKUP INTO LATEST IN '_' WITH detached = FALSE -- literals removed
+BACKUP INTO LATEST IN 'unlogged' WITH detached = FALSE -- identifiers removed

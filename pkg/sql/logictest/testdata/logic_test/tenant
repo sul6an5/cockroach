@@ -1,162 +1,504 @@
 # LogicTest: !3node-tenant-default-configs
+query IBIT colnames
+SELECT id, active, length(info), name FROM system.tenants ORDER BY id
+----
+id  active  length  name
+1   true    10      system
+
+# Create a few tenants.
+
+statement ok
+CREATE TENANT "tenant-one"
+
+statement ok
+CREATE TENANT "two"
+
+statement error invalid tenant name
+CREATE TENANT "ABC"
+
+statement error invalid tenant name
+CREATE TENANT "-a-"
+
+# More than 100 characters.
+statement error invalid tenant name
+CREATE TENANT "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+
+statement error invalid tenant name
+CREATE TENANT "invalid_name"
+
+statement error invalid tenant name
+CREATE TENANT "invalid.name"
+
+statement ok
+CREATE TENANT three
+
 query IBT colnames
-SELECT * FROM system.tenants ORDER BY id
-----
-id  active  info
-
-# Create two tenants.
-
-query I
-SELECT crdb_internal.create_tenant(5)
-----
-5
-
-query I
-SELECT crdb_internal.create_tenant(10)
-----
-10
-
-query IBT colnames
-SELECT id, active, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true)
+SELECT id, active, name
 FROM system.tenants
 ORDER BY id
 ----
-id  active  crdb_internal.pb_to_json
-5   true    {"id": "5", "state": "ACTIVE"}
-10  true    {"id": "10", "state": "ACTIVE"}
+id  active  name
+1   true    system
+2   true    tenant-one
+3   true    two
+4   true    three
 
-# Garbage collect a non-drop tenant fails.
-
-query error tenant 5 is not in state DROP
-SELECT crdb_internal.gc_tenant(5)
-
-# Note this just marks the tenant as dropped but does not call GC.
-
-query I
-SELECT crdb_internal.destroy_tenant(5)
+query ITTT colnames
+SHOW TENANT system
 ----
-5
+id  name    data_state  service_mode
+1   system  ready       shared
 
-query IBT colnames
-SELECT id, active, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true)
-FROM system.tenants
-ORDER BY id
+query ITTT colnames
+SHOW TENANT "tenant-one"
 ----
-id  active  crdb_internal.pb_to_json
-5   false   {"id": "5", "state": "DROP"}
-10  true    {"id": "10", "state": "ACTIVE"}
+id  name        data_state  service_mode
+2   tenant-one  ready       none
 
+query ITTT colnames
+SHOW TENANT "two"
+----
+id  name  data_state  service_mode
+3   two   ready       none
 
-# Try to recreate an existing tenant.
-# GC job for tenant 5 has not run yet.
-query error pgcode 42710 tenant "5" already exists
-SELECT crdb_internal.create_tenant(5)
+query ITTT colnames
+SHOW TENANT two
+----
+id  name  data_state  service_mode
+3   two   ready       none
 
-query error pgcode 42710 tenant "10" already exists
-SELECT crdb_internal.create_tenant(10)
+query ITTT colnames
+SHOW TENANT three
+----
+id  name   data_state  service_mode
+4   three  ready       none
 
-# Try to manipulate system.tenants directly as the root user.
+query ITTT colnames
+SHOW TENANTS
+----
+id  name        data_state  service_mode
+1   system      ready       shared
+2   tenant-one  ready       none
+3   two         ready       none
+4   three       ready       none
 
-statement error pgcode 42501 user root does not have INSERT privilege on relation tenants
-INSERT INTO system.tenants VALUES (15)
+statement error tenant name cannot be empty
+ALTER TENANT [4] RENAME TO ""
 
-statement error pgcode 42501 user root does not have INSERT privilege on relation tenants
-UPSERT INTO system.tenants VALUES (20)
+statement error tenant name cannot be NULL
+ALTER TENANT [4] RENAME TO NULL
 
-statement error pgcode 42501 user root does not have UPDATE privilege on relation tenants
-UPDATE system.tenants SET active = false WHERE id = 10
-
-statement error pgcode 42501 user root does not have DELETE privilege on relation tenants
-DELETE FROM system.tenants WHERE id = 10
-
-# The system tenant cannot be created or destroyed.
-
-query error pgcode 22023 cannot create tenant "1", ID assigned to system tenant
-SELECT crdb_internal.create_tenant(1)
-
-query error pgcode 22023 cannot destroy tenant "1", ID assigned to system tenant
-SELECT crdb_internal.destroy_tenant(1)
-
-# Verify that tenants are able to set in-memory cluster settings in logic tests.
+statement error invalid tenant name
+ALTER TENANT [4] RENAME TO "a.b"
 
 statement ok
-SET CLUSTER SETTING sql.defaults.vectorize='off'
-
-query T
-SHOW CLUSTER SETTING sql.defaults.vectorize
-----
-off
+ALTER TENANT [4] RENAME TO blux
 
 statement ok
-RESET CLUSTER SETTING sql.defaults.vectorize
+ALTER TENANT blux RENAME TO 'blix'
 
-query T
-SHOW CLUSTER SETTING sql.defaults.vectorize
+query ITTT colnames
+SELECT * FROM [SHOW TENANTS] WHERE id = 4
 ----
-on
-
-# Manipulate the tenants zone configurations
-
-query TT
-SHOW ZONE CONFIGURATION FOR RANGE tenants
-----
-RANGE default  ALTER RANGE default CONFIGURE ZONE USING
-               range_min_bytes = 134217728,
-               range_max_bytes = 536870912,
-               gc.ttlseconds = 90000,
-               num_replicas = 3,
-               constraints = '[]',
-               lease_preferences = '[]'
+id  name  data_state  service_mode
+4   blix  ready       none
 
 statement ok
-ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1
+ALTER TENANT blix RENAME TO three
 
-query TT
-SHOW ZONE CONFIGURATION FOR RANGE tenants
+query ITTT colnames
+SELECT * FROM [SHOW TENANTS] WHERE id = 4
 ----
-RANGE tenants  ALTER RANGE tenants CONFIGURE ZONE USING
-               range_min_bytes = 134217728,
-               range_max_bytes = 536870912,
-               gc.ttlseconds = 1,
-               num_replicas = 3,
-               constraints = '[]',
-               lease_preferences = '[]'
+id  name   data_state  service_mode
+4   three  ready       none
 
-# Set the jobs adopt interval so that this test doesn't take 30 seconds.
+query ITTTT colnames
+SELECT id, name, data_state, service_mode, source_tenant_name FROM [SHOW TENANTS WITH REPLICATION STATUS] WHERE id = 4
+----
+id  name   data_state  service_mode  source_tenant_name
+4   three  ready       none          NULL
+
+statement error tenant "seven" does not exist
+SHOW TENANT seven
+
+# Test creating a tenant with the same name as an existing tenant, but a unique
+# ID.
+statement error tenant with name "three" already exists
+CREATE TENANT three
+
+# Ignore duplicates (this is a no-op because "three" already exists).
 statement ok
-SET CLUSTER SETTING jobs.registry.interval.adopt = '1s'
+CREATE TENANT IF NOT EXISTS three
 
-query T
-SELECT status FROM [
-  SHOW JOB WHEN COMPLETE (
-      SELECT job_id FROM crdb_internal.jobs
-      WHERE description = 'GC for tenant 5'
-  )
-]
-----
-succeeded
+statement ok
+set default_transaction_read_only = on;
 
-query error pgcode 42704 tenant "5" does not exist
-SELECT crdb_internal.destroy_tenant(5)
+statement error cannot execute CREATE TENANT in a read-only transaction
+CREATE TENANT four;
 
-query IBT colnames
-SELECT id, active, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true)
-FROM system.tenants
-ORDER BY id
-----
-id  active  crdb_internal.pb_to_json
-10  true    {"id": "10", "state": "ACTIVE"}
-
-query error tenant resource limits require a CCL binary
-SELECT crdb_internal.update_tenant_resource_limits(10, 1000, 100, 0, now(), 0)
+statement ok
+set default_transaction_read_only = off;
 
 user testuser
 
-statement error only users with the admin role are allowed to create tenant
-SELECT crdb_internal.create_tenant(314)
+statement error user testuser does not have MANAGETENANT privilege on global
+CREATE TENANT four
 
-statement error only users with the admin role are allowed to destroy tenant
-SELECT crdb_internal.destroy_tenant(314)
+subtest drop_tenant
+user root
 
-statement error only users with the admin role are allowed to gc tenant
-SELECT crdb_internal.gc_tenant(314)
+statement error tenant "dne" does not exist
+DROP TENANT dne
+
+statement ok
+DROP TENANT IF EXISTS dne
+
+statement ok
+CREATE TENANT four
+
+query IBT colnames
+SELECT id, active, name
+FROM system.tenants WHERE name = 'four'
+ORDER BY id
+----
+id  active  name
+5   true    four
+
+statement ok
+DROP TENANT four
+
+query IBT colnames
+SELECT id, active, name
+FROM system.tenants WHERE name = 'four'
+ORDER BY id
+----
+id  active  name
+
+statement error tenant "four" does not exist
+SHOW TENANT four
+
+statement ok
+CREATE TENANT "five-requiring-quotes"
+
+statement ok
+DROP TENANT "five-requiring-quotes"
+
+statement ok
+set default_transaction_read_only = on;
+
+statement error cannot execute DROP TENANT in a read-only transaction
+DROP TENANT three
+
+statement ok
+set default_transaction_read_only = off;
+
+user testuser
+
+statement error user testuser does not have MANAGETENANT privilege on global
+DROP TENANT three
+
+statement error user testuser does not have MANAGETENANT privilege on global
+SHOW TENANTS
+
+statement error user testuser does not have MANAGETENANT privilege on global
+SHOW TENANT 'two'
+
+user root
+
+statement ok
+GRANT SYSTEM MANAGETENANT TO testuser
+
+user testuser
+
+query ITTT colnames
+SHOW TENANTS
+----
+id  name        data_state  service_mode
+1   system      ready       shared
+2   tenant-one  ready       none
+3   two         ready       none
+4   three       ready       none
+
+query ITTT colnames
+SHOW TENANT two
+----
+id  name        data_state  service_mode
+3   two         ready       none
+
+user root
+
+statement ok
+REVOKE SYSTEM MANAGETENANT FROM testuser
+
+subtest read_only
+
+statement ok
+SET default_transaction_read_only = true
+
+statement error cannot execute.*in a read-only transaction
+DROP TENANT three
+
+statement error cannot execute.*in a read-only transaction
+ALTER TENANT three RENAME TO blah
+
+statement error cannot execute.*in a read-only transaction
+CREATE TENANT "read-only"
+
+statement ok
+SET default_transaction_read_only = false
+
+subtest reclaim_name
+
+statement ok
+CREATE TENANT "to-be-reclaimed"
+
+statement ok
+DROP TENANT "to-be-reclaimed"
+
+statement ok
+CREATE TENANT "to-be-reclaimed"
+
+query IBTTT colnames
+SELECT
+  id,
+  active,
+  name,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'deprecatedDataState') AS deprecated_data_state,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'droppedName') AS dropped_name
+FROM system.tenants
+ORDER BY id
+----
+id  active  name             deprecated_data_state  dropped_name
+1   true    system           READY                  ·
+2   true    tenant-one       READY                  ·
+3   true    two              READY                  ·
+4   true    three            READY                  ·
+5   false   NULL             DROP                   four
+6   false   NULL             DROP                   five-requiring-quotes
+7   false   NULL             DROP                   to-be-reclaimed
+8   true    to-be-reclaimed  READY                  ·
+
+# More valid tenant names.
+statement ok
+CREATE TENANT "1";
+CREATE TENANT "a-b";
+CREATE TENANT "hello-100"
+
+query ITTT colnames
+SHOW TENANTS
+----
+id  name             data_state  service_mode
+1   system           ready       shared
+2   tenant-one       ready       none
+3   two              ready       none
+4   three            ready       none
+8   to-be-reclaimed  ready       none
+9   1                ready       none
+10  a-b              ready       none
+11  hello-100        ready       none
+
+subtest service_mode
+
+statement ok
+ALTER TENANT 'tenant-one' START SERVICE EXTERNAL
+
+# operation is idempotent
+statement ok
+ALTER TENANT 'tenant-one' START SERVICE EXTERNAL
+
+statement ok
+ALTER TENANT two START SERVICE SHARED
+
+statement ok
+ALTER TENANT two START SERVICE SHARED
+
+statement error cannot change service mode external to shared directly
+ALTER TENANT 'tenant-one' START SERVICE SHARED
+
+statement error cannot change service mode shared to external directly
+ALTER TENANT two START SERVICE EXTERNAL
+
+statement error cannot drop tenant.*in service mode shared
+DROP TENANT two
+
+statement error cannot drop tenant.*in service mode external
+DROP TENANT 'tenant-one'
+
+query ITTT colnames
+SHOW TENANTS
+----
+id  name             data_state  service_mode
+1   system           ready       shared
+2   tenant-one       ready       external
+3   two              ready       shared
+4   three            ready       none
+8   to-be-reclaimed  ready       none
+9   1                ready       none
+10  a-b              ready       none
+11  hello-100        ready       none
+
+statement ok
+ALTER TENANT two STOP SERVICE
+
+statement ok
+ALTER TENANT 'tenant-one' STOP SERVICE
+
+query ITTT colnames
+SHOW TENANTS
+----
+id  name             data_state  service_mode
+1   system           ready       shared
+2   tenant-one       ready       none
+3   two              ready       none
+4   three            ready       none
+8   to-be-reclaimed  ready       none
+9   1                ready       none
+10  a-b              ready       none
+11  hello-100        ready       none
+
+statement ok
+DROP TENANT two
+
+statement ok
+DROP TENANT 'tenant-one'
+
+subtest tenant_templates
+
+query T
+SHOW CLUSTER SETTING sql.create_tenant.default_template
+----
+·
+
+# Check we can't use the system tenant as template.
+statement error using the system tenant as config template
+CREATE TENANT othertenant LIKE system
+
+# Create some "interesting" tenant template.
+statement ok
+CREATE TENANT tmpl;
+
+let $tmplid
+SELECT id FROM system.tenants WHERE name = 'tmpl'
+
+statement ok
+ALTER TENANT tmpl GRANT CAPABILITY can_view_node_info; -- will be copied
+ALTER TENANT tmpl SET CLUSTER SETTING trace.debug.enable = true; -- will be copied
+-- Simulate resource limits. Will be copied.
+-- Note: we cannot use the update_tenant_resource_limits() builtin
+-- directly here because it can only be used from a CCL binary.
+INSERT INTO system.tenant_usage(
+        tenant_id, instance_id, next_instance_id, last_update,
+        ru_burst_limit, ru_refill_rate, ru_current, current_share_sum, total_consumption)
+VALUES ($tmplid, 0, 0, now(),
+        11, 22, 33, 44, ''::BYTES);
+ALTER TENANT tmpl START SERVICE SHARED; -- will not be copied.
+
+# Use it to create a new tenant.
+statement ok
+CREATE TENANT othertenant LIKE tmpl
+
+let $otherid
+SELECT id FROM system.tenants WHERE name = 'othertenant'
+
+# Verify the service mode was not copied.
+query BTTT
+SELECT id = $otherid, name, data_state, service_mode FROM [SHOW TENANT othertenant]
+----
+true  othertenant  ready  none
+
+# Verify the new tenant has the same caps as the template
+# (by showing there's no difference between the two)
+query TT
+SELECT capability_name, capability_value FROM [SHOW TENANT tmpl WITH CAPABILITIES]
+EXCEPT SELECT capability_name, capability_value FROM [SHOW TENANT othertenant WITH CAPABILITIES];
+----
+
+# Check that the setting overrides were copied.
+query TTTT
+SELECT variable, value, type, origin FROM [SHOW CLUSTER SETTINGS FOR TENANT othertenant]
+WHERE origin != 'no-override'
+----
+trace.debug.enable  true  b  per-tenant-override
+
+# Check that the resource usage parameters were copied.
+query IIRRRRI
+SELECT instance_id, next_instance_id,
+       ru_burst_limit, ru_refill_rate, ru_current,
+       current_share_sum, length(total_consumption)
+FROM system.tenant_usage WHERE tenant_id = $otherid
+----
+0  0  11  22  33  0  0
+
+# Clean up.
+statement ok
+DROP TENANT othertenant
+
+# Now set the default template and try again.
+statement ok
+SET CLUSTER SETTING sql.create_tenant.default_template = 'nonexistent';
+
+statement error retrieving default tenant configuration template.*tenant "nonexistent" does not exist
+CREATE TENANT othertenant
+
+statement ok
+SET CLUSTER SETTING sql.create_tenant.default_template = 'tmpl';
+
+# Create a new tenant - this should use the template implicitly now.
+statement ok
+CREATE TENANT othertenant
+
+let $otherid
+SELECT id FROM system.tenants WHERE name = 'othertenant'
+
+# Verify the service mode was not copied.
+query BTTT
+SELECT id = $otherid, name, data_state, service_mode FROM [SHOW TENANT othertenant]
+----
+true  othertenant  ready  none
+
+query TT
+SELECT capability_name, capability_value FROM [SHOW TENANT tmpl WITH CAPABILITIES]
+EXCEPT SELECT capability_name, capability_value FROM [SHOW TENANT othertenant WITH CAPABILITIES];
+----
+
+# Check the setting overrides were taken over.
+query TTTT
+SELECT variable, value, type, origin FROM [SHOW CLUSTER SETTINGS FOR TENANT othertenant]
+WHERE origin != 'no-override'
+----
+trace.debug.enable  true  b  per-tenant-override
+
+# Check that the resource usage parameters were copied.
+query IIRRRRI
+SELECT instance_id, next_instance_id,
+       ru_burst_limit, ru_refill_rate, ru_current,
+       current_share_sum, length(total_consumption)
+FROM system.tenant_usage WHERE tenant_id = $otherid
+----
+0  0  11  22  33  0  0
+
+# Clean up.
+statement ok
+DROP TENANT othertenant;
+ALTER TENANT tmpl STOP SERVICE;
+DROP TENANT tmpl
+
+statement ok
+RESET CLUSTER SETTING sql.create_tenant.default_template
+
+subtest block_drop_tenant
+
+statement ok
+SET disable_drop_tenant = 'true'
+
+statement ok
+CREATE TENANT nodelete
+
+statement error rejected.*irreversible data loss
+DROP TENANT nodelete
+
+statement ok
+RESET disable_drop_tenant
+
+statement ok
+DROP TENANT nodelete

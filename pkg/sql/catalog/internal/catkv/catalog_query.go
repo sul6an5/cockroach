@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -26,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
 )
 
@@ -34,9 +36,9 @@ import (
 // Objects of this type should be exclusively created and used by catalogReader
 // methods.
 type catalogQuery struct {
-	catalogReader
-	isRequired   bool
-	expectedType catalog.DescriptorType
+	codec                keys.SQLCodec
+	isDescriptorRequired bool
+	expectedType         catalog.DescriptorType
 }
 
 // query the catalog to retrieve data from the descriptor and namespace tables.
@@ -53,7 +55,7 @@ func (cq catalogQuery) query(
 		return errors.AssertionFailedf("nil txn for catalog query")
 	}
 	b := txn.NewBatch()
-	in(cq.Codec, b)
+	in(cq.codec, b)
 	if err := txn.Run(ctx, b); err != nil {
 		return err
 	}
@@ -62,7 +64,7 @@ func (cq catalogQuery) query(
 			return result.Err
 		}
 		for _, row := range result.Rows {
-			_, catTableID, err := cq.Codec.DecodeTablePrefix(row.Key)
+			_, catTableID, err := cq.codec.DecodeTablePrefix(row.Key)
 			if err != nil {
 				return err
 			}
@@ -71,6 +73,10 @@ func (cq catalogQuery) query(
 				err = cq.processNamespaceResultRow(row, out)
 			case keys.DescriptorTableID:
 				err = cq.processDescriptorResultRow(row, out)
+			case keys.CommentsTableID:
+				err = cq.processCommentsResultRow(row, out)
+			case keys.ZonesTableID:
+				err = cq.processZonesResultRow(row, out)
 			default:
 				err = errors.AssertionFailedf("unexpected catalog key %s", row.Key.String())
 			}
@@ -79,17 +85,16 @@ func (cq catalogQuery) query(
 			}
 		}
 	}
-	cq.systemDatabaseCache.update(cq.Version, out.Catalog)
 	return nil
 }
 
 func (cq catalogQuery) processNamespaceResultRow(row kv.KeyValue, cb *nstree.MutableCatalog) error {
-	nameInfo, err := catalogkeys.DecodeNameMetadataKey(cq.Codec, row.Key)
+	nameInfo, err := catalogkeys.DecodeNameMetadataKey(cq.codec, row.Key)
 	if err != nil {
 		return err
 	}
 	if row.Exists() {
-		cb.UpsertNamespaceEntry(nameInfo, descpb.ID(row.ValueInt()))
+		cb.UpsertNamespaceEntry(nameInfo, descpb.ID(row.ValueInt()), row.Value.Timestamp)
 	}
 	return nil
 }
@@ -97,7 +102,7 @@ func (cq catalogQuery) processNamespaceResultRow(row kv.KeyValue, cb *nstree.Mut
 func (cq catalogQuery) processDescriptorResultRow(
 	row kv.KeyValue, cb *nstree.MutableCatalog,
 ) error {
-	u32ID, err := cq.Codec.DecodeDescMetadataID(row.Key)
+	u32ID, err := cq.codec.DecodeDescMetadataID(row.Key)
 	if err != nil {
 		return err
 	}
@@ -106,11 +111,51 @@ func (cq catalogQuery) processDescriptorResultRow(
 	if expectedType == "" {
 		expectedType = catalog.Any
 	}
-	desc, err := build(expectedType, id, row.Value, cq.isRequired)
+	desc, err := build(expectedType, id, row.Value, cq.isDescriptorRequired)
 	if err != nil {
 		return wrapError(expectedType, id, err)
 	}
-	cb.UpsertDescriptorEntry(desc)
+	cb.UpsertDescriptor(desc)
+	return nil
+}
+
+func (cq catalogQuery) processCommentsResultRow(row kv.KeyValue, cb *nstree.MutableCatalog) error {
+	remaining, cmtKey, err := catalogkeys.DecodeCommentMetadataID(cq.codec, row.Key)
+	if err != nil {
+		return err
+	}
+	_, famID, err := encoding.DecodeUvarintAscending(remaining)
+	if err != nil {
+		return err
+	}
+
+	// Skip the primary column family since only the comment string is interested.
+	if famID != keys.CommentsTableCommentColFamID {
+		return nil
+	}
+	return cb.UpsertComment(cmtKey, string(row.ValueBytes()))
+}
+
+func (cq catalogQuery) processZonesResultRow(row kv.KeyValue, cb *nstree.MutableCatalog) error {
+	remaining, id, err := cq.codec.DecodeZoneConfigMetadataID(row.Key)
+	if err != nil {
+		return err
+	}
+	_, famID, err := encoding.DecodeUvarintAscending(remaining)
+	if err != nil {
+		return err
+	}
+
+	// Skip not interested column families or non-existing keys.
+	if famID != keys.ZonesTableConfigColFamID || len(row.ValueBytes()) == 0 {
+		return nil
+	}
+
+	var zoneConfig zonepb.ZoneConfig
+	if err := row.ValueProto(&zoneConfig); err != nil {
+		return errors.Wrapf(err, "decoding zone config for id %d", id)
+	}
+	cb.UpsertZoneConfig(descpb.ID(id), &zoneConfig, row.ValueBytes())
 	return nil
 }
 
@@ -133,13 +178,9 @@ func wrapError(expectedType catalog.DescriptorType, id descpb.ID, err error) err
 func build(
 	expectedType catalog.DescriptorType, id descpb.ID, rowValue *roachpb.Value, isRequired bool,
 ) (catalog.Descriptor, error) {
-	var b catalog.DescriptorBuilder
-	if rowValue != nil {
-		var descProto descpb.Descriptor
-		if err := rowValue.GetProto(&descProto); err != nil {
-			return nil, err
-		}
-		b = descbuilder.NewBuilderWithMVCCTimestamp(&descProto, rowValue.Timestamp)
+	b, err := descbuilder.FromSerializedValue(rowValue)
+	if err != nil {
+		return nil, err
 	}
 	if b == nil {
 		if isRequired {
@@ -153,6 +194,7 @@ func build(
 	if err := b.RunPostDeserializationChanges(); err != nil {
 		return nil, errors.NewAssertionErrorWithWrappedErrf(err, "error during RunPostDeserializationChanges")
 	}
+	b.SetRawBytesInStorage(rowValue.TagAndDataBytes())
 	desc := b.BuildImmutable()
 	if id != desc.GetID() {
 		return nil, errors.AssertionFailedf("unexpected ID %d in descriptor", desc.GetID())

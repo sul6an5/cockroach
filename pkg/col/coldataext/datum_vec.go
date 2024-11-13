@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -55,7 +56,15 @@ func newDatumVec(t *types.T, n int, evalCtx *eval.Context) coldata.DatumVec {
 // Note that the method is named differently from "Compare" so that we do not
 // overload tree.Datum.Compare method.
 func CompareDatum(d, dVec, other interface{}) int {
-	return d.(tree.Datum).Compare(dVec.(*datumVec).evalCtx, convertToDatum(other))
+	// Note that it's not strictly necessary to use CompareError here instead of
+	// just Compare since pkg/sql/sem/eval is in the allow-list of paths that
+	// colexecerror catches panics from. Still, it seems nicer to be explicit
+	// about this.
+	res, err := d.(tree.Datum).CompareError(dVec.(*datumVec).evalCtx, convertToDatum(other))
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	return res
 }
 
 // Hash returns the hash of the datum as a byte slice.
@@ -82,7 +91,9 @@ func (dv *datumVec) Get(i int) coldata.Datum {
 // Set implements coldata.DatumVec interface.
 func (dv *datumVec) Set(i int, v coldata.Datum) {
 	datum := convertToDatum(v)
-	dv.assertValidDatum(datum)
+	if buildutil.CrdbTestBuild {
+		dv.assertValidDatum(datum)
+	}
 	dv.data[i] = datum
 }
 
@@ -98,22 +109,33 @@ func (dv *datumVec) Window(start, end int) coldata.DatumVec {
 // CopySlice implements coldata.DatumVec interface.
 func (dv *datumVec) CopySlice(src coldata.DatumVec, destIdx, srcStartIdx, srcEndIdx int) {
 	castSrc := src.(*datumVec)
-	dv.assertSameTypeFamily(castSrc.t)
+	if buildutil.CrdbTestBuild {
+		dv.assertSameTypeFamily(castSrc.t)
+	}
 	copy(dv.data[destIdx:], castSrc.data[srcStartIdx:srcEndIdx])
 }
 
 // AppendSlice implements coldata.DatumVec interface.
 func (dv *datumVec) AppendSlice(src coldata.DatumVec, destIdx, srcStartIdx, srcEndIdx int) {
 	castSrc := src.(*datumVec)
-	dv.assertSameTypeFamily(castSrc.t)
+	if buildutil.CrdbTestBuild {
+		dv.assertSameTypeFamily(castSrc.t)
+	}
 	dv.data = append(dv.data[:destIdx], castSrc.data[srcStartIdx:srcEndIdx]...)
 }
 
 // AppendVal implements coldata.DatumVec interface.
 func (dv *datumVec) AppendVal(v coldata.Datum) {
 	datum := convertToDatum(v)
-	dv.assertValidDatum(datum)
+	if buildutil.CrdbTestBuild {
+		dv.assertValidDatum(datum)
+	}
 	dv.data = append(dv.data, datum)
+}
+
+// SetLength implements coldata.DatumVec interface.
+func (dv *datumVec) SetLength(l int) {
+	dv.data = dv.data[:l]
 }
 
 // Len implements coldata.DatumVec interface.
@@ -141,24 +163,6 @@ func (dv *datumVec) UnmarshalTo(i int, b []byte) error {
 	return err
 }
 
-// valuesSize returns the footprint of actual datums (in bytes) with ordinals in
-// [startIdx:] range, ignoring the overhead of tree.Datum wrapper.
-func (dv *datumVec) valuesSize(startIdx int) int64 {
-	var size int64
-	// Only the elements up to the length are expected to be non-nil. Note that
-	// we cannot take a short-cut with fixed-length values here because they
-	// might not be set, so we could over-account if we did something like
-	//   size += (len-startIdx) * fixedSize.
-	if startIdx < dv.Len() {
-		for _, d := range dv.data[startIdx:dv.Len()] {
-			if d != nil {
-				size += int64(d.Size())
-			}
-		}
-	}
-	return size
-}
-
 // Size implements coldata.DatumVec interface.
 func (dv *datumVec) Size(startIdx int) int64 {
 	// Note that we don't account for the overhead of datumVec struct, and the
@@ -170,18 +174,24 @@ func (dv *datumVec) Size(startIdx int) int64 {
 	if startIdx < 0 {
 		startIdx = 0
 	}
-	// We have to account for the tree.Datum overhead for the whole capacity of
-	// the underlying slice.
-	return memsize.DatumOverhead*int64(dv.Cap()-startIdx) + dv.valuesSize(startIdx)
-}
-
-// Reset implements coldata.DatumVec interface.
-func (dv *datumVec) Reset() int64 {
-	released := dv.valuesSize(0 /* startIdx */)
-	for i := range dv.data {
-		dv.data[i] = nil
+	count := int64(dv.Cap() - startIdx)
+	size := memsize.DatumOverhead * count
+	if datumSize, variable := tree.DatumTypeSize(dv.t); variable {
+		// The elements in dv.data[max(startIdx,len):cap] range are accounted with
+		// the default datum size for the type. For those in the range
+		// [startIdx, len) we call Datum.Size().
+		idx := startIdx
+		for ; idx < len(dv.data); idx++ {
+			if dv.data[idx] != nil {
+				size += int64(dv.data[idx].Size())
+			}
+		}
+		// Pick up where the loop left off.
+		size += int64(dv.Cap()-idx) * int64(datumSize)
+	} else {
+		size += int64(datumSize) * count
 	}
-	return released
+	return size
 }
 
 // assertValidDatum asserts that the given datum is valid to be stored in this
@@ -223,4 +233,9 @@ func convertToDatum(v coldata.Datum) tree.Datum {
 	colexecerror.InternalError(errors.AssertionFailedf("unexpected value: %v", v))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
+}
+
+// SetEvalCtx implements coldata.DatumVec interface.
+func (dv *datumVec) SetEvalCtx(evalCtx interface{}) {
+	dv.evalCtx = evalCtx.(*eval.Context)
 }

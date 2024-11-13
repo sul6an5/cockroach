@@ -11,6 +11,7 @@
 package opgen
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 )
@@ -19,8 +20,7 @@ func init() {
 	opRegistry.register((*scpb.Database)(nil),
 		toPublic(
 			scpb.Status_ABSENT,
-			equiv(scpb.Status_DROPPED),
-			to(scpb.Status_TXN_DROPPED,
+			to(scpb.Status_DROPPED,
 				emit(func(this *scpb.Database) *scop.NotImplemented {
 					return notImplemented(this)
 				}),
@@ -28,37 +28,30 @@ func init() {
 			to(scpb.Status_PUBLIC,
 				emit(func(this *scpb.Database) *scop.MarkDescriptorAsPublic {
 					return &scop.MarkDescriptorAsPublic{
-						DescID: this.DatabaseID,
+						DescriptorID: this.DatabaseID,
 					}
 				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
-			to(scpb.Status_TXN_DROPPED,
-				emit(func(this *scpb.Database, md *targetsWithElementMap) *scop.MarkDescriptorAsSyntheticallyDropped {
-					return &scop.MarkDescriptorAsSyntheticallyDropped{
-						DescID: this.DatabaseID,
-					}
-				}),
-			),
 			to(scpb.Status_DROPPED,
 				revertible(false),
 				emit(func(this *scpb.Database) *scop.MarkDescriptorAsDropped {
 					return &scop.MarkDescriptorAsDropped{
-						DescID: this.DatabaseID,
+						DescriptorID: this.DatabaseID,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.Database, md *targetsWithElementMap) *scop.LogEvent {
-					return newLogEventOp(this, md)
-				}),
-				emit(func(this *scpb.Database, md *targetsWithElementMap) *scop.CreateGcJobForDatabase {
-					return &scop.CreateGcJobForDatabase{
-						DatabaseID:          this.DatabaseID,
-						StatementForDropJob: statementForDropJob(this, md),
+				emit(func(this *scpb.Database, md *opGenContext) *scop.CreateGCJobForDatabase {
+					if !md.ActiveVersion.IsActive(clusterversion.V23_1) {
+						return &scop.CreateGCJobForDatabase{
+							DatabaseID:          this.DatabaseID,
+							StatementForDropJob: statementForDropJob(this, md),
+						}
 					}
+					return nil
 				}),
 				emit(func(this *scpb.Database) *scop.DeleteDescriptor {
 					return &scop.DeleteDescriptor{

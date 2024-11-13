@@ -12,7 +12,7 @@ import * as React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import { Moment } from "moment";
+import { Moment } from "moment-timezone";
 import _ from "lodash";
 
 import { AdminUIState } from "src/redux/state";
@@ -29,9 +29,10 @@ import {
   Table,
   SortSetting,
   util,
+  Timestamp,
 } from "@cockroachlabs/cluster-ui";
 import { createSelector } from "reselect";
-import { DATE_FORMAT_24_UTC } from "src/util/format";
+import { BackToAdvanceDebug } from "src/views/reports/containers/util";
 
 const decommissionedNodesSortSetting = new LocalSetting<
   AdminUIState,
@@ -76,7 +77,9 @@ const sortByDecommissioningDate = (
   return 0;
 };
 
-export class DecommissionedNodeHistory extends React.Component<DecommissionedNodeHistoryProps> {
+export class DecommissionedNodeHistory extends React.Component<
+  DecommissionedNodeHistoryProps & RouteComponentProps
+> {
   columns: ColumnsConfig<DecommissionedNodeStatusRow> = [
     {
       key: "id",
@@ -89,7 +92,12 @@ export class DecommissionedNodeHistory extends React.Component<DecommissionedNod
       title: "Decommissioned On",
       sorter: sortByDecommissioningDate,
       render: (_text, record) => {
-        return record.decommissionedDate.format(DATE_FORMAT_24_UTC);
+        return (
+          <Timestamp
+            time={record.decommissionedDate}
+            format={util.DATE_FORMAT_24_TZ}
+          />
+        );
       },
     },
   ];
@@ -110,6 +118,7 @@ export class DecommissionedNodeHistory extends React.Component<DecommissionedNod
     return (
       <section className="section">
         <Helmet title="Decommissioned Node History | Debug" />
+        <BackToAdvanceDebug history={this.props.history} />
         <h1 className="base-heading title">Decommissioned Node History</h1>
         <div>
           <Table

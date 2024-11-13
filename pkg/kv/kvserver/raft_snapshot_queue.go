@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 const (
@@ -37,6 +37,8 @@ type raftSnapshotQueue struct {
 	*baseQueue
 }
 
+var _ queueImpl = &raftSnapshotQueue{}
+
 // newRaftSnapshotQueue returns a new instance of raftSnapshotQueue.
 func newRaftSnapshotQueue(store *Store) *raftSnapshotQueue {
 	rq := &raftSnapshotQueue{}
@@ -48,7 +50,7 @@ func newRaftSnapshotQueue(store *Store) *raftSnapshotQueue {
 			// leaseholder. Operating on a replica without holding the lease is the
 			// reason Raft snapshots cannot be performed by the replicateQueue.
 			needsLease:           false,
-			needsSystemConfig:    false,
+			needsSpanConfigs:     false,
 			acceptsUnsplitRanges: true,
 			processTimeoutFunc:   makeRateLimitedTimeoutFunc(recoverySnapshotRate, rebalanceSnapshotRate),
 			successes:            store.metrics.RaftSnapshotQueueSuccesses,
@@ -114,9 +116,10 @@ func (rq *raftSnapshotQueue) processRaftSnapshot(
 		if fn := repl.store.cfg.TestingKnobs.RaftSnapshotQueueSkipReplica; fn != nil && fn() {
 			return false, nil
 		}
-		if repl.hasOutstandingSnapshotInFlightToStore(repDesc.StoreID) {
-			// There is a snapshot being transferred. It's probably an INITIAL snap,
-			// so bail for now and try again later.
+		// NB: we could pass `false` for initialOnly as well, but we are the "other"
+		// possible sender.
+		if _, ok := repl.hasOutstandingSnapshotInFlightToStore(repDesc.StoreID, true /* initialOnly */); ok {
+			// There is an INITIAL snapshot being transferred, so bail for now and try again later.
 			err := errors.Errorf(
 				"skipping snapshot; replica is likely a %s in the process of being added: %s",
 				typ,
@@ -140,7 +143,7 @@ func (rq *raftSnapshotQueue) processRaftSnapshot(
 		}
 	}
 
-	err := repl.sendSnapshot(ctx, repDesc, snapType, kvserverpb.SnapshotRequest_RECOVERY, kvserverpb.SnapshotRequest_RAFT_SNAPSHOT_QUEUE, raftSnapshotPriority)
+	err := repl.sendSnapshotUsingDelegate(ctx, repDesc, snapType, kvserverpb.SnapshotRequest_RECOVERY, kvserverpb.SnapshotRequest_RAFT_SNAPSHOT_QUEUE, raftSnapshotPriority)
 
 	// NB: if the snapshot fails because of an overlapping replica on the
 	// recipient which is also waiting for a snapshot, the "smart" thing is to
@@ -162,6 +165,11 @@ func (rq *raftSnapshotQueue) processRaftSnapshot(
 	// make sure that log truncations won't require snapshots for healthy
 	// followers.
 	return err == nil /* processed */, err
+}
+
+func (*raftSnapshotQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 func (*raftSnapshotQueue) timer(_ time.Duration) time.Duration {

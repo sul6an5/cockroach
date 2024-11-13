@@ -13,7 +13,6 @@ package ycsb
 
 import (
 	"context"
-	gosql "database/sql"
 	"encoding/binary"
 	"fmt"
 	"hash"
@@ -22,14 +21,18 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/cockroachdb/cockroach-go/v2/crdb"
+	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/pflag"
 	"golang.org/x/exp/rand"
 )
@@ -84,11 +87,12 @@ const (
 	timeFormatTemplate = `2006-01-02 15:04:05.000000-07:00`
 )
 
+var RandomSeed = workload.NewUint64RandomSeed()
+
 type ycsb struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed        uint64
 	timeString  bool
 	insertHash  bool
 	zeroPadding int
@@ -112,32 +116,32 @@ func init() {
 }
 
 var ycsbMeta = workload.Meta{
-	Name:         `ycsb`,
-	Description:  `YCSB is the Yahoo! Cloud Serving Benchmark`,
-	Version:      `1.0.0`,
-	PublicFacing: true,
+	Name:        `ycsb`,
+	Description: `YCSB is the Yahoo! Cloud Serving Benchmark.`,
+	Version:     `1.0.0`,
+	RandomSeed:  RandomSeed,
 	New: func() workload.Generator {
 		g := &ycsb{}
 		g.flags.FlagSet = pflag.NewFlagSet(`ycsb`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
 			`workload`: {RuntimeOnly: true},
 		}
-		g.flags.Uint64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.BoolVar(&g.timeString, `time-string`, false, `Prepend field[0-9] data with current time in microsecond precision.`)
 		g.flags.BoolVar(&g.insertHash, `insert-hash`, true, `Key to be hashed or ordered.`)
 		g.flags.IntVar(&g.zeroPadding, `zero-padding`, 1, `Key using "insert-hash=false" has zeros padded to left to make this length of digits.`)
 		g.flags.IntVar(&g.insertStart, `insert-start`, 0, `Key to start initial sequential insertions from. (default 0)`)
 		g.flags.IntVar(&g.insertCount, `insert-count`, 10000, `Number of rows to sequentially insert before beginning workload.`)
 		g.flags.IntVar(&g.recordCount, `record-count`, 0, `Key to start workload insertions from. Must be >= insert-start + insert-count. (Default: insert-start + insert-count)`)
-		g.flags.BoolVar(&g.json, `json`, false, `Use JSONB rather than relational data`)
-		g.flags.BoolVar(&g.families, `families`, true, `Place each column in its own column family`)
-		g.flags.BoolVar(&g.sfu, `select-for-update`, true, `Use SELECT FOR UPDATE syntax in read-modify-write transactions`)
-		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations`)
+		g.flags.BoolVar(&g.json, `json`, false, `Use JSONB rather than relational data.`)
+		g.flags.BoolVar(&g.families, `families`, true, `Place each column in its own column family.`)
+		g.flags.BoolVar(&g.sfu, `select-for-update`, true, `Use SELECT FOR UPDATE syntax in read-modify-write transactions.`)
+		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations.`)
 		g.flags.StringVar(&g.workload, `workload`, `B`, `Workload type. Choose from A-F.`)
 		g.flags.StringVar(&g.requestDistribution, `request-distribution`, ``, `Distribution for request key generation [zipfian, uniform, latest]. The default for workloads A, B, C, E, and F is zipfian, and the default for workload D is latest.`)
 		g.flags.StringVar(&g.scanLengthDistribution, `scan-length-distribution`, `uniform`, `Distribution for scan length generation [zipfian, uniform]. Primarily used for workload E.`)
 		g.flags.Uint64Var(&g.minScanLength, `min-scan-length`, 1, `The minimum length for scan operations. Primarily used for workload E.`)
 		g.flags.Uint64Var(&g.maxScanLength, `max-scan-length`, 1000, `The maximum length for scan operations. Primarily used for workload E.`)
+		RandomSeed.AddFlag(&g.flags)
 
 		// TODO(dan): g.flags.Uint64Var(&g.maxWrites, `max-writes`,
 		//     7*24*3600*1500,  // 7 days at 5% writes and 30k ops/s
@@ -345,7 +349,7 @@ func (g *ycsb) Tables() []workload.Table {
 					config:   g,
 					hashFunc: fnv.New64(),
 				}
-				rng := rand.NewSource(g.seed + uint64(batchIdx))
+				rng := rand.NewSource(RandomSeed.Seed() + uint64(batchIdx))
 
 				var tmpbuf [fieldLength]byte
 				for rowIdx := rowBegin; rowIdx < rowEnd; rowIdx++ {
@@ -426,7 +430,7 @@ func (g *ycsb) Ops(
 	rowCounter := NewAcknowledgedCounter((uint64)(g.recordCount))
 
 	var requestGen randGenerator
-	requestGenRng := rand.New(rand.NewSource(g.seed))
+	requestGenRng := rand.New(rand.NewSource(RandomSeed.Seed()))
 	switch strings.ToLower(g.requestDistribution) {
 	case "zipfian":
 		requestGen, err = NewZipfGenerator(
@@ -444,7 +448,7 @@ func (g *ycsb) Ops(
 	}
 
 	var scanLengthGen randGenerator
-	scanLengthGenRng := rand.New(rand.NewSource(g.seed + 1))
+	scanLengthGenRng := rand.New(rand.NewSource(RandomSeed.Seed() + 1))
 	switch strings.ToLower(g.scanLengthDistribution) {
 	case "zipfian":
 		scanLengthGen, err = NewZipfGenerator(scanLengthGenRng, g.minScanLength, g.maxScanLength, defaultTheta, false /* verbose */)
@@ -456,60 +460,65 @@ func (g *ycsb) Ops(
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
+	cfg := workload.NewMultiConnPoolCfgFromFlags(g.connFlags)
+	pool, err := workload.NewMultiConnPool(ctx, cfg, urls...)
+	if err != nil {
+		return workload.QueryLoad{}, err
+	}
 
 	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
-	var db *gosql.DB
-	const connsPerDB = 1000
+
+	const (
+		readStmt                     stmtKey = "read"
+		scanStmt                     stmtKey = "scan"
+		insertStmt                   stmtKey = "insert"
+		readFieldForUpdateStmtFormat         = "readFieldForUpdate%d"
+		updateStmtFormat                     = "update%d"
+	)
+	pool.AddPreparedStatement(readStmt, readStmtStr)
+	readFieldForUpdateStmts := make([]stmtKey, len(readFieldForUpdateStmtStrs))
+	for i, q := range readFieldForUpdateStmtStrs {
+		key := fmt.Sprintf(readFieldForUpdateStmtFormat, i)
+		pool.AddPreparedStatement(key, q)
+		readFieldForUpdateStmts[i] = key
+	}
+	pool.AddPreparedStatement(scanStmt, scanStmtStr)
+	pool.AddPreparedStatement(insertStmt, insertStmtStr)
+	updateStmts := make([]stmtKey, len(updateStmtStrs))
+	for i, q := range updateStmtStrs {
+		key := fmt.Sprintf(updateStmtFormat, i)
+		pool.AddPreparedStatement(key, q)
+		updateStmts[i] = key
+	}
+
 	for i := 0; i < g.connFlags.Concurrency; i++ {
-		// Give each ycsbWorker worker its own SQL connection and prepare statements
-		// using this connection. This avoids lock contention in the sql.Rows
-		// objects they produce.
-		//
-		// Additionally, create a new sql.DB for every connsPerDB connections. Even
-		// with each worker having its own connection, there is some lock contention
-		// between connections from the same DB (see DB.addDep and DB.removeDep), so
-		// this avoids additional lock contention when the load generator uses many
-		// concurrent workers.
-		if i%connsPerDB == 0 {
-			db, err = gosql.Open(`cockroach`, strings.Join(urls, ` `))
-			if err != nil {
-				return workload.QueryLoad{}, err
+		// We want to have 1 connection per worker, however the
+		// multi-connection pool round robins access to different pools so it
+		// is always possible that we hit a pool that is full, unless we create
+		// more connections than necessary. To avoid this, first check if the
+		// pool we are attempting to acquire a connection from is full. If
+		// full, skip this pool and continue to the next one, otherwise grab
+		// the connection and move on.
+		var pl *pgxpool.Pool
+		var try int
+		for try = 0; try < g.connFlags.Concurrency; try++ {
+			pl = pool.Get()
+			plStat := pl.Stat()
+			if plStat.MaxConns()-plStat.AcquiredConns() > 0 {
+				break
 			}
 		}
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			return workload.QueryLoad{}, err
-		}
-		readStmt, err := conn.PrepareContext(ctx, readStmtStr)
-		if err != nil {
-			return workload.QueryLoad{}, err
-		}
-		readFieldForUpdateStmts := make([]*gosql.Stmt, len(readFieldForUpdateStmtStrs))
-		for i, q := range readFieldForUpdateStmtStrs {
-			stmt, err := conn.PrepareContext(ctx, q)
-			if err != nil {
-				return workload.QueryLoad{}, err
-			}
-			readFieldForUpdateStmts[i] = stmt
-		}
-		scanStmt, err := conn.PrepareContext(ctx, scanStmtStr)
-		if err != nil {
-			return workload.QueryLoad{}, err
-		}
-		insertStmt, err := conn.PrepareContext(ctx, insertStmtStr)
-		if err != nil {
-			return workload.QueryLoad{}, err
-		}
-		updateStmts := make([]*gosql.Stmt, len(updateStmtStrs))
-		for i, q := range updateStmtStrs {
-			stmt, err := conn.PrepareContext(ctx, q)
-			if err != nil {
-				return workload.QueryLoad{}, err
-			}
-			updateStmts[i] = stmt
+		if try == g.connFlags.Concurrency {
+			return workload.QueryLoad{},
+				errors.AssertionFailedf("Unable to acquire connection for worker %d", i)
 		}
 
-		rng := rand.New(rand.NewSource(g.seed + uint64(i)))
+		conn, err := pl.Acquire(ctx)
+		if err != nil {
+			return workload.QueryLoad{}, err
+		}
+
+		rng := rand.New(rand.NewSource(RandomSeed.Seed() + uint64(i)))
 		w := &ycsbWorker{
 			config:                  g,
 			hists:                   reg.GetHandle(),
@@ -537,19 +546,21 @@ type randGenerator interface {
 	IncrementIMax(count uint64) error
 }
 
+type stmtKey = string
+
 type ycsbWorker struct {
 	config *ycsb
 	hists  *histogram.Histograms
-	conn   *gosql.Conn
+	conn   *pgxpool.Conn
 	// Statement to read all the fields of a row. Used for read requests.
-	readStmt *gosql.Stmt
+	readStmt stmtKey
 	// Statements to read a specific field of a row in preparation for
 	// updating it. Used for read-modify-write requests.
-	readFieldForUpdateStmts []*gosql.Stmt
-	scanStmt, insertStmt    *gosql.Stmt
+	readFieldForUpdateStmts []stmtKey
+	scanStmt, insertStmt    stmtKey
 	// In normal mode this is one statement per field, since the field name
 	// cannot be parametrized. In JSON mode it's a single statement.
-	updateStmts []*gosql.Stmt
+	updateStmts []stmtKey
 
 	// The next row index to insert.
 	rowIndex *uint64
@@ -716,7 +727,7 @@ func (yw *ycsbWorker) insertRow(ctx context.Context) error {
 	for i := 1; i <= numTableFields; i++ {
 		args[i] = yw.randString(fieldLength)
 	}
-	if _, err := yw.insertStmt.ExecContext(ctx, args[:]...); err != nil {
+	if _, err := yw.conn.Exec(ctx, yw.insertStmt, args[:]...); err != nil {
 		yw.nextInsertIndex = new(uint64)
 		*yw.nextInsertIndex = keyIndex
 		return err
@@ -730,7 +741,7 @@ func (yw *ycsbWorker) insertRow(ctx context.Context) error {
 }
 
 func (yw *ycsbWorker) updateRow(ctx context.Context) error {
-	var stmt *gosql.Stmt
+	var stmt stmtKey
 	var args [2]interface{}
 	args[0] = yw.nextReadKey()
 	fieldIdx := yw.rng.Intn(numTableFields)
@@ -742,7 +753,7 @@ func (yw *ycsbWorker) updateRow(ctx context.Context) error {
 		stmt = yw.updateStmts[fieldIdx]
 		args[1] = value
 	}
-	if _, err := stmt.ExecContext(ctx, args[:]...); err != nil {
+	if _, err := yw.conn.Exec(ctx, stmt, args[:]...); err != nil {
 		return err
 	}
 	return nil
@@ -750,7 +761,7 @@ func (yw *ycsbWorker) updateRow(ctx context.Context) error {
 
 func (yw *ycsbWorker) readRow(ctx context.Context) error {
 	key := yw.nextReadKey()
-	res, err := yw.readStmt.QueryContext(ctx, key)
+	res, err := yw.conn.Query(ctx, yw.readStmt, key)
 	if err != nil {
 		return err
 	}
@@ -768,8 +779,8 @@ func (yw *ycsbWorker) scanRows(ctx context.Context) error {
 	// the client, and so if it then hits a ReadWithinUncertaintyIntervalError
 	// then it will return this error even if it is being run as an implicit
 	// transaction.
-	return crdb.Execute(func() error {
-		res, err := yw.scanStmt.QueryContext(ctx, key, scanLength)
+	return execute(func() error {
+		res, err := yw.conn.Query(ctx, yw.scanStmt, key, scanLength)
 		if err != nil {
 			return err
 		}
@@ -780,27 +791,23 @@ func (yw *ycsbWorker) scanRows(ctx context.Context) error {
 	})
 }
 
-// stdlibTxnAdapter is copied from github.com/cockroachdb/cockroach-go/v2/crdb.
-// TODO(nvanbenschoten): the type should be exported or we should expose a way
-// to pass a *sql.Conn to crdb.ExecuteTx.
-type stdlibTxnAdapter struct {
-	tx *gosql.Tx
-}
-
-// Exec is part of the tx interface.
-func (tx stdlibTxnAdapter) Exec(ctx context.Context, q string, args ...interface{}) error {
-	_, err := tx.tx.ExecContext(ctx, q, args...)
-	return err
-}
-
-// Commit is part of the tx interface.
-func (tx stdlibTxnAdapter) Commit(context.Context) error {
-	return tx.tx.Commit()
-}
-
-// Rollback is part of the tx interface.
-func (tx stdlibTxnAdapter) Rollback(context.Context) error {
-	return tx.tx.Rollback()
+// execute is like crdb.Execute from cockroach-go, but for pgx. This function
+// should ultimately be moved to crdbpgx.
+//
+// TODO(ajwerner): Move this function to crdbpgx and adopt that.
+func execute(fn func() error) error {
+	for {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) &&
+			pgcode.MakeCode(pgErr.Code) == pgcode.SerializationFailure {
+			continue
+		}
+		return err
+	}
 }
 
 func (yw *ycsbWorker) readModifyWriteRow(ctx context.Context) error {
@@ -809,17 +816,13 @@ func (yw *ycsbWorker) readModifyWriteRow(ctx context.Context) error {
 	fieldIdx := yw.rng.Intn(numTableFields)
 	var args [2]interface{}
 	args[0] = key
-	tx, err := yw.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	err = crdb.ExecuteInTx(ctx, stdlibTxnAdapter{tx}, func() error {
+	err := crdbpgx.ExecuteTx(ctx, yw.conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		var oldValue []byte
 		readStmt := yw.readFieldForUpdateStmts[fieldIdx]
-		if err := tx.StmtContext(ctx, readStmt).QueryRowContext(ctx, key).Scan(&oldValue); err != nil {
+		if err := tx.QueryRow(ctx, readStmt, key).Scan(&oldValue); err != nil {
 			return err
 		}
-		var updateStmt *gosql.Stmt
+		var updateStmt stmtKey
 		if yw.config.json {
 			updateStmt = yw.updateStmts[0]
 			args[1] = fmt.Sprintf(`{"field%d": "%s"}`, fieldIdx, newValue)
@@ -827,10 +830,10 @@ func (yw *ycsbWorker) readModifyWriteRow(ctx context.Context) error {
 			updateStmt = yw.updateStmts[fieldIdx]
 			args[1] = newValue
 		}
-		_, err := tx.StmtContext(ctx, updateStmt).ExecContext(ctx, args[:]...)
+		_, err := tx.Exec(ctx, updateStmt, args[:]...)
 		return err
 	})
-	if errors.Is(err, gosql.ErrNoRows) && ctx.Err() != nil {
+	if errors.Is(err, pgx.ErrNoRows) && ctx.Err() != nil {
 		// Sometimes a context cancellation during a transaction can result in
 		// sql.ErrNoRows instead of the appropriate context.DeadlineExceeded. In
 		// this case, we just return ctx.Err(). See

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -51,6 +52,8 @@ var csvOutputTypes = []*types.T{
 }
 
 const readImportDataProcessorName = "readImportDataProcessor"
+
+var progressUpdateInterval = time.Second * 10
 
 var importPKAdderBufferSize = func() *settings.ByteSizeSetting {
 	s := settings.RegisterByteSizeSetting(
@@ -121,14 +124,15 @@ type readImportDataProcessor struct {
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.ReadImportDataSpec
-	output  execinfra.RowReceiver
 
+	cancel context.CancelFunc
+	wg     ctxgroup.Group
 	progCh chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
 
 	seqChunkProvider *row.SeqChunkProvider
 
 	importErr error
-	summary   *roachpb.BulkOpSummary
+	summary   *kvpb.BulkOpSummary
 }
 
 var (
@@ -137,22 +141,25 @@ var (
 )
 
 func newReadImportDataProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.ReadImportDataSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
-	cp := &readImportDataProcessor{
+	idp := &readImportDataProcessor{
 		flowCtx: flowCtx,
 		spec:    spec,
-		output:  output,
 		progCh:  make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress),
 	}
-	if err := cp.Init(cp, post, csvOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
+	if err := idp.Init(ctx, idp, post, csvOutputTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// This processor doesn't have any inputs to drain.
 			InputsToDrain: nil,
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				idp.close()
+				return nil
+			},
 		}); err != nil {
 		return nil, err
 	}
@@ -160,28 +167,31 @@ func newReadImportDataProcessor(
 	// Load the import job running the import in case any of the columns have a
 	// default expression which uses sequences. In this case we need to update the
 	// job progress within the import processor.
-	if cp.flowCtx.Cfg.JobRegistry != nil {
-		cp.seqChunkProvider = &row.SeqChunkProvider{
-			JobID:    cp.spec.Progress.JobID,
-			Registry: cp.flowCtx.Cfg.JobRegistry,
-			DB:       cp.flowCtx.Cfg.DB,
+	if idp.flowCtx.Cfg.JobRegistry != nil {
+		idp.seqChunkProvider = &row.SeqChunkProvider{
+			JobID:    idp.spec.Progress.JobID,
+			Registry: idp.flowCtx.Cfg.JobRegistry,
+			DB:       idp.flowCtx.Cfg.DB,
 		}
 	}
 
-	return cp, nil
+	return idp, nil
 }
 
 // Start is part of the RowSource interface.
 func (idp *readImportDataProcessor) Start(ctx context.Context) {
 	ctx = logtags.AddTag(ctx, "job", idp.spec.JobID)
 	ctx = idp.StartInternal(ctx, readImportDataProcessorName)
-	// We don't have to worry about this go routine leaking because next we loop over progCh
-	// which is closed only after the go routine returns.
-	go func() {
+
+	grpCtx, cancel := context.WithCancel(ctx)
+	idp.cancel = cancel
+	idp.wg = ctxgroup.WithContext(grpCtx)
+	idp.wg.GoCtx(func(ctx context.Context) error {
 		defer close(idp.progCh)
 		idp.summary, idp.importErr = runImport(ctx, idp.flowCtx, &idp.spec, idp.progCh,
 			idp.seqChunkProvider)
-	}()
+		return nil
+	})
 }
 
 // Next is part of the RowSource interface.
@@ -207,7 +217,7 @@ func (idp *readImportDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pro
 	}
 
 	// Once the import is done, send back to the controller the serialized
-	// summary of the import operation. For more info see roachpb.BulkOpSummary.
+	// summary of the import operation. For more info see kvpb.BulkOpSummary.
 	countsBytes, err := protoutil.Marshal(idp.summary)
 	idp.MoveToDraining(err)
 	if err != nil {
@@ -220,12 +230,28 @@ func (idp *readImportDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pro
 	}, nil
 }
 
-func injectTimeIntoEvalCtx(ctx *eval.Context, walltime int64) {
+func (idp *readImportDataProcessor) ConsumerClosed() {
+	idp.close()
+}
+
+func (idp *readImportDataProcessor) close() {
+	// ipd.Closed is set by idp.InternalClose().
+	if idp.Closed {
+		return
+	}
+
+	idp.cancel()
+	_ = idp.wg.Wait()
+
+	idp.InternalClose()
+}
+
+func injectTimeIntoEvalCtx(evalCtx *eval.Context, walltime int64) {
 	sec := walltime / int64(time.Second)
 	nsec := walltime % int64(time.Second)
 	unixtime := timeutil.Unix(sec, nsec)
-	ctx.StmtTimestamp = unixtime
-	ctx.TxnTimestamp = unixtime
+	evalCtx.StmtTimestamp = unixtime
+	evalCtx.TxnTimestamp = unixtime
 }
 
 func makeInputConverter(
@@ -331,9 +357,11 @@ func ingestKvs(
 	spec *execinfrapb.ReadImportDataSpec,
 	progCh chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
 	kvCh <-chan row.KVBatch,
-) (*roachpb.BulkOpSummary, error) {
+) (*kvpb.BulkOpSummary, error) {
 	ctx, span := tracing.ChildSpan(ctx, "import-ingest-kvs")
 	defer span.Finish()
+
+	defer flowCtx.Cfg.JobRegistry.MarkAsIngesting(spec.Progress.JobID)()
 
 	writeTS := hlc.Timestamp{WallTime: spec.WalltimeNanos}
 
@@ -361,7 +389,7 @@ func ingestKvs(
 	// will hog memory as it tries to grow more aggressively.
 	minBufferSize, maxBufferSize := importBufferConfigSizes(flowCtx.Cfg.Settings,
 		true /* isPKAdder */)
-	pkIndexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
+	pkIndexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB.KV(), writeTS, kvserverbase.BulkAdderOptions{
 		Name:                     pkAdderName,
 		DisallowShadowingBelow:   writeTS,
 		SkipDuplicates:           true,
@@ -377,7 +405,7 @@ func ingestKvs(
 
 	minBufferSize, maxBufferSize = importBufferConfigSizes(flowCtx.Cfg.Settings,
 		false /* isPKAdder */)
-	indexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
+	indexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB.KV(), writeTS, kvserverbase.BulkAdderOptions{
 		Name:                     indexAdderName,
 		DisallowShadowingBelow:   writeTS,
 		SkipDuplicates:           true,
@@ -407,13 +435,13 @@ func ingestKvs(
 
 	bulkSummaryMu := &struct {
 		syncutil.Mutex
-		summary roachpb.BulkOpSummary
+		summary kvpb.BulkOpSummary
 	}{}
 
 	// When the PK adder flushes, everything written has been flushed, so we set
 	// pkFlushedRow to writtenRow. Additionally if the indexAdder is empty then we
 	// can treat it as flushed as well (in case we're not adding anything to it).
-	pkIndexAdder.SetOnFlush(func(summary roachpb.BulkOpSummary) {
+	pkIndexAdder.SetOnFlush(func(summary kvpb.BulkOpSummary) {
 		for i, emitted := range writtenRow {
 			atomic.StoreInt64(&pkFlushedRow[i], emitted)
 			bulkSummaryMu.Lock()
@@ -426,7 +454,7 @@ func ingestKvs(
 			}
 		}
 	})
-	indexAdder.SetOnFlush(func(summary roachpb.BulkOpSummary) {
+	indexAdder.SetOnFlush(func(summary kvpb.BulkOpSummary) {
 		for i, emitted := range writtenRow {
 			atomic.StoreInt64(&idxFlushedRow[i], emitted)
 			bulkSummaryMu.Lock()
@@ -443,7 +471,7 @@ func ingestKvs(
 		offset++
 	}
 
-	pushProgress := func() {
+	pushProgress := func(ctx context.Context) {
 		var prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
 		prog.ResumePos = make(map[int32]int64)
 		prog.CompletedFraction = make(map[int32]float32)
@@ -464,14 +492,18 @@ func ingestKvs(
 			bulkSummaryMu.summary.Reset()
 			bulkSummaryMu.Unlock()
 		}
-		progCh <- prog
+		select {
+		case progCh <- prog:
+		case <-ctx.Done():
+		}
+
 	}
 
 	// stopProgress will be closed when there is no more progress to report.
 	stopProgress := make(chan struct{})
 	g := ctxgroup.WithContext(ctx)
 	g.GoCtx(func(ctx context.Context) error {
-		tick := time.NewTicker(time.Second * 10)
+		tick := time.NewTicker(progressUpdateInterval)
 		defer tick.Stop()
 		done := ctx.Done()
 		for {
@@ -481,7 +513,7 @@ func ingestKvs(
 			case <-stopProgress:
 				return nil
 			case <-tick.C:
-				pushProgress()
+				pushProgress(ctx)
 			}
 		}
 	})
@@ -543,7 +575,7 @@ func ingestKvs(
 			if flowCtx.Cfg.TestingKnobs.BulkAdderFlushesEveryBatch {
 				_ = pkIndexAdder.Flush(ctx)
 				_ = indexAdder.Flush(ctx)
-				pushProgress()
+				pushProgress(ctx)
 			}
 		}
 		return nil

@@ -13,6 +13,7 @@ package tenantrate_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"regexp"
 	"runtime"
 	"sort"
@@ -20,41 +21,46 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/metrictestutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 func TestCloser(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 86822, "flaky test")
+
+	ctx := context.Background()
 
 	st := cluster.MakeTestingClusterSettings()
 	start := timeutil.Now()
 	timeSource := timeutil.NewManualTime(start)
 	factory := tenantrate.NewLimiterFactory(&st.SV, &tenantrate.TestingKnobs{
 		TimeSource: timeSource,
-	})
-	tenant := roachpb.MakeTenantID(2)
+	}, fakeAuthorizer{})
+	tenant := roachpb.MustMakeTenantID(2)
 	closer := make(chan struct{})
-	ctx := context.Background()
 	limiter := factory.GetTenant(ctx, tenant, closer)
 	// First Wait call will not block.
-	require.NoError(t, limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(1, 1, 1)))
+	require.NoError(t, limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(1, 1, 1, 1)))
 	errCh := make(chan error, 1)
-	go func() { errCh <- limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(1, 1, 1<<30)) }()
+	go func() { errCh <- limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(1, 1, 1<<33, 1)) }()
 	testutils.SucceedsSoon(t, func() error {
 		if timers := timeSource.Timers(); len(timers) != 1 {
 			return errors.Errorf("expected 1 timer, found %d", len(timers))
@@ -65,23 +71,86 @@ func TestCloser(t *testing.T) {
 	require.Regexp(t, "closer", <-errCh)
 }
 
+func TestUseAfterRelease(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cs := cluster.MakeTestingClusterSettings()
+
+	factory := tenantrate.NewLimiterFactory(&cs.SV, nil /* knobs */, fakeAuthorizer{})
+	s := stop.NewStopper()
+	defer s.Stop(ctx)
+	ctx, cancel2 := s.WithCancelOnQuiesce(ctx)
+	defer cancel2()
+
+	lim := factory.GetTenant(ctx, roachpb.MinTenantID, s.ShouldQuiesce())
+
+	// Pick a large acquisition size which will cause the quota acquisition to
+	// block ~forever. We scale it a bit to stay away from overflow.
+	const n = math.MaxInt64 / 50
+
+	rq := tenantcostmodel.TestingRequestInfo(
+		2 /* writeReplicas */, n /* writeCount */, n /* writeBytes */, 1 /* *writeMultiplier */)
+	rs := tenantcostmodel.TestingResponseInfo(
+		true /* isRead */, n /* readCount */, n /* readBytes */, 1 /* readMultiplier */)
+
+	// Acquire once to exhaust the burst. The bucket is now deeply in the red.
+	require.NoError(t, lim.Wait(ctx, rq))
+
+	waitErr := make(chan error, 1)
+	_ = s.RunAsyncTask(ctx, "wait", func(ctx context.Context) {
+		waitErr <- lim.Wait(ctx, rq)
+	})
+
+	_ = s.RunAsyncTask(ctx, "release", func(ctx context.Context) {
+		require.Eventually(t, func() bool {
+			return factory.Metrics().CurrentBlocked.Value() == 1
+		}, 10*time.Second, time.Nanosecond)
+		factory.Release(lim)
+	})
+
+	select {
+	case <-time.After(10 * time.Second):
+		t.Errorf("releasing limiter did not unblock acquisition")
+	case err := <-waitErr:
+		t.Logf("waiting returned: %s", err)
+		assert.Error(t, err)
+	}
+
+	lim.RecordRead(ctx, rs)
+
+	// The read bytes are still recorded to the parent, even though the limiter
+	// was already released at that point. This isn't required behavior, what's
+	// more important is that we don't crash.
+	require.Equal(t, rs.ReadBytes(), factory.Metrics().ReadBytesAdmitted.Count())
+	// Write bytes got admitted only once because second attempt got aborted
+	// during Wait().
+	require.Equal(t, rq.WriteBytes(), factory.Metrics().WriteBytesAdmitted.Count())
+	// This is a Gauge and we want to make sure that we don't leak an increment to
+	// it, i.e. the Wait call both added and removed despite interleaving with the
+	// gauge being unlinked from the aggregating parent.
+	require.Zero(t, factory.Metrics().CurrentBlocked.Value())
+	require.NoError(t, ctx.Err()) // didn't time out
+}
+
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		defer leaktest.AfterTest(t)()
 		datadriven.RunTest(t, path, new(testState).run)
 	})
 }
 
 type testState struct {
-	initialized bool
-	tenants     map[roachpb.TenantID][]tenantrate.Limiter
-	running     map[string]*launchState
-	rl          *tenantrate.LimiterFactory
-	m           *metric.Registry
-	clock       *timeutil.ManualTime
-	settings    *cluster.Settings
-	config      tenantrate.Config
+	initialized  bool
+	tenants      map[roachpb.TenantID][]tenantrate.Limiter
+	running      map[string]*launchState
+	rl           *tenantrate.LimiterFactory
+	m            *metric.Registry
+	clock        *timeutil.ManualTime
+	settings     *cluster.Settings
+	config       tenantrate.Config
+	capabilities map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities
 }
 
 type launchState struct {
@@ -149,12 +218,12 @@ func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
 	ts.clock = timeutil.NewManualTime(t0)
 	ts.settings = cluster.MakeTestingClusterSettings()
 	ts.config = tenantrate.DefaultConfig()
+	ts.capabilities = make(map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities)
 
-	parseSettings(t, d, &ts.config)
-
+	parseSettings(t, d, &ts.config, ts.capabilities)
 	ts.rl = tenantrate.NewLimiterFactory(&ts.settings.SV, &tenantrate.TestingKnobs{
 		TimeSource: ts.clock,
-	})
+	}, ts)
 	ts.rl.UpdateConfig(ts.config)
 	ts.m = metric.NewRegistry()
 	ts.m.AddMetricStruct(ts.rl.Metrics())
@@ -165,7 +234,7 @@ func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
 // yaml object representing the limits and updates accordingly. It returns
 // the current time. See init for more details as the semantics are the same.
 func (ts *testState) updateSettings(t *testing.T, d *datadriven.TestData) string {
-	parseSettings(t, d, &ts.config)
+	parseSettings(t, d, &ts.config, ts.capabilities)
 	ts.rl.UpdateConfig(ts.config)
 	return ts.formatTime()
 }
@@ -217,7 +286,7 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 	for _, cmd := range cmds {
 		var s launchState
 		s.id = cmd.ID
-		s.tenantID = roachpb.MakeTenantID(cmd.Tenant)
+		s.tenantID = roachpb.MustMakeTenantID(cmd.Tenant)
 		s.ctx, s.cancel = context.WithCancel(context.Background())
 		s.reserveCh = make(chan error, 1)
 		s.writeRequests = cmd.WriteRequests
@@ -229,10 +298,10 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 		}
 		go func() {
 			// We'll not worry about ever releasing tenant Limiters.
-			reqInfo := tenantcostmodel.TestingRequestInfo(1, s.writeRequests, s.writeBytes)
+			reqInfo := tenantcostmodel.TestingRequestInfo(1, s.writeRequests, s.writeBytes, 1)
 			if s.writeRequests == 0 {
 				// Read-only request.
-				reqInfo = tenantcostmodel.TestingRequestInfo(0, 0, 0)
+				reqInfo = tenantcostmodel.TestingRequestInfo(0, 0, 0, 0)
 			}
 			s.reserveCh <- lims[0].Wait(s.ctx, reqInfo)
 		}()
@@ -323,13 +392,13 @@ func (ts *testState) recordRead(t *testing.T, d *datadriven.TestData) string {
 		d.Fatalf(t, "failed to unmarshal reads: %v", err)
 	}
 	for _, r := range reads {
-		tid := roachpb.MakeTenantID(r.Tenant)
+		tid := roachpb.MustMakeTenantID(r.Tenant)
 		lims := ts.tenants[tid]
 		if len(lims) == 0 {
 			d.Fatalf(t, "no outstanding limiters for %v", tid)
 		}
 		lims[0].RecordRead(
-			context.Background(), tenantcostmodel.TestingResponseInfo(true, r.ReadRequests, r.ReadBytes))
+			context.Background(), tenantcostmodel.TestingResponseInfo(true, r.ReadRequests, r.ReadBytes, 1))
 	}
 	return ts.FormatRunning()
 }
@@ -462,7 +531,7 @@ func (ts *testState) getTenants(t *testing.T, d *datadriven.TestData) string {
 	ctx := context.Background()
 	tenantIDs := parseTenantIDs(t, d)
 	for i := range tenantIDs {
-		id := roachpb.MakeTenantID(tenantIDs[i])
+		id := roachpb.MustMakeTenantID(tenantIDs[i])
 		ts.tenants[id] = append(ts.tenants[id], ts.rl.GetTenant(ctx, id, nil /* closer */))
 	}
 	return ts.FormatTenants()
@@ -481,7 +550,7 @@ func (ts *testState) getTenants(t *testing.T, d *datadriven.TestData) string {
 func (ts *testState) releaseTenants(t *testing.T, d *datadriven.TestData) string {
 	tenantIDs := parseTenantIDs(t, d)
 	for i := range tenantIDs {
-		id := roachpb.MakeTenantID(tenantIDs[i])
+		id := roachpb.MustMakeTenantID(tenantIDs[i])
 		lims := ts.tenants[id]
 		if len(lims) == 0 {
 			d.Fatalf(t, "no outstanding limiters for %v", id)
@@ -590,6 +659,44 @@ func (ts *testState) formatTime() string {
 	return ts.clock.Now().Format(timeFormat)
 }
 
+func (ts *testState) HasCapabilityForBatch(
+	context.Context, roachpb.TenantID, *kvpb.BatchRequest,
+) error {
+	panic("unimplemented")
+}
+
+func (ts *testState) BindReader(tenantcapabilities.Reader) {}
+
+func (ts *testState) HasNodeStatusCapability(_ context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanViewNodeInfo {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasTSDBQueryCapability(_ context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanViewTSDBMetrics {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasNodelocalStorageCapability(
+	_ context.Context, tenID roachpb.TenantID,
+) error {
+	if ts.capabilities[tenID].CanUseNodelocalStorage {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) IsExemptFromRateLimiting(_ context.Context, tenID roachpb.TenantID) bool {
+	return ts.capabilities[tenID].ExemptFromRateLimiting
+}
+
 func parseTenantIDs(t *testing.T, d *datadriven.TestData) []uint64 {
 	var tenantIDs []uint64
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &tenantIDs); err != nil {
@@ -605,6 +712,8 @@ type SettingValues struct {
 
 	Read  Factors
 	Write Factors
+
+	Capabilities map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities
 }
 
 // Factors for reads and writes.
@@ -616,7 +725,12 @@ type Factors struct {
 
 // parseSettings parses a SettingValues yaml and updates the given config.
 // Missing (zero) values are ignored.
-func parseSettings(t *testing.T, d *datadriven.TestData, config *tenantrate.Config) {
+func parseSettings(
+	t *testing.T,
+	d *datadriven.TestData,
+	config *tenantrate.Config,
+	capabilties map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities,
+) {
 	var vals SettingValues
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &vals); err != nil {
 		d.Fatalf(t, "failed to unmarshal limits: %v", err)
@@ -635,6 +749,9 @@ func parseSettings(t *testing.T, d *datadriven.TestData, config *tenantrate.Conf
 	override(&config.WriteBatchUnits, vals.Write.PerBatch)
 	override(&config.WriteRequestUnits, vals.Write.PerRequest)
 	override(&config.WriteUnitsPerByte, vals.Write.PerByte)
+	for tenantID, caps := range vals.Capabilities {
+		capabilties[tenantID] = caps
+	}
 }
 
 func parseStrings(t *testing.T, d *datadriven.TestData) []string {
@@ -644,3 +761,29 @@ func parseStrings(t *testing.T, d *datadriven.TestData) []string {
 	}
 	return ids
 }
+
+// fakeAuthorizer implements the tenantauthorizer.Authorizer
+// interface, but does not perform cap checks yet pretents the caller
+// is subject to rate limit checks. (For testing in this package.)
+type fakeAuthorizer struct{}
+
+func (fakeAuthorizer) HasNodeStatusCapability(_ context.Context, tenID roachpb.TenantID) error {
+	return nil
+}
+func (fakeAuthorizer) HasTSDBQueryCapability(_ context.Context, tenID roachpb.TenantID) error {
+	return nil
+}
+func (fakeAuthorizer) HasNodelocalStorageCapability(
+	_ context.Context, tenID roachpb.TenantID,
+) error {
+	return nil
+}
+func (fakeAuthorizer) IsExemptFromRateLimiting(_ context.Context, tenID roachpb.TenantID) bool {
+	return false
+}
+func (fakeAuthorizer) HasCapabilityForBatch(
+	_ context.Context, tenID roachpb.TenantID, _ *kvpb.BatchRequest,
+) error {
+	return nil
+}
+func (fakeAuthorizer) BindReader(tenantcapabilities.Reader) {}

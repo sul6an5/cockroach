@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -28,12 +29,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
 )
 
@@ -657,6 +661,75 @@ func TestShowQueries(t *testing.T) {
 	}
 }
 
+func TestShowQueriesDelegatesInternal(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	pgURL, cleanup := sqlutils.PGUrl(
+		t,
+		s.ServingSQLAddr(),
+		"TestShowQueriesDelegatesInternal",
+		url.User(username.RootUser),
+	)
+	defer cleanup()
+
+	q := pgURL.Query()
+	q.Add("application_name", "app_name")
+	pgURL.RawQuery = q.Encode()
+	copyConn, err := pgx.Connect(ctx, pgURL.String())
+	require.NoError(t, err)
+
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		// COPY TO uses the internal executor to run the source query.
+		_, err := copyConn.Exec(ctx, "COPY (SELECT pg_sleep(1) FROM ROWS FROM (generate_series(1, 60)) AS i) TO STDOUT")
+		return err
+	})
+
+	showConn, err := pgx.Connect(ctx, pgURL.String())
+	require.NoError(t, err)
+
+	// SucceedsSoon is used since COPY is being executed concurrently.
+	var appName string
+	testutils.SucceedsSoon(t, func() error {
+		// The COPY query should use the specified app name.
+		err = showConn.QueryRow(ctx, "SELECT application_name FROM [SHOW QUERIES] WHERE query LIKE 'COPY (SELECT pg_sleep(1) %'").Scan(&appName)
+		if err != nil {
+			return err
+		}
+		if appName != "app_name" {
+			return errors.New("expected COPY to appear in SHOW QUERIES")
+		}
+
+		// The internal query should use the delegated app name.
+		err = showConn.QueryRow(ctx, "SELECT application_name FROM [SHOW QUERIES] WHERE query LIKE 'SELECT pg_sleep(1) %'").Scan(&appName)
+		if err != nil {
+			return err
+		}
+		if appName != catconstants.DelegatedAppNamePrefix+"app_name" {
+			return errors.New("expected delegated query to appear in SHOW QUERIES")
+		}
+
+		return nil
+	})
+
+	err = copyConn.PgConn().CancelRequest(ctx)
+	require.NoError(t, err)
+
+	// An error is allowed here, since the query was canceled.
+	_ = g.Wait()
+
+	err = showConn.Close(ctx)
+	require.NoError(t, err)
+	err = copyConn.Close(ctx)
+	require.NoError(t, err)
+
+}
+
 func TestShowQueriesFillsInValuesForPlaceholders(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -726,6 +799,21 @@ func TestShowQueriesFillsInValuesForPlaceholders(t *testing.T) {
 			[]interface{}{"hello"},
 			"SELECT upper('hello')",
 		},
+		{
+			"SELECT /* test */ upper($1)",
+			[]interface{}{"hello"},
+			"SELECT upper('hello') /* test */",
+		},
+		{
+			"SELECT /* test */ 'hi'::string",
+			[]interface{}{},
+			"SELECT 'hi'::STRING /* test */",
+		},
+		{
+			"SELECT /* test */ 'hi'::string /* fnord */",
+			[]interface{}{},
+			"SELECT 'hi'::STRING /* test */ /* fnord */",
+		},
 	}
 
 	// Perform both as a simple execution and as a prepared statement,
@@ -761,7 +849,14 @@ func TestShowQueriesFillsInValuesForPlaceholders(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				require.Equal(t, test.expected, recordedQueries[test.statement])
+				// parse and stringify the statement so that it matches the key in the
+				// recordedQueries map.
+				stmt, err := parser.ParseOne(test.statement)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sql := stmt.AST.String()
+				require.Equal(t, test.expected, recordedQueries[sql])
 			})
 		}
 	}

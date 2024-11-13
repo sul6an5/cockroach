@@ -9,7 +9,11 @@
 // licenses/APL.txt.
 
 import { createSelector } from "reselect";
-import { IndexDetailsPageData, util } from "@cockroachlabs/cluster-ui";
+import {
+  IndexDetailsPageData,
+  util,
+  RecommendationType as RecType,
+} from "@cockroachlabs/cluster-ui";
 import { AdminUIState } from "src/redux/state";
 import { RouteComponentProps } from "react-router";
 import { getMatchParamByName } from "src/util/query";
@@ -22,11 +26,19 @@ import {
   generateTableID,
   refreshIndexStats,
   refreshNodes,
+  refreshUserSQLRoles,
 } from "src/redux/apiReducers";
 import { resetIndexUsageStatsAction } from "src/redux/indexUsageStats";
 import { longToInt } from "src/util/fixLong";
 import { cockroach } from "src/js/protos";
 import TableIndexStatsRequest = cockroach.server.serverpb.TableIndexStatsRequest;
+import {
+  selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
+} from "src/redux/user";
+import { nodeRegionsByIDSelector } from "src/redux/nodes";
+import { setGlobalTimeScaleAction } from "src/redux/statements";
+import { selectTimeScale } from "src/redux/timeScale";
 const { RecommendationType } = cockroach.sql.IndexRecommendation;
 
 export const mapStateToProps = createSelector(
@@ -37,18 +49,37 @@ export const mapStateToProps = createSelector(
   (_state: AdminUIState, props: RouteComponentProps): string =>
     getMatchParamByName(props.match, indexNameAttr),
   state => state.cachedData.indexStats,
-  (database, table, index, indexStats): IndexDetailsPageData => {
+  state => selectHasViewActivityRedactedRole(state),
+  state => nodeRegionsByIDSelector(state),
+  state => selectHasAdminRole(state),
+  state => selectTimeScale(state),
+  (
+    database,
+    table,
+    index,
+    indexStats,
+    hasViewActivityRedactedRole,
+    nodeRegions,
+    hasAdminRole,
+    timeScale,
+  ): IndexDetailsPageData => {
     const stats = indexStats[generateTableID(database, table)];
     const details = stats?.data?.statistics.filter(
       stat => stat.index_name === index, // index names must be unique for a table
     )[0];
     const filteredIndexRecommendations =
       stats?.data?.index_recommendations.filter(
-        indexRec => indexRec.index_id === details.statistics.key.index_id,
+        indexRec => indexRec.index_id === details?.statistics.key.index_id,
       ) || [];
     const indexRecommendations = filteredIndexRecommendations.map(indexRec => {
+      let type: RecType = "Unknown";
+      switch (RecommendationType[indexRec.type].toString()) {
+        case "DROP_UNUSED":
+          type = "DROP_UNUSED";
+      }
+
       return {
-        type: RecommendationType[indexRec.type].toString(),
+        type: type,
         reason: indexRec.reason,
       };
     });
@@ -57,10 +88,17 @@ export const mapStateToProps = createSelector(
       databaseName: database,
       tableName: table,
       indexName: index,
+      isTenant: false,
+      hasViewActivityRedactedRole: hasViewActivityRedactedRole,
+      hasAdminRole: hasAdminRole,
+      nodeRegions: nodeRegions,
+      timeScale: timeScale,
       details: {
         loading: !!stats?.inFlight,
         loaded: !!stats?.valid,
         createStatement: details?.create_statement || "",
+        tableID: details?.statistics.key.table_id.toString(),
+        indexID: details?.statistics.key.index_id.toString(),
         totalReads:
           longToInt(details?.statistics?.stats?.total_read_count) || 0,
         lastRead: util.TimestampToMoment(details?.statistics?.stats?.last_read),
@@ -78,4 +116,6 @@ export const mapDispatchToProps = {
   },
   resetIndexUsageStats: resetIndexUsageStatsAction,
   refreshNodes,
+  refreshUserSQLRoles,
+  onTimeScaleChange: setGlobalTimeScaleAction,
 };

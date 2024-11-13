@@ -15,6 +15,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
@@ -124,4 +126,29 @@ func IsClientSideQueryCanceledErr(err error) bool {
 		return pgcode.MakeCode(string(pqErr.Code)) == pgcode.QueryCanceled
 	}
 	return pgerror.GetPGCode(err) == pgcode.QueryCanceled
+}
+
+// ArrayStringToSlice converts a string array column to a string slice.
+// "{}" -> {}
+// "{a}" -> {"a"}
+// "{a,b}" -> {"a", "b"}
+func ArrayStringToSlice(t *testing.T, array string, message ...string) []string {
+	length := len(array)
+	require.GreaterOrEqual(t, length, 2, message)
+	require.Equal(t, "{", string(array[0]), message)
+	require.Equal(t, "}", string(array[length-1]), message)
+	if length == 2 {
+		return []string{}
+	}
+	return strings.Split(array[1:length-1], ",")
+}
+
+// PGXConn is a helper to create a pgx.Conn from a url.
+func PGXConn(t *testing.T, connURL url.URL) (*pgx.Conn, error) {
+	t.Helper()
+	pgxConfig, err := pgx.ParseConfig(connURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pgx.ConnectConfig(context.Background(), pgxConfig)
 }

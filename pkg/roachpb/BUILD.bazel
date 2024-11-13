@@ -2,45 +2,36 @@ load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//build:STRINGER.bzl", "stringer")
 load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
-load(":gen.bzl", "batch_gen")
 
 go_library(
     name = "roachpb",
     srcs = [
-        "ambiguous_result_error.go",
-        "api.go",
-        "app_stats.go",
-        "batch.go",
         "data.go",
-        "errors.go",
         "index_usage_stats.go",
         "internal.go",
         "merge_spans.go",
         "metadata.go",
         "metadata_replicas.go",
-        "method.go",
-        "replica_unavailable_error.go",
         "span_config.go",
         "span_group.go",
+        "span_stats.go",
         "tenant.go",
         "version.go",
-        ":gen-batch-generated",  # keep
-        ":gen-errordetailtype-stringer",  # keep
-        ":gen-method-stringer",  # keep
     ],
     embed = [":roachpb_go_proto"],
     importpath = "github.com/cockroachdb/cockroach/pkg/roachpb",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/base/serverident",
         "//pkg/geo/geopb",
         "//pkg/keysbase",
+        "//pkg/kv/kvserver/allocator/load",
         "//pkg/kv/kvserver/concurrency/lock",
+        "//pkg/settings",
         "//pkg/storage/enginepb",
         "//pkg/util",
         "//pkg/util/bitarray",
-        "//pkg/util/caller",
         "//pkg/util/duration",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
@@ -48,16 +39,14 @@ go_library(
         "//pkg/util/interval",
         "//pkg/util/log",
         "//pkg/util/protoutil",
+        "//pkg/util/syncutil",
         "//pkg/util/timetz",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
-        "@com_github_cockroachdb_errors//extgrpc",
         "@com_github_cockroachdb_redact//:redact",
-        "@com_github_dustin_go_humanize//:go-humanize",
-        "@com_github_gogo_protobuf//proto",
         "@com_github_golang_mock//gomock",  # keep
-        "@io_etcd_go_etcd_raft_v3//raftpb",
+        "@io_etcd_go_raft_v3//raftpb",
         "@org_golang_google_grpc//metadata",  # keep
     ],
 )
@@ -66,24 +55,19 @@ go_test(
     name = "roachpb_test",
     size = "small",
     srcs = [
-        "api_test.go",
-        "app_stats_test.go",
-        "batch_test.go",
         "data_test.go",
-        "errors_test.go",
         "index_usage_stats_test.go",
         "main_test.go",
         "merge_spans_test.go",
         "metadata_replicas_test.go",
         "metadata_test.go",
-        "replica_unavailable_error_test.go",
+        "span_config_conformance_report_test.go",
         "span_group_test.go",
         "string_test.go",
         "tenant_test.go",
         "version_test.go",
     ],
     args = ["-test.timeout=55s"],
-    data = glob(["testdata/**"]),
     embed = [":roachpb"],
     tags = ["no-remote"],
     deps = [
@@ -91,7 +75,6 @@ go_test(
         "//pkg/keys",
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/storage/enginepb",
-        "//pkg/testutils/echotest",
         "//pkg/testutils/zerofields",
         "//pkg/util",
         "//pkg/util/bitarray",
@@ -107,92 +90,62 @@ go_test(
         "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
-        "@com_github_gogo_protobuf//proto",
-        "@com_github_golang_protobuf//proto:go_default_library",
         "@com_github_kr_pretty//:pretty",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
-        "@io_etcd_go_etcd_raft_v3//:raft",
-        "@io_etcd_go_etcd_raft_v3//confchange",
-        "@io_etcd_go_etcd_raft_v3//quorum",
-        "@io_etcd_go_etcd_raft_v3//raftpb",
-        "@io_etcd_go_etcd_raft_v3//tracker",
-        "@org_golang_google_grpc//codes",
-        "@org_golang_google_grpc//status",
+        "@io_etcd_go_raft_v3//:raft",
+        "@io_etcd_go_raft_v3//confchange",
+        "@io_etcd_go_raft_v3//quorum",
+        "@io_etcd_go_raft_v3//raftpb",
+        "@io_etcd_go_raft_v3//tracker",
     ],
 )
 
 proto_library(
     name = "roachpb_proto",
     srcs = [
-        "api.proto",
-        "app_stats.proto",
         "data.proto",
-        "errors.proto",
         "index_usage_stats.proto",
         "internal.proto",
         "internal_raft.proto",
         "io-formats.proto",
         "metadata.proto",
         "span_config.proto",
+        "span_stats.proto",
     ],
     strip_import_prefix = "/pkg",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv/kvserver/concurrency/lock:lock_proto",
         "//pkg/kv/kvserver/readsummary/rspb:rspb_proto",
-        "//pkg/settings:settings_proto",
         "//pkg/storage/enginepb:enginepb_proto",
         "//pkg/util:util_proto",
         "//pkg/util/admission/admissionpb:admissionpb_proto",
         "//pkg/util/hlc:hlc_proto",
-        "//pkg/util/tracing/tracingpb:tracingpb_proto",
         "@com_github_cockroachdb_errors//errorspb:errorspb_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
         "@com_google_protobuf//:duration_proto",
         "@com_google_protobuf//:timestamp_proto",
+        "@go_googleapis//google/api:annotations_proto",
     ],
 )
 
 go_proto_library(
     name = "roachpb_go_proto",
-    compilers = ["//pkg/cmd/protoc-gen-gogoroach:protoc-gen-gogoroach_grpc_compiler"],
+    compilers = ["//pkg/cmd/protoc-gen-gogoroach:protoc-gen-gogoroach_compiler"],
     importpath = "github.com/cockroachdb/cockroach/pkg/roachpb",
     proto = ":roachpb_proto",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/kv/kvserver/readsummary/rspb",
-        "//pkg/settings",
         "//pkg/storage/enginepb",
         "//pkg/util",
         "//pkg/util/admission/admissionpb",
         "//pkg/util/hlc",
-        "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_errors//errorspb",
         "@com_github_gogo_protobuf//gogoproto",
-    ],
-)
-
-stringer(
-    name = "gen-method-stringer",
-    src = "method.go",
-    typ = "Method",
-)
-
-stringer(
-    name = "gen-errordetailtype-stringer",
-    src = "errors.go",
-    typ = "ErrorDetailType",
-)
-
-batch_gen(
-    name = "gen-batch-generated",
-    src = ":roachpb_go_proto",
-    out = "batch_generated.go",
-    visibility = [
-        ":__pkg__",
-        "//pkg/gen:__pkg__",
+        "@org_golang_google_genproto//googleapis/api/annotations:go_default_library",
     ],
 )
 

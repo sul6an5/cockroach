@@ -48,6 +48,13 @@ const contentionBars = [
   ),
 ];
 
+const cpuBars = [
+  bar(
+    "cpu",
+    (d: StatementStatistics) => d.stats.exec_stats.cpu_sql_nanos?.mean,
+  ),
+];
+
 const maxMemUsageBars = [
   bar(
     "max-mem-usage",
@@ -80,6 +87,9 @@ const latencyStdDev = bar(
 const contentionStdDev = bar(cx("contention-dev"), (d: StatementStatistics) =>
   stdDevLong(d.stats.exec_stats.contention_time, d.stats.exec_stats.count),
 );
+const cpuStdDev = bar(cx("cpu-dev"), (d: StatementStatistics) =>
+  stdDevLong(d.stats.exec_stats.cpu_sql_nanos, d.stats.exec_stats.count),
+);
 const maxMemUsageStdDev = bar(
   cx("max-mem-usage-dev"),
   (d: StatementStatistics) =>
@@ -110,6 +120,12 @@ export const contentionBarChart = barChartFactory(
   v => Duration(v * 1e9),
   contentionStdDev,
 );
+export const cpuBarChart = barChartFactory(
+  "grey",
+  cpuBars,
+  v => Duration(v),
+  cpuStdDev,
+);
 export const maxMemUsageBarChart = barChartFactory(
   "grey",
   maxMemUsageBars,
@@ -133,10 +149,11 @@ export function workloadPctBarChart(
   return barChartFactory(
     "grey",
     [
-      bar(
-        "pct-workload",
-        (d: StatementStatistics) =>
-          (d.stats.service_lat.mean * longToInt(d.stats.count)) / totalWorkload,
+      bar("pct-workload", (d: StatementStatistics) =>
+        totalWorkload !== 0
+          ? (d.stats.service_lat.mean * longToInt(d.stats.count)) /
+            totalWorkload
+          : 0,
       ),
     ],
     v => Percentage(v, 1, 1),

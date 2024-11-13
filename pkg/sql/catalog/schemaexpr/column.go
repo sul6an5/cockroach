@@ -85,6 +85,7 @@ func FormatColumnForDisplay(
 	col catalog.Column,
 	semaCtx *tree.SemaContext,
 	sessionData *sessiondata.SessionData,
+	redactableValues bool,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
 	name := col.GetName()
@@ -98,6 +99,10 @@ func FormatColumnForDisplay(
 		f.WriteString(" NULL")
 	} else {
 		f.WriteString(" NOT NULL")
+	}
+	fmtFlags := tree.FmtParsable
+	if redactableValues {
+		fmtFlags |= tree.FmtMarkRedactionNode | tree.FmtOmitNameRedaction
 	}
 	if col.HasDefault() {
 		if col.IsGeneratedAsIdentity() {
@@ -114,7 +119,7 @@ func FormatColumnForDisplay(
 
 		} else {
 			f.WriteString(" DEFAULT ")
-			defExpr, err := FormatExprForDisplay(ctx, tbl, col.GetDefaultExpr(), semaCtx, sessionData, tree.FmtParsable)
+			defExpr, err := FormatExprForDisplay(ctx, tbl, col.GetDefaultExpr(), semaCtx, sessionData, fmtFlags)
 			if err != nil {
 				return "", err
 			}
@@ -123,7 +128,7 @@ func FormatColumnForDisplay(
 	}
 	if col.HasOnUpdate() {
 		f.WriteString(" ON UPDATE ")
-		onUpdateExpr, err := FormatExprForDisplay(ctx, tbl, col.GetOnUpdateExpr(), semaCtx, sessionData, tree.FmtParsable)
+		onUpdateExpr, err := FormatExprForDisplay(ctx, tbl, col.GetOnUpdateExpr(), semaCtx, sessionData, fmtFlags)
 		if err != nil {
 			return "", err
 		}
@@ -131,7 +136,7 @@ func FormatColumnForDisplay(
 	}
 	if col.IsComputed() {
 		f.WriteString(" AS (")
-		compExpr, err := FormatExprForDisplay(ctx, tbl, col.GetComputeExpr(), semaCtx, sessionData, tree.FmtParsable)
+		compExpr, err := FormatExprForDisplay(ctx, tbl, col.GetComputeExpr(), semaCtx, sessionData, fmtFlags)
 		if err != nil {
 			return "", err
 		}
@@ -202,7 +207,7 @@ func iterColDescriptors(
 			return true, expr, nil
 		}
 
-		col, err := desc.FindColumnWithName(c.ColumnName)
+		col, err := catalog.MustFindColumnByTreeName(desc, c.ColumnName)
 		if err != nil || col.Dropped() {
 			return false, nil, pgerror.Newf(pgcode.UndefinedColumn,
 				"column %q does not exist, referenced in %q", c.ColumnName, rootExpr.String())
@@ -248,7 +253,7 @@ func (d *dummyColumn) TypeCheck(
 	return d, nil
 }
 
-func (*dummyColumn) Eval(v tree.ExprEvaluator) (tree.Datum, error) {
+func (*dummyColumn) Eval(ctx context.Context, v tree.ExprEvaluator) (tree.Datum, error) {
 	panic("dummyColumnItem.EvalVisit() is undefined")
 }
 
@@ -313,7 +318,7 @@ func replaceColumnVars(
 	tbl catalog.TableDescriptor, rootExpr tree.Expr,
 ) (tree.Expr, catalog.TableColSet, error) {
 	lookupFn := func(columnName tree.Name) (exists bool, accessible bool, id catid.ColumnID, typ *types.T) {
-		col, err := tbl.FindColumnWithName(columnName)
+		col, err := catalog.MustFindColumnByTreeName(tbl, columnName)
 		if err != nil || col.Dropped() {
 			return false, false, 0, nil
 		}
@@ -322,10 +327,10 @@ func replaceColumnVars(
 	return ReplaceColumnVars(rootExpr, lookupFn)
 }
 
-// ReplaceIDsWithFQNames walks the given expr and replaces occurrences
+// ReplaceSequenceIDsWithFQNames walks the given expr and replaces occurrences
 // of regclass IDs in the expr with the descriptor's fully qualified name.
 // For example, nextval(12345::REGCLASS) => nextval('foo.public.seq').
-func ReplaceIDsWithFQNames(
+func ReplaceSequenceIDsWithFQNames(
 	ctx context.Context, rootExpr tree.Expr, semaCtx *tree.SemaContext,
 ) (tree.Expr, error) {
 	replaceFn := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
@@ -334,13 +339,13 @@ func ReplaceIDsWithFQNames(
 			return true, expr, nil
 		}
 		// If it's not a sequence or the resolution fails, skip this node.
-		seqName, err := semaCtx.TableNameResolver.GetQualifiedTableNameByID(ctx, id, tree.ResolveRequireSequenceDesc)
+		seqName, err := semaCtx.NameResolver.GetQualifiedTableNameByID(ctx, id, tree.ResolveRequireSequenceDesc)
 		if err != nil {
 			return true, expr, nil //nolint:returnerrcheck
 		}
 
 		// Omit the database qualification if the sequence lives in the current database.
-		currDb := semaCtx.TableNameResolver.CurrentDatabase()
+		currDb := semaCtx.NameResolver.CurrentDatabase()
 		if seqName.Catalog() == currDb {
 			seqName.CatalogName = ""
 			seqName.ExplicitCatalog = false

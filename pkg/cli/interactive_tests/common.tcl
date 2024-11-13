@@ -67,6 +67,17 @@ proc eexpect {text} {
 	$text {}
 	timeout { handle_timeout $text }
     }
+    # Wait for the line reader to wake up.
+    after 10
+}
+
+# eexpect_re is like eexpect, but takes a regular expression argument
+# instead of a text string
+proc eexpect_re {text} {
+  expect {
+    -re $text {}
+    timeout { handle_timeout $text }
+  }
 }
 
 # Convenience function that sends Ctrl+C to the monitored process.
@@ -178,4 +189,3 @@ proc stop_tenant {tenant_id argv} {
 
     report "END STOP TENANT $tenant_id"
 }
-

@@ -17,9 +17,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
@@ -35,17 +38,30 @@ import (
 func (n *changeNonDescriptorBackedPrivilegesNode) ReadingOwnWrites() {}
 
 func (n *changeNonDescriptorBackedPrivilegesNode) startExec(params runParams) error {
-	if !params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.SystemPrivilegesTable) {
-		return errors.Newf("system cluster privileges are not supported until upgrade to version %s is finalized", clusterversion.SystemPrivilegesTable.String())
+	privilegesTableHasUserIDCol := params.p.ExecCfg().Settings.Version.IsActive(params.ctx,
+		clusterversion.V23_1SystemPrivilegesTableHasUserIDColumn)
+	if !params.p.ExecCfg().Settings.Version.IsActive(
+		params.ctx,
+		clusterversion.V23_1AllowNewSystemPrivileges,
+	) {
+		if n.desiredprivs.Contains(privilege.MODIFYSQLCLUSTERSETTING) {
+			return pgerror.New(pgcode.FeatureNotSupported, "upgrade must be finalized before using MODIFYSQLCLUSTERSETTING system privilege")
+		}
+		if n.desiredprivs.Contains(privilege.VIEWJOB) {
+			return pgerror.New(pgcode.FeatureNotSupported, "upgrade must be finalized before using VIEWJOB system privilege")
+		}
+		if n.desiredprivs.Contains(privilege.REPLICATION) {
+			return pgerror.New(pgcode.FeatureNotSupported, "upgrade must be finalized before using REPLICATION system privilege")
+		}
+		if n.desiredprivs.Contains(privilege.MANAGETENANT) {
+			return pgerror.New(pgcode.FeatureNotSupported, "upgrade must be finalized before using MANAGETENANT system privilege")
+		}
+
 	}
+
 	if err := params.p.preChangePrivilegesValidation(params.ctx, n.grantees, n.withGrantOption, n.isGrant); err != nil {
 		return err
 	}
-
-	deleteStmt := fmt.Sprintf(
-		`DELETE FROM system.%s VALUES WHERE username = $1 AND path = $2`,
-		catconstants.SystemPrivilegeTableName,
-	)
 
 	// Get the privilege path for this grant.
 	systemPrivilegeObjects, err := n.makeSystemPrivilegeObject(params.ctx, params.p)
@@ -56,14 +72,31 @@ func (n *changeNonDescriptorBackedPrivilegesNode) startExec(params runParams) er
 		if err := catprivilege.ValidateSyntheticPrivilegeObject(systemPrivilegeObject); err != nil {
 			return err
 		}
-		syntheticPrivDesc, err := systemPrivilegeObject.GetPrivilegeDescriptor(params.ctx, params.p)
+		syntheticPrivDesc, err := params.p.getPrivilegeDescriptor(params.ctx, systemPrivilegeObject)
 		if err != nil {
 			return err
 		}
 
-		err = params.p.CheckGrantOptionsForUser(params.ctx, syntheticPrivDesc, systemPrivilegeObject, n.desiredprivs, params.p.User(), n.isGrant)
+		err = params.p.MustCheckGrantOptionsForUser(params.ctx, syntheticPrivDesc, systemPrivilegeObject, n.desiredprivs, params.p.User(), n.isGrant)
 		if err != nil {
 			return err
+		}
+
+		deleteStmt := fmt.Sprintf(
+			`DELETE FROM system.%s VALUES WHERE username = $1 AND path = $2`, catconstants.SystemPrivilegeTableName)
+		upsertStmt := fmt.Sprintf(
+			`UPSERT INTO system.%s (username, path, privileges, grant_options) VALUES ($1, $2, $3, $4)`,
+			catconstants.SystemPrivilegeTableName)
+		if privilegesTableHasUserIDCol {
+			upsertStmt = fmt.Sprintf(`
+UPSERT INTO system.%s (username, path, privileges, grant_options, user_id)
+VALUES ($1, $2, $3, $4, (
+	SELECT CASE $1
+		WHEN '%s' THEN %d
+		ELSE (SELECT user_id FROM system.users WHERE username = $1)
+	END
+))`,
+				catconstants.SystemPrivilegeTableName, username.PublicRole, username.PublicRoleID)
 		}
 
 		if n.isGrant {
@@ -80,11 +113,11 @@ func (n *changeNonDescriptorBackedPrivilegesNode) startExec(params runParams) er
 				// public means public has SELECT which
 				// is the default case.
 				if user == username.PublicRoleName() && userPrivs.Privileges == privilege.SELECT.Mask() {
-					_, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+					_, err := params.p.InternalSQLTxn().ExecEx(
 						params.ctx,
 						`delete-system-privilege`,
 						params.p.txn,
-						sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+						sessiondata.RootUserSessionDataOverride,
 						deleteStmt,
 						user.Normalized(),
 						systemPrivilegeObject.GetPath(),
@@ -95,38 +128,45 @@ func (n *changeNonDescriptorBackedPrivilegesNode) startExec(params runParams) er
 					continue
 				}
 
-				insertStmt := fmt.Sprintf(`UPSERT INTO system.%s VALUES ($1, $2, $3, $4)`, catconstants.SystemPrivilegeTableName)
-				_, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+				privList, err := privilege.ListFromBitField(userPrivs.Privileges, n.grantOn)
+				if err != nil {
+					return err
+				}
+				grantOptionList, err := privilege.ListFromBitField(userPrivs.WithGrantOption, n.grantOn)
+				if err != nil {
+					return err
+				}
+				if _, err := params.p.InternalSQLTxn().ExecEx(
 					params.ctx,
 					`insert-system-privilege`,
 					params.p.txn,
-					sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-					insertStmt,
+					sessiondata.RootUserSessionDataOverride,
+					upsertStmt,
 					user.Normalized(),
 					systemPrivilegeObject.GetPath(),
-					privilege.ListFromBitField(userPrivs.Privileges, n.grantOn).SortedNames(),
-					privilege.ListFromBitField(userPrivs.WithGrantOption, n.grantOn).SortedNames(),
-				)
-				if err != nil {
+					privList.SortedNames(),
+					grantOptionList.SortedNames(),
+				); err != nil {
 					return err
 				}
 			}
 		} else {
-
 			// Handle revoke case.
 			for _, user := range n.grantees {
-				syntheticPrivDesc.Revoke(user, n.desiredprivs, n.grantOn, n.withGrantOption)
+				if err := syntheticPrivDesc.Revoke(user, n.desiredprivs, n.grantOn, n.withGrantOption); err != nil {
+					return err
+				}
 				userPrivs, found := syntheticPrivDesc.FindUser(user)
-				upsert := fmt.Sprintf(`UPSERT INTO system.%s VALUES ($1, $2, $3, $4)`, catconstants.SystemPrivilegeTableName)
+
 				// For Public role and virtual tables, leave an empty
 				// row to indicate that SELECT has been revoked.
 				if !found && (n.grantOn == privilege.VirtualTable && user == username.PublicRoleName()) {
-					_, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+					_, err := params.p.InternalSQLTxn().ExecEx(
 						params.ctx,
 						`insert-system-privilege`,
 						params.p.txn,
-						sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-						upsert,
+						sessiondata.RootUserSessionDataOverride,
+						upsertStmt,
 						user.Normalized(),
 						systemPrivilegeObject.GetPath(),
 						[]string{},
@@ -141,11 +181,11 @@ func (n *changeNonDescriptorBackedPrivilegesNode) startExec(params runParams) er
 				// If there are no entries remaining on the PrivilegeDescriptor for the user
 				// we can remove the entire row for the user.
 				if !found {
-					_, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+					_, err := params.p.InternalSQLTxn().ExecEx(
 						params.ctx,
 						`delete-system-privilege`,
 						params.p.txn,
-						sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+						sessiondata.RootUserSessionDataOverride,
 						deleteStmt,
 						user.Normalized(),
 						systemPrivilegeObject.GetPath(),
@@ -156,18 +196,25 @@ func (n *changeNonDescriptorBackedPrivilegesNode) startExec(params runParams) er
 					continue
 				}
 
-				_, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+				privList, err := privilege.ListFromBitField(userPrivs.Privileges, n.grantOn)
+				if err != nil {
+					return err
+				}
+				grantOptionList, err := privilege.ListFromBitField(userPrivs.WithGrantOption, n.grantOn)
+				if err != nil {
+					return err
+				}
+				if _, err := params.p.InternalSQLTxn().ExecEx(
 					params.ctx,
 					`insert-system-privilege`,
 					params.p.txn,
-					sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-					upsert,
+					sessiondata.RootUserSessionDataOverride,
+					upsertStmt,
 					user.Normalized(),
 					systemPrivilegeObject.GetPath(),
-					privilege.ListFromBitField(userPrivs.Privileges, n.grantOn).SortedNames(),
-					privilege.ListFromBitField(userPrivs.WithGrantOption, n.grantOn).SortedNames(),
-				)
-				if err != nil {
+					privList.SortedNames(),
+					grantOptionList.SortedNames(),
+				); err != nil {
 					return err
 				}
 			}
@@ -195,7 +242,7 @@ func (n *changeNonDescriptorBackedPrivilegesNode) makeSystemPrivilegeObject(
 			if err != nil {
 				return nil, err
 			}
-			tableNames, _, err := expandTableGlob(ctx, p, tableGlob)
+			tableNames, _, err := p.ExpandTableGlob(ctx, tableGlob)
 			if err != nil {
 				return nil, err
 			}
@@ -216,16 +263,17 @@ func (n *changeNonDescriptorBackedPrivilegesNode) makeSystemPrivilegeObject(
 		}
 		return ret, nil
 	case privilege.ExternalConnection:
-		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemExternalConnectionsTable) {
+		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2SystemExternalConnectionsTable) {
 			return nil, errors.Newf("External Connections are not supported until upgrade to version %s is finalized",
-				clusterversion.SystemExternalConnectionsTable.String())
+				clusterversion.TODODelete_V22_2SystemExternalConnectionsTable.String())
 		}
 
 		var ret []syntheticprivilege.Object
 		for _, externalConnectionName := range n.targets.ExternalConnections {
 			// Ensure that an External Connection of this name actually exists.
-			if _, err := externalconn.LoadExternalConnection(ctx, string(externalConnectionName),
-				p.ExecCfg().InternalExecutor, p.Txn()); err != nil {
+			if _, err := externalconn.LoadExternalConnection(
+				ctx, string(externalConnectionName), p.InternalSQLTxn(),
+			); err != nil {
 				return nil, errors.Wrap(err, "failed to resolve External Connection")
 			}
 
@@ -240,128 +288,42 @@ func (n *changeNonDescriptorBackedPrivilegesNode) makeSystemPrivilegeObject(
 	}
 }
 
-// SynthesizePrivilegeDescriptor is part of the Planner interface.
-func (p *planner) SynthesizePrivilegeDescriptor(
-	ctx context.Context,
-	privilegeObjectName string,
-	privilegeObjectPath string,
-	privilegeObjectType privilege.ObjectType,
+// getPrivilegeDescriptor returns the privilege descriptor for the
+// object. Note that for non-descriptor backed objects, we query the
+// system.privileges table to synthesize a PrivilegeDescriptor.
+func (p *planner) getPrivilegeDescriptor(
+	ctx context.Context, po privilege.Object,
 ) (*catpb.PrivilegeDescriptor, error) {
-	var tableVersions []descpb.DescriptorVersion
-	cache := p.ExecCfg().SyntheticPrivilegeCache
-	found, privileges, retErr := func() (bool, *catpb.PrivilegeDescriptor, error) {
-		cache.Lock()
-		defer cache.Unlock()
-		_, desc, err := p.Descriptors().GetImmutableTableByName(ctx, p.Txn(),
-			syntheticprivilege.SystemPrivilegesTableName, tree.ObjectLookupFlagsWithRequired())
-		if err != nil {
-			return false, nil, err
-		}
-		version := desc.GetVersion()
-		tableVersions = []descpb.DescriptorVersion{version}
-		if isEligibleForCache := cache.ClearCacheIfStaleLocked(ctx, tableVersions); isEligibleForCache {
-			val, ok := cache.GetValueLocked(privilegeObjectPath)
-			if ok {
-				privilegeDescriptor := val.(*catpb.PrivilegeDescriptor)
-				return true, privilegeDescriptor, nil
+	switch d := po.(type) {
+	case catalog.TableDescriptor:
+		if d.IsVirtualTable() {
+			// Virtual tables are somewhat of a weird case in that they
+			// have descriptors.
+			// For virtual tables, we don't store privileges on the
+			// descriptor as we don't allow the privilege descriptor to
+			// change.
+			// It is also problematic that virtual table descriptors
+			// do not store a database id, so the descriptors are not
+			// "per database" even though regular tables are per database.
+			vs, found := schemadesc.GetVirtualSchemaByID(d.GetParentSchemaID())
+			if !found {
+				return nil, errors.AssertionFailedf("no virtual schema found for virtual table %s", d.GetName())
 			}
-
+			vDesc := &syntheticprivilege.VirtualTablePrivilege{
+				SchemaName: vs.GetName(),
+				TableName:  d.GetName(),
+			}
+			return p.ExecCfg().SyntheticPrivilegeCache.Get(
+				ctx, p.InternalSQLTxn(), p.Descriptors(), vDesc,
+			)
 		}
-		return false, nil, nil
-	}()
-
-	if found {
-		return privileges, retErr
+		return d.GetPrivileges(), nil
+	case catalog.Descriptor:
+		return d.GetPrivileges(), nil
+	case syntheticprivilege.Object:
+		return p.ExecCfg().SyntheticPrivilegeCache.Get(
+			ctx, p.InternalSQLTxn(), p.Descriptors(), d,
+		)
 	}
-
-	val, err := cache.LoadValueOutsideOfCache(ctx, privilegeObjectPath, func(loadCtx context.Context) (_ interface{}, retErr error) {
-		query := fmt.Sprintf(
-			`SELECT username, privileges, grant_options FROM system.%s WHERE path='%s'`,
-			catconstants.SystemPrivilegeTableName,
-			privilegeObjectPath)
-
-		it, err := p.QueryIteratorEx(ctx, `get-system-privileges`,
-			sessiondata.NodeUserSessionDataOverride, query)
-		if err != nil {
-			return nil, err
-		}
-		defer func() {
-			retErr = errors.CombineErrors(retErr, it.Close())
-		}()
-
-		privileges = &catpb.PrivilegeDescriptor{}
-		for {
-			ok, err := it.Next(ctx)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				break
-			}
-
-			user := tree.MustBeDString(it.Cur()[0])
-			privArr := tree.MustBeDArray(it.Cur()[1])
-			var privilegeStrings []string
-			for _, elem := range privArr.Array {
-				privilegeStrings = append(privilegeStrings, string(tree.MustBeDString(elem)))
-			}
-
-			grantOptionArr := tree.MustBeDArray(it.Cur()[2])
-			var grantOptionStrings []string
-			for _, elem := range grantOptionArr.Array {
-				grantOptionStrings = append(grantOptionStrings, string(tree.MustBeDString(elem)))
-			}
-			privs, err := privilege.ListFromStrings(privilegeStrings)
-			if err != nil {
-				return nil, err
-			}
-			grantOptions, err := privilege.ListFromStrings(grantOptionStrings)
-			if err != nil {
-				return nil, err
-			}
-			privsWithGrantOption := privilege.ListFromBitField(
-				privs.ToBitField()&grantOptions.ToBitField(),
-				privilegeObjectType,
-			)
-			privsWithoutGrantOption := privilege.ListFromBitField(
-				privs.ToBitField()&^privsWithGrantOption.ToBitField(),
-				privilegeObjectType,
-			)
-			privileges.Grant(
-				username.MakeSQLUsernameFromPreNormalizedString(string(user)),
-				privsWithGrantOption,
-				true, /* withGrantOption */
-			)
-			privileges.Grant(
-				username.MakeSQLUsernameFromPreNormalizedString(string(user)),
-				privsWithoutGrantOption,
-				false, /* withGrantOption */
-			)
-		}
-
-		// To avoid having to insert a row for public for each virtual
-		// table into system.privileges, we assume that if there is
-		// NO entry for public in the PrivilegeDescriptor, Public has
-		// grant. If there is an empty row for Public, then public
-		// does not have grant.
-		if privilegeObjectType == privilege.VirtualTable {
-			if _, found := privileges.FindUser(username.PublicRoleName()); !found {
-				privileges.Grant(username.PublicRoleName(), privilege.List{privilege.SELECT}, false)
-			}
-		}
-
-		// We use InvalidID to skip checks on the root/admin roles having
-		// privileges.
-		if err := privileges.Validate(descpb.InvalidID, privilegeObjectType, privilegeObjectName, privilege.GetValidPrivilegesForObject(privilegeObjectType)); err != nil {
-			return nil, err
-		}
-		return privileges, nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	cache.MaybeWriteBackToCache(ctx, tableVersions, privilegeObjectPath, val)
-	return val.(*catpb.PrivilegeDescriptor), nil
+	return nil, errors.AssertionFailedf("unknown privilege.Object type %T", po)
 }

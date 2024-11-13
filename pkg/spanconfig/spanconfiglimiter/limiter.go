@@ -16,13 +16,12 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -40,15 +39,13 @@ var tenantLimitSetting = settings.RegisterIntSetting(
 // Limiter is used to limit the number of span configs installed by secondary
 // tenants. It's a concrete implementation of the spanconfig.Limiter interface.
 type Limiter struct {
-	ie       sqlutil.InternalExecutor
+	ie       isql.Executor
 	settings *cluster.Settings
 	knobs    *spanconfig.TestingKnobs
 }
 
 // New constructs and returns a Limiter.
-func New(
-	ie sqlutil.InternalExecutor, settings *cluster.Settings, knobs *spanconfig.TestingKnobs,
-) *Limiter {
+func New(ie isql.Executor, settings *cluster.Settings, knobs *spanconfig.TestingKnobs) *Limiter {
 	if knobs == nil {
 		knobs = &spanconfig.TestingKnobs{}
 	}
@@ -77,7 +74,7 @@ DO UPDATE SET span_count = system.span_count.span_count + $1
 RETURNING span_count
 `
 	datums, err := l.ie.QueryRowEx(ctx, "update-span-count", txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		updateSpanCountStmt, delta)
 	if err != nil {
 		return false, err

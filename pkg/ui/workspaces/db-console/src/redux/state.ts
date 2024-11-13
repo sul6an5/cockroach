@@ -25,37 +25,63 @@ import {
   RouterState,
 } from "connected-react-router";
 import { History } from "history";
-import { history } from "./history";
 
 import { apiReducersReducer, APIReducersState } from "./apiReducers";
 import { hoverReducer, HoverState } from "./hover";
 import { localSettingsReducer, LocalSettingsState } from "./localsettings";
 import { metricsReducer, MetricsState } from "./metrics";
-import { sqlActivityReducer, SqlActivityState } from "src/redux/sqlActivity";
 import { queryManagerReducer, QueryManagerState } from "./queryManager/reducer";
 import { timeScaleReducer, TimeScaleState } from "./timeScale";
 import { uiDataReducer, UIDataState } from "./uiData";
 import { loginReducer, LoginAPIState } from "./login";
 import rootSaga from "./sagas";
 import { initializeAnalytics } from "./analytics";
+import { DataFromServer } from "src/util/dataFromServer";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import FeatureFlags = cockroach.server.serverpb.FeatureFlags;
+import { createSelector } from "reselect";
 
 export interface AdminUIState {
   cachedData: APIReducersState;
   hover: HoverState;
   localSettings: LocalSettingsState;
   metrics: MetricsState;
-  sqlActivity: SqlActivityState;
 
   queryManager: QueryManagerState;
   router: RouterState;
   timeScale: TimeScaleState;
   uiData: UIDataState;
   login: LoginAPIState;
+  flags: FeatureFlags;
+}
+
+const emptyDataFromServer: DataFromServer = {
+  Insecure: true,
+  FeatureFlags: new FeatureFlags(),
+  LoggedInUser: "",
+  NodeID: "",
+  OIDCAutoLogin: false,
+  OIDCButtonText: "",
+  OIDCLoginEnabled: false,
+  Tag: "",
+  Version: "",
+};
+
+export const featureFlagSelector = createSelector(
+  (state: AdminUIState) => state.flags,
+  flags => flags,
+);
+
+export function flagsReducer(state = emptyDataFromServer.FeatureFlags) {
+  return state;
 }
 
 // createAdminUIStore is a function that returns a new store for the admin UI.
 // It's in a function so it can be recreated as necessary for testing.
-export function createAdminUIStore(historyInst: History<any>) {
+export function createAdminUIStore(
+  historyInst: History<any>,
+  dataFromServer: DataFromServer = emptyDataFromServer,
+) {
   const sagaMiddleware = createSagaMiddleware();
   const routerReducer = connectRouter(historyInst);
 
@@ -65,14 +91,25 @@ export function createAdminUIStore(historyInst: History<any>) {
       hover: hoverReducer,
       localSettings: localSettingsReducer,
       metrics: metricsReducer,
-      sqlActivity: sqlActivityReducer,
 
       queryManager: queryManagerReducer,
       router: routerReducer,
       timeScale: timeScaleReducer,
       uiData: uiDataReducer,
       login: loginReducer,
+      flags: flagsReducer,
     }),
+    {
+      login: {
+        loggedInUser: dataFromServer.LoggedInUser,
+        error: null,
+        inProgress: false,
+        oidcAutoLogin: dataFromServer.OIDCAutoLogin,
+        oidcLoginEnabled: dataFromServer.OIDCLoginEnabled,
+        oidcButtonText: dataFromServer.OIDCButtonText,
+      },
+      flags: dataFromServer.FeatureFlags,
+    },
     compose(
       applyMiddleware(thunk, sagaMiddleware, routerMiddleware(historyInst)),
       // Support for redux dev tools
@@ -99,8 +136,4 @@ export function createAdminUIStore(historyInst: History<any>) {
   return s;
 }
 
-const store = createAdminUIStore(history);
-
 export type AppDispatch = ThunkDispatch<AdminUIState, unknown, Action>;
-
-export { store };

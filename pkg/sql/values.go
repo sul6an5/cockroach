@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
@@ -35,6 +36,9 @@ type valuesNode struct {
 	externallyOwnedContainer bool
 
 	valuesRun
+
+	// Allow passing a coldata.Batch through a valuesNode.
+	coldataBatch coldata.Batch
 }
 
 func (p *planner) newContainerValuesNode(columns colinfo.ResultColumns, capacity int) *valuesNode {
@@ -42,7 +46,7 @@ func (p *planner) newContainerValuesNode(columns colinfo.ResultColumns, capacity
 		columns: columns,
 		valuesRun: valuesRun{
 			rows: rowcontainer.NewRowContainerWithCapacity(
-				p.EvalContext().Mon.MakeBoundAccount(),
+				p.Mon().MakeBoundAccount(),
 				colinfo.ColTypeInfoFromResCols(columns),
 				capacity,
 			),
@@ -68,7 +72,7 @@ func (n *valuesNode) startExec(params runParams) error {
 	// from other planNodes), so its expressions need evaluating.
 	// This may run subqueries.
 	n.rows = rowcontainer.NewRowContainerWithCapacity(
-		params.extendedEvalCtx.Mon.MakeBoundAccount(),
+		params.p.Mon().MakeBoundAccount(),
 		colinfo.ColTypeInfoFromResCols(n.columns),
 		len(n.tuples),
 	)
@@ -77,7 +81,7 @@ func (n *valuesNode) startExec(params runParams) error {
 	for _, tupleRow := range n.tuples {
 		for i, typedExpr := range tupleRow {
 			var err error
-			row[i], err = eval.Expr(params.EvalContext(), typedExpr)
+			row[i], err = eval.Expr(params.ctx, params.EvalContext(), typedExpr)
 			if err != nil {
 				return err
 			}

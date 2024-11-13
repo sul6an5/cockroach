@@ -40,9 +40,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan/replicaoracle"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -54,7 +56,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -194,10 +195,9 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 
 	size := func() int64 { return 2 << 10 }
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	rangeCache := rangecache.NewRangeCache(st, nil /* db */, size, stopper, tr)
+	rangeCache := rangecache.NewRangeCache(st, nil /* db */, size, stopper)
 	r := MakeDistSQLReceiver(
 		ctx,
 		&errOnlyResultWriter{}, /* resultWriter */
@@ -206,8 +206,6 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 		nil, /* txn */
 		nil, /* clockUpdater */
 		&SessionTracing{},
-		nil, /* contentionRegistry */
-		nil, /* testingPushCallback */
 	)
 
 	replicas := []roachpb.ReplicaDescriptor{{ReplicaID: 1}, {ReplicaID: 2}, {ReplicaID: 3}}
@@ -421,14 +419,16 @@ func TestDistSQLDeadHosts(t *testing.T) {
 		))
 	}
 	r.CheckQueryResults(t,
-		"SELECT start_key, end_key, lease_holder, replicas FROM [SHOW RANGES FROM TABLE t]",
+		`SELECT IF(substring(start_key for 1)='…',start_key,NULL),
+            IF(substring(end_key for 1)='…',end_key,NULL),
+            lease_holder, replicas FROM [SHOW RANGES FROM TABLE t WITH DETAILS]`,
 		[][]string{
-			{"NULL", "/0", "1", "{1}"},
-			{"/0", "/20", "1", "{1,2,3}"},
-			{"/20", "/40", "2", "{2,3,4}"},
-			{"/40", "/60", "3", "{1,3,4}"},
-			{"/60", "/80", "4", "{1,2,4}"},
-			{"/80", "NULL", "5", "{2,3,5}"},
+			{"NULL", "…/1/0", "1", "{1}"},
+			{"…/1/0", "…/1/20", "1", "{1,2,3}"},
+			{"…/1/20", "…/1/40", "2", "{2,3,4}"},
+			{"…/1/40", "…/1/60", "3", "{1,3,4}"},
+			{"…/1/60", "…/1/80", "4", "{1,2,4}"},
+			{"…/1/80", "NULL", "5", "{2,3,5}"},
 		},
 	)
 
@@ -579,7 +579,9 @@ type testSpanResolver struct {
 }
 
 // NewSpanResolverIterator is part of the SpanResolver interface.
-func (tsr *testSpanResolver) NewSpanResolverIterator(_ *kv.Txn) physicalplan.SpanResolverIterator {
+func (tsr *testSpanResolver) NewSpanResolverIterator(
+	txn *kv.Txn, optionalOracle replicaoracle.Oracle,
+) physicalplan.SpanResolverIterator {
 	return &testSpanResolverIterator{tsr: tsr}
 }
 
@@ -666,6 +668,8 @@ func TestPartitionSpans(t *testing.T) {
 		// spans to be passed to PartitionSpans. If the second string is empty,
 		// the span is actually a point lookup.
 		spans [][2]string
+
+		locFilter string
 
 		// expected result: a map of node to list of spans.
 		partitions map[int][][2]string
@@ -787,21 +791,68 @@ func TestPartitionSpans(t *testing.T) {
 				1: {{"A", "B"}},
 			},
 		},
+		// Test some locality-filtered planning too.
+		{
+			ranges:      []testSpanResolverRange{{"A", 1}, {"B", 2}, {"C", 1}, {"D", 3}},
+			gatewayNode: 1,
+
+			spans:     [][2]string{{"A1", "C1"}, {"D1", "X"}},
+			locFilter: "x=1",
+			partitions: map[int][][2]string{
+				1: {{"A1", "B"}, {"C", "C1"}, {"D1", "X"}},
+				2: {{"B", "C"}},
+			},
+		},
+		{
+			ranges:      []testSpanResolverRange{{"A", 1}, {"B", 2}, {"C", 1}, {"D", 3}},
+			gatewayNode: 1,
+
+			spans:     [][2]string{{"A1", "C1"}, {"D1", "X"}},
+			locFilter: "y=0",
+			partitions: map[int][][2]string{
+				2: {{"A1", "C1"}},
+				4: {{"D1", "X"}},
+			},
+		},
+		{
+			ranges:      []testSpanResolverRange{{"A", 1}, {"B", 2}, {"C", 1}, {"D", 3}},
+			gatewayNode: 7,
+
+			spans:     [][2]string{{"A1", "C1"}, {"D1", "X"}},
+			locFilter: "x=3",
+			partitions: map[int][][2]string{
+				7: {{"A1", "C1"}, {"D1", "X"}},
+			},
+		},
+		{
+			ranges:      []testSpanResolverRange{{"A", 1}, {"B", 2}, {"C", 1}, {"D", 3}},
+			gatewayNode: 1,
+
+			spans:     [][2]string{{"A1", "C1"}, {"D1", "X"}},
+			locFilter: "x=3,y=1",
+			partitions: map[int][][2]string{
+				7: {{"A1", "C1"}, {"D1", "X"}},
+			},
+		},
 	}
 
 	// We need a mock Gossip to contain addresses for the nodes. Otherwise the
 	// DistSQLPlanner will not plan flows on them.
 	testStopper := stop.NewStopper()
 	defer testStopper.Stop(context.Background())
-	mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-		testStopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+	mockGossip := gossip.NewTest(roachpb.NodeID(1), testStopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	var nodeDescs []*roachpb.NodeDescriptor
+	mockInstances := make(mockAddressResolver)
 	for i := 1; i <= 10; i++ {
 		sqlInstanceID := base.SQLInstanceID(i)
+		var l roachpb.Locality
+		require.NoError(t, l.Set(fmt.Sprintf("x=%d,y=%d", (i/3)+1, i%2)))
 		desc := &roachpb.NodeDescriptor{
-			NodeID:  roachpb.NodeID(sqlInstanceID),
-			Address: util.UnresolvedAddr{AddressField: fmt.Sprintf("addr%d", i)},
+			NodeID:   roachpb.NodeID(sqlInstanceID),
+			Address:  util.UnresolvedAddr{AddressField: fmt.Sprintf("addr%d", i)},
+			Locality: l,
 		}
+		mockInstances[sqlInstanceID] = l
 		if err := mockGossip.SetNodeDescriptor(desc); err != nil {
 			t.Fatal(err)
 		}
@@ -829,6 +880,9 @@ func TestPartitionSpans(t *testing.T) {
 				ranges: tc.ranges,
 			}
 
+			nID := &base.NodeIDContainer{}
+			nID.Reset(tsp.nodes[tc.gatewayNode-1].NodeID)
+
 			gw := gossip.MakeOptionalGossip(mockGossip)
 			dsp := DistSQLPlanner{
 				planVersion:          execinfra.Version,
@@ -851,13 +905,20 @@ func TestPartitionSpans(t *testing.T) {
 						return true
 					},
 				},
-				codec: keys.SystemSQLCodec,
+				sqlAddressResolver: mockInstances,
+				distSQLSrv:         &distsql.ServerImpl{ServerConfig: execinfra.ServerConfig{NodeID: base.NewSQLIDContainerForNode(nID)}},
+				codec:              keys.SystemSQLCodec,
+				nodeDescs:          mockGossip,
 			}
 
 			ctx := context.Background()
-			planCtx := dsp.NewPlanningCtx(ctx, &extendedEvalContext{
+			var locFilter roachpb.Locality
+			if tc.locFilter != "" {
+				require.NoError(t, locFilter.Set(tc.locFilter))
+			}
+			planCtx := dsp.NewPlanningCtxWithOracle(ctx, &extendedEvalContext{
 				Context: eval.Context{Codec: keys.SystemSQLCodec},
-			}, nil, nil, DistributionTypeSystemTenantOnly)
+			}, nil, nil, DistributionTypeSystemTenantOnly, physicalplan.DefaultReplicaChooser, locFilter)
 			var spans []roachpb.Span
 			for _, s := range tc.spans {
 				spans = append(spans, roachpb.Span{Key: roachpb.Key(s[0]), EndKey: roachpb.Key(s[1])})
@@ -989,8 +1050,7 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 			// reflect tc.nodesNotAdvertisingDistSQLVersion.
 			testStopper := stop.NewStopper()
 			defer testStopper.Stop(context.Background())
-			mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-				testStopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+			mockGossip := gossip.NewTest(roachpb.NodeID(1), testStopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 			var nodeDescs []*roachpb.NodeDescriptor
 			for i := 1; i <= 2; i++ {
 				sqlInstanceID := base.SQLInstanceID(i)
@@ -1084,8 +1144,7 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-		stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+	mockGossip := gossip.NewTest(roachpb.NodeID(1), stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	var nodeDescs []*roachpb.NodeDescriptor
 	for i := 1; i <= 2; i++ {
 		sqlInstanceID := base.SQLInstanceID(i)
@@ -1180,7 +1239,7 @@ func TestCheckNodeHealth(t *testing.T) {
 
 	const sqlInstanceID = base.SQLInstanceID(5)
 
-	mockGossip := gossip.NewTest(roachpb.NodeID(sqlInstanceID), nil /* rpcContext */, nil, /* grpcServer */
+	mockGossip := gossip.NewTest(roachpb.NodeID(sqlInstanceID),
 		stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
 	desc := &roachpb.NodeDescriptor{
@@ -1390,5 +1449,69 @@ func TestCheckScanParallelizationIfLocal(t *testing.T) {
 		prohibitParallelization, hasScanNodeToParallize := checkScanParallelizationIfLocal(context.Background(), &tc.plan)
 		require.Equal(t, tc.prohibitParallelization, prohibitParallelization)
 		require.Equal(t, tc.hasScanNodeToParallelize, hasScanNodeToParallize)
+	}
+}
+
+type mockAddressResolver map[base.SQLInstanceID]roachpb.Locality
+
+var _ sqlinstance.AddressResolver = mockAddressResolver{}
+
+func (m mockAddressResolver) GetInstance(
+	_ context.Context, id base.SQLInstanceID,
+) (sqlinstance.InstanceInfo, error) {
+	return sqlinstance.InstanceInfo{InstanceID: id, Locality: m[id]}, nil
+}
+
+func (m mockAddressResolver) GetAllInstances(
+	_ context.Context,
+) ([]sqlinstance.InstanceInfo, error) {
+	res := make([]sqlinstance.InstanceInfo, 0, len(m))
+	for i := range m {
+		res = append(res, sqlinstance.InstanceInfo{InstanceID: i, Locality: m[i]})
+	}
+	return res, nil
+}
+
+func TestClosestInstances(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	type instances map[int]string
+	type picked []int
+
+	for _, tc := range []struct {
+		instances instances
+		loc       string
+		expected  []int
+	}{
+		{instances{1: "a=x", 2: "a=y", 3: "a=z"}, "z=z", picked{}},
+		{instances{1: "a=x", 2: "a=y", 3: "a=z"}, "", picked{}},
+
+		{instances{1: "a=x", 2: "a=y", 3: "a=z"}, "a=x", picked{1}},
+		{instances{1: "a=x", 2: "a=y", 3: "a=z"}, "a=z", picked{3}},
+		{instances{1: "a=x", 2: "a=x", 3: "a=z", 4: "a=z"}, "a=x", picked{1, 2}},
+		{instances{1: "a=x", 2: "a=x", 3: "a=z", 4: "a=z"}, "a=z", picked{3, 4}},
+
+		{instances{1: "a=x,b=1", 2: "a=x,b=2", 3: "a=x,b=3", 4: "a=y,b=1", 5: "a=z,b=1"}, "a=x", picked{1, 2, 3}},
+		{instances{1: "a=x,b=1", 2: "a=x,b=2", 3: "a=x,b=3", 4: "a=y,b=1", 5: "a=z,b=1"}, "a=x,b=2", picked{2}},
+		{instances{1: "a=x,b=1", 2: "a=x,b=2", 3: "a=x,b=3", 4: "a=y,b=1", 5: "a=z,b=1"}, "a=z", picked{5}},
+	} {
+		t.Run("", func(t *testing.T) {
+			var l roachpb.Locality
+			if tc.loc != "" {
+				require.NoError(t, l.Set(tc.loc))
+			}
+			var infos []sqlinstance.InstanceInfo
+			for id, l := range tc.instances {
+				info := sqlinstance.InstanceInfo{InstanceID: base.SQLInstanceID(id)}
+				if l != "" {
+					require.NoError(t, info.Locality.Set(l))
+				}
+				infos = append(infos, info)
+			}
+			var got picked
+			for _, i := range closestInstances(infos, l) {
+				got = append(got, int(i))
+			}
+			require.ElementsMatch(t, tc.expected, got)
+		})
 	}
 }

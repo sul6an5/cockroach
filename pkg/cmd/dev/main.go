@@ -11,14 +11,17 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
 )
 
+const (
+	beaverHubServerEndpoint = "https://beaver-hub-server-jjd2v2r2dq-uk.a.run.app/process"
+	bepFileBasename         = "build_event_binary_file"
+)
+
 func main() {
-	fmt.Println("pkg/cmd/dev/main.go")
 	log.SetFlags(0)
 	log.SetPrefix("")
 

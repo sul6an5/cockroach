@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -26,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/zone"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -65,13 +66,11 @@ ORDER BY id`)
 		if err != nil {
 			t.Fatal(err)
 		}
-		descProto := &descpb.Descriptor{}
-		err = protoutil.Unmarshal(descBytes, descProto)
+		b, err := descbuilder.FromBytesAndMVCCTimestamp(descBytes, ts)
 		if err != nil {
 			t.Fatal(err)
 		}
-		b := descbuilder.NewBuilderWithMVCCTimestamp(descProto, ts)
-		if err := b.RunPostDeserializationChanges(); err != nil {
+		if err = b.RunPostDeserializationChanges(); err != nil {
 			t.Fatal(err)
 		}
 		desc := b.BuildCreatedMutable()
@@ -83,7 +82,6 @@ ORDER BY id`)
 		switch t := desc.(type) {
 		case *dbdesc.Mutable:
 			t.ModificationTime = hlc.Timestamp{}
-			t.DefaultPrivileges = nil
 		case *schemadesc.Mutable:
 			t.ModificationTime = hlc.Timestamp{}
 		case *tabledesc.Mutable:
@@ -98,7 +96,7 @@ ORDER BY id`)
 			t.TypeDescriptor.ModificationTime = hlc.Timestamp{}
 		}
 
-		cb.UpsertDescriptorEntry(desc)
+		cb.UpsertDescriptor(desc)
 	}
 	return cb
 }
@@ -108,7 +106,7 @@ func ReadNamespaceFromDB(t *testing.T, tdb *sqlutils.SQLRunner) nstree.MutableCa
 	// Fetch namespace state.
 	var cb nstree.MutableCatalog
 	nsRows := tdb.QueryStr(t, `
-SELECT "parentID", "parentSchemaID", name, id 
+SELECT "parentID", "parentSchemaID", name, id
 FROM system.namespace
 ORDER BY id`)
 	for _, nsRow := range nsRows {
@@ -134,7 +132,7 @@ ORDER BY id`)
 			ParentSchemaID: descpb.ID(parentSchemaID),
 			Name:           name,
 		}
-		cb.UpsertNamespaceEntry(key, descpb.ID(id))
+		cb.UpsertNamespaceEntry(key, descpb.ID(id), hlc.Timestamp{})
 	}
 	return cb
 }
@@ -142,9 +140,9 @@ ORDER BY id`)
 // ReadZoneConfigsFromDB reads the zone configs from tdb.
 func ReadZoneConfigsFromDB(
 	t *testing.T, tdb *sqlutils.SQLRunner, descCatalog nstree.Catalog,
-) map[catid.DescID]*zonepb.ZoneConfig {
-	zoneCfgMap := make(map[catid.DescID]*zonepb.ZoneConfig)
-	require.NoError(t, descCatalog.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+) map[catid.DescID]catalog.ZoneConfig {
+	zoneCfgMap := make(map[catid.DescID]catalog.ZoneConfig)
+	require.NoError(t, descCatalog.ForEachDescriptor(func(desc catalog.Descriptor) error {
 		zoneCfgRow := tdb.Query(t, `
 SELECT config FROM system.zones WHERE id=$1
 `,
@@ -155,9 +153,9 @@ SELECT config FROM system.zones WHERE id=$1
 			require.Falsef(t, once, "multiple zone config entries for descriptor")
 			var bytes []byte
 			require.NoError(t, zoneCfgRow.Scan(&bytes))
-			var zone zonepb.ZoneConfig
-			require.NoError(t, protoutil.Unmarshal(bytes, &zone))
-			zoneCfgMap[desc.GetID()] = &zone
+			var z zonepb.ZoneConfig
+			require.NoError(t, protoutil.Unmarshal(bytes, &z))
+			zoneCfgMap[desc.GetID()] = zone.NewZoneConfigWithRawBytes(&z, bytes)
 			once = true
 		}
 		return nil
@@ -200,15 +198,15 @@ func ReadSessionDataFromDB(
 
 // ReadCommentsFromDB reads all comments from system.comments table and return
 // them as a CommentCache.
-func ReadCommentsFromDB(t *testing.T, tdb *sqlutils.SQLRunner) map[descmetadata.CommentKey]string {
-	comments := make(map[descmetadata.CommentKey]string)
+func ReadCommentsFromDB(t *testing.T, tdb *sqlutils.SQLRunner) map[catalogkeys.CommentKey]string {
+	comments := make(map[catalogkeys.CommentKey]string)
 	commentRows := tdb.QueryStr(t, `SELECT type, object_id, sub_id, comment FROM system.comments`)
 	for _, row := range commentRows {
 		typeVal, err := strconv.Atoi(row[0])
 		if err != nil {
 			t.Fatal(err)
 		}
-		commentType := keys.CommentType(typeVal)
+		commentType := catalogkeys.CommentType(typeVal)
 		objID, err := strconv.Atoi(row[1])
 		if err != nil {
 			t.Fatal(err)
@@ -218,11 +216,7 @@ func ReadCommentsFromDB(t *testing.T, tdb *sqlutils.SQLRunner) map[descmetadata.
 			t.Fatal(err)
 		}
 		comment := row[3]
-		commentKey := descmetadata.CommentKey{
-			ObjectID:    catid.DescID(objID),
-			SubID:       uint32(subID),
-			CommentType: commentType,
-		}
+		commentKey := catalogkeys.MakeCommentKey(uint32(objID), uint32(subID), commentType)
 		comments[commentKey] = comment
 	}
 	return comments

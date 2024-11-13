@@ -103,12 +103,12 @@ type nodesResponse struct {
 //	  description: List nodes response.
 //	  schema:
 //	    "$ref": "#/definitions/nodesResponse"
-func (a *apiV2Server) listNodes(w http.ResponseWriter, r *http.Request) {
+func (a *apiV2SystemServer) listNodes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit, offset := getSimplePaginationValues(r)
-	ctx = apiToOutgoingGatewayCtx(ctx, r)
+	ctx = forwardHTTPAuthInfoToRPCCalls(ctx, r)
 
-	nodes, next, err := a.status.nodesHelper(ctx, limit, offset)
+	nodes, next, err := a.systemStatus.nodesHelper(ctx, limit, offset)
 	if err != nil {
 		apiV2InternalError(ctx, err, w)
 		return
@@ -134,6 +134,10 @@ func (a *apiV2Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSONResponse(ctx, w, 200, resp)
+}
+
+func (a *apiV2Server) listNodes(w http.ResponseWriter, r *http.Request) {
+	writeJSONResponse(r.Context(), w, http.StatusNotImplemented, nil)
 }
 
 func parseRangeIDs(input string, w http.ResponseWriter) (ranges []roachpb.RangeID, ok bool) {
@@ -191,7 +195,7 @@ type rangeResponse struct {
 //	    "$ref": "#/definitions/rangeResponse"
 func (a *apiV2Server) listRange(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = apiToOutgoingGatewayCtx(ctx, r)
+	ctx = forwardHTTPAuthInfoToRPCCalls(ctx, r)
 	vars := mux.Vars(r)
 	rangeID, err := strconv.ParseInt(vars["range_id"], 10, 64)
 	if err != nil {
@@ -372,9 +376,9 @@ type nodeRangesResponse struct {
 //	  description: Node ranges response.
 //	  schema:
 //	    "$ref": "#/definitions/nodeRangesResponse"
-func (a *apiV2Server) listNodeRanges(w http.ResponseWriter, r *http.Request) {
+func (a *apiV2SystemServer) listNodeRanges(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = apiToOutgoingGatewayCtx(ctx, r)
+	ctx = forwardHTTPAuthInfoToRPCCalls(ctx, r)
 	vars := mux.Vars(r)
 	nodeIDStr := vars["node_id"]
 	if nodeIDStr != "local" {
@@ -394,7 +398,7 @@ func (a *apiV2Server) listNodeRanges(w http.ResponseWriter, r *http.Request) {
 		RangeIDs: ranges,
 	}
 	limit, offset := getSimplePaginationValues(r)
-	statusResp, next, err := a.status.rangesHelper(ctx, req, limit, offset)
+	statusResp, next, err := a.systemStatus.rangesHelper(ctx, req, limit, offset)
 	if err != nil {
 		apiV2InternalError(ctx, err, w)
 		return
@@ -409,6 +413,10 @@ func (a *apiV2Server) listNodeRanges(w http.ResponseWriter, r *http.Request) {
 		resp.Ranges = append(resp.Ranges, ri)
 	}
 	writeJSONResponse(ctx, w, 200, resp)
+}
+
+func (a *apiV2Server) listNodeRanges(w http.ResponseWriter, r *http.Request) {
+	writeJSONResponse(r.Context(), w, http.StatusNotImplemented, nil)
 }
 
 type responseError struct {
@@ -432,16 +440,21 @@ type hotRangesResponse struct {
 //
 // swagger:model hotRangeInfo
 type hotRangeInfo struct {
-	RangeID           roachpb.RangeID  `json:"range_id"`
-	NodeID            roachpb.NodeID   `json:"node_id"`
-	QPS               float64          `json:"qps"`
-	LeaseholderNodeID roachpb.NodeID   `json:"leaseholder_node_id"`
-	TableName         string           `json:"table_name"`
-	DatabaseName      string           `json:"database_name"`
-	IndexName         string           `json:"index_name"`
-	SchemaName        string           `json:"schema_name"`
-	ReplicaNodeIDs    []roachpb.NodeID `json:"replica_node_ids"`
-	StoreID           roachpb.StoreID  `json:"store_id"`
+	RangeID             roachpb.RangeID  `json:"range_id"`
+	NodeID              roachpb.NodeID   `json:"node_id"`
+	QPS                 float64          `json:"qps"`
+	WritesPerSecond     float64          `json:"writes_per_second"`
+	ReadsPerSecond      float64          `json:"reads_per_second"`
+	WriteBytesPerSecond float64          `json:"write_bytes_per_second"`
+	ReadBytesPerSecond  float64          `json:"read_bytes_per_second"`
+	CPUTimePerSecond    float64          `json:"cpu_time_per_second"`
+	LeaseholderNodeID   roachpb.NodeID   `json:"leaseholder_node_id"`
+	TableName           string           `json:"table_name"`
+	DatabaseName        string           `json:"database_name"`
+	IndexName           string           `json:"index_name"`
+	SchemaName          string           `json:"schema_name"`
+	ReplicaNodeIDs      []roachpb.NodeID `json:"replica_node_ids"`
+	StoreID             roachpb.StoreID  `json:"store_id"`
 }
 
 // swagger:operation GET /ranges/hot/ listHotRanges
@@ -484,7 +497,7 @@ type hotRangeInfo struct {
 //	    "$ref": "#/definitions/hotRangesResponse"
 func (a *apiV2Server) listHotRanges(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = apiToOutgoingGatewayCtx(ctx, r)
+	ctx = forwardHTTPAuthInfoToRPCCalls(ctx, r)
 	nodeIDStr := r.URL.Query().Get("node_id")
 	limit, start := getRPCPaginationValues(r)
 
@@ -514,16 +527,21 @@ func (a *apiV2Server) listHotRanges(w http.ResponseWriter, r *http.Request) {
 		var hotRangeInfos = make([]hotRangeInfo, len(resp.Ranges))
 		for i, r := range resp.Ranges {
 			hotRangeInfos[i] = hotRangeInfo{
-				RangeID:           r.RangeID,
-				NodeID:            r.NodeID,
-				QPS:               r.QPS,
-				LeaseholderNodeID: r.LeaseholderNodeID,
-				TableName:         r.TableName,
-				DatabaseName:      r.DatabaseName,
-				IndexName:         r.IndexName,
-				ReplicaNodeIDs:    r.ReplicaNodeIds,
-				SchemaName:        r.SchemaName,
-				StoreID:           r.StoreID,
+				RangeID:             r.RangeID,
+				NodeID:              r.NodeID,
+				QPS:                 r.QPS,
+				WritesPerSecond:     r.WritesPerSecond,
+				ReadsPerSecond:      r.ReadsPerSecond,
+				WriteBytesPerSecond: r.WriteBytesPerSecond,
+				ReadBytesPerSecond:  r.ReadBytesPerSecond,
+				CPUTimePerSecond:    r.CPUTimePerSecond,
+				LeaseholderNodeID:   r.LeaseholderNodeID,
+				TableName:           r.TableName,
+				DatabaseName:        r.DatabaseName,
+				IndexName:           r.IndexName,
+				ReplicaNodeIDs:      r.ReplicaNodeIds,
+				SchemaName:          r.SchemaName,
+				StoreID:             r.StoreID,
 			}
 		}
 		return hotRangeInfos, nil

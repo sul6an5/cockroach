@@ -13,19 +13,19 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -38,7 +38,7 @@ import (
 )
 
 type eventStream struct {
-	streamID        streaming.StreamID
+	streamID        streampb.StreamID
 	execCfg         *sql.ExecutorConfig
 	spec            streampb.StreamPartitionSpec
 	subscribedSpans roachpb.SpanGroup
@@ -81,8 +81,10 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 
 	s.acc = s.mon.MakeBoundAccount()
 
-	// errCh consumed by ValueGenerator and is signaled when go routines encounter error.
-	s.errCh = make(chan error)
+	// errCh is buffered to ensure the sender can send an error to
+	// the buffer, without waiting, when the channel receiver is not waiting on
+	// the channel.
+	s.errCh = make(chan error, 1)
 
 	// Events channel gets RangeFeedEvents and is consumed by ValueGenerator.
 	s.eventsCh = make(chan kvcoord.RangeFeedMessage)
@@ -112,10 +114,8 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 		return err
 	}
 
-	if s.spec.StartFrom.IsEmpty() {
-		// Arrange to perform initial scan.
-		s.spec.StartFrom = s.execCfg.Clock.Now()
-
+	initialTimestamp := s.spec.InitialScanTimestamp
+	if s.spec.PreviousHighWaterTimestamp.IsEmpty() {
 		opts = append(opts,
 			rangefeed.WithInitialScan(func(ctx context.Context) {}),
 			rangefeed.WithScanRetryBehavior(rangefeed.ScanRetryRemaining),
@@ -129,12 +129,13 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 				return int(s.spec.Config.InitialScanParallelism)
 			}),
 
-			rangefeed.WithOnScanCompleted(s.onSpanCompleted),
+			rangefeed.WithOnScanCompleted(s.onInitialScanSpanCompleted),
 		)
 	} else {
+		initialTimestamp = s.spec.PreviousHighWaterTimestamp
 		// When resuming from cursor, advance frontier to the cursor position.
 		for _, sp := range s.spec.Spans {
-			if _, err := frontier.Forward(sp, s.spec.StartFrom); err != nil {
+			if _, err := frontier.Forward(sp, s.spec.PreviousHighWaterTimestamp); err != nil {
 				return err
 			}
 		}
@@ -142,7 +143,7 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 
 	// Start rangefeed, which spins up a separate go routine to perform it's job.
 	s.rf = s.execCfg.RangeFeedFactory.New(
-		fmt.Sprintf("streamID=%d", s.streamID), s.spec.StartFrom, s.onValue, opts...)
+		fmt.Sprintf("streamID=%d", s.streamID), initialTimestamp, s.onValue, opts...)
 	if err := s.rf.Start(ctx, s.spec.Spans); err != nil {
 		return err
 	}
@@ -160,6 +161,9 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 }
 
 func (s *eventStream) maybeSetError(err error) {
+	// Only send the error if the channel is empty, else it's ok to swallow the
+	// error because the first error in the channel will shut down the event
+	// stream.
 	select {
 	case s.errCh <- err:
 	default:
@@ -224,36 +228,35 @@ func (s *eventStream) Close(ctx context.Context) {
 		// Note: error in close is normal; we expect to be terminated with context canceled.
 		log.Errorf(ctx, "partition stream %d terminated with error %v", s.streamID, err)
 	}
-
 	s.sp.Finish()
 }
 
-func (s *eventStream) onValue(ctx context.Context, value *roachpb.RangeFeedValue) {
+func (s *eventStream) onValue(ctx context.Context, value *kvpb.RangeFeedValue) {
 	select {
 	case <-ctx.Done():
-	case s.eventsCh <- kvcoord.RangeFeedMessage{RangeFeedEvent: &roachpb.RangeFeedEvent{Val: value}}:
+	case s.eventsCh <- kvcoord.RangeFeedMessage{RangeFeedEvent: &kvpb.RangeFeedEvent{Val: value}}:
 		log.VInfof(ctx, 1, "onValue: %s@%s", value.Key, value.Value.Timestamp)
 	}
 }
 
-func (s *eventStream) onCheckpoint(ctx context.Context, checkpoint *roachpb.RangeFeedCheckpoint) {
+func (s *eventStream) onCheckpoint(ctx context.Context, checkpoint *kvpb.RangeFeedCheckpoint) {
 	select {
 	case <-ctx.Done():
-	case s.eventsCh <- kvcoord.RangeFeedMessage{RangeFeedEvent: &roachpb.RangeFeedEvent{Checkpoint: checkpoint}}:
+	case s.eventsCh <- kvcoord.RangeFeedMessage{RangeFeedEvent: &kvpb.RangeFeedEvent{Checkpoint: checkpoint}}:
 		log.VInfof(ctx, 1, "onCheckpoint: %s@%s", checkpoint.Span, checkpoint.ResolvedTS)
 	}
 }
 
-func (s *eventStream) onSpanCompleted(ctx context.Context, sp roachpb.Span) error {
-	checkpoint := roachpb.RangeFeedCheckpoint{
+func (s *eventStream) onInitialScanSpanCompleted(ctx context.Context, sp roachpb.Span) error {
+	checkpoint := kvpb.RangeFeedCheckpoint{
 		Span:       sp,
-		ResolvedTS: s.spec.StartFrom,
+		ResolvedTS: s.spec.InitialScanTimestamp,
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case s.eventsCh <- kvcoord.RangeFeedMessage{
-		RangeFeedEvent: &roachpb.RangeFeedEvent{Checkpoint: &checkpoint},
+		RangeFeedEvent: &kvpb.RangeFeedEvent{Checkpoint: &checkpoint},
 	}:
 		log.VInfof(ctx, 1, "onSpanCompleted: %s@%s", checkpoint.Span, checkpoint.ResolvedTS)
 		return nil
@@ -261,12 +264,12 @@ func (s *eventStream) onSpanCompleted(ctx context.Context, sp roachpb.Span) erro
 }
 
 func (s *eventStream) onSSTable(
-	ctx context.Context, sst *roachpb.RangeFeedSSTable, registeredSpan roachpb.Span,
+	ctx context.Context, sst *kvpb.RangeFeedSSTable, registeredSpan roachpb.Span,
 ) {
 	select {
 	case <-ctx.Done():
 	case s.eventsCh <- kvcoord.RangeFeedMessage{
-		RangeFeedEvent: &roachpb.RangeFeedEvent{SST: sst},
+		RangeFeedEvent: &kvpb.RangeFeedEvent{SST: sst},
 		RegisteredSpan: registeredSpan,
 	}:
 		log.VInfof(ctx, 1, "onSSTable: %s@%s with registered span %s",
@@ -274,10 +277,10 @@ func (s *eventStream) onSSTable(
 	}
 }
 
-func (s *eventStream) onDeleteRange(ctx context.Context, delRange *roachpb.RangeFeedDeleteRange) {
+func (s *eventStream) onDeleteRange(ctx context.Context, delRange *kvpb.RangeFeedDeleteRange) {
 	select {
 	case <-ctx.Done():
-	case s.eventsCh <- kvcoord.RangeFeedMessage{RangeFeedEvent: &roachpb.RangeFeedEvent{DeleteRange: delRange}}:
+	case s.eventsCh <- kvcoord.RangeFeedMessage{RangeFeedEvent: &kvpb.RangeFeedEvent{DeleteRange: delRange}}:
 		log.VInfof(ctx, 1, "onDeleteRange: %s@%s", delRange.Span, delRange.Timestamp)
 	}
 }
@@ -358,7 +361,7 @@ func (p *checkpointPacer) shouldCheckpoint(
 
 // Add a RangeFeedSSTable into current batch and return number of bytes added.
 func (s *eventStream) addSST(
-	sst *roachpb.RangeFeedSSTable, registeredSpan roachpb.Span, batch *streampb.StreamEvent_Batch,
+	sst *kvpb.RangeFeedSSTable, registeredSpan roachpb.Span, batch *streampb.StreamEvent_Batch,
 ) (int, error) {
 	// We send over the whole SSTable if the sst span is within
 	// the registered span boundaries.
@@ -374,7 +377,7 @@ func (s *eventStream) addSST(
 	// Extract the received SST to only contain data within the boundaries of
 	// matching registered span. Execute the specified operations on each MVCC
 	// key value and each MVCCRangeKey value in the trimmed SSTable.
-	if err := streamingccl.ScanSST(sst, registeredSpan,
+	if err := replicationutils.ScanSST(sst, registeredSpan,
 		func(mvccKV storage.MVCCKeyValue) error {
 			batch.KeyValues = append(batch.KeyValues, roachpb.KeyValue{
 				Key: mvccKV.Key.Key,
@@ -386,7 +389,7 @@ func (s *eventStream) addSST(
 			size += batch.KeyValues[len(batch.KeyValues)-1].Size()
 			return nil
 		}, func(rangeKeyVal storage.MVCCRangeKeyValue) error {
-			batch.DelRanges = append(batch.DelRanges, roachpb.RangeFeedDeleteRange{
+			batch.DelRanges = append(batch.DelRanges, kvpb.RangeFeedDeleteRange{
 				Span: roachpb.Span{
 					Key:    rangeKeyVal.RangeKey.StartKey,
 					EndKey: rangeKeyVal.RangeKey.EndKey,
@@ -408,7 +411,7 @@ func (s *eventStream) streamLoop(ctx context.Context, frontier *span.Frontier) e
 
 	var batch streampb.StreamEvent_Batch
 	batchSize := 0
-	addValue := func(v *roachpb.RangeFeedValue) {
+	addValue := func(v *kvpb.RangeFeedValue) {
 		keyValue := roachpb.KeyValue{
 			Key:   v.Key,
 			Value: v.Value,
@@ -417,7 +420,7 @@ func (s *eventStream) streamLoop(ctx context.Context, frontier *span.Frontier) e
 		batchSize += keyValue.Size()
 	}
 
-	addDelRange := func(delRange *roachpb.RangeFeedDeleteRange) error {
+	addDelRange := func(delRange *kvpb.RangeFeedDeleteRange) error {
 		// DelRange's span is already trimmed to enclosed within
 		// the subscribed span, just emit it.
 		batch.DelRanges = append(batch.DelRanges, *delRange)
@@ -515,7 +518,7 @@ func setConfigDefaults(cfg *streampb.StreamPartitionSpec_ExecutionConfig) {
 }
 
 func streamPartition(
-	evalCtx *eval.Context, streamID streaming.StreamID, opaqueSpec []byte,
+	evalCtx *eval.Context, streamID streampb.StreamID, opaqueSpec []byte,
 ) (eval.ValueGenerator, error) {
 	if !evalCtx.SessionData().AvoidBuffering {
 		return nil, errors.New("partition streaming requires 'SET avoid_buffering = true' option")
@@ -543,6 +546,6 @@ func streamPartition(
 		spec:            spec,
 		subscribedSpans: subscribedSpans,
 		execCfg:         execCfg,
-		mon:             evalCtx.Mon,
+		mon:             evalCtx.Planner.Mon(),
 	}, nil
 }

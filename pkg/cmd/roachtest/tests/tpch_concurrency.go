@@ -31,7 +31,6 @@ func registerTPCHConcurrency(r registry.Registry) {
 		ctx context.Context,
 		t test.Test,
 		c cluster.Cluster,
-		lowerRefreshSpansBytes bool,
 		disableStreamer bool,
 	) {
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.Range(1, numNodes-1))
@@ -39,15 +38,6 @@ func registerTPCHConcurrency(r registry.Registry) {
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, numNodes-1))
 
 		conn := c.Conn(ctx, t.L(), 1)
-		if lowerRefreshSpansBytes {
-			// Temporarily lower a KV setting to its previous default to confirm
-			// that the new value of 4MiB is, indeed, the root cause of the
-			// regression in the highest concurrency.
-			// TODO(yuzefovich): remove this.
-			if _, err := conn.Exec("SET CLUSTER SETTING kv.transaction.max_refresh_spans_bytes = 256000;"); err != nil {
-				t.Fatal(err)
-			}
-		}
 		if disableStreamer {
 			if _, err := conn.Exec("SET CLUSTER SETTING sql.distsql.use_streamer.enabled = false;"); err != nil {
 				t.Fatal(err)
@@ -105,6 +95,13 @@ func registerTPCHConcurrency(r registry.Registry) {
 			t.Status(fmt.Sprintf("running with concurrency = %d", concurrency))
 			// Run each query once on each connection.
 			for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
+				if queryNum == 15 {
+					// Skip Q15 because it involves a schema change which - when
+					// run with high concurrency - takes non-trivial amount of
+					// time.
+					t.Status("skipping Q", queryNum)
+					continue
+				}
 				t.Status("running Q", queryNum)
 				// The way --max-ops flag works is as follows: the global ops
 				// counter is incremented **after** each worker completes a
@@ -161,86 +158,72 @@ func registerTPCHConcurrency(r registry.Registry) {
 		ctx context.Context,
 		t test.Test,
 		c cluster.Cluster,
-		lowerRefreshSpansBytes bool,
 		disableStreamer bool,
 	) {
-		setupCluster(ctx, t, c, lowerRefreshSpansBytes, disableStreamer)
-		// TODO(yuzefovich): once we have a good grasp on the expected value for
-		// max supported concurrency, we should use search.Searcher instead of
-		// the binary search here. Additionally, we should introduce an
-		// additional step to ensure that some kind of lower bound for the
-		// supported concurrency is always sustained and fail the test if it
-		// isn't.
-		minConcurrency, maxConcurrency := 48, 160
+		setupCluster(ctx, t, c, disableStreamer)
+		// We use [970, 1030) range to perform the binary search over because
+		// - the interval length is smaller than 64, so we will need 6
+		// iterations. Each iteration can take 2-3 hours, and we have 18 hour
+		// timeout, so 6 iterations is the maximum without marking the test as
+		// "weekly".
+		// - the interval is centered around 1000. We often can push this a bit
+		// higher, but then the iterations also get longer. 1000 concurrently
+		// running analytical queries on the 3 node cluster that doesn't crash
+		// is much more than we expect our users to run.
+		const minConcurrency, maxConcurrency = 970, 1030
+		min, max := minConcurrency, maxConcurrency
 		// Run the binary search to find the largest concurrency that doesn't
 		// crash a node in the cluster. The current range is represented by
-		// [minConcurrency, maxConcurrency).
-		for minConcurrency < maxConcurrency-1 {
-			concurrency := (minConcurrency + maxConcurrency) / 2
+		// [min, max).
+		for min < max-1 {
+			concurrency := (min + max) / 2
 			if err := checkConcurrency(ctx, t, c, concurrency); err != nil {
-				maxConcurrency = concurrency
+				max = concurrency
 			} else {
-				minConcurrency = concurrency
+				min = concurrency
 			}
 		}
 		// Restart the cluster so that if any nodes crashed in the last
 		// iteration, it doesn't fail the test.
 		restartCluster(ctx, c, t)
-		t.Status(fmt.Sprintf("max supported concurrency is %d", minConcurrency))
+		t.Status(fmt.Sprintf("max supported concurrency is %d", min))
 		// Write the concurrency number into the stats.json file to be used by
 		// the roachperf.
 		c.Run(ctx, c.Node(numNodes), "mkdir", t.PerfArtifactsDir())
 		cmd := fmt.Sprintf(
 			`echo '{ "max_concurrency": %d }' > %s/stats.json`,
-			minConcurrency, t.PerfArtifactsDir(),
+			min, t.PerfArtifactsDir(),
 		)
 		c.Run(ctx, c.Node(numNodes), cmd)
+		if min == minConcurrency {
+			// In this case, we had a node crash in each iteration of the binary
+			// search. This is unexpected, so fail the test.
+			t.Fatal("couldn't sustain minimum concurrency")
+		}
 	}
+
+	// Each iteration of the binary search can take on the order of 2-3 hours
+	// (with concurrency around 1000), so use the longest timeout allowed by the
+	// roachtest infra (without marking the test as "weekly").
+	const timeout = 18 * time.Hour
 
 	r.Add(registry.TestSpec{
 		Name:    "tpch_concurrency",
 		Owner:   registry.OwnerSQLQueries,
+		Timeout: timeout,
 		Cluster: r.MakeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runTPCHConcurrency(ctx, t, c, true /* lowerRefreshSpansBytes */, false /* disableStreamer */)
+			runTPCHConcurrency(ctx, t, c, false /* disableStreamer */)
 		},
-		// By default, the timeout is 10 hours which might not be sufficient
-		// given that a single iteration of checkConcurrency might take on the
-		// order of an hour and a half, so in order to let each test run to
-		// complete, we'll give it 12 hours. Successful runs typically take
-		// less, around 8 hours.
-		Timeout: 12 * time.Hour,
 	})
 
-	// TODO(yuzefovich): remove this once the regression is understood.
-	r.Add(registry.TestSpec{
-		Name:    "tpch_concurrency/high_refresh_spans_bytes",
-		Owner:   registry.OwnerSQLQueries,
-		Cluster: r.MakeClusterSpec(numNodes),
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runTPCHConcurrency(ctx, t, c, false /* lowerRefreshSpansBytes */, false /* disableStreamer */)
-		},
-		// By default, the timeout is 10 hours which might not be sufficient
-		// given that a single iteration of checkConcurrency might take on the
-		// order of an hour and a half, so in order to let each test run to
-		// complete, we'll give it 12 hours. Successful runs typically take
-		// less, around 8 hours.
-		Timeout: 12 * time.Hour,
-	})
-
-	// TODO(yuzefovich): remove this once the streamer is stabilized.
 	r.Add(registry.TestSpec{
 		Name:    "tpch_concurrency/no_streamer",
 		Owner:   registry.OwnerSQLQueries,
+		Timeout: timeout,
 		Cluster: r.MakeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runTPCHConcurrency(ctx, t, c, true /* lowerRefreshSpansBytes */, true /* disableStreamer */)
+			runTPCHConcurrency(ctx, t, c, true /* disableStreamer */)
 		},
-		// By default, the timeout is 10 hours which might not be sufficient
-		// given that a single iteration of checkConcurrency might take on the
-		// order of an hour and a half, so in order to let each test run to
-		// complete, we'll give it 12 hours. Successful runs typically take
-		// less, around 8 hours.
-		Timeout: 12 * time.Hour,
 	})
 }

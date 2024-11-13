@@ -73,12 +73,12 @@ const sortedDistinctProcName = "sorted distinct"
 
 // newDistinct instantiates a new Distinct processor.
 func newDistinct(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.DistinctSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.RowSourcedProcessor, error) {
 	if len(spec.DistinctColumns) == 0 {
 		return nil, errors.AssertionFailedf("0 distinct columns specified for distinct processor")
@@ -98,8 +98,7 @@ func newDistinct(
 		}
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
-	memMonitor := execinfra.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "distinct-mem")
+	memMonitor := execinfra.NewMonitor(ctx, flowCtx.Mon, "distinct-mem")
 	d := &distinct{
 		input:            input,
 		memAcc:           memMonitor.MakeBoundAccount(),
@@ -118,7 +117,7 @@ func newDistinct(
 	}
 
 	if err := d.Init(
-		d, post, d.types, flowCtx, processorID, output, memMonitor, /* memMonitor */
+		ctx, d, post, d.types, flowCtx, processorID, memMonitor, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{d.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -128,7 +127,7 @@ func newDistinct(
 		}); err != nil {
 		return nil, err
 	}
-	d.lastGroupKey = d.OutputHelper.RowAlloc.AllocRow(len(d.types))
+	d.lastGroupKey = make(rowenc.EncDatumRow, len(d.types))
 	d.haveLastGroupKey = false
 	// If we set up the arena when d is created, the pointer to the memAcc
 	// will be changed because the sortedDistinct case makes a copy of d.
@@ -189,7 +188,7 @@ func (d *distinct) encode(appendTo []byte, row rowenc.EncDatumRow) ([]byte, erro
 		// the references to the row (and to the newly allocated datums)
 		// shortly, it'll likely take some time before GC reclaims that memory,
 		// so we choose the over-accounting route to be safe.
-		appendTo, err = datum.Fingerprint(d.Ctx, d.types[colIdx], &d.datumAlloc, appendTo, &d.memAcc)
+		appendTo, err = datum.Fingerprint(d.Ctx(), d.types[colIdx], &d.datumAlloc, appendTo, &d.memAcc)
 		if err != nil {
 			return nil, err
 		}
@@ -212,8 +211,8 @@ func (d *distinct) encode(appendTo []byte, row rowenc.EncDatumRow) ([]byte, erro
 
 func (d *distinct) close() {
 	if d.InternalClose() {
-		d.memAcc.Close(d.Ctx)
-		d.MemMonitor.Stop(d.Ctx)
+		d.memAcc.Close(d.Ctx())
+		d.MemMonitor.Stop(d.Ctx())
 	}
 }
 
@@ -258,7 +257,7 @@ func (d *distinct) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 			// allocated on it, which implies that UnsafeReset() is safe to call here.
 			copy(d.lastGroupKey, row)
 			d.haveLastGroupKey = true
-			if err := d.arena.UnsafeReset(d.Ctx); err != nil {
+			if err := d.arena.UnsafeReset(d.Ctx()); err != nil {
 				d.MoveToDraining(err)
 				break
 			}
@@ -282,7 +281,7 @@ func (d *distinct) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 			}
 			continue
 		}
-		s, err := d.arena.AllocBytes(d.Ctx, encoding)
+		s, err := d.arena.AllocBytes(d.Ctx(), encoding)
 		if err != nil {
 			d.MoveToDraining(err)
 			break

@@ -23,11 +23,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -68,6 +71,10 @@ func TestEngineComparer(t *testing.T) {
 	}
 	require.Equal(t, -1, EngineComparer.Compare(suffix(EncodeMVCCKey(keyA2)), suffix(EncodeMVCCKey(keyA1))),
 		"expected bare suffix with higher timestamp to sort first")
+	for _, k := range []MVCCKey{keyAMetadata, keyA2, keyA1, keyB2} {
+		b := EncodeMVCCKey(k)
+		require.Equal(t, 2, EngineComparer.Split(b))
+	}
 }
 
 func TestPebbleIterReuse(t *testing.T) {
@@ -251,7 +258,7 @@ func TestPebbleMetricEventListener(t *testing.T) {
 
 	settings := cluster.MakeTestingClusterSettings()
 	MaxSyncDurationFatalOnExceeded.Override(ctx, &settings.SV, false)
-	p, err := Open(ctx, InMemory(), CacheSize(1<<20 /* 1 MiB */), Settings(settings))
+	p, err := Open(ctx, InMemory(), settings, CacheSize(1<<20 /* 1 MiB */))
 	require.NoError(t, err)
 	defer p.Close()
 
@@ -409,6 +416,14 @@ func BenchmarkMVCCKeyEqual(b *testing.B) {
 	}
 }
 
+func BenchmarkMVCCKeySplit(b *testing.B) {
+	keys := makeRandEncodedKeys()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EngineComparer.Split(keys[i%len(keys)])
+	}
+}
+
 func makeRandEncodedKeys() [][]byte {
 	rng := rand.New(rand.NewSource(timeutil.Now().Unix()))
 	keys := make([][]byte, 1000)
@@ -479,7 +494,7 @@ func requireTxnForValue(t *testing.T, val testValue, intent roachpb.Intent) {
 // nonFatalLogger implements pebble.Logger by recording that a fatal log event
 // was encountered at least once. Fatal log events are downgraded to Info level.
 type nonFatalLogger struct {
-	pebble.Logger
+	pebble.LoggerAndTracer
 	t      *testing.T
 	caught atomic.Value
 }
@@ -493,9 +508,11 @@ func TestPebbleKeyValidationFunc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// Capture fatal errors by swapping out the logger.
+	// nonFatalLogger.LoggerAndTracer is nil, since the test exercises only
+	// Fatalf.
 	l := &nonFatalLogger{t: t}
 	opt := func(cfg *engineConfig) error {
-		cfg.Opts.Logger = l
+		cfg.Opts.LoggerAndTracer = l
 		return nil
 	}
 	engine := createTestPebbleEngine(opt).(*Pebble)
@@ -534,7 +551,7 @@ func TestPebbleBackgroundError(t *testing.T) {
 			errorCount: 3,
 		},
 	}
-	eng, err := Open(context.Background(), loc)
+	eng, err := Open(context.Background(), loc, cluster.MakeClusterSettings())
 	require.NoError(t, err)
 	defer eng.Close()
 
@@ -872,8 +889,6 @@ func TestPebbleMVCCTimeIntervalWithClears(t *testing.T) {
 func TestPebbleMVCCTimeIntervalWithRangeClears(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	skip.WithIssue(t, 83376, "property filters may ignore Pebble range tombstones")
-
 	// Set up an engine with tiny blocks, so each point key gets its own block,
 	// and disable compactions to keep SSTs separate.
 	overrideOptions := func(cfg *engineConfig) error {
@@ -1065,8 +1080,7 @@ func TestPebbleFlushCallbackAndDurabilityRequirement(t *testing.T) {
 	require.NoError(t, roGuaranteedPinned.PinEngineStateForIterators())
 	// Returns the value found or nil.
 	checkGetAndIter := func(reader Reader) []byte {
-		v, err := reader.MVCCGet(k)
-		require.NoError(t, err)
+		v := mvccGetRaw(t, reader, k)
 		iter := reader.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: k.Key.Next()})
 		defer iter.Close()
 		iter.SeekGE(k)
@@ -1074,7 +1088,9 @@ func TestPebbleFlushCallbackAndDurabilityRequirement(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, v != nil, valid)
 		if valid {
-			require.Equal(t, v, iter.Value())
+			value, err := iter.Value()
+			require.NoError(t, err)
+			require.Equal(t, v, value)
 		}
 		return v
 	}
@@ -1115,7 +1131,8 @@ func TestPebbleReaderMultipleIterators(t *testing.T) {
 	v3 := MVCCValue{Value: roachpb.MakeValueFromString("3")}
 	vx := MVCCValue{Value: roachpb.MakeValueFromString("x")}
 
-	decodeValue := func(encoded []byte) MVCCValue {
+	decodeValue := func(encoded []byte, err error) MVCCValue {
+		require.NoError(t, err)
 		value, err := DecodeMVCCValue(encoded)
 		require.NoError(t, err)
 		return value
@@ -1181,5 +1198,190 @@ func TestPebbleReaderMultipleIterators(t *testing.T) {
 			e2 := r.NewEngineIterator(IterOptions{UpperBound: keys.MaxKey})
 			defer e2.Close()
 		})
+	}
+}
+
+func TestShortAttributeExtractor(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var txnUUID [uuid.Size]byte
+	lockKey, _ := LockTableKey{
+		Key: roachpb.Key("a"), Strength: lock.Exclusive, TxnUUID: txnUUID[:]}.ToEngineKey(nil)
+	v := MVCCValue{}
+	tombstoneVal, err := EncodeMVCCValue(v)
+	require.NoError(t, err)
+	var sv roachpb.Value
+	sv.SetString("foo")
+	v = MVCCValue{Value: sv}
+	strVal, err := EncodeMVCCValue(v)
+	require.NoError(t, err)
+	valHeader := enginepb.MVCCValueHeader{LocalTimestamp: hlc.ClockTimestamp{WallTime: 5}}
+	v = MVCCValue{MVCCValueHeader: valHeader}
+	tombstoneWithHeaderVal, err := EncodeMVCCValue(v)
+	require.NoError(t, err)
+	v = MVCCValue{MVCCValueHeader: valHeader, Value: sv}
+	strWithHeaderVal, err := EncodeMVCCValue(v)
+	require.NoError(t, err)
+	mvccKey := EncodeMVCCKey(MVCCKey{Key: roachpb.Key("a"), Timestamp: hlc.Timestamp{WallTime: 20}})
+	testCases := []struct {
+		name   string
+		key    []byte
+		value  []byte
+		attr   pebble.ShortAttribute
+		errStr string
+	}{
+		{
+			name:  "no-version",
+			key:   EncodeMVCCKey(MVCCKey{Key: roachpb.Key("a")}),
+			value: []byte(nil),
+		},
+		{
+			name:  "lock-key",
+			key:   lockKey.Encode(),
+			value: []byte(nil),
+		},
+		{
+			name:  "tombstone-val",
+			key:   mvccKey,
+			value: tombstoneVal,
+			attr:  1,
+		},
+		{
+			name:  "str-val",
+			key:   mvccKey,
+			value: strVal,
+		},
+		{
+			name:  "tombstone-with-header-val",
+			key:   mvccKey,
+			value: tombstoneWithHeaderVal,
+			attr:  1,
+		},
+		{
+			name:  "str-with-header-val",
+			key:   mvccKey,
+			value: strWithHeaderVal,
+		},
+		{
+			name:   "invalid-val",
+			key:    mvccKey,
+			value:  []byte("v"),
+			errStr: "invalid encoded mvcc value",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			prefixLen := EngineComparer.Split(tc.key)
+			attr, err := shortAttributeExtractorForValues(tc.key, prefixLen, tc.value)
+			if len(tc.errStr) != 0 {
+				require.ErrorContains(t, err, tc.errStr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.attr, attr)
+			}
+		})
+	}
+}
+
+func TestIncompatibleVersion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	loc := Location{
+		dir: "",
+		fs:  vfs.NewMem(),
+	}
+
+	p, err := Open(ctx, loc, cluster.MakeTestingClusterSettings())
+	require.NoError(t, err)
+	p.Close()
+
+	// Overwrite the min version file with an unsupported version.
+	version := roachpb.Version{Major: 21, Minor: 1}
+	b, err := protoutil.Marshal(&version)
+	require.NoError(t, err)
+	require.NoError(t, fs.SafeWriteToFile(loc.fs, loc.dir, MinVersionFilename, b))
+
+	_, err = Open(ctx, loc, cluster.MakeTestingClusterSettings())
+	require.ErrorContains(t, err, "is too old for running version")
+}
+
+func TestNoMinVerFile(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	loc := Location{
+		dir: "",
+		fs:  vfs.NewMem(),
+	}
+
+	st := cluster.MakeTestingClusterSettings()
+	p, err := Open(ctx, loc, st)
+	require.NoError(t, err)
+	p.Close()
+
+	// Remove the min version filename.
+	require.NoError(t, loc.fs.Remove(loc.fs.PathJoin(loc.dir, MinVersionFilename)))
+
+	// We are still allowed the open the store if we haven't written anything to it.
+	// This is useful in case the initial Open crashes right before writinng the
+	// min version file.
+	p, err = Open(ctx, loc, st)
+	require.NoError(t, err)
+
+	// Now write something to the store.
+	k := MVCCKey{Key: []byte("a"), Timestamp: hlc.Timestamp{WallTime: 1}}
+	v := MVCCValue{Value: roachpb.MakeValueFromString("a1")}
+	require.NoError(t, p.PutMVCC(k, v))
+	p.Close()
+
+	// Remove the min version filename.
+	require.NoError(t, loc.fs.Remove(loc.fs.PathJoin(loc.dir, MinVersionFilename)))
+
+	_, err = Open(ctx, loc, st)
+	require.ErrorContains(t, err, "store has no min-version file")
+}
+
+func TestApproximateDiskBytes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	rng, _ := randutil.NewTestRand()
+
+	p, err := Open(ctx, InMemory(), cluster.MakeTestingClusterSettings())
+	require.NoError(t, err)
+	defer p.Close()
+
+	key := func(i int) roachpb.Key {
+		return keys.SystemSQLCodec.TablePrefix(uint32(i))
+	}
+
+	// Write keys 0000...0999.
+	b := p.NewWriteBatch()
+	for i := 0; i < 1000; i++ {
+		require.NoError(t, b.PutMVCC(
+			MVCCKey{Key: key(i), Timestamp: hlc.Timestamp{WallTime: int64(i + 1)}},
+			MVCCValue{Value: roachpb.Value{RawBytes: randutil.RandBytes(rng, 100)}},
+		))
+	}
+	require.NoError(t, b.Commit(true /* sync */))
+	require.NoError(t, p.Flush())
+
+	approxBytes := func(span roachpb.Span) uint64 {
+		v, err := p.ApproximateDiskBytes(span.Key, span.EndKey)
+		require.NoError(t, err)
+		t.Logf("%s (%x-%x): %d bytes", span, span.Key, span.EndKey, v)
+		return v
+	}
+
+	all := approxBytes(roachpb.Span{Key: roachpb.KeyMin, EndKey: roachpb.KeyMax})
+	for i := 0; i < 1000; i++ {
+		s := roachpb.Span{Key: key(i), EndKey: key(i + 1)}
+		if v := approxBytes(s); v >= all {
+			t.Errorf("ApproximateDiskBytes(%q) = %d >= entire DB size %d", s, v, all)
+		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
@@ -42,6 +43,8 @@ type JSONStatistic struct {
 	HistogramColumnType string            `json:"histo_col_type"`
 	HistogramBuckets    []JSONHistoBucket `json:"histo_buckets,omitempty"`
 	HistogramVersion    HistogramVersion  `json:"histo_version,omitempty"`
+	PartialPredicate    string            `json:"partial_predicate,omitempty"`
+	FullStatisticID     uint64            `json:"full_statistic_id,omitempty"`
 }
 
 // JSONHistoBucket is a struct used for JSON marshaling and unmarshaling of
@@ -128,7 +131,7 @@ func (js *JSONStatistic) DecodeAndSetHistogram(
 
 // GetHistogram converts the json histogram into HistogramData.
 func (js *JSONStatistic) GetHistogram(
-	semaCtx *tree.SemaContext, evalCtx *eval.Context,
+	ctx context.Context, semaCtx *tree.SemaContext, evalCtx *eval.Context,
 ) (*HistogramData, error) {
 	if js.HistogramColumnType == "" {
 		return nil, nil
@@ -138,7 +141,7 @@ func (js *JSONStatistic) GetHistogram(
 	if err != nil {
 		return nil, err
 	}
-	colType, err := tree.ResolveType(evalCtx.Context, colTypeRef, semaCtx.GetTypeResolver())
+	colType, err := tree.ResolveType(ctx, colTypeRef, semaCtx.GetTypeResolver())
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +150,7 @@ func (js *JSONStatistic) GetHistogram(
 	h.Buckets = make([]HistogramData_Bucket, len(js.HistogramBuckets))
 	for i := range h.Buckets {
 		hb := &js.HistogramBuckets[i]
-		upperVal, err := rowenc.ParseDatumStringAs(colType, hb.UpperBound, evalCtx)
+		upperVal, err := rowenc.ParseDatumStringAs(ctx, colType, hb.UpperBound, evalCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -160,4 +163,25 @@ func (js *JSONStatistic) GetHistogram(
 		}
 	}
 	return h, nil
+}
+
+// IsPartial returns true if this statistic was collected with a where clause.
+func (js *JSONStatistic) IsPartial() bool {
+	return js.PartialPredicate != ""
+}
+
+// IsMerged returns true if this statistic was created by merging a partial and
+// a full statistic.
+func (js *JSONStatistic) IsMerged() bool {
+	return js.Name == jobspb.MergedStatsName
+}
+
+// IsForecast returns true if this statistic was created by forecasting.
+func (js *JSONStatistic) IsForecast() bool {
+	return js.Name == jobspb.ForecastStatsName
+}
+
+// IsAuto returns true if this statistic was collected automatically.
+func (js *JSONStatistic) IsAuto() bool {
+	return js.Name == jobspb.AutoStatsName
 }

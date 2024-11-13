@@ -11,6 +11,7 @@
 package memo
 
 import (
+	"context"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -55,14 +56,14 @@ type logicalPropsBuilder struct {
 	disableStats bool
 }
 
-func (b *logicalPropsBuilder) init(evalCtx *eval.Context, mem *Memo) {
+func (b *logicalPropsBuilder) init(ctx context.Context, evalCtx *eval.Context, mem *Memo) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*b = logicalPropsBuilder{
 		evalCtx: evalCtx,
 		mem:     mem,
 	}
-	b.sb.init(evalCtx, mem.Metadata())
+	b.sb.init(ctx, evalCtx, mem.Metadata())
 }
 
 func (b *logicalPropsBuilder) clear() {
@@ -938,7 +939,7 @@ func (b *logicalPropsBuilder) buildWithProps(with *WithExpr, rel *props.Relation
 	// Statistics
 	// ----------
 	// Inherited from the input expression.
-	rel.Stats = inputProps.Stats
+	*rel.Statistics() = *inputProps.Statistics()
 }
 
 func (b *logicalPropsBuilder) buildWithScanProps(withScan *WithScanExpr, rel *props.Relational) {
@@ -1077,6 +1078,12 @@ func (b *logicalPropsBuilder) buildControlSchedulesProps(
 	ctl *ControlSchedulesExpr, rel *props.Relational,
 ) {
 	b.buildBasicProps(ctl, opt.ColList{}, rel)
+}
+
+func (b *logicalPropsBuilder) buildShowCompletionsProps(
+	ctl *ShowCompletionsExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(ctl, ctl.Columns, rel)
 }
 
 func (b *logicalPropsBuilder) buildCancelQueriesProps(
@@ -1656,6 +1663,7 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared, evalCtx *eval.Context) {
 		shared.VolatilitySet.Add(volatility)
 
 	case *UDFExpr:
+		shared.HasUDF = true
 		shared.VolatilitySet.Add(t.Volatility)
 
 	default:
@@ -1928,8 +1936,13 @@ func (b *logicalPropsBuilder) makeSetCardinality(
 		card = props.Cardinality{Min: 0, Max: left.Max}
 		card = card.Limit(right.Max)
 
-	case opt.ExceptOp, opt.ExceptAllOp:
+	case opt.ExceptOp:
 		// Use left Max cardinality.
+		card = props.Cardinality{Min: 0, Max: left.Max}
+
+	case opt.ExceptAllOp:
+		// Use left Max cardinality. Cardinality cannot be less than left Min minus
+		// right Max.
 		card = props.Cardinality{Min: 0, Max: left.Max}
 		if left.Min > right.Max {
 			card.Min = left.Min - right.Max
@@ -2134,7 +2147,7 @@ func ensureLookupJoinInputProps(join *LookupJoinExpr, sb *statisticsBuilder) *pr
 		relational.Cardinality = props.AnyCardinality
 		relational.FuncDeps.CopyFrom(MakeTableFuncDep(md, join.Table))
 		relational.FuncDeps.ProjectCols(relational.OutputCols)
-		relational.Stats = *sb.makeTableStatistics(join.Table)
+		*relational.Statistics() = *sb.makeTableStatistics(join.Table)
 	}
 	return relational
 }
@@ -2156,7 +2169,7 @@ func ensureInvertedJoinInputProps(join *InvertedJoinExpr, sb *statisticsBuilder)
 		relational.FuncDeps.ProjectCols(relational.OutputCols)
 
 		// TODO(rytaft): Change this to use inverted index stats once available.
-		relational.Stats = *sb.makeTableStatistics(join.Table)
+		*relational.Statistics() = *sb.makeTableStatistics(join.Table)
 	}
 	return relational
 }
@@ -2201,7 +2214,7 @@ func ensureInputPropsForIndex(
 		relProps.Cardinality = props.AnyCardinality
 		relProps.FuncDeps.CopyFrom(MakeTableFuncDep(md, tabID))
 		relProps.FuncDeps.ProjectCols(relProps.OutputCols)
-		relProps.Stats = *sb.makeTableStatistics(tabID)
+		*relProps.Statistics() = *sb.makeTableStatistics(tabID)
 	}
 }
 
@@ -2270,7 +2283,7 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 		ensureLookupJoinInputProps(join, &b.sb)
 		h.joinType = join.JoinType
 		h.rightProps = &join.lookupProps
-		h.filters = append(join.On, join.LookupExpr...)
+		h.filters = append(join.On, join.AllLookupFilters...)
 		b.addFiltersToFuncDep(h.filters, &h.filtersFD)
 		h.filterNotNullCols = b.rejectNullCols(h.filters)
 
@@ -2624,7 +2637,7 @@ func (b *logicalPropsBuilder) buildMemoCycleTestRelProps(
 	// failures.
 	rel.OutputCols = inputProps.OutputCols
 	// Make the row count non-zero to avoid assertion failures.
-	rel.Stats.RowCount = 1
+	rel.Statistics().RowCount = 1
 }
 
 // WithUses returns the WithUsesMap for the given expression.

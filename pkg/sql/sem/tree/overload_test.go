@@ -96,7 +96,7 @@ func TestVariadicFunctions(t *testing.T) {
 }
 
 type testOverload struct {
-	paramTypes ArgTypes
+	paramTypes ParamTypes
 	retType    *types.T
 	pref       bool
 }
@@ -127,7 +127,7 @@ func (to *testOverload) String() string {
 }
 
 func makeTestOverload(retType *types.T, params ...*types.T) *testOverload {
-	t := make(ArgTypes, len(params))
+	t := make(ParamTypes, len(params))
 	for i := range params {
 		t[i].Typ = params[i]
 	}
@@ -136,6 +136,12 @@ func makeTestOverload(retType *types.T, params ...*types.T) *testOverload {
 		retType:    retType,
 	}
 }
+
+// overloadImpls implements overloadSet
+type overloadImpls []overloadImpl
+
+func (o overloadImpls) len() int               { return len(o) }
+func (o overloadImpls) get(i int) overloadImpl { return o[i] }
 
 func TestTypeCheckOverloadedExprs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -269,25 +275,35 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 	for i, d := range testData {
 		t.Run(fmt.Sprintf("%v/%v", d.exprs, d.overloads), func(t *testing.T) {
 			semaCtx := MakeSemaContext()
-			if err := semaCtx.Placeholders.Init(2 /* numPlaceholders */, nil /* typeHints */, false /* fromSQL */); err != nil {
+			if err := semaCtx.Placeholders.Init(2 /* numPlaceholders */, nil /* typeHints */); err != nil {
 				t.Fatal(err)
 			}
 			desired := types.Any
 			if d.desired != nil {
 				desired = d.desired
 			}
-			typedExprs, fns, err := typeCheckOverloadedExprs(
-				ctx, &semaCtx, desired, d.overloads, d.inBinOp, d.exprs...,
+			s := getOverloadTypeChecker(overloadImpls(d.overloads), d.exprs...)
+			defer s.release()
+
+			err := s.typeCheckOverloadedExprs(
+				ctx, &semaCtx, desired, d.inBinOp,
 			)
+			typedExprs := s.typedExprs
+			var fns []overloadImpl
+			for _, idx := range s.overloadIdxs {
+				fns = append(fns, s.overloads[idx])
+			}
 			assertNoErr := func() {
 				if err != nil {
 					t.Fatalf("%d: unexpected error returned from overload resolution for exprs %s: %v",
 						i, d.exprs, err)
 				}
 			}
-			for _, e := range typedExprs {
-				if e == nil {
-					t.Errorf("%d: returned uninitialized TypedExpr", i)
+			if err == nil {
+				for _, e := range typedExprs {
+					if e == nil {
+						t.Errorf("%d: returned uninitialized TypedExpr", i)
+					}
 				}
 			}
 			switch d.expectedOverload {
@@ -329,19 +345,19 @@ func TestGetMostSignificantOverload(t *testing.T) {
 	}
 	returnTyper := FixedReturnType(types.Int)
 	newOverload := func(schema string, oid oid.Oid) QualifiedOverload {
-		return QualifiedOverload{Schema: schema, Overload: &Overload{Oid: oid, Types: ArgTypes{}, ReturnType: returnTyper}}
+		return QualifiedOverload{Schema: schema, Overload: &Overload{Oid: oid, Types: ParamTypes{}, ReturnType: returnTyper}}
 	}
 
 	testCases := []struct {
 		testName    string
-		overloads   []overloadImpl
+		overloads   []QualifiedOverload
 		searchPath  SearchPath
 		expectedOID int
 		expectedErr string
 	}{
 		{
 			testName: "empty search path",
-			overloads: []overloadImpl{
+			overloads: []QualifiedOverload{
 				newOverload("sc1", 1),
 			},
 			searchPath:  EmptySearchPath,
@@ -349,113 +365,113 @@ func TestGetMostSignificantOverload(t *testing.T) {
 		},
 		{
 			testName: "empty search path but ambiguous",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 2, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc1", Overload: &Overload{Oid: 2, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  EmptySearchPath,
 			expectedErr: "ambiguous call",
 		},
 		{
 			testName: "no udf overload",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "pg_catalog", Overload: &Overload{Oid: 1, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "pg_catalog", Overload: &Overload{Oid: 1, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2", "sc1", "pg_catalog"}),
 			expectedOID: 1,
 		},
 		{
 			testName: "no udf overload but ambiguous",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "pg_catalog", Overload: &Overload{Oid: 1, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "pg_catalog", Overload: &Overload{Oid: 2, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "pg_catalog", Overload: &Overload{Oid: 1, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "pg_catalog", Overload: &Overload{Oid: 2, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2", "sc1", "pg_catalog"}),
 			expectedErr: "ambiguous call",
 		},
 		{
 			testName: "overloads from all schemas in path",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc3", Overload: &Overload{Oid: 3, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc3", Overload: &Overload{Oid: 3, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2", "sc1"}),
 			expectedOID: 3,
 		},
 		{
 			testName: "overloads from all schemas in path but ambiguous",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc3", Overload: &Overload{Oid: 3, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc3", Overload: &Overload{Oid: 4, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc3", Overload: &Overload{Oid: 3, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc3", Overload: &Overload{Oid: 4, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2", "sc1"}),
 			expectedErr: "ambiguous call",
 		},
 		{
 			testName: "overloads from some schemas in path",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc2", Overload: &Overload{Oid: 3, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc2", Overload: &Overload{Oid: 3, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc1", "sc2"}),
 			expectedOID: 1,
 		},
 		{
 			testName: "overloads from some schemas in path but ambiguous",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc2", Overload: &Overload{Oid: 3, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc2", Overload: &Overload{Oid: 3, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2", "sc1"}),
 			expectedErr: "ambiguous call",
 		},
 		{
 			testName: "implicit pg_catalog in path",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc3", Overload: &Overload{Oid: 2, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "pg_catalog", Overload: &Overload{Oid: 3}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc3", Overload: &Overload{Oid: 2, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "pg_catalog", Overload: &Overload{Oid: 3}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2", "sc1"}),
 			expectedOID: 3,
 		},
 		{
 			testName: "explicit pg_catalog in path",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc3", Overload: &Overload{Oid: 2, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "pg_catalog", Overload: &Overload{Oid: 3}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc3", Overload: &Overload{Oid: 2, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "pg_catalog", Overload: &Overload{Oid: 3}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2", "sc1", "pg_catalog"}),
 			expectedOID: 2,
 		},
 		{
 			testName: "unique schema not in path",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2"}),
 			expectedOID: 1,
 		},
 		{
 			testName: "unique schema not in path but ambiguous",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 2, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc1", Overload: &Overload{Oid: 2, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3", "sc2"}),
 			expectedErr: "ambiguous call",
 		},
 		{
 			testName: "not unique schema and schema not in path",
-			overloads: []overloadImpl{
-				QualifiedOverload{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
-				QualifiedOverload{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ArgTypes{}, ReturnType: returnTyper}},
+			overloads: []QualifiedOverload{
+				{Schema: "sc1", Overload: &Overload{Oid: 1, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
+				{Schema: "sc2", Overload: &Overload{Oid: 2, IsUDF: true, Types: ParamTypes{}, ReturnType: returnTyper}},
 			},
 			searchPath:  makeSearchPath([]string{"sc3"}),
 			expectedErr: "unknown signature",
@@ -465,7 +481,16 @@ func TestGetMostSignificantOverload(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
 			expr := FuncExpr{Func: ResolvableFunctionReference{FunctionReference: &ResolvedFunctionDefinition{Name: "some_f"}}}
-			overload, err := getMostSignificantOverload(tc.overloads, tc.searchPath, &expr, func() string { return "some signature" })
+			impls := make([]overloadImpl, len(tc.overloads))
+			filters := make([]uint8, len(tc.overloads))
+			for i := range tc.overloads {
+				impls[i] = &tc.overloads[i]
+				filters[i] = uint8(i)
+			}
+			overload, err := getMostSignificantOverload(
+				tc.overloads, impls, filters, tc.searchPath, &expr, nil, /* typedInputExprs */
+				func() string { return "some signature" },
+			)
 			if tc.expectedErr != "" {
 				require.Error(t, err)
 				require.True(t, strings.HasPrefix(err.Error(), tc.expectedErr))

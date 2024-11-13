@@ -12,12 +12,12 @@ import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { createMemoryHistory } from "history";
 import Long from "long";
 import { JobsPageProps } from "./jobsPage";
+import moment from "moment-timezone";
 
 import JobsResponse = cockroach.server.serverpb.JobsResponse;
 import Job = cockroach.server.serverpb.IJobResponse;
 
-const jobsTimeoutErrorMessage =
-  "Unable to retrieve the Jobs table. To reduce the amount of data, try filtering the table.";
+const jobsTimeoutErrorMessage = "Unable to retrieve the Jobs table.";
 
 const defaultJobProperties = {
   username: "root",
@@ -325,15 +325,19 @@ export const earliestRetainedTime = new protos.google.protobuf.Timestamp({
 const getJobsPageProps = (
   jobs: Array<Job>,
   error: Error | null = null,
-  loading = false,
+  isLoading = false,
 ): JobsPageProps => ({
   ...staticJobProps,
-  jobs: JobsResponse.create({
+  jobs: new JobsResponse({
     jobs: jobs,
     earliest_retained_time: earliestRetainedTime,
   }),
   jobsError: error,
-  jobsLoading: loading,
+  reqInFlight: isLoading,
+  isDataValid: !isLoading,
+  columns: null,
+  onColumnsChange: () => {},
+  lastUpdated: moment(),
 });
 
 export const withData: JobsPageProps = getJobsPageProps(allJobsFixture);
@@ -346,5 +350,4 @@ export const loading: JobsPageProps = getJobsPageProps(
 export const error: JobsPageProps = getJobsPageProps(
   allJobsFixture,
   new Error(jobsTimeoutErrorMessage),
-  false,
 );

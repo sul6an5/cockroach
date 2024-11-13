@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/blobs"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -59,26 +60,45 @@ type TestingKnobs struct {
 	// server fails to start.
 	RPCListener net.Listener
 
-	// BinaryVersionOverride overrides the binary version the CRDB server thinks
-	// it's running.
+	// BinaryVersionOverride overrides the binary version that the CRDB server
+	// will end up running. This value could also influence what version the
+	// cluster is bootstrapped at.
 	//
-	// This is consulted when bootstrapping clusters, opting to do it at the
-	// override instead of clusterversion.BinaryVersion (if this server is the
-	// one bootstrapping the cluster). This can als be used by tests to
-	// essentially that a new cluster is not starting from scratch, but instead
-	// is "created" by a node starting up with engines that had already been
-	// bootstrapped, at this BinaryVersionOverride. For example, it allows
-	// convenient creation of a cluster from a 2.1 binary, but that's running at
-	// version 2.0.
+	// This value, when set, influences test cluster/server creation in two
+	// different ways:
 	//
-	// It's also used when advertising this server's binary version when sending
-	// out join requests.
+	// Case 1:
+	// ------
+	// If the test has not overridden the
+	// `cluster.Settings.Version.BinaryMinSupportedVersion`, then the cluster will
+	// be bootstrapped at `binaryMinSupportedVersion`  (if this server is the one
+	// bootstrapping the cluster). After all the servers in the test cluster have
+	// been started, `SET CLUSTER SETTING version = BinaryVersionOverride` will be
+	// run to step through the upgrades until the specified override.
+	//
+	// TODO(adityamaru): We should force tests that set BinaryVersionOverride to
+	// also set BootstrapVersionKeyOverride so as to specify what image they would
+	// like the cluster bootstrapped at before upgrading to BinaryVersionOverride.
+	//
+	// Case 2:
+	// ------
+	// If the test has overridden the
+	// `cluster.Settings.Version.BinaryMinSupportedVersion` then it is not safe
+	// for us to bootstrap at `binaryMinSupportedVersion` as it might be less than
+	// the overridden minimum supported version. Furthermore, we do not have the
+	// initial cluster data (system tables etc.) to bootstrap at the overridden
+	// minimum supported version. In this case we bootstrap at
+	// `BinaryVersionOverride` and populate the cluster with initial data
+	// corresponding to the `binaryVersion`. In other words no upgrades are
+	// *really* run and the server only thinks that it is running at
+	// `BinaryVersionOverride`. Tests that fall in this category should be audited
+	// for correctness.
+	//
+	// The version that we bootstrap at is also used when advertising this
+	// server's binary version when sending out join requests.
 	//
 	// NB: When setting this, you probably also want to set
 	// DisableAutomaticVersionUpgrade.
-	//
-	// TODO(irfansharif): Update users of this testing knob to use the
-	// appropriate clusterversion.Handle instead.
 	BinaryVersionOverride roachpb.Version
 	// An (additional) callback invoked whenever a
 	// node is permanently removed from the cluster.
@@ -110,6 +130,18 @@ type TestingKnobs struct {
 	// StubTimeNow allows tests to override the timeutil.Now() function used
 	// in the jobs endpoint to calculate earliest_retained_time.
 	StubTimeNow func() time.Time
+
+	// We use clusterversion.Key rather than a roachpb.Version because it will be used
+	// to get initial values to use during bootstrap.
+	BootstrapVersionKeyOverride clusterversion.Key
+
+	// RequireGracefulDrain, if set, causes a shutdown to fail with a log.Fatal
+	// if the server is not gracefully drained prior to its stopper shutting down.
+	RequireGracefulDrain bool
+
+	// DrainReportCh, if set, is a channel that will be notified when
+	// the SQL service shuts down.
+	DrainReportCh chan struct{}
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

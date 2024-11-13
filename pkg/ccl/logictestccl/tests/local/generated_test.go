@@ -16,8 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -46,7 +45,7 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
@@ -108,6 +107,13 @@ func TestCCLLogic_crdb_internal(
 	runCCLLogicTest(t, "crdb_internal")
 }
 
+func TestCCLLogic_explain_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "explain_redact")
+}
+
 func TestCCLLogic_new_schema_changer(
 	t *testing.T,
 ) {
@@ -157,6 +163,13 @@ func TestCCLLogic_partitioning_index(
 	runCCLLogicTest(t, "partitioning_index")
 }
 
+func TestCCLLogic_redact_descriptor(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "redact_descriptor")
+}
+
 func TestCCLLogic_restore(
 	t *testing.T,
 ) {
@@ -169,6 +182,20 @@ func TestCCLLogic_schema_change_in_txn(
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "schema_change_in_txn")
+}
+
+func TestCCLLogic_show_create(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "show_create")
+}
+
+func TestCCLLogic_tenant_capability(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "tenant_capability")
 }
 
 func TestCCLLogic_tenant_usage(

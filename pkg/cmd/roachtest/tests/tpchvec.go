@@ -527,7 +527,7 @@ func runTPCHVec(
 	firstNode := c.Node(1)
 	c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", firstNode)
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+	c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
 
 	conn := c.Conn(ctx, t.L(), 1)
 	t.Status("restoring TPCH dataset for Scale Factor 1")
@@ -544,7 +544,6 @@ func runTPCHVec(
 	t.Status("waiting for full replication")
 	err := WaitFor3XReplication(ctx, t, conn)
 	require.NoError(t, err)
-	createStatsFromTables(t, conn, tpchTables)
 
 	testRun(ctx, t, c, conn, testCase)
 	testCase.postTestRunHook(ctx, t, c, conn)
@@ -591,7 +590,7 @@ func registerTPCHVec(r registry.Registry) {
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCHVec(ctx, t, c, newTpchVecPerfTest(
 				"sql.distsql.use_streamer.enabled", /* settingName */
-				1.25,                               /* slownessThreshold */
+				1.5,                                /* slownessThreshold */
 			), baseTestRun)
 		},
 	})

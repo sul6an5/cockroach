@@ -43,11 +43,12 @@ const (
 		payload BYTES NOT NULL`
 )
 
+var RandomSeed = workload.NewInt64RandomSeed()
+
 type indexes struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed        int64
 	idxs        int
 	unique      bool
 	payload     int
@@ -62,15 +63,16 @@ var indexesMeta = workload.Meta{
 	Name:        `indexes`,
 	Description: `Indexes writes to a table with a variable number of secondary indexes`,
 	Version:     `1.0.0`,
+	RandomSeed:  RandomSeed,
 	New: func() workload.Generator {
 		g := &indexes{}
 		g.flags.FlagSet = pflag.NewFlagSet(`indexes`, pflag.ContinueOnError)
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.IntVar(&g.idxs, `secondary-indexes`, 1, `Number of indexes to add to the table.`)
 		g.flags.BoolVar(&g.unique, `unique-indexes`, false, `Use UNIQUE secondary indexes.`)
 		g.flags.IntVar(&g.payload, `payload`, 64, `Size of the unindexed payload column.`)
 		g.flags.Uint64Var(&g.cycleLength, `cycle-length`, math.MaxUint64,
 			`Number of keys repeatedly accessed by each writer through upserts.`)
+		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -94,7 +96,7 @@ func (w *indexes) Hooks() workload.Hooks {
 			}
 			return nil
 		},
-		PostLoad: func(sqlDB *gosql.DB) error {
+		PostLoad: func(_ context.Context, sqlDB *gosql.DB) error {
 			// Prevent the merge queue from immediately discarding our splits.
 			if err := maybeDisableMergeQueue(sqlDB); err != nil {
 				return err
@@ -156,9 +158,8 @@ func (w *indexes) Ops(
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
-	cfg := workload.MultiConnPoolCfg{
-		MaxTotalConnections: w.connFlags.Concurrency + 1,
-	}
+	cfg := workload.NewMultiConnPoolCfgFromFlags(w.connFlags)
+	cfg.MaxTotalConnections = w.connFlags.Concurrency + 1
 	mcp, err := workload.NewMultiConnPool(ctx, cfg, urls...)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -170,11 +171,11 @@ func (w *indexes) Ops(
 		op := &indexesOp{
 			config: w,
 			hists:  reg.GetHandle(),
-			rand:   rand.New(rand.NewSource(int64((i + 1)) * w.seed)),
+			rand:   rand.New(rand.NewSource(int64((i + 1)) * RandomSeed.Seed())),
 			buf:    make([]byte, w.payload),
 		}
 		op.stmt = op.sr.Define(stmt)
-		if err := op.sr.Init(ctx, "indexes", mcp, w.connFlags); err != nil {
+		if err := op.sr.Init(ctx, "indexes", mcp); err != nil {
 			return workload.QueryLoad{}, err
 		}
 		ql.WorkerFns = append(ql.WorkerFns, op.run)

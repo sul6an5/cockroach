@@ -56,33 +56,6 @@ func makePerNodeZipRequests(prefix, id string, status serverpb.StatusClient) []z
 	}
 }
 
-// Tables collected from each node in a debug zip using SQL.
-var debugZipTablesPerNode = []string{
-	"crdb_internal.feature_usage",
-
-	"crdb_internal.gossip_alerts",
-	"crdb_internal.gossip_liveness",
-	"crdb_internal.gossip_network",
-	"crdb_internal.gossip_nodes",
-
-	"crdb_internal.leases",
-
-	"crdb_internal.node_build_info",
-	"crdb_internal.node_contention_events",
-	"crdb_internal.node_distsql_flows",
-	"crdb_internal.node_execution_insights",
-	"crdb_internal.node_inflight_trace_spans",
-	"crdb_internal.node_metrics",
-	"crdb_internal.node_queries",
-	"crdb_internal.node_runtime_info",
-	"crdb_internal.node_sessions",
-	"crdb_internal.node_statement_statistics",
-	"crdb_internal.node_transaction_statistics",
-	"crdb_internal.node_transactions",
-	"crdb_internal.node_txn_stats",
-	"crdb_internal.active_range_feeds",
-}
-
 // collectCPUProfiles collects CPU profiles in parallel over all nodes
 // (this is useful since these profiles contain profiler labels, which
 // can then be correlated across nodes).
@@ -94,7 +67,7 @@ var debugZipTablesPerNode = []string{
 // This is called first and in isolation, before other zip operations
 // possibly influence the nodes.
 func (zc *debugZipContext) collectCPUProfiles(
-	ctx context.Context, ni nodesInfo, livenessByNodeID nodeLivenesses,
+	ctx context.Context, ni *serverpb.NodesListResponse, livenessByNodeID nodeLivenesses,
 ) error {
 	if zipCtx.cpuProfDuration <= 0 {
 		// Nothing to do; return early.
@@ -109,11 +82,11 @@ func (zc *debugZipContext) collectCPUProfiles(
 
 	zc.clusterPrinter.info("requesting CPU profiles")
 
-	if ni.nodesListResponse == nil {
+	if ni == nil {
 		return errors.AssertionFailedf("nodes list is empty; nothing to do")
 	}
 
-	nodeList := ni.nodesListResponse.Nodes
+	nodeList := ni.Nodes
 	// NB: this takes care not to produce non-deterministic log output.
 	resps := make([]profData, len(nodeList))
 	for i := range nodeList {
@@ -160,7 +133,7 @@ func (zc *debugZipContext) collectCPUProfiles(
 			continue // skipped node
 		}
 		nodeID := nodeList[i].NodeID
-		prefix := fmt.Sprintf("%s/%s", nodesPrefix, fmt.Sprintf("%d", nodeID))
+		prefix := fmt.Sprintf("%s%s/%s", zc.prefix, nodesPrefix, fmt.Sprintf("%d", nodeID))
 		s := zc.clusterPrinter.start("profile for node %d", nodeID)
 		if err := zc.z.createRawOrError(s, prefix+"/cpu.pprof", pd.data, pd.err); err != nil {
 			return err
@@ -193,9 +166,10 @@ func (zc *debugZipContext) collectPerNodeData(
 			return nil
 		}
 	}
+
 	nodePrinter := zipCtx.newZipReporter("node %d", nodeID)
 	id := fmt.Sprintf("%d", nodeID)
-	prefix := fmt.Sprintf("%s/%s", nodesPrefix, id)
+	prefix := fmt.Sprintf("%s%s/%s", zc.prefix, nodesPrefix, id)
 
 	if !zipCtx.nodes.isIncluded(nodeID) {
 		if err := zc.z.createRaw(nodePrinter.start("skipping node"), prefix+".skipped",
@@ -229,10 +203,10 @@ func (zc *debugZipContext) collectPerNodeData(
 	curSQLConn := guessNodeURL(zc.firstNodeSQLConn.GetURL(), sqlAddr.AddressField)
 	nodePrinter.info("using SQL connection URL: %s", curSQLConn.GetURL())
 
-	for _, table := range debugZipTablesPerNode {
-		query := fmt.Sprintf(`SELECT * FROM %s`, table)
-		if override, ok := customQuery[table]; ok {
-			query = override
+	for _, table := range zipInternalTablesPerNode.GetTables() {
+		query, err := zipInternalTablesPerNode.QueryForTable(table, zipCtx.redact)
+		if err != nil {
+			return err
 		}
 		if err := zc.dumpTableDataForZip(nodePrinter, curSQLConn, prefix, table, query); err != nil {
 			return errors.Wrapf(err, "fetching %s", table)
@@ -494,7 +468,7 @@ func (zc *debugZipContext) collectPerNodeData(
 					var err error
 					entries, err = zc.status.LogFile(
 						ctx, &serverpb.LogFileRequest{
-							NodeId: id, File: file.Name, Redact: zipCtx.redactLogs,
+							NodeId: id, File: file.Name, Redact: zipCtx.redact,
 						})
 					return err
 				}); requestErr != nil {
@@ -526,7 +500,7 @@ func (zc *debugZipContext) collectPerNodeData(
 					// most conservative way possible. (It's not great that
 					// possibly confidential data flew over the network, but
 					// at least it stops here.)
-					if zipCtx.redactLogs && !e.Redactable {
+					if zipCtx.redact && !e.Redactable {
 						e.Message = "REDACTEDBYZIP"
 						// We're also going to print a warning at the end.
 						warnRedactLeak = true
@@ -544,34 +518,36 @@ func (zc *debugZipContext) collectPerNodeData(
 				// Defer the warning, so that it does not get "drowned" as
 				// part of the main zip output.
 				defer func(fileName string) {
-					fmt.Fprintf(stderr, "WARNING: server-side redaction failed for %s, completed client-side (--redact-logs=true)\n", fileName)
+					fmt.Fprintf(stderr, "WARNING: server-side redaction failed for %s, completed client-side (--redact=true)\n", fileName)
 				}(file.Name)
 			}
 		}
 	}
 
-	var ranges *serverpb.RangesResponse
-	s = nodePrinter.start("requesting ranges")
-	if requestErr := zc.runZipFn(ctx, s, func(ctx context.Context) error {
-		var err error
-		ranges, err = zc.status.Ranges(ctx, &serverpb.RangesRequest{NodeId: id})
-		return err
-	}); requestErr != nil {
-		if err := zc.z.createError(s, prefix+"/ranges", requestErr); err != nil {
+	if zipCtx.includeRangeInfo {
+		var ranges *serverpb.RangesResponse
+		s = nodePrinter.start("requesting ranges")
+		if requestErr := zc.runZipFn(ctx, s, func(ctx context.Context) error {
+			var err error
+			ranges, err = zc.status.Ranges(ctx, &serverpb.RangesRequest{NodeId: id})
 			return err
-		}
-	} else {
-		s.done()
-		nodePrinter.info("%d ranges found", len(ranges.Ranges))
-		sort.Slice(ranges.Ranges, func(i, j int) bool {
-			return ranges.Ranges[i].State.Desc.RangeID <
-				ranges.Ranges[j].State.Desc.RangeID
-		})
-		for _, r := range ranges.Ranges {
-			s := nodePrinter.start("writing range %d", r.State.Desc.RangeID)
-			name := fmt.Sprintf("%s/ranges/%s", prefix, r.State.Desc.RangeID)
-			if err := zc.z.createJSON(s, name+".json", r); err != nil {
+		}); requestErr != nil {
+			if err := zc.z.createError(s, prefix+"/ranges", requestErr); err != nil {
 				return err
+			}
+		} else {
+			s.done()
+			nodePrinter.info("%d ranges found", len(ranges.Ranges))
+			sort.Slice(ranges.Ranges, func(i, j int) bool {
+				return ranges.Ranges[i].State.Desc.RangeID <
+					ranges.Ranges[j].State.Desc.RangeID
+			})
+			for _, r := range ranges.Ranges {
+				s := nodePrinter.start("writing range %d", r.State.Desc.RangeID)
+				name := fmt.Sprintf("%s/ranges/%s", prefix, r.State.Desc.RangeID)
+				if err := zc.z.createJSON(s, name+".json", r); err != nil {
+					return err
+				}
 			}
 		}
 	}

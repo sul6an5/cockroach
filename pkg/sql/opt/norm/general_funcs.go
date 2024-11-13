@@ -64,6 +64,18 @@ func (c *CustomFuncs) IsTimestampTZ(scalar opt.ScalarExpr) bool {
 	return scalar.DataType().Family() == types.TimestampTZFamily
 }
 
+// IsJSON returns true if the given scalar expression is of type
+// JSON.
+func (c *CustomFuncs) IsJSON(scalar opt.ScalarExpr) bool {
+	return scalar.DataType().Family() == types.JsonFamily
+}
+
+// IsInt returns true if the given scalar expression is of one of the
+// integer types.
+func (c *CustomFuncs) IsInt(scalar opt.ScalarExpr) bool {
+	return scalar.DataType().Family() == types.IntFamily
+}
+
 // BoolType returns the boolean SQL type.
 func (c *CustomFuncs) BoolType() *types.T {
 	return types.Bool
@@ -287,6 +299,11 @@ func (c *CustomFuncs) DuplicateColumnIDs(
 	return newTableID, newColIDs
 }
 
+// MakeBoolCol creates a new column of type Bool and returns its ID.
+func (c *CustomFuncs) MakeBoolCol() opt.ColumnID {
+	return c.mem.Metadata().AddColumn("", types.Bool)
+}
+
 // ----------------------------------------------------------------------
 //
 // Outer column functions
@@ -463,6 +480,23 @@ func (c *CustomFuncs) HasZeroOrOneRow(input memo.RelExpr) bool {
 // CanHaveZeroRows returns true if the input expression might return zero rows.
 func (c *CustomFuncs) CanHaveZeroRows(input memo.RelExpr) bool {
 	return input.Relational().Cardinality.CanBeZero()
+}
+
+// HasBoundedCardinality returns true if the input expression returns a bounded
+// number of rows.
+func (c *CustomFuncs) HasBoundedCardinality(input memo.RelExpr) bool {
+	return !input.Relational().Cardinality.IsUnbounded()
+}
+
+// GetLimitFromCardinality returns a ConstExpr equal to the upper bound on the
+// input expression's cardinality. It panics if the expression is unbounded.
+func (c *CustomFuncs) GetLimitFromCardinality(input memo.RelExpr) opt.ScalarExpr {
+	if input.Relational().Cardinality.IsUnbounded() {
+		panic(errors.AssertionFailedf("called GetLimitFromCardinality on unbounded expression"))
+	}
+	return c.f.ConstructConstVal(
+		tree.NewDInt(tree.DInt(input.Relational().Cardinality.Max)), types.Int,
+	)
 }
 
 // ----------------------------------------------------------------------

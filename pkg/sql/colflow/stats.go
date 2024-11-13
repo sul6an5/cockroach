@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -32,15 +33,16 @@ import (
 // colexecop.VectorizedStatsCollector's childStatsCollectors.
 type childStatsCollector interface {
 	getElapsedTime() time.Duration
+	getElapsedCPUTime() time.Duration
 }
 
 // batchInfoCollector is a helper used by collector implementations.
 //
-// It wraps an Operator and keeps track of how much time was spent while calling
-// Next on the underlying Operator and how many batches and tuples were
-// returned.
+// It wraps a colexecop.Operator (inside of the colexecop.OneInputNode) and
+// keeps track of how much time was spent while calling Next on the underlying
+// Operator and how many batches and tuples were returned.
 type batchInfoCollector struct {
-	colexecop.Operator
+	colexecop.OneInputNode
 	colexecop.NonExplainable
 	componentID execinfrapb.ComponentID
 
@@ -51,6 +53,9 @@ type batchInfoCollector struct {
 		initialized           bool
 		numBatches, numTuples uint64
 	}
+
+	// ctx is used only by the init() adapter.
+	ctx context.Context
 
 	// batch is the last batch returned by the wrapped operator.
 	batch coldata.Batch
@@ -78,16 +83,30 @@ func makeBatchInfoCollector(
 		colexecerror.InternalError(errors.AssertionFailedf("input watch is nil"))
 	}
 	return batchInfoCollector{
-		Operator:             op,
+		OneInputNode:         colexecop.NewOneInputNode(op),
 		componentID:          id,
 		stopwatch:            inputWatch,
 		childStatsCollectors: childStatsCollectors,
 	}
 }
 
+func (bic *batchInfoCollector) init() {
+	bic.Input.Init(bic.ctx)
+}
+
 // Init is part of the colexecop.Operator interface.
 func (bic *batchInfoCollector) Init(ctx context.Context) {
-	bic.Operator.Init(ctx)
+	bic.ctx = ctx
+	bic.stopwatch.Start()
+	// Wrap the call to Init() with a panic catcher in order to get the correct
+	// execution time (e.g. in the statement bundle).
+	err := colexecerror.CatchVectorizedRuntimeError(bic.init)
+	bic.stopwatch.Stop()
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	// Unset the context so that it's not used outside of the init() function.
+	bic.ctx = nil
 	bic.mu.Lock()
 	// If we got here, then Init above succeeded, so the wrapped operator has
 	// been properly initialized.
@@ -96,7 +115,7 @@ func (bic *batchInfoCollector) Init(ctx context.Context) {
 }
 
 func (bic *batchInfoCollector) next() {
-	bic.batch = bic.Operator.Next()
+	bic.batch = bic.Input.Next()
 }
 
 // Next is part of the colexecop.Operator interface.
@@ -122,24 +141,42 @@ func (bic *batchInfoCollector) Next() coldata.Batch {
 // operator. ok indicates whether the stats collection was successful.
 func (bic *batchInfoCollector) finishAndGetStats() (
 	numBatches, numTuples uint64,
-	time time.Duration,
+	time, cpuTime time.Duration,
 	ok bool,
 ) {
 	tm := bic.stopwatch.Elapsed()
+	cpuTm := bic.stopwatch.ElapsedCPU()
 	// Subtract the time spent in each of the child stats collectors, to produce
 	// the amount of time that the wrapped operator spent doing work itself, not
 	// including time spent waiting on its inputs.
 	for _, statsCollectors := range bic.childStatsCollectors {
 		tm -= statsCollectors.getElapsedTime()
+		cpuTm -= statsCollectors.getElapsedCPUTime()
+	}
+	if buildutil.CrdbTestBuild {
+		if tm < 0 {
+			colexecerror.InternalError(errors.AssertionFailedf("unexpectedly execution time is negative"))
+		}
+	}
+	if cpuTm < 0 {
+		// The internal clock used by grunning is non-monotonic, so in rare cases we
+		// can end up measuring a larger duration for the child operators than for
+		// the parent.
+		cpuTm = 0
 	}
 	bic.mu.Lock()
 	defer bic.mu.Unlock()
-	return bic.mu.numBatches, bic.mu.numTuples, tm, bic.mu.initialized
+	return bic.mu.numBatches, bic.mu.numTuples, tm, cpuTm, bic.mu.initialized
 }
 
 // getElapsedTime implements the childStatsCollector interface.
 func (bic *batchInfoCollector) getElapsedTime() time.Duration {
 	return bic.stopwatch.Elapsed()
+}
+
+// getElapsedCPUTime implements the childStatsCollector interface.
+func (bic *batchInfoCollector) getElapsedCPUTime() time.Duration {
+	return bic.stopwatch.ElapsedCPU()
 }
 
 // newVectorizedStatsCollector creates a colexecop.VectorizedStatsCollector
@@ -181,7 +218,7 @@ type vectorizedStatsCollectorImpl struct {
 
 // GetStats is part of the colexecop.VectorizedStatsCollector interface.
 func (vsc *vectorizedStatsCollectorImpl) GetStats() *execinfrapb.ComponentStats {
-	numBatches, numTuples, time, ok := vsc.batchInfoCollector.finishAndGetStats()
+	numBatches, numTuples, time, cpuTime, ok := vsc.batchInfoCollector.finishAndGetStats()
 	if !ok {
 		// The stats collection wasn't successful for some reason, so we will
 		// return an empty object (since nil is not allowed by the contract of
@@ -199,6 +236,12 @@ func (vsc *vectorizedStatsCollectorImpl) GetStats() *execinfrapb.ComponentStats 
 	var s *execinfrapb.ComponentStats
 	if vsc.columnarizer != nil {
 		s = vsc.columnarizer.GetStats()
+
+		// If the columnarizer is wrapping an operator that performs KV operations,
+		// we must subtract the CPU time spent performing KV work on a SQL goroutine
+		// from the measured CPU time. If the wrapped operator does not perform KV
+		// operations, this value will be zero.
+		cpuTime -= s.KV.KVCPUTime.Value()
 	} else {
 		// There was no root columnarizer, so create a new stats object.
 		s = &execinfrapb.ComponentStats{Component: vsc.componentID}
@@ -212,23 +255,37 @@ func (vsc *vectorizedStatsCollectorImpl) GetStats() *execinfrapb.ComponentStats 
 	}
 
 	if vsc.kvReader != nil {
-		// Note that kvReader is non-nil only for ColBatchScans, and this is the
-		// only case when we want to add the number of rows read, bytes read,
-		// and the contention time (because the wrapped row-execution KV reading
-		// processors - joinReaders, tableReaders, zigzagJoiners, and
-		// invertedJoiners - will add these statistics themselves). Similarly,
-		// for those wrapped processors it is ok to show the time as "execution
-		// time" since "KV time" would only make sense for tableReaders, and
-		// they are less likely to be wrapped than others.
+		// Note that kvReader is non-nil only for vectorized operators that perform
+		// kv operations, and this is the only case when we want to add the number
+		// of rows read, bytes read, and the contention time (because the wrapped
+		// row-execution KV reading processors - joinReaders, tableReaders,
+		// zigzagJoiners, and invertedJoiners - will add these statistics
+		// themselves). Similarly, for those wrapped processors it is ok to show the
+		// time as "execution time" since "KV time" would only make sense for
+		// tableReaders, and they are less likely to be wrapped than others.
 		s.KV.KVTime.Set(time)
 		s.KV.TuplesRead.Set(uint64(vsc.kvReader.GetRowsRead()))
 		s.KV.BytesRead.Set(uint64(vsc.kvReader.GetBytesRead()))
 		s.KV.BatchRequestsIssued.Set(uint64(vsc.kvReader.GetBatchRequestsIssued()))
-		s.KV.ContentionTime.Set(vsc.kvReader.GetCumulativeContentionTime())
+		totalContentionTime, events := vsc.kvReader.GetContentionInfo()
+		s.KV.ContentionTime.Set(totalContentionTime)
+		s.KV.ContentionEvents = events
 		scanStats := vsc.kvReader.GetScanStats()
 		execstats.PopulateKVMVCCStats(&s.KV, &scanStats)
+		s.Exec.ConsumedRU.Set(scanStats.ConsumedRU)
+
+		// In order to account for SQL CPU time, we have to subtract the CPU time
+		// spent while serving KV requests on a SQL goroutine.
+		cpuTime -= vsc.kvReader.GetKVCPUTime()
 	} else {
 		s.Exec.ExecTime.Set(time)
+	}
+	if cpuTime > 0 && grunning.Supported() {
+		// Note that in rare cases, the measured CPU time can be less than zero
+		// grunning uses a non-monotonic clock. This should only happen rarely when
+		// the actual CPU time is very small, so it seems OK to not set the value in
+		// that case.
+		s.Exec.CPUTime.Set(cpuTime)
 	}
 
 	s.Output.NumBatches.Set(numBatches)
@@ -264,7 +321,7 @@ type networkVectorizedStatsCollectorImpl struct {
 
 // GetStats is part of the colexecop.VectorizedStatsCollector interface.
 func (nvsc *networkVectorizedStatsCollectorImpl) GetStats() *execinfrapb.ComponentStats {
-	numBatches, numTuples, time, ok := nvsc.batchInfoCollector.finishAndGetStats()
+	numBatches, numTuples, time, _, ok := nvsc.batchInfoCollector.finishAndGetStats()
 	if !ok {
 		// The stats collection wasn't successful for some reason, so we will
 		// return an empty object (since nil is not allowed by the contract of

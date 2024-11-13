@@ -34,6 +34,9 @@ func TestPurgeSession(t *testing.T) {
 
 	ts := s.(*TestServer)
 	userName := username.TestUserName()
+	if err := ts.createAuthUser(userName, false /* isAdmin */); err != nil {
+		t.Fatal(err)
+	}
 
 	_, hashedSecret, err := CreateAuthSecret()
 	if err != nil {
@@ -44,19 +47,15 @@ func TestPurgeSession(t *testing.T) {
 	if _, err := db.Exec(`SET CLUSTER SETTING server.web_session.purge.ttl = '5s'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`SET CLUSTER SETTING server.web_session.auto_logout.timeout = '10s'`); err != nil {
-		t.Fatal(err)
-	}
 
 	settingsValues := &ts.st.SV
 	var (
-		purgeTTL          = webSessionPurgeTTL.Get(settingsValues)
-		autoLogoutTimeout = webSessionAutoLogoutTimeout.Get(settingsValues)
+		purgeTTL = webSessionPurgeTTL.Get(settingsValues)
 	)
 
 	insertSessionStmt := `
-INSERT INTO system.web_sessions ("hashedSecret", username, "expiresAt", "revokedAt", "lastUsedAt") 
-VALUES($1, $2, $3, $4, $5)
+INSERT INTO system.web_sessions ("hashedSecret", username, "expiresAt", "revokedAt", user_id)
+VALUES($1, $2, $3, $4, (SELECT user_id FROM system.users WHERE username = $2))
 `
 	// Inserts three seemingly-old sessions.
 	// Each iteration of the loop inserts a session, rewinding the age of
@@ -65,7 +64,7 @@ VALUES($1, $2, $3, $4, $5)
 		currTime := ts.clock.PhysicalTime()
 
 		// Initialize each timestamp column at the current time.
-		expiresAt, revokedAt, lastUsedAt := currTime, currTime, currTime
+		expiresAt, revokedAt := currTime, currTime
 
 		// A few extra seconds of margin to be added to a timestamp.
 		// This helps avoid having deletion checks at the boundary of valid
@@ -84,21 +83,17 @@ VALUES($1, $2, $3, $4, $5)
 			case "revokedAt":
 				durationSinceRevocation := purgeTTL + margin
 				revokedAt = revokedAt.Add(durationSinceRevocation * time.Duration(-1))
-			case "lastUsedAt":
-				durationSinceLastUsed := autoLogoutTimeout + margin
-				lastUsedAt = lastUsedAt.Add(durationSinceLastUsed * time.Duration(-1))
 			}
 			if _, err = ts.sqlServer.internalExecutor.QueryRowEx(
 				ctx,
 				"add-session",
 				nil, /* txn */
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+				sessiondata.RootUserSessionDataOverride,
 				insertSessionStmt,
 				hashedSecret,
 				userName.Normalized(),
 				expiresAt,
 				revokedAt,
-				lastUsedAt,
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -113,10 +108,15 @@ VALUES($1, $2, $3, $4, $5)
 		return count
 	}
 
+	purgeOldSessions := func() {
+		systemLogsToGC := getTablesToGC()
+		runSystemLogGC(ctx, ts.sqlServer, ts.Cfg.Settings, systemLogsToGC)
+	}
+
 	// Check deletion for old expired sessions.
 	insertOldSessions("expiresAt")
 
-	ts.authentication.purgeOldSessions(ctx)
+	purgeOldSessions()
 
 	if webSessionCount() != 0 {
 		t.Fatal("failed to delete sessions with expiration older than the purge TTL")
@@ -125,19 +125,9 @@ VALUES($1, $2, $3, $4, $5)
 	// Check deletion for old revoked sessions.
 	insertOldSessions("revokedAt")
 
-	ts.authentication.purgeOldSessions(ctx)
+	purgeOldSessions()
 
 	if webSessionCount() != 0 {
 		t.Fatal("failed to delete sessions with revocation older than the purge TTL")
-	}
-
-	// Check deletion for sessions that have timed out since they
-	// were last used.
-	insertOldSessions("lastUsedAt")
-
-	ts.authentication.purgeOldSessions(ctx)
-
-	if webSessionCount() != 0 {
-		t.Fatal("failed to delete sessions after the auto-logout timeout")
 	}
 }

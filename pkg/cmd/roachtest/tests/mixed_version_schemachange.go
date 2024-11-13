@@ -13,9 +13,11 @@ package tests
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
@@ -23,12 +25,16 @@ import (
 func registerSchemaChangeMixedVersions(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:  "schemachange/mixed-versions",
-		Owner: registry.OwnerSQLSchema,
+		Owner: registry.OwnerSQLFoundations,
 		// This tests the work done for 20.1 that made schema changes jobs and in
 		// addition prevented making any new schema changes on a mixed cluster in
 		// order to prevent bugs during upgrades.
-		Cluster: r.MakeClusterSpec(4),
+		Cluster:    r.MakeClusterSpec(4),
+		NativeLibs: registry.LibGEOS,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			if c.IsLocal() && runtime.GOARCH == "arm64" {
+				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+			}
 			maxOps := 100
 			concurrency := 5
 			if c.IsLocal() {
@@ -56,12 +62,6 @@ func runSchemaChangeWorkloadStep(loadNode, maxOps, concurrency int) versionStep 
 		t.L().Printf("Workload step run: %d", numFeatureRuns)
 		runCmd := []string{
 			"./workload run schemachange --verbose=1",
-			// The workload is still in development and occasionally discovers schema
-			// change errors so for now we don't fail on them but only on panics, server
-			// crashes, deadlocks, etc.
-			// TODO(spaskob): remove when https://github.com/cockroachdb/cockroach/issues/47430
-			// is closed.
-			"--tolerate-errors=true",
 			fmt.Sprintf("--max-ops %d", maxOps),
 			fmt.Sprintf("--concurrency %d", concurrency),
 			fmt.Sprintf("{pgurl:1-%d}", u.c.Spec().NodeCount),
@@ -78,14 +78,11 @@ func runSchemaChangeMixedVersions(
 	concurrency int,
 	buildVersion version.Version,
 ) {
-	predecessorVersion, err := PredecessorVersion(buildVersion)
+	predecessorVersion, err := version.PredecessorVersion(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// An empty string will lead to the cockroach binary specified by flag
-	// `cockroach` to be used.
-	const mainVersion = ""
 	schemaChangeStep := runSchemaChangeWorkloadStep(c.All().RandNode()[0], maxOps, concurrency)
 	if buildVersion.Major() < 20 {
 		// Schema change workload is meant to run only on versions 19.2 or higher.
@@ -108,13 +105,13 @@ func runSchemaChangeMixedVersions(
 		// Roll the nodes into the new version one by one, while repeatedly running
 		// schema changes. We use an empty string for the version below, which means
 		// use the main ./cockroach binary (i.e. the one being tested in this run).
-		binaryUpgradeStep(c.Node(3), mainVersion),
+		binaryUpgradeStep(c.Node(3), clusterupgrade.MainVersion),
 		schemaChangeStep,
-		binaryUpgradeStep(c.Node(2), mainVersion),
+		binaryUpgradeStep(c.Node(2), clusterupgrade.MainVersion),
 		schemaChangeStep,
-		binaryUpgradeStep(c.Node(1), mainVersion),
+		binaryUpgradeStep(c.Node(1), clusterupgrade.MainVersion),
 		schemaChangeStep,
-		binaryUpgradeStep(c.Node(4), mainVersion),
+		binaryUpgradeStep(c.Node(4), clusterupgrade.MainVersion),
 		schemaChangeStep,
 
 		// Roll back again, which ought to be fine because the cluster upgrade was
@@ -129,13 +126,13 @@ func runSchemaChangeMixedVersions(
 		schemaChangeStep,
 
 		// Roll nodes forward and finalize upgrade.
-		binaryUpgradeStep(c.Node(4), mainVersion),
+		binaryUpgradeStep(c.Node(4), clusterupgrade.MainVersion),
 		schemaChangeStep,
-		binaryUpgradeStep(c.Node(3), mainVersion),
+		binaryUpgradeStep(c.Node(3), clusterupgrade.MainVersion),
 		schemaChangeStep,
-		binaryUpgradeStep(c.Node(1), mainVersion),
+		binaryUpgradeStep(c.Node(1), clusterupgrade.MainVersion),
 		schemaChangeStep,
-		binaryUpgradeStep(c.Node(2), mainVersion),
+		binaryUpgradeStep(c.Node(2), clusterupgrade.MainVersion),
 		schemaChangeStep,
 
 		allowAutoUpgradeStep(1),

@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/stretchr/testify/require"
 )
 
 // The following tests need both the type checking infrastructure and also
@@ -110,7 +111,7 @@ func TestTypeCheck(t *testing.T) {
 		{`NULL = ALL ARRAY[NULL, NULL]`, `NULL`},
 		{`1 = ALL NULL`, `NULL`},
 		{`'a' = ALL current_schemas(true)`, `'a':::STRING = ALL current_schemas(true)`},
-		{`NULL = ALL current_schemas(true)`, `NULL`},
+		{`NULL = ALL current_schemas(true)`, `NULL = ALL current_schemas(true)`},
 
 		{`INTERVAL '1'`, `'00:00:01':::INTERVAL`},
 		{`DECIMAL '1.0'`, `1.0:::DECIMAL`},
@@ -212,6 +213,13 @@ func TestTypeCheck(t *testing.T) {
 
 		// String preference.
 		{`st_geomfromgeojson($1)`, `st_geomfromgeojson($1:::STRING):::GEOMETRY`},
+
+		// TSQuery and TSVector
+		{`'a' @@ 'b'`, `to_tsvector('a':::STRING) @@ plainto_tsquery('b':::STRING)`},
+		{`'a' @@ 'b':::TSQUERY`, `to_tsvector('a':::STRING) @@ '''b''':::TSQUERY`},
+		{`'a':::TSQUERY @@ 'b'`, `'''a''':::TSQUERY @@ to_tsvector('b':::STRING)`},
+		{`'a' @@ 'b':::TSVECTOR`, `'''a''':::TSQUERY @@ '''b''':::TSVECTOR`},
+		{`'a':::TSVECTOR @@ 'b'`, `'''a''':::TSVECTOR @@ '''b''':::TSQUERY`},
 	}
 	ctx := context.Background()
 	for _, d := range testData {
@@ -221,7 +229,7 @@ func TestTypeCheck(t *testing.T) {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
 			semaCtx := tree.MakeSemaContext()
-			if err := semaCtx.Placeholders.Init(1 /* numPlaceholders */, nil /* typeHints */, false /* fromSQL */); err != nil {
+			if err := semaCtx.Placeholders.Init(1 /* numPlaceholders */, nil /* typeHints */); err != nil {
 				t.Fatal(err)
 			}
 			semaCtx.TypeResolver = mapResolver
@@ -293,7 +301,7 @@ func TestTypeCheckError(t *testing.T) {
 		{`3:::int[]`, `incompatible type annotation for 3 as int[], found type: int`},
 		{`B'1001'::decimal`, `invalid cast: varbit -> decimal`},
 		{`101.3::bit`, `invalid cast: decimal -> bit`},
-		{`ARRAY[1] = ARRAY['foo']`, `could not parse "foo" as type int`},
+		{`ARRAY[1] = ARRAY['foo']`, `unsupported comparison operator: <int[]> = <string[]>`},
 		{`ARRAY[1]::int[] = ARRAY[1.0]::decimal[]`, `unsupported comparison operator: <int[]> = <decimal[]>`},
 		{`ARRAY[1] @> ARRAY['foo']`, `unsupported comparison operator: <int[]> @> <string[]>`},
 		{`ARRAY[1]::int[] @> ARRAY[1.0]::decimal[]`, `unsupported comparison operator: <int[]> @> <decimal[]>`},
@@ -337,6 +345,8 @@ func TestTypeCheckError(t *testing.T) {
 			`1 + 2::d.s.typ`,
 			`type "d.s.typ" does not exist`,
 		},
+		{`() = '03:00:00'`, `unsupported comparison operator: <tuple> = <string>`},
+		{`'03:00:00' > ROW()`, `unsupported comparison operator: <string> > <tuple>`},
 	}
 	ctx := context.Background()
 	for _, d := range testData {
@@ -398,7 +408,7 @@ func TestTypeCheckVolatility(t *testing.T) {
 
 	ctx := context.Background()
 	semaCtx := tree.MakeSemaContext()
-	if err := semaCtx.Placeholders.Init(len(placeholderTypes), placeholderTypes, false /* fromSQL */); err != nil {
+	if err := semaCtx.Placeholders.Init(len(placeholderTypes), placeholderTypes); err != nil {
 		t.Fatal(err)
 	}
 
@@ -434,4 +444,110 @@ func TestTypeCheckVolatility(t *testing.T) {
 			t.Fatalf("%s: %v", tc.expr, err)
 		}
 	}
+}
+
+func TestTypeCheckCollatedString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	// Typecheck without any restrictions.
+	semaCtx := tree.MakeSemaContext()
+	semaCtx.Properties.Require("", 0 /* flags */)
+
+	// Hint a normal string type for $1.
+	placeholderTypes := []*types.T{types.String}
+	err := semaCtx.Placeholders.Init(len(placeholderTypes), placeholderTypes)
+	require.NoError(t, err)
+
+	// The collated string constant must be on the LHS for this test, so that
+	// the type-checker chooses the collated string overload first.
+	expr, err := parser.ParseExpr("'cat'::STRING COLLATE \"en-US-u-ks-level2\" = ($1)")
+	require.NoError(t, err)
+	typed, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
+	require.NoError(t, err)
+
+	rightTyp := typed.(*tree.ComparisonExpr).Right.(tree.TypedExpr).ResolvedType()
+	require.Equal(t, rightTyp.Family(), types.CollatedStringFamily)
+	require.Equal(t, rightTyp.Locale(), "en-US-u-ks-level2")
+}
+
+func TestTypeCheckCaseExprWithPlaceholders(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Typecheck without any restrictions.
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
+	semaCtx.Properties.Require("", 0 /* flags */)
+
+	// Hint all int4 types.
+	placeholderTypes := []*types.T{types.Int4, types.Int4, types.Int4, types.Int4, types.Int4}
+	err := semaCtx.Placeholders.Init(len(placeholderTypes), placeholderTypes)
+	require.NoError(t, err)
+
+	expr, err := parser.ParseExpr("case when 1 < $1 then $2 else $3 end = $4")
+	require.NoError(t, err)
+	typed, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
+	require.NoError(t, err)
+
+	leftTyp := typed.(*tree.ComparisonExpr).Left.(tree.TypedExpr).ResolvedType()
+	require.Equal(t, types.Int4, leftTyp)
+}
+
+func TestTypeCheckCaseExprWithConstantsAndUnresolvedPlaceholders(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Typecheck without any restrictions.
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
+	semaCtx.Properties.Require("", 0 /* flags */)
+
+	// Hint all int4 types, but leave one of the THEN branches unhinted.
+	placeholderTypes := []*types.T{types.Int4, types.Int4, types.Int4, nil, types.Int4}
+	err := semaCtx.Placeholders.Init(len(placeholderTypes), placeholderTypes)
+	require.NoError(t, err)
+
+	expr, err := parser.ParseExpr("case when 1 < $1 then $2 when 1 < $3 then $4 else 3 end = $5")
+	require.NoError(t, err)
+	typed, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
+	require.NoError(t, err)
+
+	leftTyp := typed.(*tree.ComparisonExpr).Left.(tree.TypedExpr).ResolvedType()
+	require.Equal(t, types.Int4, leftTyp)
+
+	for i := 0; i < len(placeholderTypes); i++ {
+		pTyp, _, err := semaCtx.Placeholders.Type(tree.PlaceholderIdx(i))
+		require.NoError(t, err)
+		require.Equal(t, types.Int4, pTyp)
+	}
+}
+
+// Regression test for https://github.com/cockroachdb/cockroach/issues/94192.
+// If an array has only nulls and placeholders, then the type-checker should
+// still infer the types using the placeholder hints.
+func TestTypeCheckArrayWithNullAndPlaceholder(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Typecheck without any restrictions.
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
+	semaCtx.Properties.Require("", 0 /* flags */)
+
+	placeholderTypes := []*types.T{types.Int}
+	err := semaCtx.Placeholders.Init(len(placeholderTypes), placeholderTypes)
+	require.NoError(t, err)
+
+	expr, err := parser.ParseExpr("array[null, $1]::int[]")
+	require.NoError(t, err)
+	typed, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
+	require.NoError(t, err)
+	require.Equal(t, types.IntArray, typed.ResolvedType())
+
+	pTyp, _, err := semaCtx.Placeholders.Type(tree.PlaceholderIdx(0))
+	require.NoError(t, err)
+	require.Equal(t, types.Int, pTyp)
 }

@@ -27,7 +27,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	tu "github.com/cockroachdb/cockroach/pkg/testutils"
+	tu "github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
@@ -116,7 +116,9 @@ func TestBuilder(t *testing.T) {
 				if err != nil {
 					return fmt.Sprintf("error: %s\n", strings.TrimSpace(err.Error()))
 				}
-				f := memo.MakeExprFmtCtx(tester.Flags.ExprFormat, o.Memo(), catalog)
+				f := memo.MakeExprFmtCtx(
+					ctx, tester.Flags.ExprFormat, false /* redactableValues */, o.Memo(), catalog,
+				)
 				f.FormatExpr(o.Memo().RootExpr())
 				return f.Buffer.String()
 

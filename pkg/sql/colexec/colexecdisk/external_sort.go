@@ -113,7 +113,8 @@ const (
 // some amount of RAM for its buffer. This is determined by
 // maxNumberPartitions variable.
 type externalSorter struct {
-	colexecop.OneInputHelper
+	colexecop.OneInputNode
+	colexecop.InitHelper
 	colexecop.NonExplainable
 	colexecop.CloserHelper
 
@@ -127,6 +128,8 @@ type externalSorter struct {
 	// operation. This will be roughly a half of the total limit and is used by
 	// the dequeued batches and the output batch.
 	mergeMemoryLimit int64
+
+	cancelChecker colexecutils.CancelChecker
 
 	state      externalSorterState
 	inputTypes []*types.T
@@ -188,6 +191,7 @@ type externalSorter struct {
 		acquiredFDs int
 	}
 
+	merger  colexecop.ClosableOperator
 	emitter colexecop.Operator
 
 	testingKnobs struct {
@@ -232,6 +236,7 @@ func NewExternalSorter(
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	diskAcc *mon.BoundAccount,
+	converterMemAcc *mon.BoundAccount,
 	testingVecFDsToAcquire int,
 ) colexecop.Operator {
 	if diskQueueCfg.BufferSizeBytes > 0 && maxNumberPartitions == 0 {
@@ -240,6 +245,9 @@ func NewExternalSorter(
 		// the external sorter.
 		// TODO(asubiotto): this number should be tuned.
 		maxNumberPartitions = fdSemaphore.GetLimit() / 16
+		if maxNumberPartitions > maxFDsForSingleOperator {
+			maxNumberPartitions = maxFDsForSingleOperator
+		}
 	}
 	if maxNumberPartitions < colexecop.ExternalSorterMinPartitions {
 		maxNumberPartitions = colexecop.ExternalSorterMinPartitions
@@ -290,14 +298,17 @@ func NewExternalSorter(
 		partitionedDiskQueueSemaphore = nil
 	}
 	es := &externalSorter{
-		OneInputHelper:           colexecop.MakeOneInputHelper(inMemSorter),
+		OneInputNode:             colexecop.NewOneInputNode(inMemSorter),
 		mergeUnlimitedAllocator:  mergeUnlimitedAllocator,
 		outputUnlimitedAllocator: outputUnlimitedAllocator,
 		mergeMemoryLimit:         mergeMemoryLimit,
 		inMemSorter:              inMemSorter,
 		inMemSorterInput:         inputPartitioner.(*inputPartitioningOperator),
 		partitionerCreator: func() colcontainer.PartitionedQueue {
-			return colcontainer.NewPartitionedDiskQueue(inputTypes, diskQueueCfg, partitionedDiskQueueSemaphore, colcontainer.PartitionerStrategyCloseOnNewPartition, diskAcc)
+			return colcontainer.NewPartitionedDiskQueue(
+				inputTypes, diskQueueCfg, partitionedDiskQueueSemaphore,
+				colcontainer.PartitionerStrategyCloseOnNewPartition, diskAcc, converterMemAcc,
+			)
 		},
 		inputTypes:           inputTypes,
 		ordering:             ordering,
@@ -341,8 +352,17 @@ func (s *externalSorter) resetPartitionsInfo(i int) {
 	s.partitionsInfo.maxBatchMemSize[i] = 0
 }
 
+func (s *externalSorter) Init(ctx context.Context) {
+	if !s.InitHelper.Init(ctx) {
+		return
+	}
+	s.Input.Init(s.Ctx)
+	s.cancelChecker.Init(s.Ctx)
+}
+
 func (s *externalSorter) Next() coldata.Batch {
 	for {
+		s.cancelChecker.CheckEveryCall()
 		switch s.state {
 		case externalSorterNewPartition:
 			b := s.Input.Next()
@@ -404,13 +424,19 @@ func (s *externalSorter) Next() coldata.Batch {
 				}
 				n++
 			}
-			merger := s.createMergerForPartitions(n)
-			merger.Init(s.Ctx)
+			// Store the merger in the external sort to make sure it's always
+			// closed correctly. In the happy path, it'll be closed after being
+			// exhausted in the loop below, but in case a panic is thrown (e.g.
+			// due to context cancellation), the merger will be cleaned up in
+			// Close. (In the happy path Close will be called twice on the last
+			// created merger, and that's ok because the interface allows it.)
+			s.merger = s.createMergerForPartitions(n)
+			s.merger.Init(s.Ctx)
 			s.numPartitions -= n
-			for b := merger.Next(); ; b = merger.Next() {
+			for b := s.merger.Next(); ; b = s.merger.Next() {
 				partitionDone := s.enqueue(b)
 				if b.Length() == 0 || partitionDone {
-					if err := merger.Close(s.Ctx); err != nil {
+					if err := s.merger.Close(s.Ctx); err != nil {
 						colexecerror.InternalError(err)
 					}
 					break
@@ -614,6 +640,11 @@ func (s *externalSorter) Close(ctx context.Context) error {
 		lastErr = s.partitioner.Close(ctx)
 		s.partitioner = nil
 	}
+	if s.merger != nil {
+		if err := s.merger.Close(ctx); err != nil {
+			lastErr = err
+		}
+	}
 	if c, ok := s.emitter.(colexecop.Closer); ok {
 		if err := c.Close(ctx); err != nil {
 			lastErr = err
@@ -673,10 +704,13 @@ func (s *externalSorter) createMergerForPartitions(n int) *colexec.OrderedSynchr
 		)
 	}
 
-	// Calculate the limit on the output batch mem size.
+	// Calculate the limit on the output batch mem size as well as the total
+	// number of tuples to merge.
 	outputBatchMemSize := s.mergeMemoryLimit
+	var tuplesToMerge int64
 	for i := s.numPartitions - n; i < s.numPartitions; i++ {
 		outputBatchMemSize -= s.partitionsInfo.maxBatchMemSize[i]
+		tuplesToMerge += int64(s.partitionsInfo.tupleCount[i])
 		s.resetPartitionsInfo(i)
 	}
 	// It is possible that the expected usage of the dequeued batches already
@@ -689,7 +723,8 @@ func (s *externalSorter) createMergerForPartitions(n int) *colexec.OrderedSynchr
 		outputBatchMemSize = minOutputBatchMemSize
 	}
 	return colexec.NewOrderedSynchronizer(
-		s.outputUnlimitedAllocator, outputBatchMemSize, syncInputs, s.inputTypes, s.columnOrdering,
+		s.outputUnlimitedAllocator, outputBatchMemSize, syncInputs,
+		s.inputTypes, s.columnOrdering, tuplesToMerge,
 	)
 }
 

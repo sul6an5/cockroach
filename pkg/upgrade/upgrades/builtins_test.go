@@ -32,7 +32,7 @@ func TestIsAtLeastVersionBuiltin(t *testing.T) {
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
 					DisableAutomaticVersionUpgrade: make(chan struct{}),
-					BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V22_1),
+					BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V22_2),
 				},
 			},
 		},
@@ -46,9 +46,9 @@ func TestIsAtLeastVersionBuiltin(t *testing.T) {
 	)
 	defer tc.Stopper().Stop(ctx)
 
-	v := clusterversion.ByKey(clusterversion.Start22_2).String()
-	// Check that the builtin returns false when comparing against 22.1-2
-	// version because we are still on 22.1-0.
+	v := clusterversion.ByKey(clusterversion.V23_1Start).String()
+	// Check that the builtin returns false when comparing against the new version
+	// version because we are still on the bootstrap version.
 	sqlDB.CheckQueryResults(t, "SELECT crdb_internal.is_at_least_version('"+v+"')", [][]string{{"false"}})
 
 	// Run the upgrade.

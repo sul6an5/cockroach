@@ -17,14 +17,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/backfiller"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -33,16 +32,17 @@ import (
 // given arguments.
 func NewJobRunDependencies(
 	collectionFactory *descs.CollectionFactory,
-	db *kv.DB,
+	db descs.DB,
 	backfiller scexec.Backfiller,
+	spanSplitter scexec.IndexSpanSplitter,
 	merger scexec.Merger,
 	rangeCounter backfiller.RangeCounter,
-	eventLoggerFactory EventLoggerFactory,
+	eventLoggerFactory func(isql.Txn) scrun.EventLogger,
 	jobRegistry *jobs.Registry,
 	job *jobs.Job,
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
-	indexValidator scexec.IndexValidator,
+	indexValidator scexec.Validator,
 	metadataUpdaterFactory MetadataUpdaterFactory,
 	statsRefresher scexec.StatsRefresher,
 	testingKnobs *scexec.TestingKnobs,
@@ -54,6 +54,7 @@ func NewJobRunDependencies(
 		collectionFactory:     collectionFactory,
 		db:                    db,
 		backfiller:            backfiller,
+		spanSplitter:          spanSplitter,
 		merger:                merger,
 		rangeCounter:          rangeCounter,
 		eventLoggerFactory:    eventLoggerFactory,
@@ -73,18 +74,19 @@ func NewJobRunDependencies(
 
 type jobExecutionDeps struct {
 	collectionFactory     *descs.CollectionFactory
-	db                    *kv.DB
-	eventLoggerFactory    func(txn *kv.Txn) scexec.EventLogger
+	db                    descs.DB
 	statsRefresher        scexec.StatsRefresher
 	backfiller            scexec.Backfiller
+	spanSplitter          scexec.IndexSpanSplitter
 	merger                scexec.Merger
 	commentUpdaterFactory MetadataUpdaterFactory
 	rangeCounter          backfiller.RangeCounter
+	eventLoggerFactory    func(isql.Txn) scrun.EventLogger
 	jobRegistry           *jobs.Registry
 	job                   *jobs.Job
 	kvTrace               bool
 
-	indexValidator scexec.IndexValidator
+	indexValidator scexec.Validator
 
 	codec        keys.SQLCodec
 	settings     *cluster.Settings
@@ -104,25 +106,26 @@ func (d *jobExecutionDeps) ClusterSettings() *cluster.Settings {
 func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc) error {
 	var createdJobs []jobspb.JobID
 	var tableStatsToRefresh []descpb.ID
-	err := d.collectionFactory.Txn(ctx, d.db, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+	err := d.db.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
 	) error {
 		pl := d.job.Payload()
 		ed := &execDeps{
 			txnDeps: txnDeps{
 				txn:                txn,
 				codec:              d.codec,
-				descsCollection:    descriptors,
+				descsCollection:    txn.Descriptors(),
 				jobRegistry:        d.jobRegistry,
-				indexValidator:     d.indexValidator,
-				eventLogger:        d.eventLoggerFactory(txn),
+				validator:          d.indexValidator,
 				statsRefresher:     d.statsRefresher,
 				schemaChangerJobID: d.job.ID(),
+				schemaChangerJob:   d.job,
 				kvTrace:            d.kvTrace,
 				settings:           d.settings,
 			},
-			backfiller: d.backfiller,
-			merger:     d.merger,
+			backfiller:   d.backfiller,
+			merger:       d.merger,
+			spanSplitter: d.spanSplitter,
 			backfillerTracker: backfiller.NewTracker(
 				d.codec,
 				d.rangeCounter,
@@ -134,15 +137,15 @@ func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc
 			statements:              d.statements,
 			user:                    pl.UsernameProto.Decode(),
 			clock:                   NewConstantClock(timeutil.FromUnixMicros(pl.StartedMicros)),
-			metadataUpdater:         d.commentUpdaterFactory(ctx, descriptors, txn),
+			metadataUpdater:         d.commentUpdaterFactory(ctx, txn.Descriptors(), txn),
 			sessionData:             d.sessionData,
 			testingKnobs:            d.testingKnobs,
 		}
-		if err := fn(ctx, ed); err != nil {
+		if err := fn(ctx, ed, d.eventLoggerFactory(txn)); err != nil {
 			return err
 		}
 		createdJobs = ed.CreatedJobs()
-		tableStatsToRefresh = ed.getTablesForStatsRefresh()
+		tableStatsToRefresh = ed.tableStatsToRefresh
 		return nil
 	})
 	if err != nil {
@@ -152,11 +155,11 @@ func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc
 		d.jobRegistry.NotifyToResume(ctx, createdJobs...)
 	}
 	if len(tableStatsToRefresh) > 0 {
-		err := d.collectionFactory.Txn(ctx, d.db, func(
-			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		err := d.db.DescsTxn(ctx, func(
+			ctx context.Context, txn descs.Txn,
 		) error {
 			for _, id := range tableStatsToRefresh {
-				tbl, err := descriptors.GetImmutableTableByID(ctx, txn, id, tree.ObjectLookupFlagsWithRequired())
+				tbl, err := txn.Descriptors().ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, id)
 				if err != nil {
 					return err
 				}

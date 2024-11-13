@@ -16,13 +16,17 @@ import (
 	"math/bits"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -37,7 +41,7 @@ type SchemaID int32
 // privilegeBitmap stores a union of zero or more privileges. Each privilege
 // that is present in the bitmap is represented by a bit that is shifted by
 // 1 << privilege.Kind, so that multiple privileges can be stored.
-type privilegeBitmap uint32
+type privilegeBitmap uint64
 
 // Metadata assigns unique ids to the columns, tables, and other metadata used
 // for global identification within the scope of a particular query. These ids
@@ -76,7 +80,8 @@ type privilegeBitmap uint32
 // In this query, `l.x` is not equivalent to `r.x` and `l.y` is not equivalent
 // to `r.y`. Therefore, we need to give these columns different ids.
 type Metadata struct {
-	// schemas stores each schema used in the query, indexed by SchemaID.
+	// schemas stores each schema used by the query if it is a CREATE statement,
+	// indexed by SchemaID.
 	schemas []cat.Schema
 
 	// cols stores information about each metadata column, indexed by
@@ -99,15 +104,6 @@ type Metadata struct {
 	userDefinedTypes      map[oid.Oid]struct{}
 	userDefinedTypesSlice []*types.T
 
-	// deps stores information about all data source objects depended on by the
-	// query, as well as the privileges required to access them. The objects are
-	// deduplicated: any name/object pair shows up at most once.
-	// Note: the same data source object can appear multiple times if different
-	// names were used. For example, in the query `SELECT * from t, db.t` the two
-	// tables might resolve to the same object now but to different objects later;
-	// we want to verify the resolution of both names.
-	deps []mdDep
-
 	// views stores the list of referenced views. This information is only
 	// needed for EXPLAIN (opt, env).
 	views []cat.View
@@ -119,33 +115,30 @@ type Metadata struct {
 	// mutation operators, used to determine the logical properties of WithScan.
 	withBindings map[WithID]Expr
 
+	// dataSourceDeps stores each data source object that the query depends on.
+	dataSourceDeps map[cat.StableID]cat.DataSource
+
+	// udfDeps stores each user-defined function overload that the query depends
+	// on.
+	udfDeps map[cat.StableID]*tree.Overload
+
+	// objectRefsByName stores each unique name that the query uses to reference
+	// each object. It is needed because changes to the search path may change
+	// which object a given name refers to; for example, switching the database.
+	objectRefsByName map[cat.StableID][]*tree.UnresolvedObjectName
+
+	// privileges stores the privileges needed to access each object that the
+	// query depends on.
+	privileges map[cat.StableID]privilegeBitmap
+
+	// builtinRefsByName stores the names used to reference builtin functions in
+	// the query. This is necessary to handle the case where changes to the search
+	// path cause a function call to be resolved to a UDF with the same signature
+	// as a builtin function.
+	builtinRefsByName map[tree.UnresolvedName]struct{}
+
 	// NOTE! When adding fields here, update Init (if reusing allocated
 	// data structures is desired), CopyFrom and TestMetadata.
-}
-
-type mdDep struct {
-	ds cat.DataSource
-
-	name MDDepName
-
-	// privileges is the union of all required privileges.
-	privileges privilegeBitmap
-}
-
-// MDDepName stores either the unresolved DataSourceName or the StableID from
-// the query that was used to resolve a data source.
-type MDDepName struct {
-	// byID is non-zero if and only if the data source was looked up using the
-	// StableID.
-	byID cat.StableID
-
-	// byName is non-zero if and only if the data source was looked up using a
-	// name.
-	byName cat.DataSourceName
-}
-
-func (n *MDDepName) equals(other *MDDepName) bool {
-	return n.byID == other.byID && n.byName.Equals(&other.byName)
 }
 
 // Init prepares the metadata for use (or reuse).
@@ -172,14 +165,49 @@ func (md *Metadata) Init() {
 		sequences[i] = nil
 	}
 
-	deps := md.deps
-	for i := range deps {
-		deps[i] = mdDep{}
-	}
-
 	views := md.views
 	for i := range views {
 		views[i] = nil
+	}
+
+	dataSourceDeps := md.dataSourceDeps
+	if dataSourceDeps == nil {
+		dataSourceDeps = make(map[cat.StableID]cat.DataSource)
+	}
+	for id := range md.dataSourceDeps {
+		delete(md.dataSourceDeps, id)
+	}
+
+	udfDeps := md.udfDeps
+	if udfDeps == nil {
+		udfDeps = make(map[cat.StableID]*tree.Overload)
+	}
+	for id := range md.udfDeps {
+		delete(md.udfDeps, id)
+	}
+
+	objectRefsByName := md.objectRefsByName
+	if objectRefsByName == nil {
+		objectRefsByName = make(map[cat.StableID][]*tree.UnresolvedObjectName)
+	}
+	for id := range md.objectRefsByName {
+		delete(md.objectRefsByName, id)
+	}
+
+	privileges := md.privileges
+	if privileges == nil {
+		privileges = make(map[cat.StableID]privilegeBitmap)
+	}
+	for id := range md.privileges {
+		delete(md.privileges, id)
+	}
+
+	builtinRefsByName := md.builtinRefsByName
+	if builtinRefsByName == nil {
+		builtinRefsByName = make(map[tree.UnresolvedName]struct{})
+	}
+	for name := range md.builtinRefsByName {
+		delete(md.builtinRefsByName, name)
 	}
 
 	// This initialization pattern ensures that fields are not unwittingly
@@ -189,8 +217,12 @@ func (md *Metadata) Init() {
 	md.cols = cols[:0]
 	md.tables = tables[:0]
 	md.sequences = sequences[:0]
-	md.deps = deps[:0]
 	md.views = views[:0]
+	md.dataSourceDeps = dataSourceDeps
+	md.udfDeps = udfDeps
+	md.objectRefsByName = objectRefsByName
+	md.privileges = privileges
+	md.builtinRefsByName = builtinRefsByName
 }
 
 // CopyFrom initializes the metadata with a copy of the provided metadata.
@@ -203,8 +235,10 @@ func (md *Metadata) Init() {
 // expression.
 func (md *Metadata) CopyFrom(from *Metadata, copyScalarFn func(Expr) Expr) {
 	if len(md.schemas) != 0 || len(md.cols) != 0 || len(md.tables) != 0 ||
-		len(md.sequences) != 0 || len(md.deps) != 0 || len(md.views) != 0 ||
-		len(md.userDefinedTypes) != 0 || len(md.userDefinedTypesSlice) != 0 {
+		len(md.sequences) != 0 || len(md.views) != 0 || len(md.userDefinedTypes) != 0 ||
+		len(md.userDefinedTypesSlice) != 0 || len(md.dataSourceDeps) != 0 ||
+		len(md.udfDeps) != 0 || len(md.objectRefsByName) != 0 || len(md.privileges) != 0 ||
+		len(md.builtinRefsByName) != 0 {
 		panic(errors.AssertionFailedf("CopyFrom requires empty destination"))
 	}
 	md.schemas = append(md.schemas, from.schemas...)
@@ -240,13 +274,61 @@ func (md *Metadata) CopyFrom(from *Metadata, copyScalarFn func(Expr) Expr) {
 		}
 	}
 
+	for id, dataSource := range from.dataSourceDeps {
+		if md.dataSourceDeps == nil {
+			md.dataSourceDeps = make(map[cat.StableID]cat.DataSource)
+		}
+		md.dataSourceDeps[id] = dataSource
+	}
+
+	for id, overload := range from.udfDeps {
+		if md.udfDeps == nil {
+			md.udfDeps = make(map[cat.StableID]*tree.Overload)
+		}
+		md.udfDeps[id] = overload
+	}
+
+	for id, names := range from.objectRefsByName {
+		if md.objectRefsByName == nil {
+			md.objectRefsByName = make(map[cat.StableID][]*tree.UnresolvedObjectName)
+		}
+		newNames := make([]*tree.UnresolvedObjectName, len(names))
+		copy(newNames, names)
+		md.objectRefsByName[id] = newNames
+	}
+
+	for id, privilegeSet := range from.privileges {
+		if md.privileges == nil {
+			md.privileges = make(map[cat.StableID]privilegeBitmap)
+		}
+		md.privileges[id] = privilegeSet
+	}
+
+	for name := range from.builtinRefsByName {
+		if md.builtinRefsByName == nil {
+			md.builtinRefsByName = make(map[tree.UnresolvedName]struct{})
+		}
+		md.builtinRefsByName[name] = struct{}{}
+	}
+
 	md.sequences = append(md.sequences, from.sequences...)
-	md.deps = append(md.deps, from.deps...)
 	md.views = append(md.views, from.views...)
 	md.currUniqueID = from.currUniqueID
 
 	// We cannot copy the bound expressions; they must be rebuilt in the new memo.
 	md.withBindings = nil
+}
+
+// MDDepName stores either the unresolved DataSourceName or the StableID from
+// the query that was used to resolve a data source.
+type MDDepName struct {
+	// byID is non-zero if and only if the data source was looked up using the
+	// StableID.
+	byID cat.StableID
+
+	// byName is non-zero if and only if the data source was looked up using a
+	// name.
+	byName cat.DataSourceName
 }
 
 // DepByName is used with AddDependency when the data source was looked up using a
@@ -266,83 +348,160 @@ func DepByID(id cat.StableID) MDDepName {
 // detect if the name resolves to a different data source now, or if changes to
 // schema or permissions on the data source has invalidated the cached metadata.
 func (md *Metadata) AddDependency(name MDDepName, ds cat.DataSource, priv privilege.Kind) {
-	// Search for the same name / object pair.
-	for i := range md.deps {
-		if md.deps[i].ds == ds && md.deps[i].name.equals(&name) {
-			md.deps[i].privileges |= (1 << priv)
-			return
-		}
+	id := ds.ID()
+	md.dataSourceDeps[id] = ds
+	md.privileges[id] = md.privileges[id] | (1 << priv)
+	if name.byID == 0 {
+		// This data source was referenced by name.
+		md.objectRefsByName[id] = append(md.objectRefsByName[id], name.byName.ToUnresolvedObjectName())
 	}
-	md.deps = append(md.deps, mdDep{
-		ds:         ds,
-		name:       name,
-		privileges: (1 << priv),
-	})
 }
 
-// CheckDependencies resolves (again) each data source on which this metadata
-// depends, in order to check that all data source names resolve to the same
-// objects, and that the user still has sufficient privileges to access the
-// objects. If the dependencies are no longer up-to-date, then CheckDependencies
-// returns false.
+// CheckDependencies resolves (again) each database object on which this
+// metadata depends, in order to check the following conditions:
+//  1. The object has not been modified.
+//  2. If referenced by name, the name does not resolve to a different object.
+//  3. The user still has sufficient privileges to access the object. Note that
+//     this point currently only applies to data sources.
 //
-// This function cannot swallow errors and return only a boolean, as it may
-// perform KV operations on behalf of the transaction associated with the
-// provided catalog, and those errors are required to be propagated.
+// If the dependencies are no longer up-to-date, then CheckDependencies returns
+// false.
+//
+// This function can only swallow "undefined" or "dropped" errors, since these
+// are expected. Other error types must be propagated, since CheckDependencies
+// may perform KV operations on behalf of the transaction associated with the
+// provided catalog.
 func (md *Metadata) CheckDependencies(
-	ctx context.Context, catalog cat.Catalog,
+	ctx context.Context, evalCtx *eval.Context, optCatalog cat.Catalog,
 ) (upToDate bool, err error) {
-	for i := range md.deps {
-		name := &md.deps[i].name
+	// Check that no referenced data sources have changed.
+	for id, dataSource := range md.dataSourceDeps {
 		var toCheck cat.DataSource
-		var err error
-		if name.byID != 0 {
-			toCheck, _, err = catalog.ResolveDataSourceByID(ctx, cat.Flags{}, name.byID)
+		if names, ok := md.objectRefsByName[id]; ok {
+			// The data source was referenced by name at least once.
+			for _, name := range names {
+				tableName := name.ToTableName()
+				toCheck, _, err = optCatalog.ResolveDataSource(ctx, cat.Flags{}, &tableName)
+				if err != nil || !dataSource.Equals(toCheck) {
+					return false, maybeSwallowMetadataResolveErr(err)
+				}
+			}
 		} else {
-			// Resolve data source object.
-			toCheck, _, err = catalog.ResolveDataSource(ctx, cat.Flags{}, &name.byName)
+			// The data source was only referenced by ID.
+			toCheck, _, err = optCatalog.ResolveDataSourceByID(ctx, cat.Flags{}, dataSource.ID())
+			if err != nil || !dataSource.Equals(toCheck) {
+				return false, maybeSwallowMetadataResolveErr(err)
+			}
 		}
+	}
+
+	// Ensure that all required privileges for the data sources are still valid.
+	if err := md.checkDataSourcePrivileges(ctx, optCatalog); err != nil {
+		return false, err
+	}
+
+	// Check that no referenced user defined types have changed.
+	for _, typ := range md.AllUserDefinedTypes() {
+		id := cat.StableID(catid.UserDefinedOIDToID(typ.Oid()))
+		if names, ok := md.objectRefsByName[id]; ok {
+			for _, name := range names {
+				toCheck, err := optCatalog.ResolveType(ctx, name)
+				if err != nil || typ.Oid() != toCheck.Oid() ||
+					typ.TypeMeta.Version != toCheck.TypeMeta.Version {
+					return false, maybeSwallowMetadataResolveErr(err)
+				}
+			}
+		} else {
+			toCheck, err := optCatalog.ResolveTypeByOID(ctx, typ.Oid())
+			if err != nil || typ.TypeMeta.Version != toCheck.TypeMeta.Version {
+				return false, maybeSwallowMetadataResolveErr(err)
+			}
+		}
+	}
+
+	// Check that no referenced user defined functions have changed.
+	for id, overload := range md.udfDeps {
+		if names, ok := md.objectRefsByName[id]; ok {
+			for _, name := range names {
+				definition, err := optCatalog.ResolveFunction(
+					ctx, name.ToUnresolvedName(), &evalCtx.SessionData().SearchPath,
+				)
+				if err != nil {
+					return false, maybeSwallowMetadataResolveErr(err)
+				}
+				toCheck, err := definition.MatchOverload(overload.Types.Types(), name.Schema(), &evalCtx.SessionData().SearchPath)
+				if err != nil || toCheck.Oid != overload.Oid || toCheck.Version != overload.Version {
+					return false, err
+				}
+			}
+		} else {
+			_, toCheck, err := optCatalog.ResolveFunctionByOID(ctx, overload.Oid)
+			if err != nil || overload.Version != toCheck.Version {
+				return false, maybeSwallowMetadataResolveErr(err)
+			}
+		}
+	}
+
+	// Check that any references to builtin functions do not now resolve to a UDF
+	// with the same signature (e.g. after changes to the search path).
+	for name := range md.builtinRefsByName {
+		definition, err := optCatalog.ResolveFunction(
+			ctx, &name, &evalCtx.SessionData().SearchPath,
+		)
 		if err != nil {
-			return false, err
+			return false, maybeSwallowMetadataResolveErr(err)
 		}
-
-		// Ensure that it's the same object, and there were no schema or table
-		// statistics changes.
-		if !toCheck.Equals(md.deps[i].ds) {
-			return false, nil
+		for i := range definition.Overloads {
+			if definition.Overloads[i].IsUDF {
+				return false, nil
+			}
 		}
+	}
 
-		for privs := md.deps[i].privileges; privs != 0; {
+	return true, nil
+}
+
+// handleMetadataResolveErr swallows errors that are thrown when a database
+// object is dropped, since such an error potentially only means that the
+// metadata is stale and should be re-resolved.
+func maybeSwallowMetadataResolveErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	// Handle when the object no longer exists.
+	switch pgerror.GetPGCode(err) {
+	case pgcode.UndefinedObject, pgcode.UndefinedTable, pgcode.UndefinedDatabase,
+		pgcode.UndefinedSchema, pgcode.UndefinedFunction, pgcode.InvalidName,
+		pgcode.InvalidSchemaName, pgcode.InvalidCatalogName:
+		return nil
+	}
+	if errors.Is(err, catalog.ErrDescriptorDropped) {
+		return nil
+	}
+	return err
+}
+
+// checkDataSourcePrivileges checks that none of the privileges required by the
+// query for the referenced data sources have been revoked.
+func (md *Metadata) checkDataSourcePrivileges(ctx context.Context, optCatalog cat.Catalog) error {
+	for _, dataSource := range md.dataSourceDeps {
+		privileges := md.privileges[dataSource.ID()]
+		for privs := privileges; privs != 0; {
 			// Strip off each privilege bit and make call to CheckPrivilege for it.
 			// Note that priv == 0 can occur when a dependency was added with
 			// privilege.Kind = 0 (e.g. for a table within a view, where the table
 			// privileges do not need to be checked). Ignore the "zero privilege".
 			priv := privilege.Kind(bits.TrailingZeros32(uint32(privs)))
 			if priv != 0 {
-				if err := catalog.CheckPrivilege(ctx, toCheck, priv); err != nil {
-					return false, err
+				if err := optCatalog.CheckPrivilege(ctx, dataSource, priv); err != nil {
+					return err
 				}
 			}
-
 			// Set the just-handled privilege bit to zero and look for next.
 			privs &= ^(1 << priv)
 		}
 	}
-	// Check that all of the user defined types present have not changed.
-	for _, typ := range md.AllUserDefinedTypes() {
-		toCheck, err := catalog.ResolveTypeByOID(ctx, typ.Oid())
-		if err != nil {
-			// Handle when the type no longer exists.
-			if pgerror.GetPGCode(err) == pgcode.UndefinedObject {
-				return false, nil
-			}
-			return false, err
-		}
-		if typ.TypeMeta.Version != toCheck.TypeMeta.Version {
-			return false, nil
-		}
-	}
-	return true, nil
+	return nil
 }
 
 // AddSchema indexes a new reference to a schema used by the query.
@@ -358,7 +517,8 @@ func (md *Metadata) Schema(schID SchemaID) cat.Schema {
 }
 
 // AddUserDefinedType adds a user defined type to the metadata for this query.
-func (md *Metadata) AddUserDefinedType(typ *types.T) {
+// If the type was resolved by name, the name will be tracked as well.
+func (md *Metadata) AddUserDefinedType(typ *types.T, name *tree.UnresolvedObjectName) {
 	if !typ.UserDefined() {
 		return
 	}
@@ -369,11 +529,48 @@ func (md *Metadata) AddUserDefinedType(typ *types.T) {
 		md.userDefinedTypes[typ.Oid()] = struct{}{}
 		md.userDefinedTypesSlice = append(md.userDefinedTypesSlice, typ)
 	}
+	if name != nil {
+		id := cat.StableID(catid.UserDefinedOIDToID(typ.Oid()))
+		md.objectRefsByName[id] = append(md.objectRefsByName[id], name)
+	}
 }
 
 // AllUserDefinedTypes returns all user defined types contained in this query.
 func (md *Metadata) AllUserDefinedTypes() []*types.T {
 	return md.userDefinedTypesSlice
+}
+
+// AllUserDefinedFunctions returns all user defined functions used in this query.
+func (md *Metadata) AllUserDefinedFunctions() map[cat.StableID]*tree.Overload {
+	return md.udfDeps
+}
+
+// AddUserDefinedFunction adds a user-defined function to the metadata for this
+// query. If the function was resolved by name, the name will also be tracked.
+func (md *Metadata) AddUserDefinedFunction(
+	overload *tree.Overload, name *tree.UnresolvedObjectName,
+) {
+	if !overload.IsUDF {
+		return
+	}
+	id := cat.StableID(catid.UserDefinedOIDToID(overload.Oid))
+	md.udfDeps[id] = overload
+	if name != nil {
+		md.objectRefsByName[id] = append(md.objectRefsByName[id], name)
+	}
+}
+
+// AddBuiltin adds a name used to resolve a builtin function to the metadata for
+// this query. This is necessary to handle the case when changes to the search
+// path cause a function call to resolve as a UDF instead of a builtin function.
+func (md *Metadata) AddBuiltin(name *tree.UnresolvedObjectName) {
+	if name == nil {
+		return
+	}
+	if md.builtinRefsByName == nil {
+		md.builtinRefsByName = make(map[tree.UnresolvedName]struct{})
+	}
+	md.builtinRefsByName[*name.ToUnresolvedName()] = struct{}{}
 }
 
 // AddTable indexes a new reference to a table within the query. Separate
@@ -455,6 +652,7 @@ func (md *Metadata) DuplicateTable(
 	// Create new computed column expressions by remapping the column IDs in
 	// each ScalarExpr.
 	var computedCols map[ColumnID]ScalarExpr
+	var referencedColsInComputedExpressions ColSet
 	if len(tabMeta.ComputedCols) > 0 {
 		computedCols = make(map[ColumnID]ScalarExpr, len(tabMeta.ComputedCols))
 		for colID, e := range tabMeta.ComputedCols {
@@ -464,6 +662,9 @@ func (md *Metadata) DuplicateTable(
 			}
 			computedCols[ColumnID(newColID)] = remapColumnIDs(e, colMap)
 		}
+		// Add columns present in newScalarExpr to referencedColsInComputedExpressions.
+		referencedColsInComputedExpressions =
+			tabMeta.ColsInComputedColsExpressions.CopyAndMaybeRemap(colMap)
 	}
 
 	// Create new partial index predicate expressions by remapping the column
@@ -496,15 +697,16 @@ func (md *Metadata) DuplicateTable(
 	}
 
 	newTabMeta := TableMeta{
-		MetaID:                   newTabID,
-		Table:                    tabMeta.Table,
-		Alias:                    tabMeta.Alias,
-		IgnoreForeignKeys:        tabMeta.IgnoreForeignKeys,
-		Constraints:              constraints,
-		ComputedCols:             computedCols,
-		partialIndexPredicates:   partialIndexPredicates,
-		indexPartitionLocalities: tabMeta.indexPartitionLocalities,
-		checkConstraintsStats:    checkConstraintsStats,
+		MetaID:                        newTabID,
+		Table:                         tabMeta.Table,
+		Alias:                         tabMeta.Alias,
+		IgnoreForeignKeys:             tabMeta.IgnoreForeignKeys,
+		Constraints:                   constraints,
+		ComputedCols:                  computedCols,
+		ColsInComputedColsExpressions: referencedColsInComputedExpressions,
+		partialIndexPredicates:        partialIndexPredicates,
+		indexPartitionLocalities:      tabMeta.indexPartitionLocalities,
+		checkConstraintsStats:         checkConstraintsStats,
 	}
 	md.tables = append(md.tables, newTabMeta)
 	regionConfig, ok := md.TableAnnotation(tabID, regionConfigAnnID).(*multiregion.RegionConfig)
@@ -627,7 +829,7 @@ func (md *Metadata) QualifiedAlias(
 
 // UpdateTableMeta allows the caller to replace the cat.Table struct that a
 // TableMeta instance stores.
-func (md *Metadata) UpdateTableMeta(tables map[cat.StableID]cat.Table) {
+func (md *Metadata) UpdateTableMeta(evalCtx *eval.Context, tables map[cat.StableID]cat.Table) {
 	for i := range md.tables {
 		oldTable := md.tables[i].Table
 		if newTable, ok := tables[oldTable.ID()]; ok {
@@ -643,6 +845,7 @@ func (md *Metadata) UpdateTableMeta(tables map[cat.StableID]cat.Table) {
 				md.SetTableAnnotation(md.tables[i].MetaID, NotNullAnnID, nil)
 			}
 			md.tables[i].Table = newTable
+			md.tables[i].CacheIndexPartitionLocalities(evalCtx)
 		}
 	}
 }
@@ -707,9 +910,62 @@ func (md *Metadata) AllViews() []cat.View {
 	return md.views
 }
 
+// getAllReferencedTables returns all the tables referenced by the metadata.
+// This includes all tables that are directly stored in the metadata in
+// md.tables, as well as recursive references from foreign keys. The tables are
+// returned in sorted order so that later tables reference earlier tables. This
+// allows tables to be re-created in order (e.g., for statement-bundle recreate)
+// using the output from SHOW CREATE TABLE without any errors due to missing
+// tables.
+// TODO(rytaft): if there is a cycle in the foreign key references,
+// statement-bundle recreate will still hit errors. To handle this case, we
+// would need to first create the tables without the foreign keys, then add the
+// foreign keys later.
+func (md *Metadata) getAllReferencedTables(
+	ctx context.Context, catalog cat.Catalog,
+) []cat.DataSource {
+	var tableSet intsets.Fast
+	var tableList []cat.DataSource
+	var addForeignKeyReferencedTables func(tab cat.Table)
+	addForeignKeyReferencedTables = func(tab cat.Table) {
+		for i := 0; i < tab.OutboundForeignKeyCount(); i++ {
+			tabID := tab.OutboundForeignKey(i).ReferencedTableID()
+			if !tableSet.Contains(int(tabID)) {
+				tableSet.Add(int(tabID))
+				ds, _, err := catalog.ResolveDataSourceByID(ctx, cat.Flags{}, tabID)
+				if err != nil {
+					// This is a best-effort attempt to get all the tables, so don't error.
+					continue
+				}
+				refTab, ok := ds.(cat.Table)
+				if !ok {
+					// This is a best-effort attempt to get all the tables, so don't error.
+					continue
+				}
+				addForeignKeyReferencedTables(refTab)
+				tableList = append(tableList, ds)
+			}
+		}
+	}
+	for i := range md.tables {
+		tabMeta := md.tables[i]
+		tabID := tabMeta.Table.ID()
+		if !tableSet.Contains(int(tabID)) {
+			tableSet.Add(int(tabID))
+			addForeignKeyReferencedTables(tabMeta.Table)
+			tableList = append(tableList, tabMeta.Table)
+		}
+	}
+	return tableList
+}
+
 // AllDataSourceNames returns the fully qualified names of all datasources
-// referenced by the metadata.
+// referenced by the metadata. This includes all tables, sequences, and views
+// that are directly stored in the metadata, as well as tables that are
+// recursively referenced from foreign keys.
 func (md *Metadata) AllDataSourceNames(
+	ctx context.Context,
+	catalog cat.Catalog,
 	fullyQualifiedName func(ds cat.DataSource) (cat.DataSourceName, error),
 ) (tables, sequences, views []tree.TableName, _ error) {
 	// Catalog objects can show up multiple times in our lists, so deduplicate
@@ -732,8 +988,9 @@ func (md *Metadata) AllDataSourceNames(
 		return result, nil
 	}
 	var err error
-	tables, err = getNames(len(md.tables), func(i int) cat.DataSource {
-		return md.tables[i].Table
+	refTables := md.getAllReferencedTables(ctx, catalog)
+	tables, err = getNames(len(refTables), func(i int) cat.DataSource {
+		return refTables[i]
 	})
 	if err != nil {
 		return nil, nil, nil, err
@@ -774,4 +1031,32 @@ func (md *Metadata) WithBinding(id WithID) Expr {
 		panic(errors.AssertionFailedf("no binding for WithID %d", id))
 	}
 	return res
+}
+
+// ForEachWithBinding calls fn with each bound (WithID, Expr) pair in the
+// metadata.
+func (md *Metadata) ForEachWithBinding(fn func(WithID, Expr)) {
+	for id, expr := range md.withBindings {
+		fn(id, expr)
+	}
+}
+
+// TestingDataSourceDeps exposes the dataSourceDeps for testing.
+func (md *Metadata) TestingDataSourceDeps() map[cat.StableID]cat.DataSource {
+	return md.dataSourceDeps
+}
+
+// TestingUDFDeps exposes the udfDeps for testing.
+func (md *Metadata) TestingUDFDeps() map[cat.StableID]*tree.Overload {
+	return md.udfDeps
+}
+
+// TestingObjectRefsByName exposes the objectRefsByName for testing.
+func (md *Metadata) TestingObjectRefsByName() map[cat.StableID][]*tree.UnresolvedObjectName {
+	return md.objectRefsByName
+}
+
+// TestingPrivileges exposes the privileges for testing.
+func (md *Metadata) TestingPrivileges() map[cat.StableID]privilegeBitmap {
+	return md.privileges
 }

@@ -11,12 +11,12 @@
 package aws
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/flagstub"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -270,6 +269,29 @@ var defaultCreateZones = []string{
 	"eu-west-2b",
 }
 
+type Tag struct {
+	Key   string `json:"Key"`
+	Value string `json:"Value"`
+}
+
+type Tags []Tag
+
+func (t Tags) MakeMap() map[string]string {
+	tagMap := make(map[string]string, len(t))
+	for _, entry := range t {
+		tagMap[entry.Key] = entry.Value
+	}
+	return tagMap
+}
+
+func (t Tags) String() string {
+	var output []string
+	for _, tag := range t {
+		output = append(output, fmt.Sprintf("{Key=%s,Value=%s}", tag.Key, tag.Value))
+	}
+	return strings.Join(output, ",")
+}
+
 // ConfigureCreateFlags is part of the vm.ProviderOpts interface.
 // This method sets up a lot of maps between the various EC2
 // regions and the ids of the things we want to use there.  This is
@@ -319,7 +341,7 @@ func (o *ProviderOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 		" rate limit (per second) for instance creation. This is used to avoid hitting the request"+
 		" limits from aws, which can vary based on the region, and the size of the cluster being"+
 		" created. Try lowering this limit when hitting 'Request limit exceeded' errors.")
-	flags.StringVar(&providerInstance.IAMProfile, ProviderName+"-	iam-profile", providerInstance.IAMProfile,
+	flags.StringVar(&providerInstance.IAMProfile, ProviderName+"-iam-profile", providerInstance.IAMProfile,
 		"the IAM instance profile to associate with created VMs if non-empty")
 
 }
@@ -336,13 +358,13 @@ func (o *ProviderOpts) ConfigureClusterFlags(flags *pflag.FlagSet, _ vm.Multiple
 
 // CleanSSH is part of vm.Provider.  This implementation is a no-op,
 // since we depend on the user's local identity file.
-func (p *Provider) CleanSSH() error {
+func (p *Provider) CleanSSH(l *logger.Logger) error {
 	return nil
 }
 
 // ConfigSSH is part of the vm.Provider interface.
-func (p *Provider) ConfigSSH(zones []string) error {
-	keyName, err := p.sshKeyName()
+func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
+	keyName, err := p.sshKeyName(l)
 	if err != nil {
 		return err
 	}
@@ -363,17 +385,16 @@ func (p *Provider) ConfigSSH(zones []string) error {
 		// capture loop variable
 		region := r
 		g.Go(func() error {
-			exists, err := p.sshKeyExists(keyName, region)
+			exists, err := p.sshKeyExists(l, keyName, region)
 			if err != nil {
 				return err
 			}
 			if !exists {
-				err = p.sshKeyImport(keyName, region)
+				err = p.sshKeyImport(l, keyName, region)
 				if err != nil {
 					return err
 				}
-				log.Infof(context.Background(), "imported %s as %s in region %s",
-					sshPublicKeyFile, keyName, region)
+				l.Printf("imported %s as %s in region %s", sshPublicKeyFile, keyName, region)
 			}
 			return nil
 		})
@@ -398,7 +419,7 @@ func (p *Provider) Create(
 	}
 
 	// We need to make sure that the SSH keys have been distributed to all regions.
-	if err := p.ConfigSSH(expandedZones); err != nil {
+	if err := p.ConfigSSH(l, expandedZones); err != nil {
 		return err
 	}
 
@@ -439,12 +460,13 @@ func (p *Provider) Create(
 		res := limiter.Reserve()
 		g.Go(func() error {
 			time.Sleep(res.Delay())
-			return p.runInstance(capName, placement, opts, providerOpts)
+			return p.runInstance(l, capName, placement, opts, providerOpts)
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return err
 	}
+
 	return p.waitForIPs(l, names, regions, providerOpts)
 }
 
@@ -469,7 +491,7 @@ func (p *Provider) waitForIPs(
 		return m
 	}
 	for waitForIPRetry.Next() {
-		vms, err := p.listRegions(l, regions, *opts)
+		vms, err := p.listRegions(l, regions, *opts, vm.ListOptions{})
 		if err != nil {
 			return err
 		}
@@ -488,7 +510,7 @@ func (p *Provider) waitForIPs(
 
 // Delete is part of vm.Provider.
 // This will delete all instances in a single AWS command.
-func (p *Provider) Delete(vms vm.List) error {
+func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 	byRegion, err := regionMap(vms)
 	if err != nil {
 		return err
@@ -511,20 +533,20 @@ func (p *Provider) Delete(vms vm.List) error {
 			if len(data.TerminatingInstances) > 0 {
 				_ = data.TerminatingInstances[0].InstanceID // silence unused warning
 			}
-			return p.runJSONCommand(args, &data)
+			return p.runJSONCommand(l, args, &data)
 		})
 	}
 	return g.Wait()
 }
 
 // Reset is part of vm.Provider. It is a no-op.
-func (p *Provider) Reset(vms vm.List) error {
+func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 	return nil // unimplemented
 }
 
 // Extend is part of the vm.Provider interface.
 // This will update the Lifetime tag on the instances.
-func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
+func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
 	byRegion, err := regionMap(vms)
 	if err != nil {
 		return err
@@ -541,7 +563,7 @@ func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
 		args = append(args, list.ProviderIDs()...)
 
 		g.Go(func() error {
-			_, err := p.runCommand(args)
+			_, err := p.runCommand(l, args)
 			return err
 		})
 	}
@@ -553,19 +575,19 @@ var cachedActiveAccount string
 
 // FindActiveAccount is part of the vm.Provider interface.
 // This queries the AWS command for the current IAM user or role.
-func (p *Provider) FindActiveAccount() (string, error) {
+func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 	if len(cachedActiveAccount) > 0 {
 		return cachedActiveAccount, nil
 	}
 	var account string
 	var err error
 	if p.Profile == "" {
-		account, err = p.iamGetUser()
+		account, err = p.iamGetUser(l)
 		if err != nil {
 			return "", err
 		}
 	} else {
-		account, err = p.stsGetCallerIdentity()
+		account, err = p.stsGetCallerIdentity(l)
 		if err != nil {
 			return "", err
 		}
@@ -575,14 +597,14 @@ func (p *Provider) FindActiveAccount() (string, error) {
 }
 
 // iamGetUser returns the identity of an IAM user.
-func (p *Provider) iamGetUser() (string, error) {
+func (p *Provider) iamGetUser(l *logger.Logger) (string, error) {
 	var userInfo struct {
 		User struct {
 			UserName string
 		}
 	}
 	args := []string{"iam", "get-user"}
-	err := p.runJSONCommand(args, &userInfo)
+	err := p.runJSONCommand(l, args, &userInfo)
 	if err != nil {
 		return "", err
 	}
@@ -594,12 +616,12 @@ func (p *Provider) iamGetUser() (string, error) {
 
 // stsGetCallerIdentity returns the identity of a user assuming a role
 // into the account.
-func (p *Provider) stsGetCallerIdentity() (string, error) {
+func (p *Provider) stsGetCallerIdentity(l *logger.Logger) (string, error) {
 	var userInfo struct {
 		Arn string
 	}
 	args := []string{"sts", "get-caller-identity"}
-	err := p.runJSONCommand(args, &userInfo)
+	err := p.runJSONCommand(l, args, &userInfo)
 	if err != nil {
 		return "", err
 	}
@@ -611,19 +633,19 @@ func (p *Provider) stsGetCallerIdentity() (string, error) {
 }
 
 // List is part of the vm.Provider interface.
-func (p *Provider) List(l *logger.Logger) (vm.List, error) {
+func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) {
 	regions, err := p.allRegions(p.Config.availabilityZoneNames())
 	if err != nil {
 		return nil, err
 	}
 	defaultOpts := p.CreateProviderOpts().(*ProviderOpts)
-	return p.listRegions(l, regions, *defaultOpts)
+	return p.listRegions(l, regions, *defaultOpts, opts)
 }
 
 // listRegions lists VMs in the regions passed.
 // It ignores region-specific errors.
 func (p *Provider) listRegions(
-	l *logger.Logger, regions []string, opts ProviderOpts,
+	l *logger.Logger, regions []string, opts ProviderOpts, listOpts vm.ListOptions,
 ) (vm.List, error) {
 	var ret vm.List
 	var mux syncutil.Mutex
@@ -633,7 +655,7 @@ func (p *Provider) listRegions(
 		// capture loop variable
 		region := r
 		g.Go(func() error {
-			vms, err := p.listRegion(region, opts)
+			vms, err := p.listRegion(l, region, opts, listOpts)
 			if err != nil {
 				l.Printf("Failed to list AWS VMs in region: %s\n%v\n", region, err)
 				return nil
@@ -693,9 +715,66 @@ func (p *Provider) regionZones(region string, allZones []string) (zones []string
 	return zones, nil
 }
 
+func (p *Provider) getVolumesForInstance(
+	l *logger.Logger, region, instanceID string,
+) (vols map[string]vm.Volume, err error) {
+	type describeVolume struct {
+		Volumes []struct {
+			Attachments []struct {
+				AttachTime          time.Time `json:"AttachTime"`
+				Device              string    `json:"Device"`
+				InstanceID          string    `json:"InstanceId"`
+				State               string    `json:"State"`
+				VolumeID            string    `json:"VolumeId"`
+				DeleteOnTermination bool      `json:"DeleteOnTermination"`
+			} `json:"Attachments"`
+			AvailabilityZone   string    `json:"AvailabilityZone"`
+			CreateTime         time.Time `json:"CreateTime"`
+			Encrypted          bool      `json:"Encrypted"`
+			Size               int       `json:"Size"`
+			SnapshotID         string    `json:"SnapshotId"`
+			State              string    `json:"State"`
+			VolumeID           string    `json:"VolumeId"`
+			Iops               int       `json:"Iops"`
+			VolumeType         string    `json:"VolumeType"`
+			MultiAttachEnabled bool      `json:"MultiAttachEnabled"`
+			Throughput         int       `json:"Throughput,omitempty"`
+			Tags               Tags      `json:"Tags,omitempty"`
+		} `json:"Volumes"`
+	}
+
+	vols = make(map[string]vm.Volume)
+	var volumeOut describeVolume
+	getVolumesArgs := []string{
+		"ec2", "describe-volumes",
+		"--region", region,
+		"--filters", "Name=attachment.instance-id,Values=" + instanceID,
+	}
+
+	err = p.runJSONCommand(l, getVolumesArgs, &volumeOut)
+	if err != nil {
+		return vols, err
+	}
+	for _, vol := range volumeOut.Volumes {
+		tagMap := vol.Tags.MakeMap()
+		vols[vol.VolumeID] = vm.Volume{
+			ProviderResourceID: vol.VolumeID,
+			ProviderVolumeType: vol.VolumeType,
+			Zone:               vol.AvailabilityZone,
+			Encrypted:          vol.Encrypted,
+			Labels:             tagMap,
+			Size:               vol.Size,
+			Name:               tagMap["Name"],
+		}
+	}
+	return vols, err
+}
+
 // listRegion extracts the roachprod-managed instances in the
 // given region.
-func (p *Provider) listRegion(region string, opts ProviderOpts) (vm.List, error) {
+func (p *Provider) listRegion(
+	l *logger.Logger, region string, opts ProviderOpts, listOpt vm.ListOptions,
+) (vm.List, error) {
 	var data struct {
 		Reservations []struct {
 			Instances []struct {
@@ -712,10 +791,20 @@ func (p *Provider) listRegion(region string, opts ProviderOpts) (vm.List, error)
 					Code int
 					Name string
 				}
-				Tags []struct {
-					Key   string
-					Value string
-				}
+				RootDeviceName string
+
+				BlockDeviceMappings []struct {
+					DeviceName string `json:"DeviceName"`
+					Disk       struct {
+						AttachTime          time.Time `json:"AttachTime"`
+						DeleteOnTermination bool      `json:"DeleteOnTermination"`
+						Status              string    `json:"Status"`
+						VolumeID            string    `json:"VolumeId"`
+					} `json:"Ebs"`
+				} `json:"BlockDeviceMappings"`
+
+				Tags Tags
+
 				VpcID        string `json:"VpcId"`
 				InstanceType string
 			}
@@ -725,7 +814,7 @@ func (p *Provider) listRegion(region string, opts ProviderOpts) (vm.List, error)
 		"ec2", "describe-instances",
 		"--region", region,
 	}
-	err := p.runJSONCommand(args, &data)
+	err := p.runJSONCommand(l, args, &data)
 	if err != nil {
 		return nil, err
 	}
@@ -742,10 +831,8 @@ func (p *Provider) listRegion(region string, opts ProviderOpts) (vm.List, error)
 			_ = in.State.Code    // silence unused warning
 
 			// Convert the tag map into a more useful representation
-			tagMap := make(map[string]string, len(in.Tags))
-			for _, entry := range in.Tags {
-				tagMap[entry.Key] = entry.Value
-			}
+			tagMap := in.Tags.MakeMap()
+
 			// Ignore any instances that we didn't create
 			if tagMap["Roachprod"] != "true" {
 				continue in
@@ -767,23 +854,52 @@ func (p *Provider) listRegion(region string, opts ProviderOpts) (vm.List, error)
 				errs = append(errs, vm.ErrNoExpiration)
 			}
 
+			var nonBootableVolumes []vm.Volume
+			if listOpt.IncludeVolumes {
+				var volMap map[string]vm.Volume
+				rootDevice := in.RootDeviceName
+				for _, bdm := range in.BlockDeviceMappings {
+					if bdm.DeviceName != rootDevice {
+						// volMap does not exist so lazy initialize it here
+						if volMap == nil {
+							// TODO(leon, jackson): Change this to fetch the volumes in a
+							// batch instead of fetching them one at a time
+							volMap, err = p.getVolumesForInstance(l, region, in.InstanceID)
+							if err != nil {
+								errs = append(errs, err)
+							}
+						}
+						if vol, ok := volMap[bdm.Disk.VolumeID]; ok {
+							nonBootableVolumes = append(nonBootableVolumes, vol)
+						} else {
+							errs = append(errs, errors.Newf(
+								"Attempted to add volume %s however it is not in the attached volumes for instance %s",
+								bdm.Disk.VolumeID,
+								in.InstanceID,
+							))
+						}
+					}
+				}
+			}
+
 			m := vm.VM{
-				CreatedAt:   createdAt,
-				DNS:         in.PrivateDNSName,
-				Name:        tagMap["Name"],
-				Errors:      errs,
-				Lifetime:    lifetime,
-				Labels:      tagMap,
-				PrivateIP:   in.PrivateIPAddress,
-				Provider:    ProviderName,
-				ProviderID:  in.InstanceID,
-				PublicIP:    in.PublicIPAddress,
-				RemoteUser:  opts.RemoteUserName,
-				VPC:         in.VpcID,
-				MachineType: in.InstanceType,
-				Zone:        in.Placement.AvailabilityZone,
-				SQLPort:     config.DefaultSQLPort,
-				AdminUIPort: config.DefaultAdminUIPort,
+				CreatedAt:              createdAt,
+				DNS:                    in.PrivateDNSName,
+				Name:                   tagMap["Name"],
+				Errors:                 errs,
+				Lifetime:               lifetime,
+				Labels:                 tagMap,
+				PrivateIP:              in.PrivateIPAddress,
+				Provider:               ProviderName,
+				ProviderID:             in.InstanceID,
+				PublicIP:               in.PublicIPAddress,
+				RemoteUser:             opts.RemoteUserName,
+				VPC:                    in.VpcID,
+				MachineType:            in.InstanceType,
+				Zone:                   in.Placement.AvailabilityZone,
+				SQLPort:                config.DefaultSQLPort,
+				AdminUIPort:            config.DefaultAdminUIPort,
+				NonBootAttachedVolumes: nonBootableVolumes,
 			}
 			ret = append(ret, m)
 		}
@@ -797,7 +913,7 @@ func (p *Provider) listRegion(region string, opts ProviderOpts) (vm.List, error)
 // we need to do a bit of work to look up all of the various ids that
 // we need in order to actually allocate an instance.
 func (p *Provider) runInstance(
-	name string, zone string, opts vm.CreateOpts, providerOpts *ProviderOpts,
+	l *logger.Logger, name string, zone string, opts vm.CreateOpts, providerOpts *ProviderOpts,
 ) error {
 	// There exist different flags to control the machine type when ssd is true.
 	// This enables sane defaults for either setting but the behavior can be
@@ -822,7 +938,7 @@ func (p *Provider) runInstance(
 			p.Config.regionNames(), zone)
 	}
 
-	keyName, err := p.sshKeyName()
+	keyName, err := p.sshKeyName(l)
 	if err != nil {
 		return err
 	}
@@ -848,23 +964,27 @@ func (p *Provider) runInstance(
 		vm.TagRoachprod: "Roachprod",
 	}
 
-	var sb strings.Builder
-	sb.WriteString("ResourceType=instance,Tags=[")
+	var labelPairs []string
+	addLabel := func(key, value string) {
+		labelPairs = append(labelPairs, fmt.Sprintf("{Key=%s,Value=%s}", key, value))
+	}
+
 	for key, value := range opts.CustomLabels {
 		_, ok := m[strings.ToLower(key)]
 		if ok {
 			return fmt.Errorf("duplicate label name defined: %s", key)
 		}
-		fmt.Fprintf(&sb, "{Key=%s,Value=%s},", key, value)
+		addLabel(key, value)
 	}
 	for key, value := range m {
 		if n, ok := awsLabelsNameMap[key]; ok {
 			key = n
 		}
-		fmt.Fprintf(&sb, "{Key=%s,Value=%s},", key, value)
+		addLabel(key, value)
 	}
-	s := sb.String()
-	tagSpecs := fmt.Sprintf("%s]", s[:len(s)-1])
+	labels := strings.Join(labelPairs, ",")
+	vmTagSpecs := fmt.Sprintf("ResourceType=instance,Tags=[%s]", labels)
+	volumeTagSpecs := fmt.Sprintf("ResourceType=volume,Tags=[%s]", labels)
 
 	var data struct {
 		Instances []struct {
@@ -884,7 +1004,7 @@ func (p *Provider) runInstance(
 			extraMountOpts = "nobarrier"
 		}
 	}
-	filename, err := writeStartupScript(extraMountOpts, providerOpts.UseMultipleDisks)
+	filename, err := writeStartupScript(name, extraMountOpts, providerOpts.UseMultipleDisks, opts.EnableFIPS)
 	if err != nil {
 		return errors.Wrapf(err, "could not write AWS startup script to temp file")
 	}
@@ -899,17 +1019,21 @@ func (p *Provider) runInstance(
 		return *fl
 	}
 
+	imageID := withFlagOverride(az.region.AMI, &providerOpts.ImageAMI)
+	if opts.EnableFIPS {
+		imageID = withFlagOverride(az.region.AMI_FIPS, &providerOpts.ImageAMI)
+	}
 	args := []string{
 		"ec2", "run-instances",
 		"--associate-public-ip-address",
 		"--count", "1",
 		"--instance-type", machineType,
-		"--image-id", withFlagOverride(az.region.AMI, &providerOpts.ImageAMI),
+		"--image-id", imageID,
 		"--key-name", keyName,
 		"--region", az.region.Name,
 		"--security-group-ids", az.region.SecurityGroup,
 		"--subnet-id", az.subnetID,
-		"--tag-specifications", tagSpecs,
+		"--tag-specifications", vmTagSpecs, volumeTagSpecs,
 		"--user-data", "file://" + filename,
 	}
 
@@ -920,6 +1044,35 @@ func (p *Provider) runInstance(
 	if p.IAMProfile != "" {
 		args = append(args, "--iam-instance-profile", "Name="+p.IAMProfile)
 	}
+	ebsVolumes := assignEBSVolumes(&opts, providerOpts)
+	args, err = genDeviceMapping(ebsVolumes, args)
+	if err != nil {
+		return err
+	}
+	return p.runJSONCommand(l, args, &data)
+}
+
+func genDeviceMapping(ebsVolumes ebsVolumeList, args []string) ([]string, error) {
+	mapping, err := json.Marshal(ebsVolumes)
+	if err != nil {
+		return nil, err
+	}
+
+	deviceMapping, err := os.CreateTemp("", "aws-block-device-mapping")
+	if err != nil {
+		return nil, err
+	}
+	defer deviceMapping.Close()
+	if _, err := deviceMapping.Write(mapping); err != nil {
+		return nil, err
+	}
+	return append(args,
+		"--block-device-mapping",
+		"file://"+deviceMapping.Name(),
+	), nil
+}
+
+func assignEBSVolumes(opts *vm.CreateOpts, providerOpts *ProviderOpts) ebsVolumeList {
 	// Make a local copy of providerOpts.EBSVolumes to prevent data races
 	ebsVolumes := providerOpts.EBSVolumes
 	// The local NVMe devices are automatically mapped.  Otherwise, we need to map an EBS data volume.
@@ -946,26 +1099,7 @@ func (p *Provider) runInstance(
 			DeleteOnTermination: true,
 		},
 	}
-	ebsVolumes = append(ebsVolumes, osDiskVolume)
-
-	mapping, err := json.Marshal(ebsVolumes)
-	if err != nil {
-		return err
-	}
-
-	deviceMapping, err := os.CreateTemp("", "aws-block-device-mapping")
-	if err != nil {
-		return err
-	}
-	defer deviceMapping.Close()
-	if _, err := deviceMapping.Write(mapping); err != nil {
-		return err
-	}
-	args = append(args,
-		"--block-device-mapping",
-		"file://"+deviceMapping.Name(),
-	)
-	return p.runJSONCommand(args, &data)
+	return append(ebsVolumes, osDiskVolume)
 }
 
 // Active is part of the vm.Provider interface.
@@ -976,4 +1110,198 @@ func (p *Provider) Active() bool {
 // ProjectActive is part of the vm.Provider interface.
 func (p *Provider) ProjectActive(project string) bool {
 	return project == ""
+}
+
+type attachJsonResponse struct {
+	AttachTime string `json:"AttachTime"`
+	InstanceID string `json:"InstanceId"`
+	VolumeID   string `json:"VolumeId"`
+	State      string `json:"State"`
+	Device     string `json:"Device"`
+}
+
+func (p *Provider) AttachVolumeToVM(l *logger.Logger, volume vm.Volume, vm *vm.VM) (string, error) {
+	// TODO(leon): what happens if this device already exists?
+	deviceName := "/dev/sdf"
+	args := []string{
+		"ec2",
+		"attach-volume",
+		"--instance-id", vm.ProviderID,
+		"--volume-id", volume.ProviderResourceID,
+		"--device", deviceName,
+		"--region", vm.Zone[:len(vm.Zone)-1],
+	}
+
+	var commandResponse attachJsonResponse
+	err := p.runJSONCommand(l, args, &commandResponse)
+	if err != nil {
+		return "", err
+	}
+	if commandResponse.State != "attaching" && commandResponse.State != "in-use" {
+		return "", errors.New("Command to attach succeeded but volume is not in the attached state")
+	}
+
+	args = []string{
+		"ec2",
+		"--region", vm.Zone[:len(vm.Zone)-1],
+		"modify-instance-attribute",
+		"--attribute", "blockDeviceMapping",
+		"--instance-id", vm.ProviderID,
+		"--block-device-mappings",
+		"DeviceName=" + deviceName + ",Ebs={DeleteOnTermination=true,VolumeId=" + volume.ProviderResourceID + "}",
+	}
+	_, err = p.runCommand(l, args)
+	if err != nil {
+		return "", err
+	}
+
+	return "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_" +
+		strings.Replace(volume.ProviderResourceID, "-", "", 1), nil
+}
+
+type createVolume struct {
+	AvailabilityZone string    `json:"AvailabilityZone"`
+	Encrypted        bool      `json:"Encrypted"`
+	VolumeType       string    `json:"VolumeType"`
+	VolumeID         string    `json:"VolumeId"`
+	State            string    `json:"State"`
+	Iops             int       `json:"Iops"`
+	SnapshotID       string    `json:"SnapshotId"`
+	CreateTime       time.Time `json:"CreateTime"`
+	Size             int       `json:"Size"`
+}
+
+func (p *Provider) CreateVolume(
+	l *logger.Logger, vco vm.VolumeCreateOpts,
+) (vol vm.Volume, err error) {
+	// TODO(leon): SourceSnapshotID and IOPS, are not handled
+	if vco.SourceSnapshotID != "" || vco.IOPS != 0 {
+		err = errors.New("Creating a volume with SourceSnapshotID or IOPS is not supported at this time.")
+		return vol, err
+	}
+
+	region := vco.Zone[:len(vco.Zone)-1]
+	args := []string{
+		"ec2",
+		"create-volume",
+		"--availability-zone", vco.Zone,
+		"--region", region,
+	}
+	if vco.Encrypted {
+		args = append(args, "--encrypted")
+	}
+	var tags Tags
+
+	if vco.Name != "" {
+		// Add label to create options label which will be converted into Tags
+		vco.Labels["Name"] = vco.Name
+	}
+
+	for key, value := range vco.Labels {
+		tags = append(tags, Tag{
+			key,
+			value,
+		})
+	}
+
+	if tags != nil {
+		args = append(args, "--tag-specifications", "ResourceType=volume,Tags=["+tags.String()+"]")
+	}
+
+	switch vco.Type {
+	case "gp2", "gp3", "io1", "io2", "st1", "sc1", "standard":
+		args = append(args, "--volume-type", vco.Type)
+	case "":
+		// Use the default.
+	default:
+		return vol, errors.Newf("Invalid volume type %q", vco.Type)
+	}
+
+	if vco.Size == 0 {
+		return vol, errors.New("Cannot create a volume of size 0")
+	}
+	args = append(args, "--size", strconv.Itoa(vco.Size))
+	var volumeDetails createVolume
+	err = p.runJSONCommand(l, args, &volumeDetails)
+	if err != nil {
+		return vol, err
+	}
+
+	waitForVolumeCloser := make(chan struct{})
+
+	waitForVolume := retry.Start(retry.Options{
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     500 * time.Millisecond,
+		MaxRetries:     10,
+		Closer:         waitForVolumeCloser,
+	})
+
+	var state []string
+	args = []string{
+		"ec2",
+		"describe-volumes",
+		"--volume-id", volumeDetails.VolumeID,
+		"--region", region,
+		"--query", "Volumes[*].State",
+	}
+	for waitForVolume.Next() {
+		err = p.runJSONCommand(l, args, &state)
+		if len(state) > 0 && state[0] == "available" {
+			close(waitForVolumeCloser)
+		}
+	}
+
+	if err != nil {
+		return vm.Volume{}, err
+	}
+
+	vol = vm.Volume{
+		ProviderResourceID: volumeDetails.VolumeID,
+		ProviderVolumeType: volumeDetails.VolumeType,
+		Encrypted:          volumeDetails.Encrypted,
+		Zone:               vol.Zone,
+		Size:               volumeDetails.Size,
+		Labels:             vco.Labels,
+		Name:               vco.Name,
+	}
+	return vol, err
+}
+
+type snapshotOutput struct {
+	Description string `json:"Description"`
+	Tags        []struct {
+		Value string `json:"Value"`
+		Key   string `json:"Key"`
+	} `json:"Tags"`
+	Encrypted  bool      `json:"Encrypted"`
+	VolumeID   string    `json:"VolumeId"`
+	State      string    `json:"State"`
+	VolumeSize int       `json:"VolumeSize"`
+	StartTime  time.Time `json:"StartTime"`
+	Progress   string    `json:"Progress"`
+	OwnerID    string    `json:"OwnerId"`
+	SnapshotID string    `json:"SnapshotId"`
+}
+
+func (p *Provider) SnapshotVolume(
+	l *logger.Logger, volume vm.Volume, name, description string, labels map[string]string,
+) (string, error) {
+	region := volume.Zone[:len(volume.Zone)-1]
+	labels["Name"] = name
+	var tags []string
+	for k, v := range labels {
+		tags = append(tags, fmt.Sprintf("{Key=%s,Value=%s}", k, v))
+	}
+
+	args := []string{
+		"ec2", "create-snapshot",
+		"--description", description,
+		"--region", region,
+		"--volume-id", volume.ProviderResourceID,
+		"--tag-specifications", "ResourceType=snapshot,Tags=[" + strings.Join(tags, ",") + "]",
+	}
+
+	var so snapshotOutput
+	err := p.runJSONCommand(l, args, &so)
+	return so.SnapshotID, err
 }

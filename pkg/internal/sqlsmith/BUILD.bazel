@@ -33,6 +33,9 @@ go_library(
         "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/sem/volatility",
         "//pkg/sql/types",
+        "//pkg/util",
+        "//pkg/util/randident",
+        "//pkg/util/randident/randidentcfg",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
@@ -53,7 +56,6 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/ccl",
-        "//pkg/ccl/utilccl",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
@@ -62,6 +64,7 @@ go_test(
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
+        "//pkg/util/log",
         "//pkg/util/randutil",
     ],
 )

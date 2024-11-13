@@ -22,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 func (r *Replica) maybeAcquireProposalQuota(
@@ -160,7 +160,7 @@ func (r *Replica) updateProposalQuotaRaftMuLocked(
 		// will stall), whereas for quiescing the downside is lower.
 
 		if !r.mu.lastUpdateTimes.isFollowerActiveSince(
-			ctx, rep.ReplicaID, now, r.store.cfg.RangeLeaseActiveDuration(),
+			ctx, rep.ReplicaID, now, r.store.cfg.RangeLeaseDuration,
 		) {
 			return
 		}

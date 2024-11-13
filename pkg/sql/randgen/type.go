@@ -11,9 +11,11 @@
 package randgen
 
 import (
+	"context"
 	"math/rand"
 	"sort"
 
+	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -38,6 +40,10 @@ var (
 func init() {
 	for _, typ := range types.OidToType {
 		switch typ.Oid() {
+		case oid.T_regnamespace:
+			// Temporarily don't include this.
+			// TODO(msirek): Remove this exclusion once
+			// https://github.com/cockroachdb/cockroach/issues/55791 is fixed.
 		case oid.T_unknown, oid.T_anyelement:
 			// Don't include these.
 		case oid.T_anyarray, oid.T_oidvector, oid.T_int2vector:
@@ -55,6 +61,14 @@ func init() {
 		if IsAllowedForArray(typ) {
 			arrayContentsTypes = append(arrayContentsTypes, typ)
 		}
+	}
+
+	// Add a collated string separately (since it shares the oid with the STRING
+	// type and, thus, wasn't included above).
+	collatedStringType := types.MakeCollatedString(types.String, "en" /* locale */)
+	SeedTypes = append(SeedTypes, collatedStringType)
+	if IsAllowedForArray(collatedStringType) {
+		arrayContentsTypes = append(arrayContentsTypes, collatedStringType)
 	}
 
 	// Sort these so randomly chosen indexes always point to the same element.
@@ -151,16 +165,26 @@ func IsLegalColumnType(typ *types.T) bool {
 		// OIDVECTOR and INT2VECTOR are not valid column types for
 		// user-created tables.
 		return false
+	case oid.T_regproc, oid.T_regprocedure:
+		// REGPROC and REGPROCEDURE columns hit an edge case. Customers are very
+		// unlikely to use these types of columns, so disabling their generation
+		// is low risk.
+		// TODO(#95641): Remove this once we correctly handle this edge case.
+		return false
 	}
-	return colinfo.ValidateColumnDefType(typ) == nil
+	ctx := context.Background()
+	version := clustersettings.MakeTestingClusterSettings().Version
+	return colinfo.ValidateColumnDefType(ctx, version, typ) == nil
 }
 
 // RandArrayType generates a random array type.
 func RandArrayType(rng *rand.Rand) *types.T {
+	ctx := context.Background()
+	version := clustersettings.MakeTestingClusterSettings().Version
 	for {
 		typ := RandColumnType(rng)
 		resTyp := types.MakeArray(typ)
-		if err := colinfo.ValidateColumnDefType(resTyp); err == nil {
+		if err := colinfo.ValidateColumnDefType(ctx, version, resTyp); err == nil {
 			return resTyp
 		}
 	}
@@ -247,11 +271,13 @@ func RandEncodableType(rng *rand.Rand) *types.T {
 // TODO(andyk): Remove this workaround once #36736 is resolved. Replace calls to
 // it with calls to RandColumnTypes.
 func RandEncodableColumnTypes(rng *rand.Rand, numCols int) []*types.T {
+	ctx := context.Background()
+	version := clustersettings.MakeTestingClusterSettings().Version
 	types := make([]*types.T, numCols)
 	for i := range types {
 		for {
 			types[i] = RandEncodableType(rng)
-			if err := colinfo.ValidateColumnDefType(types[i]); err == nil {
+			if err := colinfo.ValidateColumnDefType(ctx, version, types[i]); err == nil {
 				break
 			}
 		}

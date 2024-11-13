@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
@@ -61,10 +61,10 @@ func TestWindowFramer(t *testing.T) {
 	// colcontainer.DiskQueueCacheModeClearAndReuseCache mode.
 	queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeClearAndReuseCache)
 	memAcc := testMemMonitor.MakeBoundAccount()
-	defer memAcc.Close(evalCtx.Ctx())
+	defer memAcc.Close(context.Background())
 
 	factory := coldataext.NewExtendedColumnFactory(evalCtx)
-	allocator := colmem.NewAllocator(evalCtx.Ctx(), &memAcc, factory)
+	allocator := colmem.NewAllocator(context.Background(), &memAcc, factory)
 
 	var memLimits = []int64{1, 1 << 10, 1 << 20}
 
@@ -165,20 +165,20 @@ func testWindowFramer(t *testing.T, testCfg *testConfig) {
 
 	for i := 0; i < testCfg.count; i++ {
 		// Advance the columnar framer.
-		colWindowFramer.next(testCfg.evalCtx.Ctx())
+		colWindowFramer.next(context.Background())
 
 		// Advance the row-wise framer.
 		if testCfg.ordered {
-			vec, vecIdx, _ := partition.GetVecWithTuple(testCfg.evalCtx.Ctx(), peersColIdx, i)
+			vec, vecIdx, _ := partition.GetVecWithTuple(context.Background(), peersColIdx, i)
 			if i > 0 && vec.Bool()[vecIdx] {
 				rowWindowFramer.CurRowPeerGroupNum++
 				require.NoError(t, rowWindowFramer.PeerHelper.Update(rowWindowFramer))
 			}
 		}
 		rowWindowFramer.RowIdx = i
-		rowStartIdx, err := rowWindowFramer.FrameStartIdx(testCfg.evalCtx.Ctx(), testCfg.evalCtx)
+		rowStartIdx, err := rowWindowFramer.FrameStartIdx(context.Background(), testCfg.evalCtx)
 		require.NoError(t, err)
-		rowEndIdx, err := rowWindowFramer.FrameEndIdx(testCfg.evalCtx.Ctx(), testCfg.evalCtx)
+		rowEndIdx, err := rowWindowFramer.FrameEndIdx(context.Background(), testCfg.evalCtx)
 		require.NoError(t, err)
 
 		// Validate that the columnar window framer describes the same window
@@ -186,7 +186,7 @@ func testWindowFramer(t *testing.T, testCfg *testConfig) {
 		var colFrameIdx, firstIdx, lastIdx int
 		var foundRow bool
 		for j := rowStartIdx; j < rowEndIdx; j++ {
-			skipped, err := rowWindowFramer.IsRowSkipped(testCfg.evalCtx.Ctx(), j)
+			skipped, err := rowWindowFramer.IsRowSkipped(context.Background(), j)
 			require.NoError(t, err)
 			if skipped {
 				continue
@@ -211,7 +211,7 @@ func testWindowFramer(t *testing.T, testCfg *testConfig) {
 		require.Equal(t, lastIdx, colWindowFramer.frameLastIdx(), "LastIdx")
 	}
 
-	partition.Close(testCfg.evalCtx.Ctx())
+	partition.Close(context.Background())
 }
 
 func validForStart(bound treewindow.WindowFrameBoundType) bool {
@@ -294,7 +294,8 @@ func makeSortedPartition(testCfg *testConfig) (tree.Datums, *colexecutils.Spilli
 
 	partition := colexecutils.NewSpillingBuffer(
 		testCfg.allocator, testCfg.memLimit, testCfg.queueCfg,
-		colexecop.NewTestingSemaphore(2), []*types.T{testCfg.typ, types.Bool}, testDiskAcc,
+		colexecop.NewTestingSemaphore(2), []*types.T{testCfg.typ, types.Bool},
+		testDiskAcc, testMemAcc,
 	)
 	insertBatch := testCfg.allocator.NewMemBatchWithFixedCapacity(
 		[]*types.T{testCfg.typ, types.Bool},
@@ -333,7 +334,7 @@ func makeSortedPartition(testCfg *testConfig) (tree.Datums, *colexecutils.Spilli
 		}
 		insertBatch.SetLength(1)
 		partition.AppendTuples(
-			testCfg.evalCtx.Ctx(), insertBatch, 0 /* startIdx */, insertBatch.Length())
+			context.Background(), insertBatch, 0 /* startIdx */, insertBatch.Length())
 	}
 	return datums.rows, partition
 }
@@ -355,9 +356,9 @@ func initWindowFramers(
 
 	datums, colBuffer := makeSortedPartition(testCfg)
 
-	datumEncoding := descpb.DatumEncoding_ASCENDING_KEY
+	datumEncoding := catenumpb.DatumEncoding_ASCENDING_KEY
 	if !testCfg.asc {
-		datumEncoding = descpb.DatumEncoding_DESCENDING_KEY
+		datumEncoding = catenumpb.DatumEncoding_DESCENDING_KEY
 	}
 	frame := &execinfrapb.WindowerSpec_Frame{
 		Mode: modeToExecinfrapb(testCfg.mode),
@@ -398,7 +399,7 @@ func initWindowFramers(
 	}
 	colWindowFramer := newWindowFramer(
 		testCfg.evalCtx, frame, ordering, []*types.T{testCfg.typ, types.Bool}, peersCol)
-	colWindowFramer.startPartition(testCfg.evalCtx.Ctx(), colBuffer.Length(), colBuffer)
+	colWindowFramer.startPartition(context.Background(), colBuffer.Length(), colBuffer)
 
 	rowDir := encoding.Ascending
 	if !testCfg.asc {

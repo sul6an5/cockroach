@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/redact"
 	"google.golang.org/grpc"
 )
@@ -41,6 +41,9 @@ type ClusterConfig struct {
 
 	// Dialer constructs connections to other nodes.
 	Dialer NodeDialer
+
+	// RangeDescScanner paginates through all range descriptors.
+	RangeDescScanner rangedesc.Scanner
 
 	// DB provides access the kv.DB instance backing the cluster.
 	//
@@ -94,8 +97,8 @@ func (c *Cluster) UntilClusterStable(ctx context.Context, fn func() error) error
 	return nil
 }
 
-// NumNodes is part of the upgrade.Cluster interface.
-func (c *Cluster) NumNodes(ctx context.Context) (int, error) {
+// NumNodesOrTenantPods is part of the upgrade.Cluster interface.
+func (c *Cluster) NumNodesOrServers(ctx context.Context) (int, error) {
 	ns, err := NodesFromNodeLiveness(ctx, c.c.NodeLiveness)
 	if err != nil {
 		return 0, err
@@ -103,8 +106,8 @@ func (c *Cluster) NumNodes(ctx context.Context) (int, error) {
 	return len(ns), nil
 }
 
-// ForEveryNode is part of the upgrade.Cluster interface.
-func (c *Cluster) ForEveryNode(
+// ForEveryNodeOrTenantPod is part of the upgrade.Cluster interface.
+func (c *Cluster) ForEveryNodeOrServer(
 	ctx context.Context, op string, fn func(context.Context, serverpb.MigrationClient) error,
 ) error {
 
@@ -143,50 +146,10 @@ func (c *Cluster) ForEveryNode(
 func (c *Cluster) IterateRangeDescriptors(
 	ctx context.Context, blockSize int, init func(), fn func(...roachpb.RangeDescriptor) error,
 ) error {
-	return c.c.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		// Inform the caller that we're starting a fresh attempt to page in
-		// range descriptors.
-		init()
+	return c.c.RangeDescScanner.Scan(ctx, blockSize, init, keys.EverythingSpan, fn)
+}
 
-		// Iterate through meta{1,2} to pull out all the range descriptors.
-		var lastRangeIDInMeta1 roachpb.RangeID
-		return txn.Iterate(ctx, keys.MetaMin, keys.MetaMax, blockSize,
-			func(rows []kv.KeyValue) error {
-				descriptors := make([]roachpb.RangeDescriptor, 0, len(rows))
-				var desc roachpb.RangeDescriptor
-				for _, row := range rows {
-					err := row.ValueProto(&desc)
-					if err != nil {
-						return errors.Wrapf(err, "unable to unmarshal range descriptor from %s", row.Key)
-					}
-
-					// In small enough clusters it's possible for the same range
-					// descriptor to be stored in both meta1 and meta2. This
-					// happens when some range spans both the meta and the user
-					// keyspace. Consider when r1 is [/Min,
-					// /System/NodeLiveness); we'll store the range descriptor
-					// in both /Meta2/<r1.EndKey> and in /Meta1/KeyMax[1].
-					//
-					// As part of iterator we'll de-duplicate this descriptor
-					// away by checking whether we've seen it before in meta1.
-					// Since we're scanning over the meta range in sorted
-					// order, it's enough to check against the last range
-					// descriptor we've seen in meta1.
-					//
-					// [1]: See kvserver.rangeAddressing.
-					if desc.RangeID == lastRangeIDInMeta1 {
-						continue
-					}
-
-					descriptors = append(descriptors, desc)
-					if keys.InMeta1(keys.RangeMetaKey(desc.StartKey)) {
-						lastRangeIDInMeta1 = desc.RangeID
-					}
-				}
-
-				// Invoke fn with the current chunk (of size ~blockSize) of
-				// range descriptors.
-				return fn(descriptors...)
-			})
-	})
+// ValidateAfterUpdateSystemVersion is part of the upgrade.Cluster interface.
+func (c *Cluster) ValidateAfterUpdateSystemVersion(_ context.Context) error {
+	return nil
 }

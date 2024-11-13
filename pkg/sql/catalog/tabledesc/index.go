@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -27,9 +28,13 @@ import (
 )
 
 var _ catalog.Index = (*index)(nil)
+var _ catalog.UniqueWithIndexConstraint = (*index)(nil)
 
 // index implements the catalog.Index interface by wrapping the protobuf index
 // descriptor along with some metadata from its parent table descriptor.
+//
+// index also implements the catalog.Constraint interface for index-backed-constraints
+// (i.e. PRIMARY KEY or UNIQUE).
 type index struct {
 	maybeMutation
 	desc    *descpb.IndexDescriptor
@@ -154,24 +159,18 @@ func (w index) ExplicitColumnStartIdx() int {
 	return w.desc.ExplicitColumnStartIdx()
 }
 
-// IsValidOriginIndex returns whether the index can serve as an origin index for
-// a foreign key constraint with the provided set of originColIDs.
-func (w index) IsValidOriginIndex(originColIDs descpb.ColumnIDs) bool {
-	return w.desc.IsValidOriginIndex(originColIDs)
+// IsValidOriginIndex implements the catalog.Index interface.
+func (w index) IsValidOriginIndex(fk catalog.ForeignKeyConstraint) bool {
+	if w.IsPartial() {
+		return false
+	}
+	return descpb.ColumnIDs(w.desc.KeyColumnIDs).HasPrefix(fk.ForeignKeyDesc().OriginColumnIDs)
 }
 
-// IsHelpfulOriginIndex returns whether the index may be a helpful index for
-// performing foreign key checks and cascades for a foreign key with the given
-// origin columns.
-func (w index) IsHelpfulOriginIndex(originColIDs descpb.ColumnIDs) bool {
-	return w.desc.IsHelpfulOriginIndex(originColIDs)
-}
-
-// IsValidReferencedUniqueConstraint returns whether the index can serve as a
-// referenced index for a foreign  key constraint with the provided set of
-// referencedColumnIDs.
-func (w index) IsValidReferencedUniqueConstraint(referencedColIDs descpb.ColumnIDs) bool {
-	return w.desc.IsValidReferencedUniqueConstraint(referencedColIDs)
+// IsValidReferencedUniqueConstraint implements the catalog.UniqueConstraint
+// interface.
+func (w index) IsValidReferencedUniqueConstraint(fk catalog.ForeignKeyConstraint) bool {
+	return w.desc.IsValidReferencedUniqueConstraint(fk.ForeignKeyDesc().ReferencedColumnIDs)
 }
 
 // HasOldStoredColumns returns whether the index has stored columns in the old
@@ -284,11 +283,11 @@ func (w index) GetVersion() descpb.IndexDescriptorVersion {
 // GetEncodingType returns the encoding type of this index. For backward
 // compatibility reasons, this might not match what is stored in
 // w.desc.EncodingType.
-func (w index) GetEncodingType() descpb.IndexDescriptorEncodingType {
+func (w index) GetEncodingType() catenumpb.IndexDescriptorEncodingType {
 	if w.Primary() {
 		// Primary indexes always use the PrimaryIndexEncoding, regardless of what
 		// desc.EncodingType indicates.
-		return descpb.PrimaryIndexEncoding
+		return catenumpb.PrimaryIndexEncoding
 	}
 	return w.desc.EncodingType
 }
@@ -311,7 +310,7 @@ func (w index) GetKeyColumnName(columnOrdinal int) string {
 
 // GetKeyColumnDirection returns the direction of the columnOrdinal-th column in
 // the index key.
-func (w index) GetKeyColumnDirection(columnOrdinal int) catpb.IndexColumn_Direction {
+func (w index) GetKeyColumnDirection(columnOrdinal int) catenumpb.IndexColumn_Direction {
 	return w.desc.KeyColumnDirections[columnOrdinal]
 }
 
@@ -392,15 +391,49 @@ func (w index) UseDeletePreservingEncoding() bool {
 	return w.desc.UseDeletePreservingEncoding && !w.maybeMutation.DeleteOnly()
 }
 
-// ForcePut returns true if writes to the index should only use Put (rather than
-// CPut or InitPut). This is used by:
+// ForcePut forces all writes to use Put rather than CPut or InitPut.
 //
-//   - indexes currently being built by the MVCC-compliant index backfiller, and
-//   - the temporary indexes that support that process, and
-//   - old primary indexes which are being dropped.
+// Users of this options should take great care as it
+// effectively mean unique constraints are not respected.
+//
+// Currently (2023-03-09) there are three users:
+//   - delete preserving indexes
+//   - merging indexes
+//   - dropping primary indexes
+//   - adding primary indexes with new columns (same key)
+//
+// Delete preserving encoding indexes are used only as a log of
+// index writes during backfill, thus we can blindly put values into
+// them.
+//
+// New indexes may miss updates during the backfilling process
+// that would lead to CPut failures until the missed updates
+// are merged into the index. Uniqueness for such indexes is
+// checked by the schema changer before they are brought back
+// online.
+//
+// In the case of dropping primary indexes, we always ensure that
+// there's a replacement primary index which has become public.
+// The reason we must not use cput is that the new primary index
+// may not store all the columns stored in this index.
+//
+// In the case of adding primary indexes with new columns, we don't
+// know the value of the new column when performing updates, so we can't
+// synthesize the expectation. This is okay because the uniqueness of
+// the key is being enforced by the existing primary index.
+//
+// When altering a primary key, we never simultaneously add new columns.
+// When adding a new primary index which has a new key, we always ensure that
+// the source primary index, which is the public primary index, has all
+// columns in that new primary index. In this case, it's unsafe to avoid the
+// ForcePut when that index is in WriteOnly because we need the write to be
+// upholding uniqueness. To re-iterate, when changing the primary key of a
+// table, we'll not be both adding new columns and creating the new primary
+// key at the same time; we have to materialize the new columns and make them
+// available as the public primary index on the table before proceeding to
+// populate the new primary index with the new key structure.
 func (w index) ForcePut() bool {
-	return w.Merging() || w.desc.UseDeletePreservingEncoding ||
-		w.Dropped() && w.IsUnique() && w.GetEncodingType() == descpb.PrimaryIndexEncoding
+	return w.mutationForcePutForIndexWrites
 }
 
 func (w index) CreatedAt() time.Time {
@@ -410,7 +443,7 @@ func (w index) CreatedAt() time.Time {
 	return timeutil.Unix(0, w.desc.CreatedAtNanos)
 }
 
-// IsTemporaryIndexForBackfill() returns true iff the index is
+// IsTemporaryIndexForBackfill returns true iff the index is
 // an index being used as the temporary index being used by an
 // in-progress index backfill.
 //
@@ -418,6 +451,63 @@ func (w index) CreatedAt() time.Time {
 // of the index it is a temporary index for.
 func (w index) IsTemporaryIndexForBackfill() bool {
 	return w.desc.UseDeletePreservingEncoding
+}
+
+// AsCheck implements the catalog.ConstraintProvider interface.
+func (w index) AsCheck() catalog.CheckConstraint {
+	return nil
+}
+
+// AsForeignKey implements the catalog.ConstraintProvider interface.
+func (w index) AsForeignKey() catalog.ForeignKeyConstraint {
+	return nil
+}
+
+// AsUniqueWithoutIndex implements the catalog.ConstraintProvider interface.
+func (w index) AsUniqueWithoutIndex() catalog.UniqueWithoutIndexConstraint {
+	return nil
+}
+
+// AsUniqueWithIndex implements the catalog.ConstraintProvider interface.
+func (w index) AsUniqueWithIndex() catalog.UniqueWithIndexConstraint {
+	if w.Primary() {
+		return &w
+	}
+	if w.IsUnique() && !w.desc.UseDeletePreservingEncoding {
+		return &w
+	}
+	return nil
+}
+
+// String implements the catalog.Constraint interface.
+func (w index) String() string {
+	return fmt.Sprintf("%v", w.desc)
+}
+
+// IsConstraintValidated implements the catalog.Constraint interface.
+func (w index) IsConstraintValidated() bool {
+	return !w.IsMutation()
+}
+
+// IsConstraintUnvalidated implements the catalog.Constraint interface.
+func (w index) IsConstraintUnvalidated() bool {
+	return false
+}
+
+// GetConstraintValidity implements the catalog.Constraint interface.
+func (w index) GetConstraintValidity() descpb.ConstraintValidity {
+	if w.Adding() {
+		return descpb.ConstraintValidity_Validating
+	}
+	if w.Dropped() {
+		return descpb.ConstraintValidity_Dropping
+	}
+	return descpb.ConstraintValidity_Validated
+}
+
+// IsEnforced implements the catalog.Constraint interface.
+func (w index) IsEnforced() bool {
+	return !w.IsMutation() || w.WriteAndDeleteOnly()
 }
 
 // partitioning is the backing struct for a catalog.Partitioning interface.
@@ -538,7 +628,7 @@ func (p partitioning) NumImplicitColumns() int {
 
 // indexCache contains precomputed slices of catalog.Index interfaces.
 type indexCache struct {
-	primary              catalog.Index
+	primary              catalog.UniqueWithIndexConstraint
 	all                  []catalog.Index
 	active               []catalog.Index
 	nonDrop              []catalog.Index
@@ -572,7 +662,7 @@ func newIndexCache(desc *descpb.TableDescriptor, mutations *mutationCache) *inde
 		c.all = append(c.all, m.AsIndex())
 	}
 	// Populate the remaining fields in c.
-	c.primary = c.all[0]
+	c.primary = c.all[0].AsUniqueWithIndex()
 	c.active = c.all[:numPublic]
 	c.publicNonPrimary = c.active[1:]
 	for _, idx := range c.all[1:] {

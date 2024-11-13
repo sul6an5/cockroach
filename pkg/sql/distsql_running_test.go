@@ -21,8 +21,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
@@ -37,10 +39,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgtest"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/datadriven"
@@ -102,7 +104,10 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 		if err := conflictTxn.Put(ctx, key, "pusher was here"); err != nil {
 			return err
 		}
-		return conflictTxn.CommitOrCleanup(ctx)
+		err = conflictTxn.Commit(ctx)
+		require.NoError(t, err)
+		t.Log(conflictTxn.Rollback(ctx))
+		return err
 	}
 
 	// Make a db with a short heartbeat interval, so that the aborted txn finds
@@ -160,8 +165,6 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 			txn,
 			execCfg.Clock,
 			p.ExtendedEvalContext().Tracing,
-			execCfg.ContentionRegistry,
-			nil, /* testingPushCallback */
 		)
 
 		// We need to re-plan every time, since the plan is closed automatically
@@ -170,6 +173,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 		if err := p.makeOptimizerPlan(ctx); err != nil {
 			t.Fatal(err)
 		}
+		defer p.curPlan.close(ctx)
 
 		evalCtx := p.ExtendedEvalContext()
 		// We need distribute = true so that executing the plan involves marshaling
@@ -180,8 +184,8 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 		planCtx.stmtType = recv.stmtType
 
 		execCfg.DistSQLPlanner.PlanAndRun(
-			ctx, evalCtx, planCtx, txn, p.curPlan.main, recv,
-		)()
+			ctx, evalCtx, planCtx, txn, p.curPlan.main, recv, nil, /* finishedSetupFn */
+		)
 		return rw.Err()
 	})
 	if err != nil {
@@ -192,6 +196,201 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	}
 	if tracing.FindMsgInRecording(getRecAndFinish(), clientRejectedMsg) == -1 {
 		t.Fatalf("didn't find expected message in trace: %s", clientRejectedMsg)
+	}
+}
+
+// TestDistSQLRunningParallelFKChecksAfterAbort simulates a SQL transaction
+// that writes two rows required to validate a FK check and then proceeds to
+// write a third row that would actually trigger this check. The transaction is
+// aborted after the third row is written but before the FK check is performed.
+// We assert that this construction doesn't throw a FK violation; instead, the
+// transaction should be able to retry.
+// This test serves as a regression test for the hazard identified in
+// https://github.com/cockroachdb/cockroach/issues/97141.
+func TestDistSQLRunningParallelFKChecksAfterAbort(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	mu := struct {
+		syncutil.Mutex
+		abortTxn func(uuid uuid.UUID)
+	}{}
+
+	s, conn, db := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			DistSQL: &execinfra.TestingKnobs{
+				RunBeforeCascadesAndChecks: func(txnID uuid.UUID) {
+					mu.Lock()
+					defer mu.Unlock()
+					if mu.abortTxn != nil {
+						mu.abortTxn(txnID)
+					}
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+	sqlDB := sqlutils.MakeSQLRunner(conn)
+
+	// Set up schemas for the test. We want a construction that results in 2 FK
+	// checks, of which 1 is done in parallel.
+	sqlDB.Exec(t, "create database test")
+	sqlDB.Exec(t, "create table test.parent1(a INT PRIMARY KEY)")
+	sqlDB.Exec(t, "create table test.parent2(b INT PRIMARY KEY)")
+	sqlDB.Exec(
+		t,
+		"create table test.child(a INT, b INT, FOREIGN KEY (a) REFERENCES test.parent1(a), FOREIGN KEY (b) REFERENCES test.parent2(b))",
+	)
+	key := roachpb.Key("a")
+
+	setupQueries := []string{
+		"insert into test.parent1 VALUES(1)",
+		"insert into test.parent2 VALUES(2)",
+	}
+	query := "insert into test.child VALUES(1, 2)"
+
+	createPlannerAndRunQuery := func(ctx context.Context, txn *kv.Txn, query string) error {
+		execCfg := s.ExecutorConfig().(ExecutorConfig)
+		// Plan the statement.
+		internalPlanner, cleanup := NewInternalPlanner(
+			"test",
+			txn,
+			username.RootUserName(),
+			&MemoryMetrics{},
+			&execCfg,
+			sessiondatapb.SessionData{},
+		)
+		defer cleanup()
+		p := internalPlanner.(*planner)
+		stmt, err := parser.ParseOne(query)
+		require.NoError(t, err)
+
+		rw := NewCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
+			return nil
+		})
+		recv := MakeDistSQLReceiver(
+			ctx,
+			rw,
+			stmt.AST.StatementReturnType(),
+			execCfg.RangeDescriptorCache,
+			txn,
+			execCfg.Clock,
+			p.ExtendedEvalContext().Tracing,
+		)
+
+		p.stmt = makeStatement(stmt, clusterunique.ID{})
+		if err := p.makeOptimizerPlan(ctx); err != nil {
+			t.Fatal(err)
+		}
+		defer p.curPlan.close(ctx)
+
+		evalCtx := p.ExtendedEvalContext()
+		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, txn, DistributionTypeNone)
+		planCtx.stmtType = recv.stmtType
+
+		evalCtxFactory := func(bool) *extendedEvalContext {
+			factoryEvalCtx := extendedEvalContext{Tracing: evalCtx.Tracing}
+			factoryEvalCtx.Context = evalCtx.Context
+			return &factoryEvalCtx
+		}
+		err = execCfg.DistSQLPlanner.PlanAndRunAll(ctx, evalCtx, planCtx, p, recv, evalCtxFactory)
+		if err != nil {
+			return err
+		}
+		return rw.Err()
+	}
+
+	push := func(ctx context.Context, key roachpb.Key) error {
+		// Conflicting transaction that pushes another transaction.
+		conflictTxn := kv.NewTxn(ctx, db, 0 /* gatewayNodeID */)
+		// We need to explicitly set a high priority for the push to happen.
+		if err := conflictTxn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
+			return err
+		}
+		// Push through a Put, as opposed to a Get, so that the pushee gets aborted.
+		if err := conflictTxn.Put(ctx, key, "pusher was here"); err != nil {
+			return err
+		}
+		err := conflictTxn.Commit(ctx)
+		require.NoError(t, err)
+		t.Log(conflictTxn.Rollback(ctx))
+		return err
+	}
+
+	// Make a db with a short heartbeat interval, so that the aborted txn finds
+	// out quickly.
+	ambient := s.AmbientCtx()
+	tsf := kvcoord.NewTxnCoordSenderFactory(
+		kvcoord.TxnCoordSenderFactoryConfig{
+			AmbientCtx: ambient,
+			// Short heartbeat interval.
+			HeartbeatInterval: time.Millisecond,
+			Settings:          s.ClusterSettings(),
+			Clock:             s.Clock(),
+			Stopper:           s.Stopper(),
+		},
+		s.DistSenderI().(*kvcoord.DistSender),
+	)
+	shortDB := kv.NewDB(ambient, tsf, s.Clock(), s.Stopper())
+
+	iter := 0
+	// We'll trace to make sure the test isn't fooling itself.
+	tr := s.TracerI().(*tracing.Tracer)
+	runningCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "test")
+	defer getRecAndFinish()
+	err := shortDB.Txn(runningCtx, func(ctx context.Context, txn *kv.Txn) error {
+		iter++
+
+		// set up the test.
+		for _, query := range setupQueries {
+			err := createPlannerAndRunQuery(ctx, txn, query)
+			require.NoError(t, err)
+		}
+
+		if iter == 1 {
+			// On the first iteration, abort the txn by setting the abortTxn function.
+			mu.Lock()
+			mu.abortTxn = func(txnID uuid.UUID) {
+				if txnID != txn.ID() {
+					return // not our txn
+				}
+				if err := txn.Put(ctx, key, "val"); err != nil {
+					t.Fatal(err)
+				}
+				if err := push(ctx, key); err != nil {
+					t.Fatal(err)
+				}
+				// Now wait until the heartbeat loop notices that the transaction is aborted.
+				testutils.SucceedsSoon(t, func() error {
+					if txn.Sender().(*kvcoord.TxnCoordSender).IsTracking() {
+						return fmt.Errorf("txn heartbeat loop running")
+					}
+					return nil
+				})
+			}
+			mu.Unlock()
+			defer func() {
+				// clear the abortTxn function before returning.
+				mu.Lock()
+				mu.abortTxn = nil
+				mu.Unlock()
+			}()
+		}
+
+		// Execute the FK checks.
+		return createPlannerAndRunQuery(ctx, txn, query)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, iter, 2)
+	if tracing.FindMsgInRecording(getRecAndFinish(), clientRejectedMsg) == -1 {
+		t.Fatalf("didn't find expected message in trace: %s", clientRejectedMsg)
+	}
+	concurrentFKChecksLogMessage := fmt.Sprintf(executingParallelAndSerialChecks, 1, 1)
+	if tracing.FindMsgInRecording(getRecAndFinish(), concurrentFKChecksLogMessage) == -1 {
+		t.Fatalf("didn't find expected message in trace: %s", concurrentFKChecksLogMessage)
 	}
 }
 
@@ -221,18 +420,16 @@ func TestDistSQLReceiverErrorRanking(t *testing.T) {
 		txn,
 		nil, /* clockUpdater */
 		&SessionTracing{},
-		nil, /* contentionRegistry */
-		nil, /* testingPushCallback */
 	)
 
-	retryErr := roachpb.NewErrorWithTxn(
-		roachpb.NewTransactionRetryError(
-			roachpb.RETRY_SERIALIZABLE, "test err"),
+	retryErr := kvpb.NewErrorWithTxn(
+		kvpb.NewTransactionRetryError(
+			kvpb.RETRY_SERIALIZABLE, "test err"),
 		txn.TestingCloneTxn()).GoError()
 
-	abortErr := roachpb.NewErrorWithTxn(
-		roachpb.NewTransactionAbortedError(
-			roachpb.ABORT_REASON_ABORTED_RECORD_FOUND),
+	abortErr := kvpb.NewErrorWithTxn(
+		kvpb.NewTransactionAbortedError(
+			kvpb.ABORT_REASON_ABORTED_RECORD_FOUND),
 		txn.TestingCloneTxn()).GoError()
 
 	errs := []struct {
@@ -327,14 +524,15 @@ func TestDistSQLReceiverReportsContention(t *testing.T) {
 		}()
 		// TODO(yuzefovich): turning the tracing ON won't be necessary once
 		// always-on tracing is enabled.
-		_, err = otherConn.ExecContext(ctx, `
-SET TRACING=on;
-BEGIN;
-SET TRANSACTION PRIORITY HIGH;
-UPDATE test.test SET x = 100 WHERE x = 1;
-COMMIT;
-SET TRACING=off;
-`)
+		_, err = otherConn.ExecContext(ctx, `SET TRACING=on;`)
+		require.NoError(t, err)
+		txn, err := otherConn.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, err = txn.ExecContext(ctx, `
+			SET TRANSACTION PRIORITY HIGH;
+			UPDATE test.test SET x = 100 WHERE x = 1;
+		`)
+
 		require.NoError(t, err)
 		if contention {
 			// Soft check to protect against flakiness where an internal query
@@ -347,8 +545,14 @@ SET TRACING=off;
 				"contention metric unexpectedly non-zero when no contention events are produced",
 			)
 		}
+
 		require.Equal(t, contention, strings.Contains(contentionRegistry.String(), contentionEventSubstring))
+		err = txn.Commit()
+		require.NoError(t, err)
+		_, err = otherConn.ExecContext(ctx, `SET TRACING=off;`)
+		require.NoError(t, err)
 	})
+
 }
 
 // TestDistSQLReceiverDrainsOnError is a simple unit test that asserts that the
@@ -366,8 +570,6 @@ func TestDistSQLReceiverDrainsOnError(t *testing.T) {
 		nil, /* txn */
 		nil, /* clockUpdater */
 		&SessionTracing{},
-		nil, /* contentionRegistry */
-		nil, /* testingPushCallback */
 	)
 	status := recv.Push(nil /* row */, &execinfrapb.ProducerMetadata{Err: errors.New("some error")})
 	require.Equal(t, execinfra.DrainRequested, status)
@@ -397,11 +599,11 @@ func TestDistSQLReceiverDrainsMeta(t *testing.T) {
 			UseDatabase: "test",
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &ExecutorTestingKnobs{
-					DistSQLReceiverPushCallbackFactory: func(query string) func(rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
+					DistSQLReceiverPushCallbackFactory: func(query string) func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata) {
 						if query != testQuery {
 							return nil
 						}
-						return func(row rowenc.EncDatumRow, meta *execinfrapb.ProducerMetadata) {
+						return func(_ rowenc.EncDatumRow, _ coldata.Batch, meta *execinfrapb.ProducerMetadata) {
 							if meta != nil {
 								accumulatedMeta = append(accumulatedMeta, *meta)
 							}
@@ -437,6 +639,14 @@ func TestDistSQLReceiverDrainsMeta(t *testing.T) {
 	p, err := pgtest.NewPGTest(ctx, tc.Server(0).ServingSQLAddr(), username.RootUser)
 	require.NoError(t, err)
 
+	// We disable multiple active portals here as it only supports local-only plan.
+	// TODO(sql-sessions): remove this line when we finish
+	// https://github.com/cockroachdb/cockroach/issues/100822.
+	require.NoError(t, p.SendOneLine(`Query {"String": "SET multiple_active_portals_enabled = false"}`))
+	until := pgtest.ParseMessages("ReadyForQuery")
+	_, err = p.Until(false /* keepErrMsg */, until...)
+	require.NoError(t, err)
+
 	// Execute the test query asking for at most 25 rows.
 	require.NoError(t, p.SendOneLine(`Query {"String": "USE test"}`))
 	require.NoError(t, p.SendOneLine(fmt.Sprintf(`Parse {"Query": "%s"}`, testQuery)))
@@ -447,7 +657,7 @@ func TestDistSQLReceiverDrainsMeta(t *testing.T) {
 	// Retrieve all of the results. We need to receive until two 'ReadyForQuery'
 	// messages are returned (the first one for "USE test" query and the second
 	// one is for the limited portal execution).
-	until := pgtest.ParseMessages("ReadyForQuery\nReadyForQuery")
+	until = pgtest.ParseMessages("ReadyForQuery\nReadyForQuery")
 	msgs, err := p.Until(false /* keepErrMsg */, until...)
 	require.NoError(t, err)
 	received := pgtest.MsgsToJSONWithIgnore(msgs, &datadriven.TestData{})
@@ -483,7 +693,7 @@ func TestCancelFlowsCoordinator(t *testing.T) {
 		require.GreaterOrEqual(t, numNodes-1, c.mu.deadFlowsByNode.Len())
 		seen := make(map[base.SQLInstanceID]struct{})
 		for i := 0; i < c.mu.deadFlowsByNode.Len(); i++ {
-			deadFlows := c.mu.deadFlowsByNode.Get(i).(*deadFlowsOnNode)
+			deadFlows := c.mu.deadFlowsByNode.Get(i)
 			require.NotEqual(t, gatewaySQLInstanceID, deadFlows.sqlInstanceID)
 			_, ok := seen[deadFlows.sqlInstanceID]
 			require.False(t, ok)
@@ -552,140 +762,6 @@ func TestCancelFlowsCoordinator(t *testing.T) {
 	wg.Wait()
 }
 
-// TestDistSQLReceiverCancelsDeadFlows verifies that if a local flow of a
-// distributed query errors out while the remote flows are queued for running,
-// then the remote flows won't actually run and will be canceled via
-// CancelDeadFlows RPC instead.
-//
-// It does so by forcing all remote flows to be placed in queue, waiting for the
-// query to error out on the gateway and making sure that the remote flows are
-// promptly canceled.
-func TestDistSQLReceiverCancelsDeadFlows(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	const numNodes = 3
-	const gatewayNodeID = 0
-	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationManual,
-	})
-	defer tc.Stopper().Stop(ctx)
-
-	// Create a table with 30 rows, split them into 3 ranges with each node
-	// having one.
-	db := tc.ServerConn(gatewayNodeID)
-	sqlDB := sqlutils.MakeSQLRunner(db)
-	sqlutils.CreateTable(
-		t, db, "foo",
-		"k INT PRIMARY KEY, v INT",
-		30,
-		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(2)),
-	)
-	sqlDB.Exec(t, "ALTER TABLE test.foo SPLIT AT VALUES (10), (20)")
-	sqlDB.Exec(
-		t,
-		fmt.Sprintf("ALTER TABLE test.foo EXPERIMENTAL_RELOCATE VALUES (ARRAY[%d], 0), (ARRAY[%d], 10), (ARRAY[%d], 20)",
-			tc.Server(0).GetFirstStoreID(),
-			tc.Server(1).GetFirstStoreID(),
-			tc.Server(2).GetFirstStoreID(),
-		),
-	)
-
-	// Enable the queueing mechanism of the flow scheduler.
-	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.flow_scheduler_queueing.enabled = true")
-
-	// Disable the execution of all remote flows and shorten the timeout.
-	const maxRunningFlows = 0
-	const flowStreamTimeout = 1 // in seconds
-	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.max_running_flows=$1", maxRunningFlows)
-	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.flow_stream_timeout=$1", fmt.Sprintf("%ds", flowStreamTimeout))
-
-	// Wait for all nodes to get the updated values of these cluster settings.
-	testutils.SucceedsSoon(t, func() error {
-		for nodeID := 0; nodeID < numNodes; nodeID++ {
-			conn := tc.ServerConn(nodeID)
-			db := sqlutils.MakeSQLRunner(conn)
-			var flows int
-			db.QueryRow(t, "SHOW CLUSTER SETTING sql.distsql.max_running_flows").Scan(&flows)
-			if flows != maxRunningFlows {
-				return errors.New("old max_running_flows value")
-			}
-			var timeout string
-			db.QueryRow(t, "SHOW CLUSTER SETTING sql.distsql.flow_stream_timeout").Scan(&timeout)
-			if timeout != fmt.Sprintf("00:00:0%d", flowStreamTimeout) {
-				return errors.Errorf("old flow_stream_timeout value")
-			}
-		}
-		return nil
-	})
-
-	remoteServers := []*distsql.ServerImpl{
-		tc.Server(1).DistSQLServer().(*distsql.ServerImpl),
-		tc.Server(2).DistSQLServer().(*distsql.ServerImpl),
-	}
-
-	// If assertEmpty is true, this function asserts that the queues of the
-	// remote servers are empty; otherwise - that the queues are not empty.
-	assertQueues := func(assertEmpty bool) error {
-		for idx, s := range remoteServers {
-			numQueued := s.NumRemoteFlowsInQueue()
-			if (numQueued != 0 && assertEmpty) || (numQueued == 0 && !assertEmpty) {
-				return errors.Errorf("unexpectedly %d flows are found in the queue of node %d", numQueued, idx+1)
-			}
-		}
-		return nil
-	}
-
-	// Check that the queues on the remote servers are empty and set the testing
-	// callback.
-	if err := assertQueues(true /* assertEmpty */); err != nil {
-		t.Fatal(err)
-	}
-	var numCanceledAtomic int64
-	for _, s := range remoteServers {
-		s.SetCancelDeadFlowsCallback(func(numCanceled int) {
-			atomic.AddInt64(&numCanceledAtomic, int64(numCanceled))
-		})
-	}
-
-	// Spin up a separate goroutine that will try running the query. The query
-	// eventually will error out because the remote flows don't connect in time.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	g := ctxgroup.WithContext(ctx)
-	g.GoCtx(func(ctx context.Context) error {
-		conn := tc.ServerConn(gatewayNodeID)
-		_, err := conn.ExecContext(ctx, "SELECT * FROM test.foo")
-		return err
-	})
-
-	// Wait for remote flows to be scheduled (i.e. for queues to become
-	// non-empty).
-	t.Log("waiting for remote flows to be scheduled")
-	testutils.SucceedsSoon(t, func() error {
-		return assertQueues(false /* assertEmpty */)
-	})
-
-	t.Log("waiting for query to error out")
-	queryErr := g.Wait()
-	require.Error(t, queryErr)
-	require.True(t, strings.Contains(queryErr.Error(), "no inbound stream connection"))
-
-	// Now wait for the queues to become empty again and make sure that the dead
-	// flows were, in fact, canceled.
-	t.Log("waiting for queues to be empty")
-	testutils.SucceedsSoon(t, func() error {
-		if err := assertQueues(true /* assertEmpty */); err != nil {
-			return err
-		}
-		if int64(numNodes-1) != atomic.LoadInt64(&numCanceledAtomic) {
-			return errors.New("not all flows are still canceled")
-		}
-		return nil
-	})
-}
-
 // TestDistSQLRunnerCoordinator verifies that the runnerCoordinator correctly
 // reacts to the changes of the corresponding setting.
 func TestDistSQLRunnerCoordinator(t *testing.T) {
@@ -715,4 +791,174 @@ func TestDistSQLRunnerCoordinator(t *testing.T) {
 
 	// Now bump it up to 100.
 	checkNumRunners(100)
+}
+
+// TestSetupFlowRPCError verifies that the distributed query plan errors out and
+// cleans up all flows if the SetupFlow RPC fails for one of the remote nodes.
+// It also checks that the expected error is returned.
+func TestSetupFlowRPCError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Start a 3 node cluster where we can inject an error for SetupFlow RPC on
+	// the server side for the queries in question.
+	const numNodes = 3
+	ctx := context.Background()
+	getError := func(nodeID base.SQLInstanceID) error {
+		return errors.Newf("injected error on n%d", nodeID)
+	}
+	// We use different queries to simplify handling the node ID on which the
+	// error should be injected (i.e. we avoid the need for synchronization in
+	// the test). In particular, the difficulty comes from the fact that some of
+	// the SetupFlow RPCs might not be issued at all while others are served
+	// after the corresponding flow on the gateway has exited.
+	queries := []string{
+		"SELECT k FROM test.foo",
+		"SELECT v FROM test.foo",
+		"SELECT * FROM test.foo",
+	}
+	stmtToNodeIDForError := map[string]base.SQLInstanceID{
+		queries[0]: 2, // error on n2
+		queries[1]: 3, // error on n3
+		queries[2]: 0, // no error
+	}
+	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				DistSQL: &execinfra.TestingKnobs{
+					SetupFlowCb: func(_ context.Context, nodeID base.SQLInstanceID, req *execinfrapb.SetupFlowRequest) error {
+						nodeIDForError, ok := stmtToNodeIDForError[req.StatementSQL]
+						if !ok || nodeIDForError != nodeID {
+							return nil
+						}
+						return getError(nodeID)
+					},
+				},
+			},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	// Create a table with 30 rows, split them into 3 ranges with each node
+	// having one.
+	db := tc.ServerConn(0)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlutils.CreateTable(
+		t, db, "foo",
+		"k INT PRIMARY KEY, v INT",
+		30,
+		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(2)),
+	)
+	sqlDB.Exec(t, "ALTER TABLE test.foo SPLIT AT VALUES (10), (20)")
+	sqlDB.Exec(
+		t,
+		fmt.Sprintf("ALTER TABLE test.foo EXPERIMENTAL_RELOCATE VALUES (ARRAY[%d], 0), (ARRAY[%d], 10), (ARRAY[%d], 20)",
+			tc.Server(0).GetFirstStoreID(),
+			tc.Server(1).GetFirstStoreID(),
+			tc.Server(2).GetFirstStoreID(),
+		),
+	)
+
+	// assertNoRemoteFlows verifies that the remote flows exit "soon".
+	//
+	// Note that in practice this happens very quickly, but in an edge case it
+	// could take 10s (sql.distsql.flow_stream_timeout). That edge case occurs
+	// when the server-side goroutine of the SetupFlow RPC is scheduled after
+	// - the gateway flow exits with an error
+	// - the CancelDeadFlows RPC for the remote flow in question completes.
+	// With such setup the FlowStream RPC of the outbox will time out after 10s.
+	assertNoRemoteFlows := func() {
+		testutils.SucceedsSoon(t, func() error {
+			for i, remoteNode := range []*distsql.ServerImpl{
+				tc.Server(1).DistSQLServer().(*distsql.ServerImpl),
+				tc.Server(2).DistSQLServer().(*distsql.ServerImpl),
+			} {
+				if n := remoteNode.NumRemoteRunningFlows(); n != 0 {
+					return errors.Newf("%d remote flows still running on n%d", n, i+2)
+				}
+			}
+			return nil
+		})
+	}
+
+	// Run query twice while injecting an error on the remote nodes.
+	for i := 0; i < 2; i++ {
+		query := queries[i]
+		nodeID := stmtToNodeIDForError[query]
+		t.Logf("running %q with error being injected on n%d", query, nodeID)
+		_, err := db.ExecContext(ctx, query)
+		require.True(t, strings.Contains(err.Error(), getError(nodeID).Error()))
+		assertNoRemoteFlows()
+	}
+
+	// Sanity check that the query doesn't error out without error injection.
+	t.Logf("running %q with no error injection", queries[2])
+	_, err := db.ExecContext(ctx, queries[2])
+	require.NoError(t, err)
+	assertNoRemoteFlows()
+}
+
+// TestDistSQLPlannerParallelChecks can be used to stress the behavior of
+// postquery checks when they run in parallel.
+func TestDistSQLPlannerParallelChecks(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	rng, _ := randutil.NewTestRand()
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	// Set up a child table with two foreign keys into two parent tables.
+	sqlDB.Exec(t, `CREATE TABLE parent1 (id1 INT8 PRIMARY KEY)`)
+	sqlDB.Exec(t, `CREATE TABLE parent2 (id2 INT8 PRIMARY KEY)`)
+	sqlDB.Exec(t, `
+CREATE TABLE child (
+    id INT8 PRIMARY KEY, parent_id1 INT8 NOT NULL, parent_id2 INT8 NOT NULL,
+    FOREIGN KEY (parent_id1) REFERENCES parent1 (id1),
+    FOREIGN KEY (parent_id2) REFERENCES parent2 (id2)
+);`)
+	// Disable the insert fast path in order for the foreign key checks to be
+	// planned as parallel postqueries.
+	sqlDB.Exec(t, `SET enable_insert_fast_path = false`)
+	if rng.Float64() < 0.1 {
+		// In 10% of the cases, set a very low workmem limit in order to force
+		// the bufferNode to spill to disk.
+		sqlDB.Exec(t, `SET distsql_workmem = '1KiB'`)
+	}
+
+	const numIDs = 1000
+	for id := 0; id < numIDs; id++ {
+		sqlDB.Exec(t, `INSERT INTO parent1 VALUES ($1)`, id)
+		sqlDB.Exec(t, `INSERT INTO parent2 VALUES ($1)`, id)
+		var prefix string
+		if rng.Float64() < 0.5 {
+			// In 50% of the cases, run the INSERT query with FK checks via
+			// EXPLAIN ANALYZE (or EXPLAIN ANALYZE (DEBUG)) in order to exercise
+			// the planning code paths that are only taken when the tracing is
+			// enabled.
+			prefix = "EXPLAIN ANALYZE "
+			if rng.Float64() < 0.02 {
+				// Run DEBUG flavor only in 1% of all cases since it is
+				// noticeably slower.
+				prefix = "EXPLAIN ANALYZE (DEBUG) "
+			}
+		}
+		if rng.Float64() < 0.1 {
+			// In 10% of the cases, run the INSERT that results in an error (we
+			// don't have any negative ids in the parent tables).
+			invalidID := -1
+			// The FK violation occurs for both FKs, but we expect that the
+			// error for parent_id1 is always chosen.
+			sqlDB.ExpectErr(
+				t,
+				`insert on table "child" violates foreign key constraint "child_parent_id1_fkey"`,
+				fmt.Sprintf(`%[1]sINSERT INTO child VALUES (%[2]d, %[2]d, %[2]d)`, prefix, invalidID),
+			)
+			continue
+		}
+		sqlDB.Exec(t, fmt.Sprintf(`%[1]sINSERT INTO child VALUES (%[2]d, %[2]d, %[2]d)`, prefix, id))
+	}
 }

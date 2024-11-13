@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 var (
@@ -198,7 +199,13 @@ func makeConstDatum(s *Smither, typ *types.T) tree.Datum {
 	if f := datum.ResolvedType().Family(); f != types.UnknownFamily && s.simpleDatums {
 		datum = randgen.RandDatumSimple(s.rnd, typ)
 	}
-
+	if v, ok := tree.AsDString(datum); ok && s.stringConstPrefix != "" {
+		sv := s.stringConstPrefix + string(v)
+		if typ.Width() > 0 {
+			sv = util.TruncateString(sv, int(typ.Width()))
+		}
+		datum = tree.NewDString(sv)
+	}
 	return datum
 }
 
@@ -223,6 +230,9 @@ func getColRef(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, *colRef,
 		return nil, nil, false
 	}
 	col := cols[s.rnd.Intn(len(cols))]
+	if s.disableDecimals && col.typ.Family() == types.DecimalFamily {
+		return nil, nil, false
+	}
 	return col.typedExpr(), col, true
 }
 
@@ -335,6 +345,10 @@ func makeBinOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 			op.RightType = transform.rightType
 		}
 	}
+	if s.disableDivision &&
+		(op.Operator.Symbol == treebin.Div || op.Operator.Symbol == treebin.FloorDiv) {
+		return nil, false
+	}
 	left := makeScalar(s, op.LeftType, refs)
 	right := makeScalar(s, op.RightType, refs)
 	return castType(
@@ -433,11 +447,11 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		args = append(args, castType(arg, argTyp))
 	}
 
-	if fn.def.Class == tree.WindowClass && s.disableWindowFuncs {
+	if fn.overload.Class == tree.WindowClass && s.disableWindowFuncs {
 		return nil, false
 	}
 
-	if fn.def.Class == tree.AggregateClass && s.disableAggregateFuncs {
+	if fn.overload.Class == tree.AggregateClass && s.disableAggregateFuncs {
 		return nil, false
 	}
 
@@ -445,7 +459,8 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 	// Use a window function if:
 	// - we chose an aggregate function, then 1/6 chance, but not if we're in a HAVING (noWindow == true)
 	// - we explicitly chose a window function
-	if fn.def.Class == tree.WindowClass || (!s.disableWindowFuncs && !ctx.noWindow && s.d6() == 1 && fn.def.Class == tree.AggregateClass) {
+	if fn.overload.Class == tree.WindowClass ||
+		(!s.disableWindowFuncs && !ctx.noWindow && s.d6() == 1 && fn.overload.Class == tree.AggregateClass) {
 		var parts tree.Exprs
 		s.sample(len(refs), 2, func(i int) {
 			parts = append(parts, refs[i].item)
@@ -455,7 +470,9 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 			orderTypes []*types.T
 		)
 		addOrdCol := func(expr tree.Expr, typ *types.T) {
-			order = append(order, &tree.Order{Expr: expr, Direction: s.randDirection()})
+			order = append(order, &tree.Order{
+				Expr: expr, Direction: s.randDirection(), NullsOrder: s.randNullsOrder(),
+			})
 			orderTypes = append(orderTypes, typ)
 		}
 		s.sample(len(refs)-len(parts), 2, func(i int) {
@@ -464,18 +481,15 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		})
 		if s.disableNondeterministicFns {
 			switch fn.def.Name {
-			case "lead", "lag":
-				// Lead and lag need all columns to be added to the ORDER BY because
-				// while they respect the order, they can return any value within the
-				// partition. This means we need to be consistent about which rows fall
-				// on the boundary between peer groups.
-				for _, ref := range refs {
-					addOrdCol(ref.typedExpr(), ref.typ)
-				}
+			case "rank", "dense_rank", "percent_rank":
+				// The rank functions don't need to add ordering columns because they
+				// return the same result for all rows in a given peer group.
 			default:
-				// Other window functions only need to order by the argument columns.
-				for _, arg := range args {
-					addOrdCol(arg, arg.ResolvedType())
+				// Other window functions care about the relative order of rows within
+				// each peer group, so we ensure that the ordering is deterministic by
+				// limiting each peer group to one row (by ordering on all columns).
+				for _, i := range s.rnd.Perm(len(refs)) {
+					addOrdCol(refs[i].typedExpr(), refs[i].typ)
 				}
 			}
 		}
@@ -516,7 +530,9 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 			funcExpr.AggType = tree.GeneralAgg
 			funcExpr.OrderBy = make(tree.OrderBy, len(args))
 			for i := range funcExpr.OrderBy {
-				funcExpr.OrderBy[i] = &tree.Order{Expr: args[i], Direction: s.randDirection()}
+				funcExpr.OrderBy[i] = &tree.Order{
+					Expr: args[i], Direction: s.randDirection(), NullsOrder: s.randNullsOrder(),
+				}
 			}
 		}
 	}

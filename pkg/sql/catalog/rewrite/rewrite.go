@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -70,6 +71,18 @@ func TableDescs(
 		table.UnexposedParentSchemaID = tableRewrite.ParentSchemaID
 		table.ParentID = tableRewrite.ParentID
 
+		// Rewrite CHECK constraints before function IDs in expressions are
+		// rewritten. Check constraint mutations are also dropped if any function
+		// referenced are missing.
+		if err := dropCheckConstraintMissingDeps(table, descriptorRewrites); err != nil {
+			return err
+		}
+
+		// Drop column expressions if referenced UDFs not found.
+		if err := dropColumnExpressionsMissingDeps(table, descriptorRewrites); err != nil {
+			return err
+		}
+
 		// Remap type IDs and sequence IDs in all serialized expressions within the TableDescriptor.
 		// TODO (rohany): This needs tests once partial indexes are ready.
 		if err := tabledesc.ForEachExprStringInTableDesc(table, func(expr *string) error {
@@ -80,6 +93,12 @@ func TableDescs(
 			*expr = newExpr
 
 			newExpr, err = rewriteSequencesInExpr(*expr, descriptorRewrites)
+			if err != nil {
+				return err
+			}
+			*expr = newExpr
+
+			newExpr, err = rewriteFunctionsInExpr(*expr, descriptorRewrites)
 			if err != nil {
 				return err
 			}
@@ -98,7 +117,7 @@ func TableDescs(
 			table.ViewQuery = viewQuery
 		}
 
-		// TODO(lucy): deal with outbound foreign key mutations here as well.
+		// Rewrite outbound FKs in both `OutboundFKs` and `Mutations` slice.
 		origFKs := table.OutboundFKs
 		table.OutboundFKs = nil
 		for i := range origFKs {
@@ -118,6 +137,16 @@ func TableDescs(
 			// a db and name matching the one the FK pointed to at backup, should
 			// we update the FK to point to it?
 			table.OutboundFKs = append(table.OutboundFKs, *fk)
+		}
+		for idx := range table.Mutations {
+			if c := table.Mutations[idx].GetConstraint(); c != nil &&
+				c.ConstraintType == descpb.ConstraintToUpdate_FOREIGN_KEY {
+				fk := &c.ForeignKey
+				if rewriteOfReferencedTable, ok := descriptorRewrites[fk.ReferencedTableID]; ok {
+					fk.ReferencedTableID = rewriteOfReferencedTable.ID
+					fk.OriginTableID = tableRewrite.ID
+				}
+			}
 		}
 
 		origInboundFks := table.InboundFKs
@@ -159,6 +188,34 @@ func TableDescs(
 			if refRewrite, ok := descriptorRewrites[ref.ID]; ok {
 				ref.ID = refRewrite.ID
 				table.DependedOnBy = append(table.DependedOnBy, ref)
+			}
+		}
+
+		// Rewrite unique_without_index in both `UniqueWithoutIndexConstraints`
+		// and `Mutations` slice.
+		origUniqueWithoutIndexConstraints := table.UniqueWithoutIndexConstraints
+		table.UniqueWithoutIndexConstraints = nil
+		for _, unique := range origUniqueWithoutIndexConstraints {
+			if rewrite, ok := descriptorRewrites[unique.TableID]; ok {
+				unique.TableID = rewrite.ID
+				table.UniqueWithoutIndexConstraints = append(table.UniqueWithoutIndexConstraints, unique)
+			} else {
+				// A table's UniqueWithoutIndexConstraint.TableID references itself, and
+				// we should always find a rewrite for the table being restored.
+				return errors.AssertionFailedf("cannot restore %q because referenced table ID in "+
+					"UniqueWithoutIndexConstraint %d was not found", table.Name, unique.TableID)
+			}
+		}
+		for idx := range table.Mutations {
+			if c := table.Mutations[idx].GetConstraint(); c != nil &&
+				c.ConstraintType == descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX {
+				uwi := &c.UniqueWithoutIndexConstraint
+				if rewrite, ok := descriptorRewrites[uwi.TableID]; ok {
+					uwi.TableID = rewrite.ID
+				} else {
+					return errors.AssertionFailedf("cannot restore %q because referenced table ID in "+
+						"UniqueWithoutIndexConstraint %d was not found", table.Name, uwi.TableID)
+				}
 			}
 		}
 
@@ -209,6 +266,12 @@ func TableDescs(
 			}
 			col.OwnsSequenceIds = newOwnedSeqRefs
 
+			for i, fnID := range col.UsesFunctionIds {
+				// We have dropped expressions missing UDF references. so it's safe to
+				// just rewrite ids.
+				col.UsesFunctionIds[i] = descriptorRewrites[fnID].ID
+			}
+
 			return nil
 		}
 
@@ -230,10 +293,20 @@ func TableDescs(
 	return nil
 }
 
+func makeDBNameReplaceFunc(newDB string) func(ctx *tree.FmtCtx, tn *tree.TableName) {
+	return func(ctx *tree.FmtCtx, tn *tree.TableName) {
+		// empty catalog e.g. ``"".information_schema.tables` should stay empty.
+		if tn.CatalogName != "" {
+			tn.CatalogName = tree.Name(newDB)
+		}
+		ctx.WithReformatTableNames(nil, func() {
+			ctx.FormatNode(tn)
+		})
+	}
+}
+
 // rewriteViewQueryDBNames rewrites the passed table's ViewQuery replacing all
 // non-empty db qualifiers with `newDB`.
-//
-// TODO: this AST traversal misses tables named in strings (#24556).
 func rewriteViewQueryDBNames(table *tabledesc.Mutable, newDB string) error {
 	stmt, err := parser.ParseOne(table.ViewQuery)
 	if err != nil {
@@ -243,19 +316,34 @@ func rewriteViewQueryDBNames(table *tabledesc.Mutable, newDB string) error {
 	// Re-format to change all DB names to `newDB`.
 	f := tree.NewFmtCtx(
 		tree.FmtParsable,
-		tree.FmtReformatTableNames(func(ctx *tree.FmtCtx, tn *tree.TableName) {
-			// empty catalog e.g. ``"".information_schema.tables` should stay empty.
-			if tn.CatalogName != "" {
-				tn.CatalogName = tree.Name(newDB)
-			}
-			ctx.WithReformatTableNames(nil, func() {
-				ctx.FormatNode(tn)
-			})
-		}),
+		tree.FmtReformatTableNames(makeDBNameReplaceFunc(newDB)),
 	)
 	f.FormatNode(stmt.AST)
 	table.ViewQuery = f.CloseAndGetString()
 	return nil
+}
+
+func rewriteFunctionBodyDBNames(fnBody string, newDB string) (string, error) {
+	stmts, err := parser.Parse(fnBody)
+	if err != nil {
+		return "", err
+	}
+	replaceFunc := makeDBNameReplaceFunc(newDB)
+
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	for i, stmt := range stmts {
+		if i > 0 {
+			fmtCtx.WriteString("\n")
+		}
+		f := tree.NewFmtCtx(
+			tree.FmtParsable,
+			tree.FmtReformatTableNames(replaceFunc),
+		)
+		f.FormatNode(stmt.AST)
+		fmtCtx.WriteString(f.CloseAndGetString())
+		fmtCtx.WriteString(";")
+	}
+	return fmtCtx.CloseAndGetString(), nil
 }
 
 // rewriteTypesInExpr rewrites all explicit ID type references in the input
@@ -270,20 +358,13 @@ func rewriteTypesInExpr(expr string, rewrites jobspb.DescRewriteMap) (string, er
 		tree.FmtSerializable,
 		tree.FmtIndexedTypeFormat(func(ctx *tree.FmtCtx, ref *tree.OIDTypeReference) {
 			newRef := ref
-			var id descpb.ID
-			id, err = typedesc.UserDefinedTypeOIDToID(ref.OID)
-			if err != nil {
-				return
-			}
+			id := typedesc.UserDefinedTypeOIDToID(ref.OID)
 			if rw, ok := rewrites[id]; ok {
 				newRef = &tree.OIDTypeReference{OID: catid.TypeIDToOID(rw.ID)}
 			}
 			ctx.WriteString(newRef.SQLString())
 		}),
 	)
-	if err != nil {
-		return "", err
-	}
 	ctx.FormatNode(parsed)
 	return ctx.CloseAndGetString(), nil
 }
@@ -295,39 +376,52 @@ func rewriteSequencesInExpr(expr string, rewrites jobspb.DescRewriteMap) (string
 	if err != nil {
 		return "", err
 	}
-	rewriteFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-		id, ok := schemaexpr.GetSeqIDFromExpr(expr)
-		if !ok {
-			return true, expr, nil
-		}
-		annotateTypeExpr, ok := expr.(*tree.AnnotateTypeExpr)
-		if !ok {
-			return true, expr, nil
-		}
 
-		rewrite, ok := rewrites[descpb.ID(id)]
-		if !ok {
-			return true, expr, nil
-		}
-		annotateTypeExpr.Expr = tree.NewNumVal(
-			constant.MakeInt64(int64(rewrite.ID)),
-			strconv.Itoa(int(rewrite.ID)),
-			false, /* negative */
-		)
-		return false, annotateTypeExpr, nil
-	}
-
-	newExpr, err := tree.SimpleVisit(parsed, rewriteFunc)
+	newExpr, err := tree.SimpleVisit(parsed, makeSequenceReplaceFunc(rewrites))
 	if err != nil {
 		return "", err
 	}
 	return newExpr.String(), nil
 }
 
-// rewriteSequencesInView walks the given viewQuery and
-// rewrites all sequence IDs in it according to rewrites.
-func rewriteSequencesInView(viewQuery string, rewrites jobspb.DescRewriteMap) (string, error) {
-	rewriteFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+func rewriteFunctionsInExpr(expr string, rewrites jobspb.DescRewriteMap) (string, error) {
+	parsed, err := parser.ParseExpr(expr)
+	if err != nil {
+		return "", err
+	}
+
+	replaceFunc := func(ex tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		funcExpr, ok := ex.(*tree.FuncExpr)
+		if !ok {
+			return true, ex, nil
+		}
+		oidRef, ok := funcExpr.Func.FunctionReference.(*tree.FunctionOID)
+		if !ok {
+			return true, ex, nil
+		}
+		if !funcdesc.IsOIDUserDefinedFunc(oidRef.OID) {
+			return true, ex, nil
+		}
+		fnID := funcdesc.UserDefinedFunctionOIDToID(oidRef.OID)
+		rewriteID := catid.FuncIDToOID(rewrites[fnID].ID)
+		newFuncExpr := *funcExpr
+		newFuncExpr.Func = tree.ResolvableFunctionReference{
+			FunctionReference: &tree.FunctionOID{OID: rewriteID},
+		}
+		return true, &newFuncExpr, nil
+	}
+
+	newExpr, err := tree.SimpleVisit(parsed, replaceFunc)
+	if err != nil {
+		return "", err
+	}
+	return newExpr.String(), nil
+}
+
+func makeSequenceReplaceFunc(
+	rewrites jobspb.DescRewriteMap,
+) func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+	return func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		id, ok := schemaexpr.GetSeqIDFromExpr(expr)
 		if !ok {
 			return true, expr, nil
@@ -347,16 +441,41 @@ func rewriteSequencesInView(viewQuery string, rewrites jobspb.DescRewriteMap) (s
 		)
 		return false, annotateTypeExpr, nil
 	}
+}
 
+// rewriteSequencesInView walks the given viewQuery and
+// rewrites all sequence IDs in it according to rewrites.
+func rewriteSequencesInView(viewQuery string, rewrites jobspb.DescRewriteMap) (string, error) {
 	stmt, err := parser.ParseOne(viewQuery)
 	if err != nil {
 		return "", err
 	}
-	newStmt, err := tree.SimpleStmtVisit(stmt.AST, rewriteFunc)
+	newStmt, err := tree.SimpleStmtVisit(stmt.AST, makeSequenceReplaceFunc(rewrites))
 	if err != nil {
 		return "", err
 	}
 	return newStmt.String(), nil
+}
+
+func rewriteSequencesInFunction(fnBody string, rewrites jobspb.DescRewriteMap) (string, error) {
+	stmts, err := parser.Parse(fnBody)
+	if err != nil {
+		return "", err
+	}
+
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	for i, stmt := range stmts {
+		newStmt, err := tree.SimpleStmtVisit(stmt.AST, makeSequenceReplaceFunc(rewrites))
+		if err != nil {
+			return "", err
+		}
+		if i > 0 {
+			fmtCtx.WriteString("\n")
+		}
+		fmtCtx.FormatNode(newStmt)
+		fmtCtx.WriteString(";")
+	}
+	return fmtCtx.CloseAndGetString(), nil
 }
 
 // rewriteIDsInTypesT rewrites all ID's in the input types.T using the input
@@ -365,20 +484,14 @@ func rewriteIDsInTypesT(typ *types.T, descriptorRewrites jobspb.DescRewriteMap) 
 	if !typ.UserDefined() {
 		return nil
 	}
-	tid, err := typedesc.GetUserDefinedTypeDescID(typ)
-	if err != nil {
-		return err
-	}
+	tid := typedesc.GetUserDefinedTypeDescID(typ)
 	// Collect potential new OID values.
 	var newOID, newArrayOID oid.Oid
 	if rw, ok := descriptorRewrites[tid]; ok {
 		newOID = catid.TypeIDToOID(rw.ID)
 	}
 	if typ.Family() != types.ArrayFamily {
-		tid, err = typedesc.GetUserDefinedArrayTypeDescID(typ)
-		if err != nil {
-			return err
-		}
+		tid = typedesc.GetUserDefinedArrayTypeDescID(typ)
 		if rw, ok := descriptorRewrites[tid]; ok {
 			newArrayOID = catid.TypeIDToOID(rw.ID)
 		}
@@ -480,6 +593,39 @@ func SchemaDescs(schemas []*schemadesc.Mutable, descriptorRewrites jobspb.DescRe
 		sc.ID = rewrite.ID
 		sc.ParentID = rewrite.ParentID
 
+		// Rewrite function ID and types ID in function signatures.
+		newFns := make(map[string]descpb.SchemaDescriptor_Function)
+		for fnName, fn := range sc.GetFunctions() {
+			newSigs := make([]descpb.SchemaDescriptor_FunctionSignature, 0, len(fn.Signatures))
+			for i := range fn.Signatures {
+				sig := &fn.Signatures[i]
+				// If the function is not found in the backup, we just skip. This only
+				// happens when restoring from a backup with `BACKUP TABLE` where the
+				// function descriptors are not backup.
+				fnDesc, ok := descriptorRewrites[sig.ID]
+				if !ok {
+					continue
+				}
+				sig.ID = fnDesc.ID
+				for _, typ := range sig.ArgTypes {
+					if err := rewriteIDsInTypesT(typ, descriptorRewrites); err != nil {
+						return err
+					}
+				}
+				if err := rewriteIDsInTypesT(sig.ReturnType, descriptorRewrites); err != nil {
+					return err
+				}
+				newSigs = append(newSigs, *sig)
+			}
+			if len(newSigs) > 0 {
+				newFns[fnName] = descpb.SchemaDescriptor_Function{
+					Name:       fnName,
+					Signatures: newSigs,
+				}
+			}
+		}
+		sc.Functions = newFns
+
 		if err := rewriteSchemaChangerState(sc, descriptorRewrites); err != nil {
 			return err
 		}
@@ -501,6 +647,8 @@ func rewriteSchemaChangerState(
 			err = errors.Wrap(err, "rewriting declarative schema changer state")
 		}
 	}()
+
+	var droppedConstraints catalog.ConstraintIDSet
 	for i := 0; i < len(state.Targets); i++ {
 		t := &state.Targets[i]
 		if err := screl.WalkDescIDs(t.Element(), func(id *descpb.ID) error {
@@ -516,9 +664,9 @@ func rewriteSchemaChangerState(
 			*id = rewrite.ID
 			return nil
 		}); err != nil {
-			// We'll permit this in the special case of a schema parent element.
 			switch el := t.Element().(type) {
 			case *scpb.SchemaParent:
+				// We'll permit this in the special case of a schema parent element.
 				_, scExists := descriptorRewrites[el.SchemaID]
 				if !scExists && state.CurrentStatuses[i] == scpb.Status_ABSENT {
 					state.Targets = append(state.Targets[:i], state.Targets[i+1:]...)
@@ -527,6 +675,23 @@ func rewriteSchemaChangerState(
 					i--
 					continue
 				}
+			case *scpb.CheckConstraint:
+				// IF there is any dependency missing for check constraint, we just drop
+				// the target.
+				state.Targets = append(state.Targets[:i], state.Targets[i+1:]...)
+				state.CurrentStatuses = append(state.CurrentStatuses[:i], state.CurrentStatuses[i+1:]...)
+				state.TargetRanks = append(state.TargetRanks[:i], state.TargetRanks[i+1:]...)
+				i--
+				droppedConstraints.Add(el.ConstraintID)
+				continue
+			case *scpb.ColumnDefaultExpression:
+				// IF there is any dependency missing for column default expression, we
+				// just drop the target.
+				state.Targets = append(state.Targets[:i], state.Targets[i+1:]...)
+				state.CurrentStatuses = append(state.CurrentStatuses[:i], state.CurrentStatuses[i+1:]...)
+				state.TargetRanks = append(state.TargetRanks[:i], state.TargetRanks[i+1:]...)
+				i--
+				continue
 			}
 			return errors.Wrap(err, "rewriting descriptor ids")
 		}
@@ -543,6 +708,10 @@ func rewriteSchemaChangerState(
 			if err != nil {
 				return errors.Wrapf(err, "rewriting expression sequence references: %q", newExpr)
 			}
+			newExpr, err = rewriteFunctionsInExpr(newExpr, descriptorRewrites)
+			if err != nil {
+				return errors.Wrapf(err, "rewriting expression function references: %q", newExpr)
+			}
 			*expr = catpb.Expression(newExpr)
 			return nil
 		}); err != nil {
@@ -556,7 +725,110 @@ func rewriteSchemaChangerState(
 		// TODO(ajwerner): Remember to rewrite views when the time comes. Currently
 		// views are not handled by the declarative schema changer.
 	}
+
+	// Drop all children targets of dropped CHECK constraint.
+	for i := 0; i < len(state.Targets); i++ {
+		t := &state.Targets[i]
+		if err := screl.WalkConstraintIDs(t.Element(), func(id *catid.ConstraintID) error {
+			if !droppedConstraints.Contains(*id) {
+				return nil
+			}
+			state.Targets = append(state.Targets[:i], state.Targets[i+1:]...)
+			state.CurrentStatuses = append(state.CurrentStatuses[:i], state.CurrentStatuses[i+1:]...)
+			state.TargetRanks = append(state.TargetRanks[:i], state.TargetRanks[i+1:]...)
+			i--
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	d.SetDeclarativeSchemaChangerState(state)
+	return nil
+}
+
+func dropCheckConstraintMissingDeps(
+	table *tabledesc.Mutable, descriptorRewrites jobspb.DescRewriteMap,
+) error {
+	var newChecks []*descpb.TableDescriptor_CheckConstraint
+	for i := range table.Checks {
+		fnIDs, err := table.GetAllReferencedFunctionIDsInConstraint(table.Checks[i].ConstraintID)
+		if err != nil {
+			return err
+		}
+		allFnFound := true
+		for _, fnID := range fnIDs.Ordered() {
+			if _, ok := descriptorRewrites[fnID]; !ok {
+				allFnFound = false
+				break
+			}
+		}
+		if allFnFound {
+			newChecks = append(newChecks, table.Checks[i])
+		}
+	}
+	table.Checks = newChecks
+	var newMutations []descpb.DescriptorMutation
+	for i := range table.Mutations {
+		keepMutation := true
+		if c := table.Mutations[i].GetConstraint(); c != nil && c.ConstraintType == descpb.ConstraintToUpdate_CHECK {
+			fnIDs, err := table.GetAllReferencedFunctionIDsInConstraint(c.Check.ConstraintID)
+			if err != nil {
+				return err
+			}
+			for _, fnID := range fnIDs.Ordered() {
+				if _, ok := descriptorRewrites[fnID]; !ok {
+					keepMutation = false
+					break
+				}
+			}
+		}
+		if keepMutation {
+			newMutations = append(newMutations, table.Mutations[i])
+		}
+	}
+	table.Mutations = newMutations
+	return nil
+}
+
+func dropColumnExpressionsMissingDeps(
+	table *tabledesc.Mutable, descriptorRewrites jobspb.DescRewriteMap,
+) error {
+	maybeDropExpressions := func(col *descpb.ColumnDescriptor) error {
+		allFnFound := true
+		fnIDs, err := table.GetAllReferencedFunctionIDsInColumnExprs(col.ID)
+		if err != nil {
+			return err
+		}
+		for _, fnID := range fnIDs.Ordered() {
+			if _, ok := descriptorRewrites[fnID]; !ok {
+				allFnFound = false
+				break
+			}
+		}
+		if !allFnFound {
+			// TODO(chengxiong): right now, we only allow UDFs in DEFAULT expression,
+			// so it's ok to just clear default expression and referenced function
+			// ids. Need to refactor to support ON UPDATE and computed column
+			// expression once supported.
+			col.DefaultExpr = nil
+			col.UsesFunctionIds = nil
+		}
+		return nil
+	}
+
+	for i := range table.Columns {
+		col := &table.Columns[i]
+		if err := maybeDropExpressions(col); err != nil {
+			return err
+		}
+	}
+	for i := range table.Mutations {
+		if col := table.Mutations[i].GetColumn(); col != nil {
+			if err := maybeDropExpressions(col); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -604,6 +876,84 @@ func DatabaseDescs(
 			return err
 		}
 		db.Schemas = newSchemas
+	}
+	return nil
+}
+
+// FunctionDescs rewrites all ID's in the input slice of function descriptors
+// using the input ID rewrite mapping.
+func FunctionDescs(
+	functions []*funcdesc.Mutable, descriptorRewrites jobspb.DescRewriteMap, overrideDB string,
+) error {
+	for _, fnDesc := range functions {
+		fnRewrite, ok := descriptorRewrites[fnDesc.ID]
+		if !ok {
+			return errors.Errorf("missing function rewrite for function %d", fnDesc.ID)
+		}
+		// Reset the version and modification time on this new descriptor.
+		fnDesc.Version = 1
+		fnDesc.ModificationTime = hlc.Timestamp{}
+
+		fnDesc.ID = fnRewrite.ID
+		fnDesc.ParentSchemaID = fnRewrite.ParentSchemaID
+		fnDesc.ParentID = fnRewrite.ParentID
+
+		// Rewrite function body.
+		fnBody := fnDesc.FunctionBody
+		if overrideDB != "" {
+			dbNameReplaced, err := rewriteFunctionBodyDBNames(fnDesc.FunctionBody, overrideDB)
+			if err != nil {
+				return err
+			}
+			fnBody = dbNameReplaced
+		}
+		fnBody, err := rewriteSequencesInFunction(fnBody, descriptorRewrites)
+		if err != nil {
+			return err
+		}
+		fnDesc.FunctionBody = fnBody
+
+		// Rewrite type IDs.
+		for _, param := range fnDesc.Params {
+			if err := rewriteIDsInTypesT(param.Type, descriptorRewrites); err != nil {
+				return err
+			}
+		}
+		if err := rewriteIDsInTypesT(fnDesc.ReturnType.Type, descriptorRewrites); err != nil {
+			return err
+		}
+
+		// Rewrite Dependency IDs.
+		for i, depID := range fnDesc.DependsOn {
+			if depRewrite, ok := descriptorRewrites[depID]; ok {
+				fnDesc.DependsOn[i] = depRewrite.ID
+			} else {
+				return errors.AssertionFailedf(
+					"cannot restore function %q because referenced table %d was not found",
+					fnDesc.Name, depID)
+			}
+		}
+
+		for i, typID := range fnDesc.DependsOnTypes {
+			if typRewrite, ok := descriptorRewrites[typID]; ok {
+				fnDesc.DependsOnTypes[i] = typRewrite.ID
+			} else {
+				return errors.AssertionFailedf(
+					"cannot restore function %q because referenced type %d was not found",
+					fnDesc.Name, typID)
+			}
+		}
+
+		// Rewrite back reference IDs.
+		for i, dep := range fnDesc.DependedOnBy {
+			if depRewrite, ok := descriptorRewrites[dep.ID]; ok {
+				fnDesc.DependedOnBy[i].ID = depRewrite.ID
+			} else {
+				return errors.AssertionFailedf(
+					"cannot restore function %q because back referenced relation %d was not found",
+					fnDesc.Name, dep.ID)
+			}
+		}
 	}
 	return nil
 }

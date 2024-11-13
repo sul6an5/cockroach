@@ -11,6 +11,7 @@
 package opgen
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -21,16 +22,22 @@ func init() {
 		toTransientAbsent(
 			scpb.Status_ABSENT,
 			to(scpb.Status_DELETE_ONLY,
-				emit(func(this *scpb.TemporaryIndex) *scop.MakeAddedTempIndexDeleteOnly {
-					return &scop.MakeAddedTempIndexDeleteOnly{
+				emit(func(this *scpb.TemporaryIndex) *scop.MakeAbsentTempIndexDeleteOnly {
+					return &scop.MakeAbsentTempIndexDeleteOnly{
 						Index:            *protoutil.Clone(&this.Index).(*scpb.Index),
 						IsSecondaryIndex: this.IsUsingSecondaryEncoding,
 					}
 				}),
+				emit(func(this *scpb.TemporaryIndex) *scop.MaybeAddSplitForIndex {
+					return &scop.MaybeAddSplitForIndex{
+						TableID: this.TableID,
+						IndexID: this.IndexID,
+					}
+				}),
 			),
 			to(scpb.Status_WRITE_ONLY,
-				emit(func(this *scpb.TemporaryIndex) *scop.MakeAddedIndexDeleteAndWriteOnly {
-					return &scop.MakeAddedIndexDeleteAndWriteOnly{
+				emit(func(this *scpb.TemporaryIndex) *scop.MakeDeleteOnlyIndexWriteOnly {
+					return &scop.MakeDeleteOnlyIndexWriteOnly{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
 					}
@@ -41,26 +48,31 @@ func init() {
 			scpb.Status_WRITE_ONLY,
 			to(scpb.Status_DELETE_ONLY,
 				revertible(false),
-				emit(func(this *scpb.TemporaryIndex) *scop.MakeDroppedIndexDeleteOnly {
-					return &scop.MakeDroppedIndexDeleteOnly{
+				emit(func(this *scpb.TemporaryIndex) *scop.MakeWriteOnlyIndexDeleteOnly {
+					return &scop.MakeWriteOnlyIndexDeleteOnly{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.TemporaryIndex) *scop.CreateGcJobForIndex {
-					return &scop.CreateGcJobForIndex{
-						TableID: this.TableID,
-						IndexID: this.IndexID,
+				emit(func(this *scpb.TemporaryIndex, md *opGenContext) *scop.CreateGCJobForIndex {
+					if !md.ActiveVersion.IsActive(clusterversion.V23_1) {
+						return &scop.CreateGCJobForIndex{
+							TableID:             this.TableID,
+							IndexID:             this.IndexID,
+							StatementForDropJob: statementForDropJob(this, md),
+						}
 					}
+					return nil
 				}),
 				emit(func(this *scpb.TemporaryIndex) *scop.MakeIndexAbsent {
 					return &scop.MakeIndexAbsent{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
 					}
-				})),
+				}),
+			),
 		),
 	)
 }

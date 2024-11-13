@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/password"
@@ -34,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/ui"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -55,7 +58,6 @@ const (
 	secretLength = 16
 	// SessionCookieName is the name of the cookie used for HTTP auth.
 	SessionCookieName = "session"
-
 	// DemoLoginPath is the demo shell auto-login URL.
 	DemoLoginPath = "/demologin"
 )
@@ -238,7 +240,7 @@ func (s *authenticationServer) demoLogin(w http.ResponseWriter, req *http.Reques
 
 	w.Header()["Set-Cookie"] = []string{cookie.String()}
 	w.Header()["Location"] = []string{"/"}
-	w.WriteHeader(302)
+	w.WriteHeader(http.StatusTemporaryRedirect)
 	_, _ = w.Write([]byte("you can use the UI now"))
 }
 
@@ -264,7 +266,6 @@ func (s *authenticationServer) UserLoginFromSSO(
 	exists, _, canLoginDBConsole, _, _, _, err := sql.GetUserSessionInitInfo(
 		ctx,
 		s.sqlServer.execCfg,
-		s.sqlServer.execCfg.InternalExecutor,
 		username,
 		"", /* databaseName */
 	)
@@ -305,7 +306,7 @@ func (s *authenticationServer) createSessionFor(
 func (s *authenticationServer) UserLogout(
 	ctx context.Context, req *serverpb.UserLogoutRequest,
 ) (*serverpb.UserLogoutResponse, error) {
-	md, ok := metadata.FromIncomingContext(ctx)
+	md, ok := grpcutil.FastFromIncomingContext(ctx)
 	if !ok {
 		return nil, apiInternalError(ctx, fmt.Errorf("couldn't get incoming context"))
 	}
@@ -326,7 +327,7 @@ func (s *authenticationServer) UserLogout(
 		ctx,
 		"revoke-auth-session",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		`UPDATE system.web_sessions SET "revokedAt" = now() WHERE id = $1`,
 		sessionID,
 	); err != nil {
@@ -376,7 +377,7 @@ WHERE id = $1`
 		ctx,
 		"lookup-auth-session",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		sessionQuery, cookie.ID)
 	if row == nil || err != nil {
 		return false, "", err
@@ -429,7 +430,6 @@ func (s *authenticationServer) verifyPasswordDBConsole(
 	exists, _, canLoginDBConsole, _, _, pwRetrieveFn, err := sql.GetUserSessionInitInfo(
 		ctx,
 		s.sqlServer.execCfg,
-		s.sqlServer.execCfg.InternalExecutor,
 		userName,
 		"", /* databaseName */
 	)
@@ -459,7 +459,7 @@ func (s *authenticationServer) verifyPasswordDBConsole(
 		// This auto-conversion is a CockroachDB-specific feature, which
 		// pushes clusters upgraded from a previous version into using
 		// SCRAM-SHA-256.
-		sql.MaybeUpgradeStoredPasswordHash(ctx,
+		sql.MaybeConvertStoredPasswordHash(ctx,
 			s.sqlServer.execCfg,
 			userName,
 			passwordStr, hashedPassword)
@@ -487,6 +487,9 @@ func CreateAuthSecret() (secret, hashedSecret []byte, err error) {
 func (s *authenticationServer) newAuthSession(
 	ctx context.Context, userName username.SQLUsername,
 ) (int64, []byte, error) {
+	webSessionsTableHasUserIDCol := s.sqlServer.execCfg.Settings.Version.IsActive(ctx,
+		clusterversion.V23_1WebSessionsTableHasUserIDColumn)
+
 	secret, hashedSecret, err := CreateAuthSecret()
 	if err != nil {
 		return 0, nil, err
@@ -499,13 +502,20 @@ INSERT INTO system.web_sessions ("hashedSecret", username, "expiresAt")
 VALUES($1, $2, $3)
 RETURNING id
 `
+	if webSessionsTableHasUserIDCol {
+		insertSessionStmt = `
+INSERT INTO system.web_sessions ("hashedSecret", username, "expiresAt", user_id)
+VALUES($1, $2, $3, (SELECT user_id FROM system.users WHERE username = $2))
+RETURNING id
+`
+	}
 	var id int64
 
 	row, err := s.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"create-auth-session",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		insertSessionStmt,
 		hashedSecret,
 		userName.Normalized(),
@@ -570,10 +580,8 @@ const webSessionIDKeyStr = "websessionid"
 func (am *authenticationMux) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	username, cookie, err := am.getSession(w, req)
 	if err == nil {
-		ctx := req.Context()
-		ctx = context.WithValue(ctx, webSessionUserKey{}, username)
-		ctx = context.WithValue(ctx, webSessionIDKey{}, cookie.ID)
-		req = req.WithContext(ctx)
+		req = req.WithContext(
+			contextWithHTTPAuthInfo(req.Context(), username, cookie.ID))
 	} else if !am.allowAnonymous {
 		if log.V(1) {
 			log.Infof(req.Context(), "web session error: %v", err)
@@ -616,29 +624,10 @@ func makeCookieWithValue(value string, forHTTPSOnly bool) *http.Cookie {
 func (am *authenticationMux) getSession(
 	w http.ResponseWriter, req *http.Request,
 ) (string, *serverpb.SessionCookie, error) {
-	ctx := req.Context()
-	// Validate the returned cookie.
-	cookies := req.Cookies()
-	found := false
-	var cookie *serverpb.SessionCookie
-	var err error
-	for _, c := range cookies {
-		if c.Name != SessionCookieName {
-			continue
-		}
-		found = true
-		cookie, err = decodeSessionCookie(c)
-		if err != nil {
-			// Multiple cookies with the same name may be included in the
-			// header. We continue searching even if we find a matching
-			// name with an invalid value
-			log.Infof(ctx, "found a matching cookie that failed decoding: %v", err)
-			continue
-		}
-		break
-	}
-	if err != nil || !found {
-		return "", nil, http.ErrNoCookie
+	st := am.server.sqlServer.cfg.Settings
+	cookie, err := findAndDecodeSessionCookie(req.Context(), st, req.Cookies())
+	if err != nil {
+		return "", nil, err
 	}
 
 	valid, username, err := am.server.verifySession(req.Context(), cookie)
@@ -686,7 +675,42 @@ func authenticationHeaderMatcher(key string) (string, bool) {
 	return fmt.Sprintf("%s%s", gwruntime.MetadataHeaderPrefix, key), true
 }
 
-func forwardAuthenticationMetadata(ctx context.Context, _ *http.Request) metadata.MD {
+// contextWithHTTPAuthInfo embeds the HTTP authentication details into
+// a go context. Meant for use with userFromHTTPAuthInfoContext().
+func contextWithHTTPAuthInfo(
+	ctx context.Context, username string, sessionID int64,
+) context.Context {
+	ctx = context.WithValue(ctx, webSessionUserKey{}, username)
+	if sessionID != 0 {
+		ctx = context.WithValue(ctx, webSessionIDKey{}, sessionID)
+	}
+	return ctx
+}
+
+// userFromHTTPAuthInfoContext returns a SQL username from the request
+// context of a HTTP route requiring login. Only use in routes that require
+// login (e.g. requiresAuth = true in the API v2 route definition).
+//
+// Do not use this function in _RPC_ API handlers. These access their
+// SQL identity via the RPC incoming context. See
+// userFromIncomingRPCContext().
+func userFromHTTPAuthInfoContext(ctx context.Context) username.SQLUsername {
+	return username.MakeSQLUsernameFromPreNormalizedString(ctx.Value(webSessionUserKey{}).(string))
+}
+
+// maybeUserFromHTTPAuthInfoContext is like userFromHTTPAuthInfoContext but
+// it returns a boolean false if there is no user in the context.
+func maybeUserFromHTTPAuthInfoContext(ctx context.Context) (username.SQLUsername, bool) {
+	if u := ctx.Value(webSessionUserKey{}); u != nil {
+		return username.MakeSQLUsernameFromPreNormalizedString(u.(string)), true
+	}
+	return username.SQLUsername{}, false
+}
+
+// translateHTTPAuthInfoToGRPCMetadata translates the context.Value
+// that results from HTTP authentication into gRPC metadata suitable
+// for use by RPC API handlers.
+func translateHTTPAuthInfoToGRPCMetadata(ctx context.Context, _ *http.Request) metadata.MD {
 	md := metadata.MD{}
 	if user := ctx.Value(webSessionUserKey{}); user != nil {
 		md.Set(webSessionUserKeyStr, user.(string))
@@ -695,4 +719,186 @@ func forwardAuthenticationMetadata(ctx context.Context, _ *http.Request) metadat
 		md.Set(webSessionIDKeyStr, fmt.Sprintf("%v", sessionID))
 	}
 	return md
+}
+
+// forwardSQLIdentityThroughRPCCalls forwards the SQL identity of the
+// original request (as populated by translateHTTPAuthInfoToGRPCMetadata in
+// grpc-gateway) so it remains available to the remote node handling
+// the request.
+func forwardSQLIdentityThroughRPCCalls(ctx context.Context) context.Context {
+	if md, ok := grpcutil.FastFromIncomingContext(ctx); ok {
+		if u, ok := md[webSessionUserKeyStr]; ok {
+			return metadata.NewOutgoingContext(ctx, metadata.MD{webSessionUserKeyStr: u})
+		}
+	}
+	return ctx
+}
+
+// forwardHTTPAuthInfoToRPCCalls converts an HTTP API (v1 or v2) context, to one that
+// can issue outgoing RPC requests under the same logged-in user.
+func forwardHTTPAuthInfoToRPCCalls(ctx context.Context, r *http.Request) context.Context {
+	md := translateHTTPAuthInfoToGRPCMetadata(ctx, r)
+	return metadata.NewOutgoingContext(ctx, md)
+}
+
+// userFromIncomingRPCContext is to be used in RPC API handlers. It
+// assumes the SQL identity was populated in the context implicitly by
+// gRPC via translateHTTPAuthInfoToGRPCMetadata(), or explicitly via
+// forwardHTTPAuthInfoToRPCCalls() or
+// forwardSQLIdentityThroughRPCCalls().
+//
+// Do not use this function in _HTTP_ API handlers. Those access their
+// SQL identity via a special context key. See
+// userFromHTTPAuthInfoContext().
+func userFromIncomingRPCContext(ctx context.Context) (res username.SQLUsername, err error) {
+	md, ok := grpcutil.FastFromIncomingContext(ctx)
+	if !ok {
+		return username.RootUserName(), nil
+	}
+	usernames, ok := md[webSessionUserKeyStr]
+	if !ok {
+		// If the incoming context has metadata but no attached web session user,
+		// it's a gRPC / internal SQL connection which has root on the cluster.
+		// This assumption is a historical hiccup, and would be best described
+		// as a bug. See: https://github.com/cockroachdb/cockroach/issues/45018
+		return username.RootUserName(), nil
+	}
+	if len(usernames) != 1 {
+		log.Warningf(ctx, "context's incoming metadata contains unexpected number of usernames: %+v ", md)
+		return res, fmt.Errorf(
+			"context's incoming metadata contains unexpected number of usernames: %+v ", md)
+	}
+	// At this point the user is already logged in, so we can assume
+	// the username has been normalized already.
+	username := username.MakeSQLUsernameFromPreNormalizedString(usernames[0])
+	return username, nil
+}
+
+// sessionCookieValue defines the data needed to construct the
+// aggregate session cookie in the order provided.
+type sessionCookieValue struct {
+	// The name of the tenant.
+	name string
+	// The value of set-cookie.
+	setCookie string
+}
+
+// createAggregatedSessionCookieValue is used for multi-tenant login.
+// It takes a slice of sessionCookieValue and converts it to a single
+// string which is the aggregated session. Currently the format of the
+// aggregated session is: `session,tenant_name,session2,tenant_name2` etc.
+func createAggregatedSessionCookieValue(sessionCookieValue []sessionCookieValue) string {
+	var sessionsStr string
+	for _, val := range sessionCookieValue {
+		sessionCookieSlice := strings.Split(strings.ReplaceAll(val.setCookie, "session=", ""), ";")
+		sessionsStr += sessionCookieSlice[0] + "," + val.name + ","
+	}
+	if len(sessionsStr) > 0 {
+		sessionsStr = sessionsStr[:len(sessionsStr)-1]
+	}
+	return sessionsStr
+}
+
+// findAndDecodeSessionCookie looks for multitenant-session and session cookies
+// in the cookies slice. If they are found the value will need to be processed if
+// it is a multitenant-session cookie (see findSessionCookieValueForTenant for details)
+// and then decoded. If there is an error in decoding or processing, the function
+// will return an error.
+func findAndDecodeSessionCookie(
+	ctx context.Context, st *cluster.Settings, cookies []*http.Cookie,
+) (*serverpb.SessionCookie, error) {
+	found := false
+	var sessionCookie *serverpb.SessionCookie
+	tenantSelectCookieVal := findTenantSelectCookieValue(cookies)
+	for _, cookie := range cookies {
+		if cookie.Name != SessionCookieName {
+			continue
+		}
+		found = true
+		mtSessionVal, err := findSessionCookieValueForTenant(
+			st,
+			cookie,
+			tenantSelectCookieVal)
+		if err != nil {
+			return sessionCookie, apiInternalError(ctx, err)
+		}
+		if mtSessionVal != "" {
+			cookie.Value = mtSessionVal
+		}
+		sessionCookie, err = decodeSessionCookie(cookie)
+		if err != nil {
+			// Multiple cookies with the same name may be included in the
+			// header. We continue searching even if we find a matching
+			// name with an invalid value.
+			log.Infof(ctx, "found a matching cookie that failed decoding: %v", err)
+			found = false
+			continue
+		}
+		break
+	}
+	if !found {
+		return nil, http.ErrNoCookie
+	}
+	return sessionCookie, nil
+}
+
+// findSessionCookieValueForTenant finds the encoded session in the provided
+// aggregated session cookie value established in multi-tenant clusters that's
+// associated with the provided tenant name. If an empty tenant name is provided,
+// we default to the defaultTenantSelect cluster setting value.
+//
+// If the method cannot find a match between the tenant name and session, or
+// if the provided session cookie is nil, it will return an empty string.
+//
+// e.g. tenant name is "system" and session cookie's value is
+// "abcd1234,system,efgh5678,app" the output will be "abcd1234".
+//
+// In the case of legacy session cookies, where tenant names are not encoded
+// into the cookie value, we assume that the session belongs to defaultTenantSelect.
+// Note that these legacy session cookies only contained a single session string
+// as the cookie's value.
+func findSessionCookieValueForTenant(
+	st *cluster.Settings, sessionCookie *http.Cookie, tenantName string,
+) (string, error) {
+	if sessionCookie == nil {
+		return "", nil
+	}
+	if mtSessionStr := sessionCookie.Value; sessionCookie.Value != "" {
+		sessionSlice := strings.Split(mtSessionStr, ",")
+		if len(sessionSlice) == 1 {
+			// If no separator was found in the cookie value, this is likely
+			// a cookie from a previous CRDB version where the cookie value
+			// contained a single session string without any tenant names encoded.
+			// To maintain backwards compatibility, assume this session belongs
+			// to the default tenant. In this case, the entire cookie value is
+			// the session string.
+			return mtSessionStr, nil
+		}
+		if tenantName == "" {
+			tenantName = defaultTenantSelect.Get(&st.SV)
+		}
+		var encodedSession string
+		for idx, val := range sessionSlice {
+			if val == tenantName && idx > 0 {
+				encodedSession = sessionSlice[idx-1]
+			}
+		}
+		if encodedSession == "" {
+			return "", errors.Newf("unable to find session cookie value that matches tenant %q", tenantName)
+		}
+		return encodedSession, nil
+	}
+	return "", nil
+}
+
+// findTenantSelectCookieValue iterates through all request cookies in order
+// to find the value of the tenant select cookie. If the tenant select cookie
+// is not found, it returns the empty string.
+func findTenantSelectCookieValue(cookies []*http.Cookie) string {
+	for _, c := range cookies {
+		if c.Name == TenantSelectCookieName {
+			return c.Value
+		}
+	}
+	return ""
 }

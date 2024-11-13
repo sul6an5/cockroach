@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -100,13 +101,13 @@ const hashJoinerProcName = "hash joiner"
 
 // newHashJoiner creates a new hash join processor.
 func newHashJoiner(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.HashJoinerSpec,
 	leftSource execinfra.RowSource,
 	rightSource execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*hashJoiner, error) {
 	h := &hashJoiner{
 		leftSource:   leftSource,
@@ -119,6 +120,7 @@ func newHashJoiner(
 	}
 
 	if err := h.joinerBase.init(
+		ctx,
 		h,
 		flowCtx,
 		processorID,
@@ -128,7 +130,6 @@ func newHashJoiner(
 		spec.OnExpr,
 		false, /* outputContinuationColumn */
 		post,
-		output,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{h.leftSource, h.rightSource},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -140,10 +141,9 @@ func newHashJoiner(
 		return nil, err
 	}
 
-	ctx := h.FlowCtx.EvalCtx.Ctx()
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// The hashJoiner will overflow to disk if this limit is not enough.
-	h.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "hashjoiner-limited")
+	h.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "hashjoiner-limited")
 	h.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "hashjoiner-disk")
 	h.hashTable = rowcontainer.NewHashDiskBackedRowContainer(
 		h.EvalCtx, h.MemMonitor, h.diskMonitor, h.FlowCtx.Cfg.TempStorage,
@@ -157,7 +157,7 @@ func newHashJoiner(
 	}
 
 	return h, h.hashTable.Init(
-		h.Ctx,
+		h.Ctx(),
 		shouldMarkRightSide(h.joinType),
 		h.rightSource.OutputTypes(),
 		h.eqCols[rightSide],
@@ -170,7 +170,7 @@ func (h *hashJoiner) Start(ctx context.Context) {
 	ctx = h.StartInternal(ctx, hashJoinerProcName)
 	h.leftSource.Start(ctx)
 	h.rightSource.Start(ctx)
-	h.cancelChecker.Reset(ctx)
+	h.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 	h.runningState = hjBuilding
 }
 
@@ -189,7 +189,7 @@ func (h *hashJoiner) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) 
 		case hjEmittingRightUnmatched:
 			h.runningState, row, meta = h.emitRightUnmatched()
 		default:
-			log.Fatalf(h.Ctx, "unsupported state: %d", h.runningState)
+			log.Fatalf(h.Ctx(), "unsupported state: %d", h.runningState)
 		}
 
 		if row == nil && meta == nil {
@@ -235,14 +235,14 @@ func (h *hashJoiner) build() (hashJoinerState, rowenc.EncDatumRow, *execinfrapb.
 				return hjStateUnknown, nil, h.DrainHelper()
 			}
 			// If hashTable is in-memory, pre-reserve the memory needed to mark.
-			if err = h.hashTable.ReserveMarkMemoryMaybe(h.Ctx); err != nil {
+			if err = h.hashTable.ReserveMarkMemoryMaybe(h.Ctx()); err != nil {
 				h.MoveToDraining(err)
 				return hjStateUnknown, nil, h.DrainHelper()
 			}
 			return hjReadingLeftSide, nil, nil
 		}
 
-		err = h.hashTable.AddRow(h.Ctx, row)
+		err = h.hashTable.AddRow(h.Ctx(), row)
 		// Regardless of the underlying row container (disk backed or in-memory
 		// only), we cannot do anything about an error if it occurs.
 		if err != nil {
@@ -276,7 +276,7 @@ func (h *hashJoiner) readLeftSide() (
 		// hjEmittingRightUnmatched if unmatched rows on the right side need to
 		// be emitted, otherwise finish.
 		if shouldEmitUnmatchedRow(rightSide, h.joinType) {
-			i := h.hashTable.NewUnmarkedIterator(h.Ctx)
+			i := h.hashTable.NewUnmarkedIterator(h.Ctx())
 			i.Rewind()
 			h.emittingRightUnmatchedState.iter = i
 			return hjEmittingRightUnmatched, nil, nil
@@ -290,14 +290,14 @@ func (h *hashJoiner) readLeftSide() (
 	h.probingRowState.row = row
 	h.probingRowState.matched = false
 	if h.probingRowState.iter == nil {
-		i, err := h.hashTable.NewBucketIterator(h.Ctx, row, h.eqCols[leftSide])
+		i, err := h.hashTable.NewBucketIterator(h.Ctx(), row, h.eqCols[leftSide])
 		if err != nil {
 			h.MoveToDraining(err)
 			return hjStateUnknown, nil, h.DrainHelper()
 		}
 		h.probingRowState.iter = i
 	} else {
-		if err := h.probingRowState.iter.Reset(h.Ctx, row); err != nil {
+		if err := h.probingRowState.iter.Reset(h.Ctx(), row); err != nil {
 			h.MoveToDraining(err)
 			return hjStateUnknown, nil, h.DrainHelper()
 		}
@@ -337,7 +337,7 @@ func (h *hashJoiner) probeRow() (
 	}
 
 	leftRow := h.probingRowState.row
-	rightRow, err := i.Row()
+	rightRow, err := i.EncRow()
 	if err != nil {
 		h.MoveToDraining(err)
 		return hjStateUnknown, nil, h.DrainHelper()
@@ -358,7 +358,7 @@ func (h *hashJoiner) probeRow() (
 	h.probingRowState.matched = true
 	shouldEmit := true
 	if shouldMarkRightSide(h.joinType) {
-		if i.IsMarked(h.Ctx) {
+		if i.IsMarked(h.Ctx()) {
 			switch h.joinType {
 			case descpb.RightSemiJoin:
 				// The row from the right already had a match and was emitted
@@ -375,7 +375,7 @@ func (h *hashJoiner) probeRow() (
 				// whether we have a corresponding unmarked row from the right.
 				h.probingRowState.matched = false
 			}
-		} else if err := i.Mark(h.Ctx); err != nil {
+		} else if err := i.Mark(h.Ctx()); err != nil {
 			h.MoveToDraining(err)
 			return hjStateUnknown, nil, h.DrainHelper()
 		}
@@ -436,7 +436,7 @@ func (h *hashJoiner) emitRightUnmatched() (
 		return hjStateUnknown, nil, h.DrainHelper()
 	}
 
-	row, err := i.Row()
+	row, err := i.EncRow()
 	if err != nil {
 		h.MoveToDraining(err)
 		return hjStateUnknown, nil, h.DrainHelper()
@@ -448,16 +448,16 @@ func (h *hashJoiner) emitRightUnmatched() (
 
 func (h *hashJoiner) close() {
 	if h.InternalClose() {
-		h.hashTable.Close(h.Ctx)
+		h.hashTable.Close(h.Ctx())
 		if h.probingRowState.iter != nil {
 			h.probingRowState.iter.Close()
 		}
 		if h.emittingRightUnmatchedState.iter != nil {
 			h.emittingRightUnmatchedState.iter.Close()
 		}
-		h.MemMonitor.Stop(h.Ctx)
+		h.MemMonitor.Stop(h.Ctx())
 		if h.diskMonitor != nil {
-			h.diskMonitor.Stop(h.Ctx)
+			h.diskMonitor.Stop(h.Ctx())
 		}
 	}
 }

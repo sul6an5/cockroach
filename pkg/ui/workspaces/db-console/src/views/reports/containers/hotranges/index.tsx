@@ -10,7 +10,7 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import moment from "moment";
+import moment from "moment-timezone";
 import { Button } from "@cockroachlabs/ui-components";
 import { cockroach } from "src/js/protos";
 import { getHotRanges } from "src/util/api";
@@ -33,7 +33,7 @@ const HotRanges = (props: HotRangesProps) => {
   }, []);
 
   useEffect(() => {
-    const request = cockroach.server.serverpb.HotRangesRequest.create({
+    const request = new cockroach.server.serverpb.HotRangesRequest({
       node_id: nodeId,
       page_size: pageSize,
       page_token: pageToken,

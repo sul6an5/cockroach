@@ -14,7 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
@@ -37,7 +37,6 @@ type rangeFeedConfig struct {
 type rangefeedFactory func(
 	ctx context.Context,
 	spans []kvcoord.SpanTimePair,
-	withDiff bool,
 	eventC chan<- kvcoord.RangeFeedMessage,
 	opts ...kvcoord.RangeFeedOption,
 ) error
@@ -79,30 +78,43 @@ func (p rangefeedFactory) Run(ctx context.Context, sink kvevent.Writer, cfg rang
 	if cfg.UseMux {
 		rfOpts = append(rfOpts, kvcoord.WithMuxRangeFeed())
 	}
+	if cfg.WithDiff {
+		rfOpts = append(rfOpts, kvcoord.WithDiff())
+	}
 
 	g.GoCtx(func(ctx context.Context) error {
-		return p(ctx, cfg.Spans, cfg.WithDiff, feed.eventC, rfOpts...)
+		return p(ctx, cfg.Spans, feed.eventC, rfOpts...)
 	})
 	return g.Wait()
 }
 
+// addEventsToBuffer consumes rangefeed events from `p.eventC`, transforms
+// them to changfeed events and push onto `p.memBuf`.
+// `p.memBuf`.
 func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
 	for {
 		select {
 		case e := <-p.eventC:
 			switch t := e.GetValue().(type) {
-			case *roachpb.RangeFeedValue:
+			case *kvpb.RangeFeedValue:
 				if p.cfg.Knobs.OnRangeFeedValue != nil {
 					if err := p.cfg.Knobs.OnRangeFeedValue(); err != nil {
 						return err
 					}
+				}
+				if p.knobs.ModifyTimestamps != nil {
+					e = kvcoord.RangeFeedMessage{RangeFeedEvent: e.ShallowCopy(), RegisteredSpan: e.RegisteredSpan}
+					p.knobs.ModifyTimestamps(&e.Val.Value.Timestamp)
 				}
 				if err := p.memBuf.Add(
 					ctx, kvevent.MakeKVEvent(e.RangeFeedEvent),
 				); err != nil {
 					return err
 				}
-			case *roachpb.RangeFeedCheckpoint:
+			case *kvpb.RangeFeedCheckpoint:
+				if p.knobs.ModifyTimestamps != nil {
+					p.knobs.ModifyTimestamps(&t.ResolvedTS)
+				}
 				if !t.ResolvedTS.IsEmpty() && t.ResolvedTS.Less(p.cfg.Frontier) {
 					// RangeFeed happily forwards any closed timestamps it receives as
 					// soon as there are no outstanding intents under them.
@@ -117,12 +129,12 @@ func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
 				); err != nil {
 					return err
 				}
-			case *roachpb.RangeFeedSSTable:
+			case *kvpb.RangeFeedSSTable:
 				// For now, we just error on SST ingestion, since we currently don't
 				// expect SST ingestion into spans with active changefeeds.
 				return errors.Errorf("unexpected SST ingestion: %v", t)
 
-			case *roachpb.RangeFeedDeleteRange:
+			case *kvpb.RangeFeedDeleteRange:
 				// For now, we just ignore on MVCC range tombstones. These are currently
 				// only expected to be used by schema GC and IMPORT INTO, and such spans
 				// should not have active changefeeds across them, at least at the times

@@ -35,7 +35,7 @@ import (
 // blocking forever on PAUSED jobs. Jobs using old index backfills
 // will fail on Resume.
 func waitForAllSchemaChanges(
-	ctx context.Context, _ clusterversion.ClusterVersion, d upgrade.TenantDeps, _ *jobs.Job,
+	ctx context.Context, _ clusterversion.ClusterVersion, d upgrade.TenantDeps,
 ) error {
 
 	initialJobListQuery := fmt.Sprintf(`
@@ -74,5 +74,5 @@ WHERE
 		}
 		jobList[i] = jobspb.JobID(*id)
 	}
-	return d.JobRegistry.WaitForJobsIgnoringJobErrors(ctx, d.InternalExecutor, jobList)
+	return d.JobRegistry.WaitForJobsIgnoringJobErrors(ctx, jobList)
 }

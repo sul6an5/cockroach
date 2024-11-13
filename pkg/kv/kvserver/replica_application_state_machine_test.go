@@ -14,16 +14,20 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 // TestReplicaStateMachineChangeReplicas tests the behavior of applying a
@@ -84,38 +88,37 @@ func TestReplicaStateMachineChangeReplicas(t *testing.T) {
 		}
 
 		// Create a new application batch.
-		b := sm.NewBatch(false /* ephemeral */).(*replicaAppBatch)
+		b := sm.NewBatch().(*replicaAppBatch)
 		defer b.Close()
 
 		// Stage a command with the ChangeReplicas trigger.
-		cmd := &replicatedCmd{
-			ctx: ctx,
-			ent: &raftpb.Entry{
+		ent := &raftlog.Entry{
+			Entry: raftpb.Entry{
 				Index: r.mu.state.RaftAppliedIndex + 1,
 				Type:  raftpb.EntryConfChange,
 			},
-			decodedRaftEntry: decodedRaftEntry{
-				idKey: makeIDKey(),
-				raftCmd: kvserverpb.RaftCommand{
-					ProposerLeaseSequence: r.mu.state.Lease.Sequence,
-					MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
-					ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
-						State:          &kvserverpb.ReplicaState{Desc: &newDesc},
-						ChangeReplicas: &kvserverpb.ChangeReplicas{ChangeReplicasTrigger: trigger},
-						WriteTimestamp: r.mu.state.GCThreshold.Add(1, 0),
-					},
-				},
-				confChange: &decodedConfChange{
-					ConfChangeI: confChange,
+			ID: makeIDKey(),
+			Cmd: kvserverpb.RaftCommand{
+				ProposerLeaseSequence: r.mu.state.Lease.Sequence,
+				MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
+				ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
+					State:          &kvserverpb.ReplicaState{Desc: &newDesc},
+					ChangeReplicas: &kvserverpb.ChangeReplicas{ChangeReplicasTrigger: trigger},
+					WriteTimestamp: r.mu.state.GCThreshold.Add(1, 0),
 				},
 			},
+			ConfChangeV1: &confChange,
+		}
+		cmd := &replicatedCmd{
+			ReplicatedCmd: raftlog.ReplicatedCmd{Entry: ent},
+			ctx:           ctx,
 		}
 
 		checkedCmd, err := b.Stage(cmd.ctx, cmd)
 		require.NoError(t, err)
 		require.Equal(t, !add, b.changeRemovesReplica)
-		require.Equal(t, b.state.RaftAppliedIndex, cmd.ent.Index)
-		require.Equal(t, b.state.LeaseAppliedIndex, cmd.raftCmd.MaxLeaseIndex)
+		require.Equal(t, b.state.RaftAppliedIndex, cmd.Index())
+		require.Equal(t, b.state.LeaseAppliedIndex, cmd.Cmd.MaxLeaseIndex)
 
 		// Check the replica's destroy status.
 		reason, _ := r.IsDestroyed()
@@ -143,8 +146,16 @@ func TestReplicaStateMachineChangeReplicas(t *testing.T) {
 			require.NoError(t, err)
 		} else {
 			require.Error(t, err)
-			require.IsType(t, &roachpb.RangeNotFoundError{}, err)
+			require.IsType(t, &kvpb.RangeNotFoundError{}, err)
 		}
+		// Set a destroyStatus to make sure there won't be any raft processing once
+		// we release raftMu. We applied a command but not one from the raft log, so
+		// should there be a command in the raft log (i.e. some errant lease request
+		// or whatnot) this will fire assertions because it will conflict with the
+		// log index that we pulled out of thin air above.
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.mu.destroyStatus.Set(errors.New("test done"), destroyReasonRemoved)
 	})
 }
 
@@ -167,7 +178,7 @@ func TestReplicaStateMachineRaftLogTruncationStronglyCoupled(t *testing.T) {
 		sm := r.getStateMachine()
 
 		// Create a new application batch.
-		b := sm.NewBatch(false /* ephemeral */).(*replicaAppBatch)
+		b := sm.NewBatch().(*replicaAppBatch)
 		defer b.Close()
 
 		r.mu.Lock()
@@ -185,29 +196,30 @@ func TestReplicaStateMachineRaftLogTruncationStronglyCoupled(t *testing.T) {
 		}
 		// Stage a command that truncates one raft log entry which we pretend has a
 		// byte size of 1.
-		cmd := &replicatedCmd{
-			ctx: ctx,
-			ent: &raftpb.Entry{
+		ent := &raftlog.Entry{
+			Entry: raftpb.Entry{
 				Index: raftAppliedIndex + 1,
 				Type:  raftpb.EntryNormal,
 			},
-			decodedRaftEntry: decodedRaftEntry{
-				idKey: makeIDKey(),
-				raftCmd: kvserverpb.RaftCommand{
-					ProposerLeaseSequence: r.mu.state.Lease.Sequence,
-					MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
-					ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
-						State: &kvserverpb.ReplicaState{
-							TruncatedState: &roachpb.RaftTruncatedState{
-								Index: truncatedIndex + 1,
-							},
+			ID: makeIDKey(),
+			Cmd: kvserverpb.RaftCommand{
+				ProposerLeaseSequence: r.mu.state.Lease.Sequence,
+				MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
+				ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
+					State: &kvserverpb.ReplicaState{
+						TruncatedState: &roachpb.RaftTruncatedState{
+							Index: truncatedIndex + 1,
 						},
-						RaftLogDelta:           -1,
-						RaftExpectedFirstIndex: expectedFirstIndex,
-						WriteTimestamp:         r.mu.state.GCThreshold.Add(1, 0),
 					},
+					RaftLogDelta:           -1,
+					RaftExpectedFirstIndex: expectedFirstIndex,
+					WriteTimestamp:         r.mu.state.GCThreshold.Add(1, 0),
 				},
 			},
+		}
+		cmd := &replicatedCmd{
+			ctx:           ctx,
+			ReplicatedCmd: raftlog.ReplicatedCmd{Entry: ent},
 		}
 
 		checkedCmd, err := b.Stage(cmd.ctx, cmd)
@@ -223,6 +235,13 @@ func TestReplicaStateMachineRaftLogTruncationStronglyCoupled(t *testing.T) {
 		func() {
 			r.mu.Lock()
 			defer r.mu.Unlock()
+			// Set a destroyStatus to make sure there won't be any raft processing once
+			// we release raftMu. We applied a command but not one from the raft log, so
+			// should there be a command in the raft log (i.e. some errant lease request
+			// or whatnot) this will fire assertions because it will conflict with the
+			// log index that we pulled out of thin air above.
+			r.mu.destroyStatus.Set(errors.New("test done"), destroyReasonRemoved)
+
 			require.Equal(t, raftAppliedIndex+1, r.mu.state.RaftAppliedIndex)
 			require.Equal(t, truncatedIndex+1, r.mu.state.TruncatedState.Index)
 			expectedSize := raftLogSize - 1
@@ -253,56 +272,73 @@ func TestReplicaStateMachineRaftLogTruncationLooselyCoupled(t *testing.T) {
 		looselyCoupledTruncationEnabled.Override(ctx, &st.SV, true)
 		// Remove the flush completed callback since we don't want a
 		// non-deterministic flush to cause the test to fail.
-		tc.store.engine.RegisterFlushCompletedCallback(func() {})
+		tc.store.TODOEngine().RegisterFlushCompletedCallback(func() {})
 		r := tc.repl
-		r.mu.Lock()
-		raftAppliedIndex := r.mu.state.RaftAppliedIndex
-		truncatedIndex := r.mu.state.TruncatedState.Index
-		raftLogSize := r.mu.raftLogSize
-		// Overwrite to be trusted, since we want to check if transitions to false
-		// or not.
-		r.mu.raftLogSizeTrusted = true
-		r.mu.Unlock()
-		expectedFirstIndex := truncatedIndex + 1
-		if !accurate {
-			expectedFirstIndex = truncatedIndex
+
+		{
+			k := tc.repl.Desc().EndKey.AsRawKey().Prevish(10)
+			pArgs := putArgs(k, []byte("foo"))
+			_, pErr := tc.SendWrapped(&pArgs)
+			require.NoError(t, pErr.GoError())
+			gArgs := getArgs(k)
+			_, pErr = tc.SendWrapped(&gArgs)
+			require.NoError(t, pErr.GoError())
 		}
 
-		// Enqueue the truncation.
-		func() {
-			// Lock the replica.
+		raftLogSize, truncatedIndex := func() (_rls int64, truncIdx uint64) {
+			// Lock the replica. We do this early to avoid interference from any other
+			// moving parts on the Replica, whatever they may be. For example, we don't
+			// want a skewed lease applied index because commands are applying concurrently
+			// while we are busy picking values. Though note that we flush out commands above
+			// because even if we serialize correctly, there might be an unapplied command
+			// that already consumed our chosen lease index, we just wouldn't know.
 			r.raftMu.Lock()
 			defer r.raftMu.Unlock()
+			r.mu.Lock()
+			raftAppliedIndex := r.mu.state.RaftAppliedIndex
+			truncatedIndex := r.mu.state.TruncatedState.Index
+			raftLogSize := r.mu.raftLogSize
+			// Overwrite to be trusted, since we want to check if transitions to false
+			// or not.
+			r.mu.raftLogSizeTrusted = true
+			r.mu.Unlock()
+			expectedFirstIndex := truncatedIndex + 1
+			if !accurate {
+				expectedFirstIndex = truncatedIndex
+			}
+
+			// Enqueue the truncation.
 			sm := r.getStateMachine()
 
 			// Create a new application batch.
-			b := sm.NewBatch(false /* ephemeral */).(*replicaAppBatch)
+			b := sm.NewBatch().(*replicaAppBatch)
 			defer b.Close()
 			// Stage a command that truncates one raft log entry which we pretend has a
 			// byte size of 1.
-			cmd := &replicatedCmd{
-				ctx: ctx,
-				ent: &raftpb.Entry{
+			ent := &raftlog.Entry{
+				Entry: raftpb.Entry{
 					Index: raftAppliedIndex + 1,
 					Type:  raftpb.EntryNormal,
 				},
-				decodedRaftEntry: decodedRaftEntry{
-					idKey: makeIDKey(),
-					raftCmd: kvserverpb.RaftCommand{
-						ProposerLeaseSequence: r.mu.state.Lease.Sequence,
-						MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
-						ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
-							State: &kvserverpb.ReplicaState{
-								TruncatedState: &roachpb.RaftTruncatedState{
-									Index: truncatedIndex + 1,
-								},
+				ID: makeIDKey(),
+				Cmd: kvserverpb.RaftCommand{
+					ProposerLeaseSequence: r.mu.state.Lease.Sequence,
+					MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
+					ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
+						State: &kvserverpb.ReplicaState{
+							TruncatedState: &roachpb.RaftTruncatedState{
+								Index: truncatedIndex + 1,
 							},
-							RaftLogDelta:           -1,
-							RaftExpectedFirstIndex: expectedFirstIndex,
-							WriteTimestamp:         r.mu.state.GCThreshold.Add(1, 0),
 						},
+						RaftLogDelta:           -1,
+						RaftExpectedFirstIndex: expectedFirstIndex,
+						WriteTimestamp:         r.mu.state.GCThreshold.Add(1, 0),
 					},
 				},
+			}
+			cmd := &replicatedCmd{
+				ctx:           ctx,
+				ReplicatedCmd: raftlog.ReplicatedCmd{Entry: ent},
 			}
 
 			checkedCmd, err := b.Stage(cmd.ctx, cmd)
@@ -329,8 +365,9 @@ func TestReplicaStateMachineRaftLogTruncationLooselyCoupled(t *testing.T) {
 			require.Equal(t, expectedFirstIndex, trunc.expectedFirstIndex)
 			require.EqualValues(t, -1, trunc.logDeltaBytes)
 			require.True(t, trunc.isDeltaTrusted)
+			return raftLogSize, truncatedIndex
 		}()
-		require.NoError(t, tc.store.Engine().Flush())
+		require.NoError(t, tc.store.TODOEngine().Flush())
 		// Asynchronous call to advance durability.
 		tc.store.raftTruncator.durabilityAdvancedCallback()
 		expectedSize := raftLogSize - 1
@@ -360,4 +397,85 @@ func TestReplicaStateMachineRaftLogTruncationLooselyCoupled(t *testing.T) {
 			return nil
 		})
 	})
+}
+
+// TestReplicaStateMachineEphemeralAppBatchRejection is a regression test for
+// #94409. It verifies that if two commands are in an ephemeral batch but the
+// first command's MaxLeaseIndex prevents the second command from succeeding, we
+// don't accidentally ack the second command.
+func TestReplicaStateMachineEphemeralAppBatchRejection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	tc := testContext{}
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	tc.Start(ctx, t, stopper)
+
+	// Lock the replica for the entire test.
+	r := tc.repl
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	// Avoid additional raft processing after we're done with this replica because
+	// we've applied entries that aren't in the log.
+	defer r.mu.destroyStatus.Set(errors.New("boom"), destroyReasonRemoved)
+
+	sm := r.getStateMachine()
+
+	r.mu.Lock()
+	raftAppliedIndex := r.mu.state.RaftAppliedIndex
+	r.mu.Unlock()
+
+	descWriteRepr := func(v string) (kvpb.Request, []byte) {
+		b := tc.store.TODOEngine().NewBatch()
+		defer b.Close()
+		key := keys.LocalMax
+		val := roachpb.MakeValueFromString("hello")
+		require.NoError(t, b.PutMVCC(storage.MVCCKey{
+			Timestamp: tc.Clock().Now(),
+			Key:       key,
+		}, storage.MVCCValue{
+			Value: val,
+		}))
+		return kvpb.NewPut(key, val), b.Repr()
+	}
+
+	// Make two commands that have the same MaxLeaseIndex. They'll go
+	// into the same ephemeral batch and we expect that batch to accept
+	// the first command and reject the second.
+	var cmds []*replicatedCmd
+	for _, s := range []string{"earlier", "later"} {
+		req, repr := descWriteRepr(s)
+		ent := &raftlog.Entry{
+			Entry: raftpb.Entry{
+				Index: raftAppliedIndex + 1,
+				Type:  raftpb.EntryNormal,
+			},
+			ID: makeIDKey(),
+			Cmd: kvserverpb.RaftCommand{
+				ProposerLeaseSequence: r.mu.state.Lease.Sequence,
+				MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
+				WriteBatch:            &kvserverpb.WriteBatch{Data: repr},
+			},
+		}
+		var ba kvpb.BatchRequest
+		ba.Add(req)
+		cmd := &replicatedCmd{
+			ctx:           ctx,
+			ReplicatedCmd: raftlog.ReplicatedCmd{Entry: ent},
+			proposal:      &ProposalData{Request: &ba},
+		}
+		require.True(t, cmd.CanAckBeforeApplication())
+		cmds = append(cmds, cmd)
+	}
+
+	var rejs []bool
+	b := sm.NewEphemeralBatch()
+	for _, cmd := range cmds {
+		checkedCmd, err := b.Stage(cmd.ctx, cmd)
+		require.NoError(t, err)
+		rejs = append(rejs, checkedCmd.Rejected())
+	}
+	b.Close()
+	require.Equal(t, []bool{false, true}, rejs)
 }

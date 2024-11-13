@@ -19,15 +19,15 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -35,7 +35,9 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-var sqlAPIClock timeutil.TimeSource = timeutil.DefaultTimeSource{}
+// SQLAPIClock is exposed for override by tests. Tenant tests are in
+// the serverccl package.
+var SQLAPIClock timeutil.TimeSource = timeutil.DefaultTimeSource{}
 
 // swagger:operation POST /sql/ execSQL
 //
@@ -203,9 +205,9 @@ func (a *apiV2Server) execSQL(w http.ResponseWriter, r *http.Request) {
 		ApplicationName string `json:"application_name"`
 		Execute         bool   `json:"execute"`
 		Statements      []struct {
-			SQL       string           `json:"sql"`
-			stmt      parser.Statement `json:"-"`
-			Arguments []interface{}    `json:"arguments,omitempty"`
+			SQL       string                               `json:"sql"`
+			stmt      statements.Statement[tree.Statement] `json:"-"`
+			Arguments []interface{}                        `json:"arguments,omitempty"`
 		} `json:"statements"`
 	}
 	// Type for the result.
@@ -263,7 +265,7 @@ func (a *apiV2Server) execSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	ctx = a.admin.server.AnnotateCtx(ctx)
+	ctx = a.sqlServer.ambientCtx.AnnotateCtx(ctx)
 
 	// Read the request arguments.
 	// Is there a request payload?
@@ -312,8 +314,7 @@ func (a *apiV2Server) execSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if requestPayload.Database == "" {
-		// TODO(knz): maybe derive the default value off the username?
-		requestPayload.Database = "defaultdb"
+		requestPayload.Database = "system"
 	}
 	if requestPayload.ApplicationName == "" {
 		requestPayload.ApplicationName = "$ api-v2-sql"
@@ -358,42 +359,18 @@ func (a *apiV2Server) execSQL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The SQL username that owns this session.
-	username := getSQLUsername(ctx)
+	username := userFromHTTPAuthInfoContext(ctx)
 
-	// runner is the function that will execute all the statements as a group.
-	// If there's just one statement, we execute them with an implicit,
-	// auto-commit transaction.
-
-	type (
-		txnFunc    = func(context.Context, *kv.Txn, sqlutil.InternalExecutor) error
-		runnerFunc = func(ctx context.Context, fn txnFunc) error
-	)
-	var runner runnerFunc
-	if len(requestPayload.Statements) > 1 {
-		// We need a transaction to group the statements together.
-		// We use TxnWithSteppingEnabled here even though we don't
-		// use stepping below, because that buys us admission control.
-		cf := a.admin.server.sqlServer.execCfg.CollectionFactory
-		runner = func(ctx context.Context, fn txnFunc) error {
-			return cf.TxnWithExecutor(ctx, a.admin.server.db, nil, func(
-				ctx context.Context, txn *kv.Txn, _ *descs.Collection, ie sqlutil.InternalExecutor,
-			) error {
-				return fn(ctx, txn, ie)
-			}, descs.SteppingEnabled())
-		}
-	} else {
-		runner = func(ctx context.Context, fn func(context.Context, *kv.Txn, sqlutil.InternalExecutor) error) error {
-			return fn(ctx, nil, a.admin.ie)
-		}
+	options := []isql.TxnOption{
+		isql.WithPriority(admissionpb.NormalPri),
 	}
-
 	result.Execution = &execResult{}
 	result.Execution.TxnResults = make([]txnResult, 0, len(requestPayload.Statements))
 
 	err = contextutil.RunWithTimeout(ctx, "run-sql-via-api", timeout, func(ctx context.Context) error {
 		retryNum := 0
 
-		return runner(ctx, func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor) error {
+		return a.sqlServer.internalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			result.Execution.TxnResults = result.Execution.TxnResults[:0]
 			result.Execution.Retries = retryNum
 			retryNum++
@@ -419,18 +396,18 @@ func (a *apiV2Server) execSQL(w http.ResponseWriter, r *http.Request) {
 
 				returnType := stmt.stmt.AST.StatementReturnType()
 				stmtErr := func() (retErr error) {
-					txnRes.Start = jsonTime(sqlAPIClock.Now())
+					txnRes.Start = jsonTime(SQLAPIClock.Now())
 					txnRes.Statement = stmtIdx + 1
 					txnRes.Tag = stmt.stmt.AST.StatementTag()
 					defer func() {
-						txnRes.End = jsonTime(sqlAPIClock.Now())
+						txnRes.End = jsonTime(SQLAPIClock.Now())
 						if retErr != nil {
 							retErr = errors.Wrapf(retErr, "executing stmt %d", stmtIdx+1)
 							txnRes.Error = &jsonError{retErr}
 						}
 					}()
 
-					it, err := ie.QueryIteratorEx(ctx, "run-query-via-api", txn,
+					it, err := txn.QueryIteratorEx(ctx, "run-query-via-api", txn.KV(),
 						sessiondata.InternalExecutorOverride{
 							User:            username,
 							Database:        requestPayload.Database,
@@ -442,7 +419,7 @@ func (a *apiV2Server) execSQL(w http.ResponseWriter, r *http.Request) {
 					}
 					// We have to make sure to close the iterator since we might return from the
 					// for loop early (before Next() returns false).
-					defer func(it sqlutil.InternalRows) {
+					defer func(it isql.Rows) {
 						if returnType == tree.RowsAffected || (returnType != tree.Rows && it.RowsAffected() > 0) {
 							txnRes.RowsAffected = it.RowsAffected()
 						}
@@ -471,7 +448,7 @@ func (a *apiV2Server) execSQL(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			return nil
-		})
+		}, options...)
 	})
 	if err != nil {
 		result.Error = &jsonError{err}
@@ -536,7 +513,7 @@ func (r *resultRow) MarshalJSON() ([]byte, error) {
 
 func (a *apiV2Server) shouldStop(ctx context.Context) error {
 	select {
-	case <-a.admin.server.stopper.ShouldQuiesce():
+	case <-a.sqlServer.stopper.ShouldQuiesce():
 		return errors.New("server is shutting down")
 	case <-ctx.Done():
 		return ctx.Err()

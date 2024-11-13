@@ -7,6 +7,19 @@ CREATE USER testuser2
 statement ok
 CREATE USER target
 
+# Check privileges that `public` has by default, ignoring types and virtual tables.
+query TTTTTB colnames
+SELECT * FROM [SHOW GRANTS FOR public] WHERE relation_name IS NULL
+----
+database_name  schema_name         relation_name  grantee  privilege_type  is_grantable
+test           crdb_internal       NULL           public   USAGE           false
+test           information_schema  NULL           public   USAGE           false
+test           pg_catalog          NULL           public   USAGE           false
+test           pg_extension        NULL           public   USAGE           false
+test           public              NULL           public   CREATE          false
+test           public              NULL           public   USAGE           false
+test           NULL                NULL           public   CONNECT         false
+
 statement error grant options cannot be granted to "public" role
 GRANT ALL PRIVILEGES ON TABLE t TO public WITH GRANT OPTION
 
@@ -267,6 +280,7 @@ SHOW GRANTS FOR testuser
 ----
 database_name  schema_name  relation_name  grantee   privilege_type  is_grantable
 test           public       t              testuser  BACKUP          true
+test           public       t              testuser  CHANGEFEED      true
 test           public       t              testuser  CREATE          true
 test           public       t              testuser  DROP            true
 test           public       t              testuser  INSERT          true
@@ -516,8 +530,11 @@ test           public       t1          testuser  ALL             true
 statement ok
 GRANT SELECT ON TABLE t1 TO testuser2
 
-statement ok
+# Show a notice when revoking privileges from the owner.
+query T noticetrace
 REVOKE ALL PRIVILEGES ON TABLE t1 FROM testuser
+----
+NOTICE: testuser is the owner of t1 and still has all privileges implicitly
 
 query TTTTTB colnames
 SHOW GRANTS ON TABLE t1;

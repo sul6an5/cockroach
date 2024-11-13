@@ -1,6 +1,8 @@
 subtest backup-feature-flags
 
-new-server name=s1
+# disabled for tenants as they can't enable/disable backup and restore features
+
+new-cluster name=s1 disable-tenant
 ----
 
 exec-sql
@@ -15,7 +17,7 @@ SET CLUSTER SETTING feature.backup.enabled = FALSE;
 ----
 
 exec-sql
-BACKUP INTO 'nodelocal://0/test-root/';
+BACKUP INTO 'nodelocal://1/test-root/';
 ----
 pq: feature BACKUP was disabled by the database administrator
 
@@ -25,7 +27,7 @@ SET CLUSTER SETTING feature.backup.enabled = TRUE;
 ----
 
 exec-sql
-BACKUP INTO 'nodelocal://0/test-root/';
+BACKUP INTO 'nodelocal://1/test-root/';
 ----
 
 exec-sql
@@ -38,7 +40,7 @@ SET CLUSTER SETTING feature.restore.enabled = FALSE;
 ----
 
 exec-sql
-RESTORE TABLE d.t FROM LATEST IN 'nodelocal://0/test-root/';
+RESTORE TABLE d.t FROM LATEST IN 'nodelocal://1/test-root/';
 ----
 pq: feature RESTORE was disabled by the database administrator
 
@@ -48,7 +50,7 @@ SET CLUSTER SETTING feature.restore.enabled = TRUE;
 ----
 
 exec-sql
-RESTORE TABLE d.t FROM LATEST IN 'nodelocal://0/test-root/';
+RESTORE TABLE d.t FROM LATEST IN 'nodelocal://1/test-root/';
 ----
 
 subtest end

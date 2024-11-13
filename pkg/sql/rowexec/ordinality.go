@@ -36,26 +36,25 @@ var _ execinfra.RowSource = &ordinalityProcessor{}
 const ordinalityProcName = "ordinality"
 
 func newOrdinalityProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.OrdinalitySpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.RowSourcedProcessor, error) {
-	ctx := flowCtx.EvalCtx.Ctx()
 	o := &ordinalityProcessor{input: input, curCnt: 1}
 
 	colTypes := make([]*types.T, len(input.OutputTypes())+1)
 	copy(colTypes, input.OutputTypes())
 	colTypes[len(colTypes)-1] = types.Int
 	if err := o.Init(
+		ctx,
 		o,
 		post,
 		colTypes,
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{o.input},

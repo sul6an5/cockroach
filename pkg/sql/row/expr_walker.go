@@ -18,11 +18,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
@@ -88,13 +89,15 @@ type importRand struct {
 }
 
 func (r *importRand) reseed(pos importRandPosition) {
-	adjPos := (pos / reseedRandEveryN) * reseedRandEveryN
-	rnd := rand.New(rand.NewSource(int64(adjPos)))
-	for i := int(pos % reseedRandEveryN); i > 0; i-- {
-		_ = rnd.Float64()
+	adjPos := int64((pos / reseedRandEveryN) * reseedRandEveryN)
+	if r.Rand == nil {
+		r.Rand = rand.New(rand.NewSource(adjPos))
+	} else {
+		r.Rand.Seed(adjPos)
 	}
-
-	r.Rand = rnd
+	for i := int(pos % reseedRandEveryN); i > 0; i-- {
+		_ = r.Rand.Float64()
+	}
 	r.pos = pos
 }
 
@@ -246,7 +249,9 @@ func makeImportRand(c *CellInfoAnnotation) randomSource {
 // TODO(anzoteh96): As per the issue in #51004, having too many columns with
 // default expression unique_rowid() could cause collisions when IMPORTs are run
 // too close to each other. It will therefore be nice to fix this problem.
-func importUniqueRowID(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+func importUniqueRowID(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	avoidCollisionsWithSQLsIDs := uint64(1 << 63)
 	shiftedIndex := int64(c.uniqueRowIDTotal)*c.RowID + int64(c.uniqueRowIDInstance)
@@ -256,7 +261,9 @@ func importUniqueRowID(evalCtx *eval.Context, args tree.Datums) (tree.Datum, err
 	return tree.NewDInt(tree.DInt(avoidCollisionsWithSQLsIDs | returnIndex)), nil
 }
 
-func importRandom(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+func importRandom(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	if c.randSource == nil {
 		c.randSource = makeImportRand(c)
@@ -264,7 +271,9 @@ func importRandom(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 	return tree.NewDFloat(tree.DFloat(c.randSource.Float64(c))), nil
 }
 
-func importGenUUID(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+func importGenUUID(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	if c.randSource == nil {
 		c.randSource = makeImportRand(c)
@@ -280,7 +289,7 @@ func importGenUUID(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) 
 type SeqChunkProvider struct {
 	JobID    jobspb.JobID
 	Registry *jobs.Registry
-	DB       *kv.DB
+	DB       isql.DB
 }
 
 // RequestChunk updates seqMetadata with information about the chunk of sequence
@@ -288,12 +297,12 @@ type SeqChunkProvider struct {
 // first checks if there is a previously allocated chunk associated with the
 // row, and if not goes on to allocate a new chunk.
 func (j *SeqChunkProvider) RequestChunk(
-	evalCtx *eval.Context, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
+	ctx context.Context, evalCtx *eval.Context, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
 ) error {
 	var hasAllocatedChunk bool
-	return j.DB.Txn(evalCtx.Context, func(ctx context.Context, txn *kv.Txn) error {
+	return j.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		var foundFromPreviouslyAllocatedChunk bool
-		resolveChunkFunc := func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		resolveChunkFunc := func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 			progress := md.Progress
 
 			// Check if we have already reserved a chunk corresponding to this row in a
@@ -310,7 +319,7 @@ func (j *SeqChunkProvider) RequestChunk(
 
 			// Reserve a new sequence value chunk at the KV level.
 			if !hasAllocatedChunk {
-				if err := reserveChunkOfSeqVals(evalCtx, c, seqMetadata, j.DB); err != nil {
+				if err := reserveChunkOfSeqVals(ctx, evalCtx, c, seqMetadata, j.DB.KV()); err != nil {
 					return err
 				}
 				hasAllocatedChunk = true
@@ -348,9 +357,11 @@ func (j *SeqChunkProvider) RequestChunk(
 			ju.UpdateProgress(progress)
 			return nil
 		}
-		const useReadLock = true
-		err := j.Registry.UpdateJobWithTxn(ctx, j.JobID, txn, useReadLock, resolveChunkFunc)
+		job, err := j.Registry.LoadJobWithTxn(ctx, j.JobID, txn)
 		if err != nil {
+			return err
+		}
+		if err := job.WithTxn(txn).Update(ctx, resolveChunkFunc); err != nil {
 			return err
 		}
 
@@ -380,7 +391,7 @@ func incrementSequenceByVal(
 	seqValueKey := codec.SequenceKey(uint32(descriptor.GetID()))
 	val, err = kv.IncrementValRetryable(ctx, db, seqValueKey, incrementBy)
 	if err != nil {
-		if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
+		if errors.HasType(err, (*kvpb.IntegerOverflowError)(nil)) {
 			return 0, boundsExceededError(descriptor)
 		}
 		return 0, err
@@ -448,7 +459,11 @@ func (j *SeqChunkProvider) checkForPreviouslyAllocatedChunks(
 // reserveChunkOfSeqVals ascertains the size of the next chunk, and reserves it
 // at the KV level. The seqMetadata is updated to reflect this.
 func reserveChunkOfSeqVals(
-	evalCtx *eval.Context, c *CellInfoAnnotation, seqMetadata *SequenceMetadata, db *kv.DB,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	c *CellInfoAnnotation,
+	seqMetadata *SequenceMetadata,
+	db *kv.DB,
 ) error {
 	seqOpts := seqMetadata.SeqDesc.GetSequenceOpts()
 	newChunkSize := int64(initialChunkSize)
@@ -472,8 +487,9 @@ func reserveChunkOfSeqVals(
 	incrementValBy := newChunkSize * seqOpts.Increment
 	// incrementSequenceByVal keeps retrying until it is able to find a slot
 	// of incrementValBy.
-	seqVal, err := incrementSequenceByVal(evalCtx.Context, seqMetadata.SeqDesc, db,
-		evalCtx.Codec, incrementValBy)
+	seqVal, err := incrementSequenceByVal(
+		ctx, seqMetadata.SeqDesc, db, evalCtx.Codec, incrementValBy,
+	)
 	if err != nil {
 		return err
 	}
@@ -488,32 +504,36 @@ func reserveChunkOfSeqVals(
 	return nil
 }
 
-func importNextVal(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+func importNextVal(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	seqName := tree.MustBeDString(args[0])
 	seqMetadata, ok := c.seqNameToMetadata[string(seqName)]
 	if !ok {
 		return nil, errors.Newf("sequence %s not found in annotation", seqName)
 	}
-	return importNextValHelper(evalCtx, c, seqMetadata)
+	return importNextValHelper(ctx, evalCtx, c, seqMetadata)
 }
 
-func importNextValByID(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+func importNextValByID(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	oid := tree.MustBeDOid(args[0])
 	seqMetadata, ok := c.seqIDToMetadata[descpb.ID(oid.Oid)]
 	if !ok {
 		return nil, errors.Newf("sequence with ID %v not found in annotation", oid)
 	}
-	return importNextValHelper(evalCtx, c, seqMetadata)
+	return importNextValHelper(ctx, evalCtx, c, seqMetadata)
 }
 
 // importDefaultToDatabasePrimaryRegion returns the primary region of the
 // database being imported into.
 func importDefaultToDatabasePrimaryRegion(
-	evalCtx *eval.Context, _ tree.Datums,
+	ctx context.Context, evalCtx *eval.Context, _ tree.Datums,
 ) (tree.Datum, error) {
-	regionConfig, err := evalCtx.Regions.CurrentDatabaseRegionConfig(evalCtx.Context)
+	regionConfig, err := evalCtx.Regions.CurrentDatabaseRegionConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -526,7 +546,7 @@ func importDefaultToDatabasePrimaryRegion(
 }
 
 func importNextValHelper(
-	evalCtx *eval.Context, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
+	ctx context.Context, evalCtx *eval.Context, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
 ) (tree.Datum, error) {
 	seqOpts := seqMetadata.SeqDesc.GetSequenceOpts()
 	if c.seqChunkProvider == nil {
@@ -537,7 +557,7 @@ func importNextValHelper(
 	// seqName, or the row we are processing is outside the range of rows covered
 	// by the active chunk, we need to request a chunk.
 	if seqMetadata.CurChunk == nil || c.RowID == seqMetadata.CurChunk.NextChunkStartRow {
-		if err := c.seqChunkProvider.RequestChunk(evalCtx, c, seqMetadata); err != nil {
+		if err := c.seqChunkProvider.RequestChunk(ctx, evalCtx, c, seqMetadata); err != nil {
 			return nil, err
 		}
 	} else {
@@ -586,7 +606,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["unique_rowid"],
 			tree.Overload{
-				Types:      tree.ArgTypes{},
+				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Int),
 				Fn:         importUniqueRowID,
 				Info:       "Returns a unique rowid based on row position and time",
@@ -602,7 +622,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["random"],
 			tree.Overload{
-				Types:      tree.ArgTypes{},
+				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Float),
 				Fn:         importRandom,
 				Info:       "Returns a random number between 0 and 1 based on row position and time.",
@@ -618,7 +638,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["gen_random_uuid"],
 			tree.Overload{
-				Types:      tree.ArgTypes{},
+				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Uuid),
 				Fn:         importGenUUID,
 				Info: "Generates a random UUID based on row position and time, " +
@@ -653,13 +673,13 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["nextval"],
 			tree.Overload{
-				Types:      tree.ArgTypes{{builtinconstants.SequenceNameArg, types.String}},
+				Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.String}},
 				ReturnType: tree.FixedReturnType(types.Int),
 				Info:       "Advances the value of the sequence and returns the final value.",
 				Fn:         importNextVal,
 			},
 			tree.Overload{
-				Types:      tree.ArgTypes{{builtinconstants.SequenceNameArg, types.RegClass}},
+				Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.RegClass}},
 				ReturnType: tree.FixedReturnType(types.Int),
 				Info:       "Advances the value of the sequence and returns the final value.",
 				Fn:         importNextValByID,
@@ -670,7 +690,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["default_to_database_primary_region"],
 			tree.Overload{
-				Types:      tree.ArgTypes{{"val", types.String}},
+				Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 				ReturnType: tree.FixedReturnType(types.String),
 				Info:       "Returns the primary region of the database.",
 				Fn:         importDefaultToDatabasePrimaryRegion,
@@ -681,7 +701,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["gateway_region"],
 			tree.Overload{
-				Types:      tree.ArgTypes{},
+				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.String),
 				Info:       "Returns the primary region of the database.",
 				// gateway_region also maps to importDefaultToDatabasePrimaryRegion to
@@ -709,7 +729,7 @@ type unsafeErrExpr struct {
 var _ tree.TypedExpr = &unsafeErrExpr{}
 
 // Eval implements the TypedExpr interface.
-func (e *unsafeErrExpr) Eval(_ tree.ExprEvaluator) (tree.Datum, error) {
+func (e *unsafeErrExpr) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	return nil, e.err
 }
 

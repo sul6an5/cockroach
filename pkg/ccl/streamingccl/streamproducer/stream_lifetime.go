@@ -13,17 +13,17 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -31,46 +31,51 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// startReplicationStreamJob initializes a replication stream producer job on the source cluster that
-// 1. Tracks the liveness of the replication stream consumption
-// 2. TODO(casper): Updates the protected timestamp for spans being replicated
-func startReplicationStreamJob(
-	evalCtx *eval.Context, txn *kv.Txn, tenantID uint64,
-) (streaming.StreamID, error) {
+// startReplicationProducerJob initializes a replication stream producer job on
+// the source cluster that:
+//
+// 1. Tracks the liveness of the replication stream consumption.
+// 2. Updates the protected timestamp for spans being replicated.
+func startReplicationProducerJob(
+	ctx context.Context, evalCtx *eval.Context, txn isql.Txn, tenantName roachpb.TenantName,
+) (streampb.ReplicationProducerSpec, error) {
 	execConfig := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
-	hasAdminRole, err := evalCtx.SessionAccessor.HasAdminRole(evalCtx.Ctx())
 
+	if !kvserver.RangefeedEnabled.Get(&evalCtx.Settings.SV) {
+		return streampb.ReplicationProducerSpec{}, errors.Errorf("kv.rangefeed.enabled must be true to start a replication job")
+	}
+
+	tenantRecord, err := sql.GetTenantRecordByName(ctx, evalCtx.Settings, txn, tenantName)
 	if err != nil {
-		return streaming.InvalidStreamID, err
+		return streampb.ReplicationProducerSpec{}, err
 	}
-
-	if !hasAdminRole {
-		return streaming.InvalidStreamID, errors.New("admin role required to start stream replication jobs")
-	}
+	tenantID := tenantRecord.ID
 
 	registry := execConfig.JobRegistry
 	timeout := streamingccl.StreamReplicationJobLivenessTimeout.Get(&evalCtx.Settings.SV)
 	ptsID := uuid.MakeV4()
+
 	jr := makeProducerJobRecord(registry, tenantID, timeout, evalCtx.SessionData().User(), ptsID)
-	if _, err := registry.CreateAdoptableJobWithTxn(evalCtx.Ctx(), jr, jr.JobID, txn); err != nil {
-		return streaming.InvalidStreamID, err
+	if _, err := registry.CreateAdoptableJobWithTxn(ctx, jr, jr.JobID, txn); err != nil {
+		return streampb.ReplicationProducerSpec{}, err
 	}
 
-	ptp := execConfig.ProtectedTimestampProvider
+	ptp := execConfig.ProtectedTimestampProvider.WithTxn(txn)
 	statementTime := hlc.Timestamp{
 		WallTime: evalCtx.GetStmtTimestamp().UnixNano(),
 	}
-
 	deprecatedSpansToProtect := roachpb.Spans{*makeTenantSpan(tenantID)}
-	targetToProtect := ptpb.MakeTenantsTarget([]roachpb.TenantID{roachpb.MakeTenantID(tenantID)})
-
+	targetToProtect := ptpb.MakeTenantsTarget([]roachpb.TenantID{roachpb.MustMakeTenantID(tenantID)})
 	pts := jobsprotectedts.MakeRecord(ptsID, int64(jr.JobID), statementTime,
 		deprecatedSpansToProtect, jobsprotectedts.Jobs, targetToProtect)
 
-	if err := ptp.Protect(evalCtx.Ctx(), txn, pts); err != nil {
-		return streaming.InvalidStreamID, err
+	if err := ptp.Protect(ctx, pts); err != nil {
+		return streampb.ReplicationProducerSpec{}, err
 	}
-	return streaming.StreamID(jr.JobID), nil
+	return streampb.ReplicationProducerSpec{
+		StreamID:             streampb.StreamID(jr.JobID),
+		ReplicationStartTime: statementTime,
+	}, nil
 }
 
 // Convert the producer job's status into corresponding replication
@@ -97,15 +102,22 @@ func convertProducerJobStatusToStreamStatus(
 func updateReplicationStreamProgress(
 	ctx context.Context,
 	expiration time.Time,
-	ptsProvider protectedts.Provider,
+	ptsProvider protectedts.Manager,
 	registry *jobs.Registry,
-	streamID streaming.StreamID,
+	streamID streampb.StreamID,
 	consumedTime hlc.Timestamp,
-	txn *kv.Txn,
+	txn isql.Txn,
 ) (status streampb.StreamReplicationStatus, err error) {
-	const useReadLock = false
-	err = registry.UpdateJobWithTxn(ctx, jobspb.JobID(streamID), txn, useReadLock,
-		func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+	updateJob := func() (streampb.StreamReplicationStatus, error) {
+		j, err := registry.LoadJobWithTxn(ctx, jobspb.JobID(streamID), txn)
+		if err != nil {
+			return status, err
+		}
+		if err := j.WithTxn(txn).Update(ctx, func(
+			txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+		) error {
+			status = streampb.StreamReplicationStatus{}
+			pts := ptsProvider.WithTxn(txn)
 			status.StreamStatus = convertProducerJobStatusToStreamStatus(md.Status)
 			// Skip checking PTS record in cases that it might already be released
 			if status.StreamStatus != streampb.StreamReplicationStatus_STREAM_ACTIVE &&
@@ -114,7 +126,7 @@ func updateReplicationStreamProgress(
 			}
 
 			ptsID := md.Payload.GetStreamReplication().ProtectedTimestampRecordID
-			ptsRecord, err := ptsProvider.GetRecord(ctx, txn, ptsID)
+			ptsRecord, err := pts.GetRecord(ctx, ptsID)
 			if err != nil {
 				return err
 			}
@@ -132,7 +144,7 @@ func updateReplicationStreamProgress(
 			// ingestion using the previous ingestion high watermark, it can fall behind the
 			// source cluster protected timestamp.
 			if shouldUpdatePTS := ptsRecord.Timestamp.Less(consumedTime); shouldUpdatePTS {
-				if err = ptsProvider.UpdateTimestamp(ctx, txn, ptsID, consumedTime); err != nil {
+				if err = pts.UpdateTimestamp(ctx, ptsID, consumedTime); err != nil {
 					return err
 				}
 				status.ProtectedTimestamp = &consumedTime
@@ -141,13 +153,17 @@ func updateReplicationStreamProgress(
 			md.Progress.GetStreamReplication().Expiration = expiration
 			ju.UpdateProgress(md.Progress)
 			return nil
-		})
+		}); err != nil {
+			return streampb.StreamReplicationStatus{}, err
+		}
+		return status, nil
+	}
 
+	status, err = updateJob()
 	if jobs.HasJobNotFoundError(err) || testutils.IsError(err, "not found in system.jobs table") {
 		status.StreamStatus = streampb.StreamReplicationStatus_STREAM_INACTIVE
 		err = nil
 	}
-
 	return status, err
 }
 
@@ -155,7 +171,11 @@ func updateReplicationStreamProgress(
 // record to the specified frontier. If 'frontier' is hlc.MaxTimestamp, returns the producer job
 // progress without updating it.
 func heartbeatReplicationStream(
-	evalCtx *eval.Context, streamID streaming.StreamID, frontier hlc.Timestamp, txn *kv.Txn,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	txn isql.Txn,
+	streamID streampb.StreamID,
+	frontier hlc.Timestamp,
 ) (streampb.StreamReplicationStatus, error) {
 	execConfig := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
 	timeout := streamingccl.StreamReplicationJobLivenessTimeout.Get(&evalCtx.Settings.SV)
@@ -164,7 +184,7 @@ func heartbeatReplicationStream(
 	// job progress.
 	if frontier == hlc.MaxTimestamp {
 		var status streampb.StreamReplicationStatus
-		pj, err := execConfig.JobRegistry.LoadJob(evalCtx.Ctx(), jobspb.JobID(streamID))
+		pj, err := execConfig.JobRegistry.LoadJob(ctx, jobspb.JobID(streamID))
 		if jobs.HasJobNotFoundError(err) || testutils.IsError(err, "not found in system.jobs table") {
 			status.StreamStatus = streampb.StreamReplicationStatus_STREAM_INACTIVE
 			return status, nil
@@ -174,8 +194,9 @@ func heartbeatReplicationStream(
 		}
 		status.StreamStatus = convertProducerJobStatusToStreamStatus(pj.Status())
 		payload := pj.Payload()
-		ptsRecord, err := execConfig.ProtectedTimestampProvider.GetRecord(evalCtx.Ctx(), txn,
-			payload.GetStreamReplication().ProtectedTimestampRecordID)
+		ptsRecord, err := execConfig.ProtectedTimestampProvider.WithTxn(txn).GetRecord(
+			ctx, payload.GetStreamReplication().ProtectedTimestampRecordID,
+		)
 		// Nil protected timestamp indicates it was not created or has been released.
 		if errors.Is(err, protectedts.ErrNotExists) {
 			return status, nil
@@ -187,18 +208,18 @@ func heartbeatReplicationStream(
 		return status, nil
 	}
 
-	return updateReplicationStreamProgress(evalCtx.Ctx(),
+	return updateReplicationStreamProgress(ctx,
 		expirationTime, execConfig.ProtectedTimestampProvider, execConfig.JobRegistry,
 		streamID, frontier, txn)
 }
 
 // getReplicationStreamSpec gets a replication stream specification for the specified stream.
 func getReplicationStreamSpec(
-	evalCtx *eval.Context, txn *kv.Txn, streamID streaming.StreamID,
+	ctx context.Context, evalCtx *eval.Context, streamID streampb.StreamID,
 ) (*streampb.ReplicationStreamSpec, error) {
 	jobExecCtx := evalCtx.JobExecContext.(sql.JobExecContext)
 	// Returns error if the replication stream is not active
-	j, err := jobExecCtx.ExecCfg().JobRegistry.LoadJob(evalCtx.Ctx(), jobspb.JobID(streamID))
+	j, err := jobExecCtx.ExecCfg().JobRegistry.LoadJob(ctx, jobspb.JobID(streamID))
 	if err != nil {
 		return nil, errors.Wrapf(err, "replication stream %d has error", streamID)
 	}
@@ -207,10 +228,9 @@ func getReplicationStreamSpec(
 	}
 
 	// Partition the spans with SQLPlanner
-	var noTxn *kv.Txn
 	dsp := jobExecCtx.DistSQLPlanner()
-	planCtx := dsp.NewPlanningCtx(evalCtx.Ctx(), jobExecCtx.ExtendedEvalContext(),
-		nil /* planner */, noTxn, sql.DistributionTypeSystemTenantOnly)
+	planCtx := dsp.NewPlanningCtx(ctx, jobExecCtx.ExtendedEvalContext(),
+		nil /* planner */, nil /* txn */, sql.DistributionTypeSystemTenantOnly)
 
 	details, ok := j.Details().(jobspb.StreamReplicationDetails)
 	if !ok {
@@ -221,13 +241,14 @@ func getReplicationStreamSpec(
 	for _, span := range replicatedSpans {
 		spans = append(spans, *span)
 	}
-	spanPartitions, err := dsp.PartitionSpans(evalCtx.Ctx(), planCtx, spans)
+	spanPartitions, err := dsp.PartitionSpans(ctx, planCtx, spans)
 	if err != nil {
 		return nil, err
 	}
 
 	res := &streampb.ReplicationStreamSpec{
-		Partitions: make([]streampb.ReplicationStreamSpec_Partition, 0, len(spanPartitions)),
+		Partitions:     make([]streampb.ReplicationStreamSpec_Partition, 0, len(spanPartitions)),
+		SourceTenantID: details.TenantID,
 	}
 	for _, sp := range spanPartitions {
 		nodeInfo, err := dsp.GetSQLInstanceInfo(sp.SQLInstanceID)
@@ -250,30 +271,39 @@ func getReplicationStreamSpec(
 }
 
 func completeReplicationStream(
-	evalCtx *eval.Context, txn *kv.Txn, streamID streaming.StreamID, successfulIngestion bool,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	txn isql.Txn,
+	streamID streampb.StreamID,
+	successfulIngestion bool,
 ) error {
-	registry := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig).JobRegistry
-	const useReadLock = false
-	return registry.UpdateJobWithTxn(evalCtx.Ctx(), jobspb.JobID(streamID), txn, useReadLock,
-		func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-			// Updates the stream ingestion status, make the job resumer exit running
-			// when picking up the new status.
-			if (md.Status == jobs.StatusRunning || md.Status == jobs.StatusPending) &&
-				md.Progress.GetStreamReplication().StreamIngestionStatus ==
-					jobspb.StreamReplicationProgress_NOT_FINISHED {
-				if successfulIngestion {
-					md.Progress.GetStreamReplication().StreamIngestionStatus =
-						jobspb.StreamReplicationProgress_FINISHED_SUCCESSFULLY
-					md.Progress.RunningStatus = "succeeding this producer job as the corresponding " +
-						"stream ingestion finished successfully"
-				} else {
-					md.Progress.GetStreamReplication().StreamIngestionStatus =
-						jobspb.StreamReplicationProgress_FINISHED_UNSUCCESSFULLY
-					md.Progress.RunningStatus = "canceling this producer job as the corresponding " +
-						"stream ingestion did not finish successfully"
-				}
-				ju.UpdateProgress(md.Progress)
+	jobExecCtx := evalCtx.JobExecContext.(sql.JobExecContext)
+	registry := jobExecCtx.ExecCfg().JobRegistry
+	j, err := registry.LoadJobWithTxn(ctx, jobspb.JobID(streamID), txn)
+	if err != nil {
+		return err
+	}
+	return j.WithTxn(txn).Update(ctx, func(
+		txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+	) error {
+		// Updates the stream ingestion status, make the job resumer exit running
+		// when picking up the new status.
+		if (md.Status == jobs.StatusRunning || md.Status == jobs.StatusPending) &&
+			md.Progress.GetStreamReplication().StreamIngestionStatus ==
+				jobspb.StreamReplicationProgress_NOT_FINISHED {
+			if successfulIngestion {
+				md.Progress.GetStreamReplication().StreamIngestionStatus =
+					jobspb.StreamReplicationProgress_FINISHED_SUCCESSFULLY
+				md.Progress.RunningStatus = "succeeding this producer job as the corresponding " +
+					"stream ingestion finished successfully"
+			} else {
+				md.Progress.GetStreamReplication().StreamIngestionStatus =
+					jobspb.StreamReplicationProgress_FINISHED_UNSUCCESSFULLY
+				md.Progress.RunningStatus = "canceling this producer job as the corresponding " +
+					"stream ingestion did not finish successfully"
 			}
-			return nil
-		})
+			ju.UpdateProgress(md.Progress)
+		}
+		return nil
+	})
 }

@@ -18,7 +18,7 @@ import { createSelector } from "reselect";
 import { refreshMetricMetadata, refreshNodes } from "src/redux/apiReducers";
 import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
-import { LineGraph } from "src/views/cluster/components/linegraph";
+import LineGraph from "src/views/cluster/components/linegraph";
 import { DropdownOption } from "src/views/shared/components/dropdown";
 import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
@@ -47,6 +47,7 @@ import {
   selectTimeScale,
   setTimeScale,
 } from "src/redux/timeScale";
+import { BackToAdvanceDebug } from "src/views/reports/containers/util";
 
 export interface CustomChartProps {
   refreshNodes: typeof refreshNodes;
@@ -292,6 +293,7 @@ export class CustomChart extends React.Component<
     return (
       <>
         <Helmet title="Custom Chart | Debug" />
+        <BackToAdvanceDebug history={this.props.history} />
         <section className="section">
           <h1 className="base-heading">Custom Chart</h1>
         </section>

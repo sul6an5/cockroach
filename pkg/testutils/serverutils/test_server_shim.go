@@ -23,7 +23,6 @@ import (
 	"flag"
 	"math/rand"
 	"net/url"
-	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -39,8 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -50,14 +47,6 @@ import (
 // TenantModeFlagName is the exported name of the tenantMode flag, for use
 // in other packages.
 const TenantModeFlagName = "tenantMode"
-
-// TenantSkipCCLBinaryMessage is the message we return any time we need to
-// skip a test due to the lack of a CCL binary.
-const TenantSkipCCLBinaryMessage = "skipping due to lack of CCL binary"
-
-// RequiresCCLBinaryMessage is the message we look for to determine if we've
-// encountered an error due to the lack of a CCL binary.
-const RequiresCCLBinaryMessage = "requires a CCL binary"
 
 var tenantModeFlag = flag.String(
 	TenantModeFlagName, tenantModeDefault,
@@ -103,22 +92,7 @@ func ShouldStartDefaultTestTenant(t testing.TB) bool {
 		t.Fatal("invalid setting of tenantMode flag")
 	}
 
-	if rand.Float64() > probabilityOfStartingDefaultTestTenant {
-		return false
-	}
-
-	if !skip.UnderBench() {
-		// We're starting the default SQL server (i.e. we're running this test
-		// in a tenant). Log this for easier debugging unless we're running a
-		// benchmark (because these INFO messages would break the benchstat
-		// utility).
-		log.Shout(context.Background(), severity.INFO,
-			"Running test with the default test tenant. "+
-				"If you are only seeing a test case failure when this message appears, there may be a "+
-				"problem with your test case running within tenants.")
-	}
-
-	return true
+	return rand.Float64() <= probabilityOfStartingDefaultTestTenant
 }
 
 // TestServerInterface defines test server functionality that tests need; it is
@@ -153,15 +127,16 @@ type TestServerInterface interface {
 	// Note: use ServingRPCAddr() instead unless specific reason not to.
 	RPCAddr() string
 
-	// DB returns a *client.DB instance for talking to this KV server.
-	DB() *kv.DB
-
 	// LeaseManager() returns the *sql.LeaseManager as an interface{}.
 	LeaseManager() interface{}
 
 	// InternalExecutor returns a *sql.InternalExecutor as an interface{} (which
-	// also implements sqlutil.InternalExecutor if the test cannot depend on sql).
+	// also implements insql.InternalExecutor if the test cannot depend on sql).
 	InternalExecutor() interface{}
+
+	// InternalExecutorInternalExecutorFactory returns a
+	// insql.InternalDB as an interface{}.
+	InternalDB() interface{}
 
 	// TracerI returns a *tracing.Tracer as an interface{}.
 	TracerI() interface{}
@@ -182,9 +157,6 @@ type TestServerInterface interface {
 
 	// SQLLivenessProvider returns the sqlliveness.Provider as an interface{}.
 	SQLLivenessProvider() interface{}
-
-	// StartupMigrationsManager returns the *startupmigrations.Manager as an interface{}.
-	StartupMigrationsManager() interface{}
 
 	// NodeLiveness exposes the NodeLiveness instance used by the TestServer as an
 	// interface{}.
@@ -260,7 +232,22 @@ type TestServerInterface interface {
 	// updates that are available.
 	UpdateChecker() interface{}
 
-	// StartTenant spawns off tenant process connecting to this TestServer.
+	// StartSharedProcessTenant starts a "shared-process" tenant - i.e. a tenant
+	// running alongside a KV server.
+	//
+	// args.TenantName must be specified. If a tenant with that name already
+	// exists, its ID is checked against args.TenantID (if set), and, if it
+	// matches, new tenant metadata is not created in the system.tenants table.
+	//
+	// See also StartTenant(), which starts a tenant mimicking out-of-process tenant
+	// servers.
+	StartSharedProcessTenant(
+		ctx context.Context, args base.TestSharedProcessTenantArgs,
+	) (TestTenantInterface, *gosql.DB, error)
+
+	// StartTenant starts a tenant server connecting to this TestServer. The
+	// tenant server simulates an out-of-process server. See also
+	// StartSharedProcessTenant() for a tenant simulating a shared-memory server.
 	StartTenant(ctx context.Context, params base.TestTenantArgs) (TestTenantInterface, error)
 
 	// ScratchRange splits off a range suitable to be used as KV scratch space.
@@ -285,6 +272,21 @@ type TestServerInterface interface {
 	// SpanConfigKVSubscriber returns the embedded spanconfig.KVSubscriber for
 	// the server.
 	SpanConfigKVSubscriber() interface{}
+
+	// TestTenants returns the test tenants associated with the server
+	TestTenants() []TestTenantInterface
+
+	// StartedDefaultTestTenant returns true if the server has started the default
+	// test tenant.
+	StartedDefaultTestTenant() bool
+
+	// TenantOrServer returns the default test tenant, if it was started or this
+	// server if not.
+	TenantOrServer() TestTenantInterface
+
+	// BinaryVersionOverride returns the value of an override if set using
+	// TestingKnobs.
+	BinaryVersionOverride() roachpb.Version
 }
 
 // TestServerFactory encompasses the actual implementation of the shim
@@ -320,20 +322,26 @@ func StartServer(
 		}
 	}
 
-	server, err := NewServer(params)
+	s, err := NewServer(params)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	if err := server.Start(context.Background()); err != nil {
-		if strings.Contains(err.Error(), RequiresCCLBinaryMessage) {
-			skip.IgnoreLint(t, TenantSkipCCLBinaryMessage)
-		}
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("%+v", err)
 	}
 	goDB := OpenDBConn(
-		t, server.ServingSQLAddr(), params.UseDatabase, params.Insecure, server.Stopper())
-	return server, goDB, server.DB()
+		t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+
+	// Now that we have started the server on the bootstrap version, let us run
+	// the migrations up to the overridden BinaryVersion.
+	if v := s.BinaryVersionOverride(); v != (roachpb.Version{}) {
+		if _, err := goDB.Exec(`SET CLUSTER SETTING version = $1`, v.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return s, goDB, s.DB()
 }
 
 // NewServer creates a test server.
@@ -427,25 +435,49 @@ func StartTenant(
 	return tenant, goDB
 }
 
+func StartSharedProcessTenant(
+	t testing.TB, ts TestServerInterface, params base.TestSharedProcessTenantArgs,
+) (TestTenantInterface, *gosql.DB) {
+	tenant, goDB, err := ts.StartSharedProcessTenant(context.Background(), params)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	return tenant, goDB
+}
+
 // TestTenantID returns a roachpb.TenantID that can be used when
 // starting a test Tenant. The returned tenant IDs match those built
 // into the test certificates.
 func TestTenantID() roachpb.TenantID {
-	return roachpb.MakeTenantID(security.EmbeddedTenantIDs()[0])
+	return roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[0])
+}
+
+// TestTenantID2 returns another roachpb.TenantID that can be used when
+// starting a test Tenant. The returned tenant IDs match those built
+// into the test certificates.
+func TestTenantID2() roachpb.TenantID {
+	return roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[1])
+}
+
+// TestTenantID3 returns another roachpb.TenantID that can be used when
+// starting a test Tenant. The returned tenant IDs match those built
+// into the test certificates.
+func TestTenantID3() roachpb.TenantID {
+	return roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[2])
 }
 
 // GetJSONProto uses the supplied client to GET the URL specified by the parameters
 // and unmarshals the result into response.
-func GetJSONProto(ts TestServerInterface, path string, response protoutil.Message) error {
+func GetJSONProto(ts TestTenantInterface, path string, response protoutil.Message) error {
 	return GetJSONProtoWithAdminOption(ts, path, response, true)
 }
 
 // GetJSONProtoWithAdminOption is like GetJSONProto but the caller can customize
 // whether the request is performed with admin privilege
 func GetJSONProtoWithAdminOption(
-	ts TestServerInterface, path string, response protoutil.Message, isAdmin bool,
+	ts TestTenantInterface, path string, response protoutil.Message, isAdmin bool,
 ) error {
-	httpClient, err := ts.GetAuthenticatedHTTPClient(isAdmin)
+	httpClient, err := ts.GetAuthenticatedHTTPClient(isAdmin, SingleTenantSession)
 	if err != nil {
 		return err
 	}
@@ -454,7 +486,7 @@ func GetJSONProtoWithAdminOption(
 
 // PostJSONProto uses the supplied client to POST the URL specified by the parameters
 // and unmarshals the result into response.
-func PostJSONProto(ts TestServerInterface, path string, request, response protoutil.Message) error {
+func PostJSONProto(ts TestTenantInterface, path string, request, response protoutil.Message) error {
 	return PostJSONProtoWithAdminOption(ts, path, request, response, true)
 }
 
@@ -462,9 +494,9 @@ func PostJSONProto(ts TestServerInterface, path string, request, response protou
 // can customize whether the request is performed with admin
 // privilege.
 func PostJSONProtoWithAdminOption(
-	ts TestServerInterface, path string, request, response protoutil.Message, isAdmin bool,
+	ts TestTenantInterface, path string, request, response protoutil.Message, isAdmin bool,
 ) error {
-	httpClient, err := ts.GetAuthenticatedHTTPClient(isAdmin)
+	httpClient, err := ts.GetAuthenticatedHTTPClient(isAdmin, SingleTenantSession)
 	if err != nil {
 		return err
 	}

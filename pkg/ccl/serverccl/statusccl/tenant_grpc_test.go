@@ -59,7 +59,7 @@ func TestTenantGRPCServices(t *testing.T) {
 	t.Logf("subtests starting")
 
 	t.Run("gRPC is running", func(t *testing.T) {
-		grpcAddr := tenant.SQLAddr()
+		grpcAddr := tenant.RPCAddr()
 		rpcCtx := tenant.RPCContext()
 
 		nodeID := roachpb.NodeID(tenant.SQLInstanceID())
@@ -107,7 +107,7 @@ func TestTenantGRPCServices(t *testing.T) {
 	})
 
 	tenant3, connTenant3 := serverutils.StartTenant(t, server, base.TestTenantArgs{
-		TenantID:     roachpb.MakeTenantID(11),
+		TenantID:     roachpb.MustMakeTenantID(11),
 		TestingKnobs: testingKnobs,
 	})
 	defer connTenant3.Close()
@@ -127,7 +127,7 @@ func TestTenantGRPCServices(t *testing.T) {
 	})
 
 	t.Run("fanout of statements endpoint between tenants", func(t *testing.T) {
-		grpcAddr := tenant.SQLAddr()
+		grpcAddr := tenant.RPCAddr()
 		rpcCtx := tenant2.RPCContext()
 
 		nodeID := roachpb.NodeID(tenant.SQLInstanceID())

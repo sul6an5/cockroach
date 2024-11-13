@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
@@ -31,7 +32,7 @@ import (
 func TestJSONFormats(t *testing.T) {
 	// CLI tests are sensitive to the server version, but test binaries don't have
 	// a version injected. Pretend to be a very up-to-date version.
-	defer build.TestingOverrideTag("v999.0.0")()
+	defer build.TestingOverrideVersion("v999.0.0")()
 
 	tm, err := time.Parse(MessageTimeFormat, "060102 15:04:05.654321")
 	if err != nil {
@@ -39,6 +40,8 @@ func TestJSONFormats(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	sysIDPayload := testIDPayload{tenantID: "1"}
+	ctx = context.WithValue(ctx, serverident.ServerIdentificationContextKey{}, sysIDPayload)
 	ctx = logtags.AddTag(ctx, "noval", nil)
 	ctx = logtags.AddTag(ctx, "s", "1")
 	ctx = logtags.AddTag(ctx, "long", "2")
@@ -52,8 +55,8 @@ func TestJSONFormats(t *testing.T) {
 		}(),
 		// Normal (non-header) entries.
 		{},
-		{idPayload: idPayload{clusterID: "abc", nodeID: "123"}},
-		{idPayload: idPayload{tenantID: "456", sqlInstanceID: "123"}},
+		{IDPayload: serverident.IDPayload{TenantIDInternal: "1", ClusterID: "abc", NodeID: "123"}},
+		{IDPayload: serverident.IDPayload{TenantIDInternal: "456", SQLInstanceID: "123"}},
 		makeStructuredEntry(ctx, severity.INFO, channel.DEV, 0, &logpb.TestingStructuredLogEvent{
 			CommonEventDetails: logpb.CommonEventDetails{
 				Timestamp: 123,

@@ -15,9 +15,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -166,15 +166,15 @@ func TestCmdClearRange(t *testing.T) {
 					EvalCtx: (&MockEvalCtx{
 						ClusterSettings: cluster.MakeTestingClusterSettings(),
 						Desc:            &desc,
-						Clock:           hlc.NewClockWithSystemTimeSource(time.Nanosecond),
+						Clock:           hlc.NewClockForTesting(nil),
 						Stats:           stats,
 					}).EvalContext(),
-					Header: roachpb.Header{
+					Header: kvpb.Header{
 						RangeID:   desc.RangeID,
 						Timestamp: hlc.Timestamp{WallTime: nowNanos},
 					},
-					Args: &roachpb.ClearRangeRequest{
-						RequestHeader: roachpb.RequestHeader{
+					Args: &kvpb.ClearRangeRequest{
+						RequestHeader: kvpb.RequestHeader{
 							Key:    startKey,
 							EndKey: endKey,
 						},
@@ -192,7 +192,7 @@ func TestCmdClearRange(t *testing.T) {
 				defer batch.Close()
 
 				// Run the request.
-				result, err := ClearRange(ctx, batch, cArgs, &roachpb.ClearRangeResponse{})
+				result, err := ClearRange(ctx, batch, cArgs, &kvpb.ClearRangeResponse{})
 				require.NoError(t, err)
 				require.NotNil(t, result.Replicated.MVCCHistoryMutation)
 				require.Equal(t, result.Replicated.MVCCHistoryMutation.Spans, []roachpb.Span{{Key: startKey, EndKey: endKey}})
@@ -246,14 +246,14 @@ func TestCmdClearRangeDeadline(t *testing.T) {
 		RangeID: 99, StartKey: roachpb.RKey(startKey), EndKey: roachpb.RKey(endKey),
 	}
 
-	clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 123)), time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 
-	args := roachpb.ClearRangeRequest{
-		RequestHeader: roachpb.RequestHeader{Key: startKey, EndKey: endKey},
+	args := kvpb.ClearRangeRequest{
+		RequestHeader: kvpb.RequestHeader{Key: startKey, EndKey: endKey},
 	}
 
 	cArgs := CommandArgs{
-		Header: roachpb.Header{RangeID: desc.RangeID},
+		Header: kvpb.Header{RangeID: desc.RangeID},
 		EvalCtx: (&MockEvalCtx{
 			ClusterSettings: cluster.MakeTestingClusterSettings(),
 			Desc:            &desc,
@@ -269,26 +269,26 @@ func TestCmdClearRangeDeadline(t *testing.T) {
 
 	// no deadline
 	args.Deadline = hlc.Timestamp{}
-	if _, err := ClearRange(ctx, batch, cArgs, &roachpb.ClearRangeResponse{}); err != nil {
+	if _, err := ClearRange(ctx, batch, cArgs, &kvpb.ClearRangeResponse{}); err != nil {
 		t.Fatal(err)
 	}
 
 	// before deadline
 	args.Deadline = hlc.Timestamp{WallTime: 124}
-	if _, err := ClearRange(ctx, batch, cArgs, &roachpb.ClearRangeResponse{}); err != nil {
+	if _, err := ClearRange(ctx, batch, cArgs, &kvpb.ClearRangeResponse{}); err != nil {
 		t.Fatal(err)
 	}
 
 	// at deadline.
 	args.Deadline = hlc.Timestamp{WallTime: 123}
-	if _, err := ClearRange(ctx, batch, cArgs, &roachpb.ClearRangeResponse{}); err == nil {
+	if _, err := ClearRange(ctx, batch, cArgs, &kvpb.ClearRangeResponse{}); err == nil {
 		t.Fatal("expected deadline error")
 	}
 
 	// after deadline
 	args.Deadline = hlc.Timestamp{WallTime: 122}
 	if _, err := ClearRange(
-		ctx, batch, cArgs, &roachpb.ClearRangeResponse{},
+		ctx, batch, cArgs, &kvpb.ClearRangeResponse{},
 	); !testutils.IsError(err, "ClearRange has deadline") {
 		t.Fatal("expected deadline error")
 	}

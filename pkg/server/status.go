@@ -37,12 +37,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvisstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangestats"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -52,23 +54,24 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
@@ -78,13 +81,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	raft "go.etcd.io/etcd/raft/v3"
+	raft "go.etcd.io/raft/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -132,13 +135,6 @@ type metricMarshaler interface {
 	ScrapeIntoPrometheus(pm *metric.PrometheusExporter)
 }
 
-func propagateGatewayMetadata(ctx context.Context) context.Context {
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		return metadata.NewOutgoingContext(ctx, md)
-	}
-	return ctx
-}
-
 // baseStatusServer implements functionality shared by the tenantStatusServer
 // and the full statusServer.
 type baseStatusServer struct {
@@ -152,11 +148,13 @@ type baseStatusServer struct {
 	privilegeChecker   *adminPrivilegeChecker
 	sessionRegistry    *sql.SessionRegistry
 	closedSessionCache *sql.ClosedSessionCache
-	flowScheduler      *flowinfra.FlowScheduler
+	remoteFlowRunner   *flowinfra.RemoteFlowRunner
 	st                 *cluster.Settings
 	sqlServer          *SQLServer
 	rpcCtx             *rpc.Context
 	stopper            *stop.Stopper
+	serverIterator     ServerIterator
+	clock              *hlc.Clock
 }
 
 func isInternalAppName(app string) bool {
@@ -168,7 +166,7 @@ func isInternalAppName(app string) bool {
 func (b *baseStatusServer) getLocalSessions(
 	ctx context.Context, req *serverpb.ListSessionsRequest,
 ) ([]serverpb.Session, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = b.AnnotateCtx(ctx)
 
 	sessionUser, isAdmin, err := b.privilegeChecker.getUserAndRole(ctx)
@@ -211,30 +209,27 @@ func (b *baseStatusServer) getLocalSessions(
 	showAll := reqUsername.Undefined()
 	showInternal := SQLStatsShowInternal.Get(&b.st.SV) || req.IncludeInternal
 
-	// In order to avoid duplicate sessions showing up as both open and closed,
-	// we lock the session registry to prevent any changes to it while we
-	// serialize the sessions from the session registry and the closed session
-	// cache.
-	b.sessionRegistry.Lock()
-	sessions := b.sessionRegistry.SerializeAllLocked()
-
+	sessions := b.sessionRegistry.SerializeAll()
 	var closedSessions []serverpb.Session
+	var closedSessionIDs map[uint128.Uint128]struct{}
 	if !req.ExcludeClosedSessions {
 		closedSessions = b.closedSessionCache.GetSerializedSessions()
+		closedSessionIDs = make(map[uint128.Uint128]struct{}, len(closedSessions))
+		for _, closedSession := range closedSessions {
+			closedSessionIDs[uint128.FromBytes(closedSession.ID)] = struct{}{}
+		}
 	}
-	b.sessionRegistry.Unlock()
-
-	userSessions := make([]serverpb.Session, 0)
-	sessions = append(sessions, closedSessions...)
 
 	reqUserNameNormalized := reqUsername.Normalized()
-	for _, session := range sessions {
+
+	userSessions := make([]serverpb.Session, 0, len(sessions)+len(closedSessions))
+	addUserSession := func(session serverpb.Session) {
 		// We filter based on the session name instead of the executor type because we
 		// may want to surface certain internal sessions, such as those executed by
 		// the SQL over HTTP api, as non-internal.
 		if (reqUserNameNormalized != session.Username && !showAll) ||
 			(!showInternal && isInternalAppName(session.ApplicationName)) {
-			continue
+			return
 		}
 
 		if !isAdmin && hasViewActivityRedacted && (reqUserNameNormalized != session.Username) {
@@ -246,8 +241,21 @@ func (b *baseStatusServer) getLocalSessions(
 			}
 			session.LastActiveQuery = session.LastActiveQueryNoConstants
 		}
-
 		userSessions = append(userSessions, session)
+	}
+	for _, session := range sessions {
+		// The same session can appear as both open and closed because reading the
+		// open and closed sessions is not synchronized. Prefer the closed session
+		// over the open one if the same session appears as both because it was
+		// closed in between reading the open sessions and reading the closed ones.
+		_, ok := closedSessionIDs[uint128.FromBytes(session.ID)]
+		if ok {
+			continue
+		}
+		addUserSession(session)
+	}
+	for _, session := range closedSessions {
+		addUserSession(session)
 	}
 
 	sort.Slice(userSessions, func(i, j int) bool {
@@ -257,107 +265,70 @@ func (b *baseStatusServer) getLocalSessions(
 	return userSessions, nil
 }
 
-type sessionFinder func(sessions []serverpb.Session) (serverpb.Session, error)
-
-func findSessionBySessionID(sessionID []byte) sessionFinder {
-	return func(sessions []serverpb.Session) (serverpb.Session, error) {
-		var session serverpb.Session
-		for _, s := range sessions {
-			if bytes.Equal(sessionID, s.ID) {
-				session = s
-				break
-			}
-		}
-		if len(session.ID) == 0 {
-			return session, fmt.Errorf("session ID %s not found", clusterunique.IDFromBytes(sessionID))
-		}
-		return session, nil
-	}
-}
-
-func findSessionByQueryID(queryID string) sessionFinder {
-	return func(sessions []serverpb.Session) (serverpb.Session, error) {
-		var session serverpb.Session
-		for _, s := range sessions {
-			for _, q := range s.ActiveQueries {
-				if queryID == q.ID {
-					session = s
-					break
-				}
-			}
-		}
-		if len(session.ID) == 0 {
-			return session, fmt.Errorf("query ID %s not found", queryID)
-		}
-		return session, nil
-	}
-}
-
 // checkCancelPrivilege returns nil if the user has the necessary cancel action
 // privileges for a session. This function returns a proper gRPC error status.
 func (b *baseStatusServer) checkCancelPrivilege(
-	ctx context.Context, userName username.SQLUsername, findSession sessionFinder,
+	ctx context.Context, reqUsername username.SQLUsername, sessionUsername username.SQLUsername,
 ) error {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = b.AnnotateCtx(ctx)
-	// reqUser is the user who made the cancellation request.
-	var reqUser username.SQLUsername
-	{
-		sessionUser, isAdmin, err := b.privilegeChecker.getUserAndRole(ctx)
-		if err != nil {
-			return serverError(ctx, err)
-		}
-		if userName.Undefined() || userName == sessionUser {
-			reqUser = sessionUser
-		} else {
-			// When CANCEL QUERY is run as a SQL statement, sessionUser is always root
-			// and the user who ran the statement is passed as req.Username.
-			if !isAdmin {
-				return errRequiresAdmin
-			}
-			reqUser = userName
-		}
-	}
 
-	hasAdmin, err := b.privilegeChecker.hasAdminRole(ctx, reqUser)
+	ctxUsername, isCtxAdmin, err := b.privilegeChecker.getUserAndRole(ctx)
 	if err != nil {
 		return serverError(ctx, err)
 	}
+	if reqUsername.Undefined() {
+		reqUsername = ctxUsername
+	} else if reqUsername != ctxUsername && !isCtxAdmin {
+		// When CANCEL QUERY is run as a SQL statement, sessionUser is always root
+		// and the user who ran the statement is passed as req.Username.
+		return errRequiresAdmin
+	}
 
-	if !hasAdmin {
-		// Check if the user has permission to see the session.
-		session, err := findSession(b.sessionRegistry.SerializeAll())
+	// A user can always cancel their own sessions/queries.
+	if sessionUsername == reqUsername {
+		return nil
+	}
+
+	// If reqUsername equals ctxUsername then isReqAdmin is isCtxAdmin and was
+	// checked inside getUserAndRole above.
+	isReqAdmin := isCtxAdmin
+	if reqUsername != ctxUsername {
+		isReqAdmin, err = b.privilegeChecker.hasAdminRole(ctx, reqUsername)
 		if err != nil {
 			return serverError(ctx, err)
 		}
+	}
 
-		sessionUser := username.MakeSQLUsernameFromPreNormalizedString(session.Username)
-		if sessionUser != reqUser {
-			// Must have CANCELQUERY privilege to cancel other users'
-			// sessions/queries.
-			hasCancelQuery := false
-			if b.privilegeChecker.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-				hasCancelQuery = b.privilegeChecker.checkHasGlobalPrivilege(ctx, reqUser, privilege.CANCELQUERY)
-			}
-			if !hasCancelQuery {
-				ok, err := b.privilegeChecker.hasRoleOption(ctx, reqUser, roleoption.CANCELQUERY)
-				if err != nil {
-					return serverError(ctx, err)
-				}
-				if !ok {
-					return errRequiresRoleOption(roleoption.CANCELQUERY)
-				}
-			}
-			// Non-admins cannot cancel admins' sessions/queries.
-			isAdminSession, err := b.privilegeChecker.hasAdminRole(ctx, sessionUser)
-			if err != nil {
-				return serverError(ctx, err)
-			}
-			if isAdminSession {
-				return status.Error(
-					codes.PermissionDenied, "permission denied to cancel admin session")
-			}
+	// Admin users can cancel sessions/queries.
+	if isReqAdmin {
+		return nil
+	}
+
+	// Must have CANCELQUERY privilege to cancel other users'
+	// sessions/queries.
+	hasGlobalCancelQuery, err := b.privilegeChecker.hasGlobalPrivilege(ctx, reqUsername, privilege.CANCELQUERY)
+	if err != nil {
+		return serverError(ctx, err)
+	}
+	if !hasGlobalCancelQuery {
+		hasRoleCancelQuery, err := b.privilegeChecker.hasRoleOption(ctx, reqUsername, roleoption.CANCELQUERY)
+		if err != nil {
+			return serverError(ctx, err)
 		}
+		if !hasRoleCancelQuery {
+			return errRequiresRoleOption(roleoption.CANCELQUERY)
+		}
+	}
+
+	// Non-admins cannot cancel admins' sessions/queries.
+	isSessionAdmin, err := b.privilegeChecker.hasAdminRole(ctx, sessionUsername)
+	if err != nil {
+		return serverError(ctx, err)
+	}
+	if isSessionAdmin {
+		return status.Error(
+			codes.PermissionDenied, "permission denied to cancel admin session")
 	}
 
 	return nil
@@ -367,7 +338,7 @@ func (b *baseStatusServer) checkCancelPrivilege(
 func (b *baseStatusServer) ListLocalContentionEvents(
 	ctx context.Context, _ *serverpb.ListContentionEventsRequest,
 ) (*serverpb.ListContentionEventsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = b.AnnotateCtx(ctx)
 
 	if err := b.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
@@ -384,7 +355,7 @@ func (b *baseStatusServer) ListLocalContentionEvents(
 func (b *baseStatusServer) ListLocalDistSQLFlows(
 	ctx context.Context, _ *serverpb.ListDistSQLFlowsRequest,
 ) (*serverpb.ListDistSQLFlowsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = b.AnnotateCtx(ctx)
 
 	if err := b.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
@@ -395,28 +366,17 @@ func (b *baseStatusServer) ListLocalDistSQLFlows(
 
 	nodeIDOrZero, _ := b.sqlServer.sqlIDContainer.OptionalNodeID()
 
-	running, queued := b.flowScheduler.Serialize()
+	flows := b.remoteFlowRunner.Serialize()
 	response := &serverpb.ListDistSQLFlowsResponse{
-		Flows: make([]serverpb.DistSQLRemoteFlows, 0, len(running)+len(queued)),
+		Flows: make([]serverpb.DistSQLRemoteFlows, 0, len(flows)),
 	}
-	for _, f := range running {
+	for _, f := range flows {
 		response.Flows = append(response.Flows, serverpb.DistSQLRemoteFlows{
 			FlowID: f.FlowID,
 			Infos: []serverpb.DistSQLRemoteFlows_Info{{
 				NodeID:    nodeIDOrZero,
 				Timestamp: f.Timestamp,
 				Status:    serverpb.DistSQLRemoteFlows_RUNNING,
-				Stmt:      f.StatementSQL,
-			}},
-		})
-	}
-	for _, f := range queued {
-		response.Flows = append(response.Flows, serverpb.DistSQLRemoteFlows{
-			FlowID: f.FlowID,
-			Infos: []serverpb.DistSQLRemoteFlows_Info{{
-				NodeID:    nodeIDOrZero,
-				Timestamp: f.Timestamp,
-				Status:    serverpb.DistSQLRemoteFlows_QUEUED,
 				Stmt:      f.StatementSQL,
 			}},
 		})
@@ -436,7 +396,15 @@ func (b *baseStatusServer) localExecutionInsights(
 
 	reader := b.sqlServer.pgServer.SQLServer.GetInsightsReader()
 	reader.IterateInsights(ctx, func(ctx context.Context, insight *insights.Insight) {
-		response.Insights = append(response.Insights, *insight)
+		if insight == nil {
+			return
+		}
+
+		// Versions <=22.2.6 expects that Statement is not null when building the exec insights virtual table.
+		insightWithStmt := *insight
+		insightWithStmt.Statement = &insights.Statement{}
+
+		response.Insights = append(response.Insights, insightWithStmt)
 	})
 
 	return &response, nil
@@ -501,16 +469,50 @@ type statusServer struct {
 	*baseStatusServer
 
 	cfg                      *base.Config
-	admin                    *adminServer
 	db                       *kv.DB
-	gossip                   *gossip.Gossip
 	metricSource             metricMarshaler
-	nodeLiveness             *liveness.NodeLiveness
-	storePool                *storepool.StorePool
-	stores                   *kvserver.Stores
 	si                       systemInfoOnce
 	stmtDiagnosticsRequester StmtDiagnosticsRequester
 	internalExecutor         *sql.InternalExecutor
+
+	// cancelSemaphore is a semaphore that limits the number of
+	// concurrent calls to the pgwire query cancellation endpoint. This
+	// is needed to avoid the risk of a DoS attack by malicious users
+	// that attempts to cancel random queries by spamming the request.
+	//
+	// See CancelQueryByKey() for details.
+	//
+	// The semaphore is initialized with a hard-coded limit of 256
+	// concurrent pgwire cancel requests (per node). We also add a
+	// 1-second penalty for failed cancellation requests in
+	// CancelQueryByKey, meaning that an attacker needs 1 second per
+	// guess. With an attacker randomly guessing a 32-bit secret, it
+	// would take 2^24 seconds to hit one query. If we suppose there are
+	// 256 concurrent queries actively running on a node, then it would
+	// take 2^16 seconds (18 hours) to hit any one of them.
+	cancelSemaphore *quotapool.IntPool
+}
+
+// systemStatusServer is an extension of the standard
+// statusServer defined above with a few extra fields
+// that support additional implementations of APIs that
+// require system tenant access. This includes endpoints
+// that require gossip, or information about nodes and
+// stores.
+// In general, add new RPC implementations to the base
+// statusServer to ensure feature parity with system and
+// app tenants.
+type systemStatusServer struct {
+	*statusServer
+
+	gossip             *gossip.Gossip
+	storePool          *storepool.StorePool
+	stores             *kvserver.Stores
+	nodeLiveness       *liveness.NodeLiveness
+	spanConfigReporter spanconfig.Reporter
+	distSender         *kvcoord.DistSender
+	rangeStatsFetcher  *rangestats.Fetcher
+	node               *Node
 }
 
 // StmtDiagnosticsRequester is the interface into *stmtdiagnostics.Registry
@@ -556,7 +558,53 @@ func newStatusServer(
 	st *cluster.Settings,
 	cfg *base.Config,
 	adminAuthzCheck *adminPrivilegeChecker,
-	adminServer *adminServer,
+	db *kv.DB,
+	metricSource metricMarshaler,
+	rpcCtx *rpc.Context,
+	stopper *stop.Stopper,
+	sessionRegistry *sql.SessionRegistry,
+	closedSessionCache *sql.ClosedSessionCache,
+	remoteFlowRunner *flowinfra.RemoteFlowRunner,
+	internalExecutor *sql.InternalExecutor,
+	serverIterator ServerIterator,
+	clock *hlc.Clock,
+) *statusServer {
+	ambient.AddLogTag("status", nil)
+	if !rpcCtx.TenantID.IsSystem() {
+		ambient.AddLogTag("tenant", rpcCtx.TenantID)
+	}
+
+	server := &statusServer{
+		baseStatusServer: &baseStatusServer{
+			AmbientContext:     ambient,
+			privilegeChecker:   adminAuthzCheck,
+			sessionRegistry:    sessionRegistry,
+			closedSessionCache: closedSessionCache,
+			remoteFlowRunner:   remoteFlowRunner,
+			st:                 st,
+			rpcCtx:             rpcCtx,
+			stopper:            stopper,
+			serverIterator:     serverIterator,
+			clock:              clock,
+		},
+		cfg:              cfg,
+		db:               db,
+		metricSource:     metricSource,
+		internalExecutor: internalExecutor,
+
+		// See the docstring on cancelSemaphore for details about this initialization.
+		cancelSemaphore: quotapool.NewIntPool("pgwire-cancel", 256),
+	}
+
+	return server
+}
+
+// newSystemStatusServer allocates and returns a statusServer.
+func newSystemStatusServer(
+	ambient log.AmbientContext,
+	st *cluster.Settings,
+	cfg *base.Config,
+	adminAuthzCheck *adminPrivilegeChecker,
 	db *kv.DB,
 	gossip *gossip.Gossip,
 	metricSource metricMarshaler,
@@ -567,33 +615,43 @@ func newStatusServer(
 	stopper *stop.Stopper,
 	sessionRegistry *sql.SessionRegistry,
 	closedSessionCache *sql.ClosedSessionCache,
-	flowScheduler *flowinfra.FlowScheduler,
+	remoteFlowRunner *flowinfra.RemoteFlowRunner,
 	internalExecutor *sql.InternalExecutor,
-) *statusServer {
-	ambient.AddLogTag("status", nil)
-	server := &statusServer{
-		baseStatusServer: &baseStatusServer{
-			AmbientContext:     ambient,
-			privilegeChecker:   adminAuthzCheck,
-			sessionRegistry:    sessionRegistry,
-			closedSessionCache: closedSessionCache,
-			flowScheduler:      flowScheduler,
-			st:                 st,
-			rpcCtx:             rpcCtx,
-			stopper:            stopper,
-		},
-		cfg:              cfg,
-		admin:            adminServer,
-		db:               db,
-		gossip:           gossip,
-		metricSource:     metricSource,
-		nodeLiveness:     nodeLiveness,
-		storePool:        storePool,
-		stores:           stores,
-		internalExecutor: internalExecutor,
-	}
+	serverIterator ServerIterator,
+	spanConfigReporter spanconfig.Reporter,
+	clock *hlc.Clock,
+	distSender *kvcoord.DistSender,
+	rangeStatsFetcher *rangestats.Fetcher,
+	node *Node,
+) *systemStatusServer {
+	server := newStatusServer(
+		ambient,
+		st,
+		cfg,
+		adminAuthzCheck,
+		db,
+		metricSource,
+		rpcCtx,
+		stopper,
+		sessionRegistry,
+		closedSessionCache,
+		remoteFlowRunner,
+		internalExecutor,
+		serverIterator,
+		clock,
+	)
 
-	return server
+	return &systemStatusServer{
+		statusServer:       server,
+		gossip:             gossip,
+		storePool:          storePool,
+		stores:             stores,
+		nodeLiveness:       nodeLiveness,
+		spanConfigReporter: spanConfigReporter,
+		distSender:         distSender,
+		rangeStatsFetcher:  rangeStatsFetcher,
+		node:               node,
+	}
 }
 
 // setStmtDiagnosticsRequester is used to provide a StmtDiagnosticsRequester to
@@ -618,46 +676,33 @@ func (s *statusServer) RegisterGateway(
 	return serverpb.RegisterStatusHandler(ctx, mux, conn)
 }
 
-func (s *statusServer) parseNodeID(nodeIDParam string) (roachpb.NodeID, bool, error) {
-	return parseNodeID(s.gossip, nodeIDParam)
+// RegisterService registers the GRPC service.
+func (s *systemStatusServer) RegisterService(g *grpc.Server) {
+	serverpb.RegisterStatusServer(g, s)
 }
 
-func parseNodeID(
-	gossip *gossip.Gossip, nodeIDParam string,
-) (nodeID roachpb.NodeID, isLocal bool, err error) {
-	// No parameter provided or set to local.
-	if len(nodeIDParam) == 0 || localRE.MatchString(nodeIDParam) {
-		return gossip.NodeID.Get(), true, nil
-	}
-
-	id, err := strconv.ParseInt(nodeIDParam, 0, 32)
-	if err != nil {
-		return 0, false, errors.Wrap(err, "node ID could not be parsed")
-	}
-	nodeID = roachpb.NodeID(id)
-	return nodeID, nodeID == gossip.NodeID.Get(), nil
+func (s *statusServer) parseNodeID(nodeIDParam string) (roachpb.NodeID, bool, error) {
+	id, local, err := s.serverIterator.parseServerID(nodeIDParam)
+	return roachpb.NodeID(id), local, err
 }
 
 func (s *statusServer) dialNode(
 	ctx context.Context, nodeID roachpb.NodeID,
 ) (serverpb.StatusClient, error) {
-	addr, err := s.gossip.GetNodeIDAddress(nodeID)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := s.rpcCtx.GRPCDialNode(addr.String(), nodeID,
-		rpc.DefaultClass).Connect(ctx)
+	conn, err := s.serverIterator.dialNode(ctx, serverID(nodeID))
 	if err != nil {
 		return nil, err
 	}
 	return serverpb.NewStatusClient(conn), nil
 }
 
-// Gossip returns gossip network status.
-func (s *statusServer) Gossip(
+// Gossip returns gossip network status. It is implemented
+// in the systemStatusServer since the system tenant has
+// access to gossip.
+func (s *systemStatusServer) Gossip(
 	ctx context.Context, req *serverpb.GossipRequest,
 ) (*gossip.InfoStatus, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -682,10 +727,10 @@ func (s *statusServer) Gossip(
 	return status.Gossip(ctx, req)
 }
 
-func (s *statusServer) EngineStats(
+func (s *systemStatusServer) EngineStats(
 	ctx context.Context, req *serverpb.EngineStatsRequest,
 ) (*serverpb.EngineStatsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -712,7 +757,7 @@ func (s *statusServer) EngineStats(
 		engineStatsInfo := serverpb.EngineStatsInfo{
 			StoreID:              store.Ident.StoreID,
 			TickersAndHistograms: nil,
-			EngineType:           store.Engine().Type(),
+			EngineType:           store.TODOEngine().Type(),
 		}
 
 		resp.Stats = append(resp.Stats, engineStatsInfo)
@@ -725,13 +770,13 @@ func (s *statusServer) EngineStats(
 }
 
 // Allocator returns simulated allocator info for the ranges on the given node.
-func (s *statusServer) Allocator(
+func (s *systemStatusServer) Allocator(
 	ctx context.Context, req *serverpb.AllocatorRequest,
 ) (*serverpb.AllocatorResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+	if err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
@@ -761,7 +806,7 @@ func (s *statusServer) Allocator(
 						return true // continue.
 					}
 					var allocatorSpans tracingpb.Recording
-					allocatorSpans, err = store.AllocatorDryRun(ctx, rep)
+					allocatorSpans, err = store.ReplicateQueueDryRun(ctx, rep)
 					if err != nil {
 						return false // break and bubble up the error.
 					}
@@ -786,7 +831,7 @@ func (s *statusServer) Allocator(
 			if !rep.OwnsValidLease(ctx, store.Clock().NowAsClockTimestamp()) {
 				continue
 			}
-			allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
+			allocatorSpans, err := store.ReplicateQueueDryRun(ctx, rep)
 			if err != nil {
 				return err
 			}
@@ -817,11 +862,58 @@ func recordedSpansToTraceEvents(spans []tracingpb.RecordedSpan) []*serverpb.Trac
 	return output
 }
 
+// CriticalNodes retrieves nodes that are considered critical. A critical node
+// is one whose unexpected termination could result in data loss. A node is
+// considered critical if any of its replicas are unavailable or
+// under-replicated. The response includes a list of node descriptors that are
+// considered critical, and the corresponding SpanConfigConformanceReport that
+// includes details of non-conforming ranges contributing to the criticality.
+func (s *systemStatusServer) CriticalNodes(
+	ctx context.Context, req *serverpb.CriticalNodesRequest,
+) (*serverpb.CriticalNodesResponse, error) {
+	ctx = s.AnnotateCtx(ctx)
+	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+		return nil, err
+	}
+	conformance, err := s.node.SpanConfigConformance(
+		ctx, &roachpb.SpanConfigConformanceRequest{
+			Spans: []roachpb.Span{keys.EverythingSpan},
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	critical := make(map[roachpb.NodeID]bool)
+	for _, r := range conformance.Report.UnderReplicated {
+		for _, desc := range r.RangeDescriptor.Replicas().Descriptors() {
+			critical[desc.NodeID] = true
+		}
+	}
+	for _, r := range conformance.Report.Unavailable {
+		for _, desc := range r.RangeDescriptor.Replicas().Descriptors() {
+			critical[desc.NodeID] = true
+		}
+	}
+
+	res := &serverpb.CriticalNodesResponse{
+		CriticalNodes: nil,
+		Report:        conformance.Report,
+	}
+	for nodeID := range critical {
+		ns, err := s.nodeStatus(ctx, &serverpb.NodeRequest{NodeId: nodeID.String()})
+		if err != nil {
+			return nil, err
+		}
+		res.CriticalNodes = append(res.CriticalNodes, ns.Desc)
+	}
+	return res, nil
+}
+
 // AllocatorRange returns simulated allocator info for the requested range.
-func (s *statusServer) AllocatorRange(
+func (s *systemStatusServer) AllocatorRange(
 	ctx context.Context, req *serverpb.AllocatorRangeRequest,
 ) (*serverpb.AllocatorRangeResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
@@ -843,7 +935,7 @@ func (s *statusServer) AllocatorRange(
 			ctx,
 			"server.statusServer: requesting remote Allocator simulation",
 			func(ctx context.Context) {
-				_ = contextutil.RunWithTimeout(ctx, "allocator range", base.NetworkTimeout, func(ctx context.Context) error {
+				_ = contextutil.RunWithTimeout(ctx, "allocator range", 3*time.Second, func(ctx context.Context) error {
 					status, err := s.dialNode(ctx, nodeID)
 					var allocatorResponse *serverpb.AllocatorResponse
 					if err == nil {
@@ -910,7 +1002,7 @@ func (s *statusServer) AllocatorRange(
 func (s *statusServer) Certificates(
 	ctx context.Context, req *serverpb.CertificatesRequest,
 ) (*serverpb.CertificatesResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -1031,7 +1123,7 @@ func extractCertFields(contents []byte, details *serverpb.CertificateDetails) er
 func (s *statusServer) Details(
 	ctx context.Context, req *serverpb.DetailsRequest,
 ) (*serverpb.DetailsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -1052,16 +1144,16 @@ func (s *statusServer) Details(
 		return status.Details(ctx, req)
 	}
 
-	remoteNodeID := s.gossip.NodeID.Get()
+	remoteNodeID := roachpb.NodeID(s.serverIterator.getID())
 	resp := &serverpb.DetailsResponse{
 		NodeID:     remoteNodeID,
 		BuildInfo:  build.GetInfo(),
 		SystemInfo: s.si.systemInfo(ctx),
 	}
-	if addr, err := s.gossip.GetNodeIDAddress(remoteNodeID); err == nil {
+	if addr, err := s.serverIterator.getServerIDAddress(ctx, serverID(remoteNodeID)); err == nil {
 		resp.Address = *addr
 	}
-	if addr, err := s.gossip.GetNodeIDSQLAddress(remoteNodeID); err == nil {
+	if addr, err := s.serverIterator.getServerIDSQLAddress(ctx, serverID(remoteNodeID)); err == nil {
 		resp.SQLAddress = *addr
 	}
 
@@ -1072,7 +1164,7 @@ func (s *statusServer) Details(
 func (s *statusServer) GetFiles(
 	ctx context.Context, req *serverpb.GetFilesRequest,
 ) (*serverpb.GetFilesResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -1128,7 +1220,7 @@ func checkFilePattern(pattern string) error {
 func (s *statusServer) LogFilesList(
 	ctx context.Context, req *serverpb.LogFilesListRequest,
 ) (*serverpb.LogFilesListResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -1163,7 +1255,7 @@ func (s *statusServer) LogFilesList(
 func (s *statusServer) LogFile(
 	ctx context.Context, req *serverpb.LogFileRequest,
 ) (*serverpb.LogEntriesResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -1202,6 +1294,13 @@ func (s *statusServer) LogFile(
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
+	// Unless we're the system tenant, clients should only be able
+	// to view logs that pertain to their own tenant. Set the filter
+	// accordingly.
+	tenantIDFilter := ""
+	if s.rpcCtx.TenantID != roachpb.SystemTenantID {
+		tenantIDFilter = s.rpcCtx.TenantID.String()
+	}
 	for {
 		var entry logpb.Entry
 		if err := decoder.Decode(&entry); err != nil {
@@ -1209,6 +1308,9 @@ func (s *statusServer) LogFile(
 				break
 			}
 			return nil, serverError(ctx, err)
+		}
+		if tenantIDFilter != "" && entry.TenantID != tenantIDFilter {
+			continue
 		}
 		resp.Entries = append(resp.Entries, entry)
 	}
@@ -1251,7 +1353,7 @@ func parseInt64WithDefault(s string, defaultValue int64) (int64, error) {
 func (s *statusServer) Logs(
 	ctx context.Context, req *serverpb.LogsRequest,
 ) (*serverpb.LogEntriesResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -1317,14 +1419,29 @@ func (s *statusServer) Logs(
 		return nil, serverError(ctx, err)
 	}
 
-	return &serverpb.LogEntriesResponse{Entries: entries}, nil
+	out := &serverpb.LogEntriesResponse{}
+	// Unless we're the system tenant, clients should only be able
+	// to view logs that pertain to their own tenant. Set the filter
+	// accordingly.
+	tenantIDFilter := ""
+	if s.rpcCtx.TenantID != roachpb.SystemTenantID {
+		tenantIDFilter = s.rpcCtx.TenantID.String()
+	}
+	for _, e := range entries {
+		if tenantIDFilter != "" && e.TenantID != tenantIDFilter {
+			continue
+		}
+		out.Entries = append(out.Entries, e)
+	}
+
+	return out, nil
 }
 
 // Stacks returns goroutine or thread stack traces.
 func (s *statusServer) Stacks(
 	ctx context.Context, req *serverpb.StacksRequest,
 ) (*serverpb.JSONResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -1357,7 +1474,7 @@ func (s *statusServer) Stacks(
 func (s *statusServer) Profile(
 	ctx context.Context, req *serverpb.ProfileRequest,
 ) (*serverpb.JSONResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -1382,8 +1499,8 @@ func (s *statusServer) Profile(
 	return profileLocal(ctx, req, s.st)
 }
 
-// Regions implements the serverpb.Status interface.
-func (s *statusServer) Regions(
+// Regions implements the serverpb.StatusServer interface.
+func (s *systemStatusServer) Regions(
 	ctx context.Context, req *serverpb.RegionsRequest,
 ) (*serverpb.RegionsResponse, error) {
 	resp, _, err := s.nodesHelper(ctx, 0 /* limit */, 0 /* offset */)
@@ -1436,7 +1553,7 @@ func regionsResponseFromNodesResponse(nr *serverpb.NodesResponse) *serverpb.Regi
 func (s *statusServer) NodesList(
 	ctx context.Context, _ *serverpb.NodesListRequest,
 ) (*serverpb.NodesListResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	// The node status contains details about the command line, network
@@ -1446,19 +1563,7 @@ func (s *statusServer) NodesList(
 		// already returns a proper gRPC error status.
 		return nil, err
 	}
-	statuses, _, err := s.getNodeStatuses(ctx, 0 /* limit */, 0 /* offset */)
-	if err != nil {
-		return nil, serverError(ctx, err)
-	}
-	resp := &serverpb.NodesListResponse{
-		Nodes: make([]serverpb.NodeDetails, len(statuses)),
-	}
-	for i, status := range statuses {
-		resp.Nodes[i].NodeID = int32(status.Desc.NodeID)
-		resp.Nodes[i].Address = status.Desc.Address
-		resp.Nodes[i].SQLAddress = status.Desc.SQLAddress
-	}
-	return resp, nil
+	return s.serverIterator.nodesList(ctx)
 }
 
 // Nodes returns all node statuses.
@@ -1472,10 +1577,10 @@ func (s *statusServer) NodesList(
 // information will not have an entry. Clients can exploit the fact
 // that status "UNKNOWN" has value 0 (the default) when accessing the
 // map.
-func (s *statusServer) Nodes(
+func (s *systemStatusServer) Nodes(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
@@ -1490,10 +1595,46 @@ func (s *statusServer) Nodes(
 	return resp, nil
 }
 
+// NodesUI on the tenant, delegates to the storage layer's endpoint after
+// checking local SQL permissions. The tenant connector will require
+// additional tenant capabilities in order to let the request through,
+// but the `NodesTenant` endpoint will do no additional permissioning on
+// the system-tenant side.
 func (s *statusServer) NodesUI(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponseExternal, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	hasViewClusterMetadata := false
+	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
+	if err != nil {
+		if !grpcutil.IsAuthError(err) {
+			return nil, err
+		}
+	} else {
+		hasViewClusterMetadata = true
+	}
+
+	internalResp, err := s.sqlServer.tenantConnect.Nodes(ctx, req)
+	if err != nil {
+		return nil, serverError(ctx, err)
+	}
+
+	resp := &serverpb.NodesResponseExternal{
+		Nodes:            make([]serverpb.NodeResponse, len(internalResp.Nodes)),
+		LivenessByNodeID: internalResp.LivenessByNodeID,
+	}
+	for i, nodeStatus := range internalResp.Nodes {
+		resp.Nodes[i] = nodeStatusToResp(&nodeStatus, hasViewClusterMetadata)
+	}
+
+	return resp, nil
+}
+
+func (s *systemStatusServer) NodesUI(
+	ctx context.Context, req *serverpb.NodesRequest,
+) (*serverpb.NodesResponseExternal, error) {
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	hasViewClusterMetadata := false
@@ -1622,7 +1763,7 @@ func nodeStatusToResp(n *statuspb.NodeStatus, hasViewClusterMetadata bool) serve
 //
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
-func (s *statusServer) ListNodesInternal(
+func (s *systemStatusServer) ListNodesInternal(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponse, error) {
 	resp, _, err := s.nodesHelper(ctx, 0 /* limit */, 0 /* offset */)
@@ -1631,15 +1772,15 @@ func (s *statusServer) ListNodesInternal(
 
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
-func (s *statusServer) getNodeStatuses(
-	ctx context.Context, limit, offset int,
+func getNodeStatuses(
+	ctx context.Context, db *kv.DB, limit, offset int,
 ) (statuses []statuspb.NodeStatus, next int, _ error) {
 	startKey := keys.StatusNodePrefix
 	endKey := startKey.PrefixEnd()
 
 	b := &kv.Batch{}
 	b.Scan(startKey, endKey)
-	if err := s.db.Run(ctx, b); err != nil {
+	if err := db.Run(ctx, b); err != nil {
 		return nil, 0, err
 	}
 
@@ -1661,13 +1802,13 @@ func (s *statusServer) getNodeStatuses(
 
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
-func (s *statusServer) nodesHelper(
+func (s *systemStatusServer) nodesHelper(
 	ctx context.Context, limit, offset int,
 ) (*serverpb.NodesResponse, int, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	statuses, next, err := s.getNodeStatuses(ctx, limit, offset)
+	statuses, next, err := getNodeStatuses(ctx, s.db, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1675,7 +1816,7 @@ func (s *statusServer) nodesHelper(
 		Nodes: statuses,
 	}
 
-	clock := s.admin.server.clock
+	clock := s.clock
 	resp.LivenessByNodeID, err = getLivenessStatusMap(ctx, s.nodeLiveness, clock.Now().GoTime(), s.st)
 	if err != nil {
 		return nil, 0, err
@@ -1683,50 +1824,11 @@ func (s *statusServer) nodesHelper(
 	return &resp, next, nil
 }
 
-// nodesStatusWithLiveness is like Nodes but for internal
-// use within this package.
-//
-// Note that the function returns plain errors, and it is the caller's
-// responsibility to convert them to serverErrors.
-func (s *statusServer) nodesStatusWithLiveness(
-	ctx context.Context,
-) (map[roachpb.NodeID]nodeStatusWithLiveness, error) {
-	nodes, err := s.ListNodesInternal(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	clock := s.admin.server.clock
-	statusMap, err := getLivenessStatusMap(ctx, s.nodeLiveness, clock.Now().GoTime(), s.st)
-	if err != nil {
-		return nil, err
-	}
-	ret := make(map[roachpb.NodeID]nodeStatusWithLiveness)
-	for _, node := range nodes.Nodes {
-		nodeID := node.Desc.NodeID
-		livenessStatus := statusMap[nodeID]
-		if livenessStatus == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
-			// Skip over removed nodes.
-			continue
-		}
-		ret[nodeID] = nodeStatusWithLiveness{
-			NodeStatus:     node,
-			livenessStatus: livenessStatus,
-		}
-	}
-	return ret, nil
-}
-
-// nodeStatusWithLiveness combines a NodeStatus with a NodeLivenessStatus.
-type nodeStatusWithLiveness struct {
-	statuspb.NodeStatus
-	livenessStatus livenesspb.NodeLivenessStatus
-}
-
 // handleNodeStatus handles GET requests for a single node's status.
 func (s *statusServer) Node(
 	ctx context.Context, req *serverpb.NodeRequest,
 ) (*statuspb.NodeStatus, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	// The node status contains details about the command line, network
@@ -1768,7 +1870,7 @@ func (s *statusServer) nodeStatus(
 func (s *statusServer) NodeUI(
 	ctx context.Context, req *serverpb.NodeRequest,
 ) (*serverpb.NodeResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	// The node status contains details about the command line, network
@@ -1792,7 +1894,7 @@ func (s *statusServer) NodeUI(
 func (s *statusServer) Metrics(
 	ctx context.Context, req *serverpb.MetricsRequest,
 ) (*serverpb.JSONResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
@@ -1815,13 +1917,13 @@ func (s *statusServer) Metrics(
 }
 
 // RaftDebug returns raft debug information for all known nodes.
-func (s *statusServer) RaftDebug(
+func (s *systemStatusServer) RaftDebug(
 	ctx context.Context, req *serverpb.RaftDebugRequest,
 ) (*serverpb.RaftDebugResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+	if err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
@@ -1930,7 +2032,7 @@ func (h varsHandler) handleVars(w http.ResponseWriter, r *http.Request) {
 }
 
 // Ranges returns range info for the specified node.
-func (s *statusServer) Ranges(
+func (s *systemStatusServer) Ranges(
 	ctx context.Context, req *serverpb.RangesRequest,
 ) (*serverpb.RangesResponse, error) {
 	resp, next, err := s.rangesHelper(ctx, req, int(req.Limit), int(req.Offset))
@@ -1941,10 +2043,10 @@ func (s *statusServer) Ranges(
 }
 
 // Ranges returns range info for the specified node.
-func (s *statusServer) rangesHelper(
+func (s *systemStatusServer) rangesHelper(
 	ctx context.Context, req *serverpb.RangesRequest, limit, offset int,
 ) (*serverpb.RangesResponse, int, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
@@ -2030,7 +2132,8 @@ func (s *statusServer) rangesHelper(
 				WaitingWriters: lm.WaitingWriters,
 			})
 		}
-		qps, _ := rep.QueriesPerSecond()
+
+		loadStats := rep.LoadStats()
 		locality := serverpb.Locality{}
 		for _, tier := range rep.GetNodeLocality().Tiers {
 			locality.Tiers = append(locality.Tiers, serverpb.Tier{
@@ -2046,12 +2149,13 @@ func (s *statusServer) rangesHelper(
 			SourceStoreID: storeID,
 			LeaseHistory:  leaseHistory,
 			Stats: serverpb.RangeStatistics{
-				QueriesPerSecond:    qps,
-				RequestsPerSecond:   rep.RequestsPerSecond(),
-				WritesPerSecond:     rep.WritesPerSecond(),
-				ReadsPerSecond:      rep.ReadsPerSecond(),
-				WriteBytesPerSecond: rep.WriteBytesPerSecond(),
-				ReadBytesPerSecond:  rep.ReadBytesPerSecond(),
+				QueriesPerSecond:    loadStats.QueriesPerSecond,
+				RequestsPerSecond:   loadStats.RequestsPerSecond,
+				WritesPerSecond:     loadStats.WriteKeysPerSecond,
+				ReadsPerSecond:      loadStats.ReadKeysPerSecond,
+				WriteBytesPerSecond: loadStats.WriteBytesPerSecond,
+				ReadBytesPerSecond:  loadStats.ReadBytesPerSecond,
+				CPUTimePerSecond:    loadStats.RaftCPUNanosPerSecond + loadStats.RequestCPUNanosPerSecond,
 			},
 			Problems: serverpb.RangeProblems{
 				Unavailable:            metrics.Unavailable,
@@ -2142,16 +2246,30 @@ func (s *statusServer) rangesHelper(
 	return &output, next, nil
 }
 
-func (s *statusServer) TenantRanges(
+func (t *statusServer) TenantRanges(
 	ctx context.Context, req *serverpb.TenantRangesRequest,
 ) (*serverpb.TenantRangesResponse, error) {
-	propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = t.AnnotateCtx(ctx)
+
+	// The tenant range report contains replica metadata which is admin-only.
+	if _, err := t.privilegeChecker.requireAdminUser(ctx); err != nil {
+		return nil, err
+	}
+
+	return t.sqlServer.tenantConnect.TenantRanges(ctx, req)
+}
+
+func (s *systemStatusServer) TenantRanges(
+	ctx context.Context, req *serverpb.TenantRangesRequest,
+) (*serverpb.TenantRangesResponse, error) {
+	forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
 		return nil, err
 	}
 
-	tID, ok := roachpb.TenantFromContext(ctx)
+	tID, ok := roachpb.ClientTenantFromContext(ctx)
 	if !ok {
 		return nil, status.Error(codes.Internal, "no tenant ID found in context")
 	}
@@ -2292,20 +2410,20 @@ func (s *statusServer) TenantRanges(
 }
 
 // HotRanges returns the hottest ranges on each store on the requested node(s).
-func (s *statusServer) HotRanges(
+func (s *systemStatusServer) HotRanges(
 	ctx context.Context, req *serverpb.HotRangesRequest,
 ) (*serverpb.HotRangesResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+	if err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
 	response := &serverpb.HotRangesResponse{
-		NodeID:            s.gossip.NodeID.Get(),
+		NodeID:            roachpb.NodeID(s.serverIterator.getID()),
 		HotRangesByNodeID: make(map[roachpb.NodeID]serverpb.HotRangesResponse_NodeResponse),
 	}
 
@@ -2317,7 +2435,7 @@ func (s *statusServer) HotRanges(
 
 		// Only hot ranges from the local node.
 		if local {
-			response.HotRangesByNodeID[requestedNodeID] = s.localHotRanges(ctx)
+			response.HotRangesByNodeID[requestedNodeID] = s.localHotRanges(ctx, roachpb.TenantID{})
 			return response, nil
 		}
 
@@ -2363,13 +2481,37 @@ type tableMeta struct {
 	indexName  string
 }
 
-// HotRangesV2 returns hot ranges from all stores on requested node or all nodes in case
-// request message doesn't include specific node ID.
-func (s *statusServer) HotRangesV2(
+func (t *statusServer) HotRangesV2(
 	ctx context.Context, req *serverpb.HotRangesRequest,
 ) (*serverpb.HotRangesResponseV2, error) {
-	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
+	ctx = t.AnnotateCtx(ctx)
+
+	err := t.privilegeChecker.requireViewClusterMetadataPermission(ctx)
+	if err != nil {
 		return nil, err
+	}
+
+	return t.sqlServer.tenantConnect.HotRangesV2(ctx, req)
+}
+
+// HotRangesV2 returns hot ranges from all stores on requested node or all nodes for specified tenant
+// in case request message doesn't include specific node ID.
+func (s *systemStatusServer) HotRangesV2(
+	ctx context.Context, req *serverpb.HotRangesRequest,
+) (*serverpb.HotRangesResponseV2, error) {
+	ctx = s.AnnotateCtx(forwardSQLIdentityThroughRPCCalls(ctx))
+
+	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var tenantID roachpb.TenantID
+	if len(req.TenantID) > 0 {
+		tenantID, err = roachpb.TenantIDFromString(req.TenantID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	size := int(req.PageSize)
@@ -2389,27 +2531,14 @@ func (s *statusServer) HotRangesV2(
 
 	var requestedNodes []roachpb.NodeID
 	if len(req.NodeID) > 0 {
-		requestedNodeID, _, err := s.parseNodeID(req.NodeID)
+		requestedNodeID, local, err := s.parseNodeID(req.NodeID)
 		if err != nil {
 			return nil, err
 		}
-		requestedNodes = []roachpb.NodeID{requestedNodeID}
-	}
-
-	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
-		client, err := s.dialNode(ctx, nodeID)
-		return client, err
-	}
-	remoteRequest := serverpb.HotRangesRequest{NodeID: "local"}
-	nodeFn := func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error) {
-		status := client.(serverpb.StatusClient)
-		resp, err := status.HotRanges(ctx, &remoteRequest)
-		if err != nil || resp == nil {
-			return nil, err
-		}
-		var ranges []*serverpb.HotRangesResponseV2_HotRange
-		for nodeID, hr := range resp.HotRangesByNodeID {
-			for _, store := range hr.Stores {
+		if local {
+			resp := s.localHotRanges(ctx, tenantID)
+			var ranges []*serverpb.HotRangesResponseV2_HotRange
+			for _, store := range resp.Stores {
 				for _, r := range store.HotRanges {
 					var (
 						dbName, tableName, indexName, schemaName string
@@ -2428,15 +2557,10 @@ func (s *statusServer) HotRangesV2(
 						schemaName = meta.(tableMeta).schemaName
 						indexName = meta.(tableMeta).indexName
 					} else {
-						if err = s.sqlServer.distSQLServer.CollectionFactory.TxnWithExecutor(
-							ctx, s.db, nil, func(ctx context.Context, txn *kv.Txn, col *descs.Collection, ie sqlutil.InternalExecutor) error {
-								commonLookupFlags := tree.CommonLookupFlags{
-									Required:    false,
-									AvoidLeased: true,
-								}
-								desc, err := col.GetImmutableTableByID(ctx, txn, descpb.ID(tableID), tree.ObjectLookupFlags{
-									CommonLookupFlags: commonLookupFlags,
-								})
+						if err = s.sqlServer.distSQLServer.DB.DescsTxn(
+							ctx, func(ctx context.Context, txn descs.Txn) error {
+								col := txn.Descriptors()
+								desc, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
 								if err != nil {
 									return errors.Wrapf(err, "cannot get table descriptor with tableID: %d, %s", tableID, r.Desc)
 								}
@@ -2446,21 +2570,21 @@ func (s *statusServer) HotRangesV2(
 									if _, _, idxID, err := s.sqlServer.execCfg.Codec.DecodeIndexPrefix(r.Desc.StartKey.AsRawKey()); err != nil {
 										log.Warningf(ctx, "cannot decode index prefix for range descriptor: %s: %v", r.Desc, err)
 									} else {
-										if index, err := desc.FindIndexWithID(descpb.IndexID(idxID)); err != nil {
-											log.Warningf(ctx, "cannot get index name for range descriptor: %s: %v", r.Desc, err)
+										if index := catalog.FindIndexByID(desc, descpb.IndexID(idxID)); index == nil {
+											log.Warningf(ctx, "cannot get index name for range descriptor: %s: index with ID %d not found", r.Desc, idxID)
 										} else {
 											indexName = index.GetName()
 										}
 									}
 								}
 
-								if ok, dbDesc, err := col.GetImmutableDatabaseByID(ctx, txn, desc.GetParentID(), commonLookupFlags); err != nil {
+								if dbDesc, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Database(ctx, desc.GetParentID()); err != nil {
 									log.Warningf(ctx, "cannot get database by descriptor ID: %s: %v", r.Desc, err)
-								} else if ok {
+								} else {
 									dbName = dbDesc.GetName()
 								}
 
-								if schemaDesc, err := col.GetImmutableSchemaByID(ctx, txn, desc.GetParentSchemaID(), commonLookupFlags); err != nil {
+								if schemaDesc, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Schema(ctx, desc.GetParentSchemaID()); err != nil {
 									log.Warningf(ctx, "cannot get schema name for range descriptor: %s: %v", r.Desc, err)
 								} else {
 									schemaName = schemaDesc.GetName()
@@ -2480,21 +2604,43 @@ func (s *statusServer) HotRangesV2(
 					}
 
 					ranges = append(ranges, &serverpb.HotRangesResponseV2_HotRange{
-						RangeID:           r.Desc.RangeID,
-						NodeID:            nodeID,
-						QPS:               r.QueriesPerSecond,
-						TableName:         tableName,
-						SchemaName:        schemaName,
-						DatabaseName:      dbName,
-						IndexName:         indexName,
-						ReplicaNodeIds:    replicaNodeIDs,
-						LeaseholderNodeID: r.LeaseholderNodeID,
-						StoreID:           store.StoreID,
+						RangeID:             r.Desc.RangeID,
+						NodeID:              requestedNodeID,
+						QPS:                 r.QueriesPerSecond,
+						WritesPerSecond:     r.WritesPerSecond,
+						ReadsPerSecond:      r.ReadsPerSecond,
+						WriteBytesPerSecond: r.WriteBytesPerSecond,
+						ReadBytesPerSecond:  r.ReadBytesPerSecond,
+						CPUTimePerSecond:    r.CPUTimePerSecond,
+						TableName:           tableName,
+						SchemaName:          schemaName,
+						DatabaseName:        dbName,
+						IndexName:           indexName,
+						ReplicaNodeIds:      replicaNodeIDs,
+						LeaseholderNodeID:   r.LeaseholderNodeID,
+						StoreID:             store.StoreID,
 					})
 				}
 			}
+			response.Ranges = ranges
+			response.ErrorsByNodeID[requestedNodeID] = resp.ErrorMessage
+			return response, nil
 		}
-		return ranges, nil
+		requestedNodes = []roachpb.NodeID{requestedNodeID}
+	}
+
+	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
+		client, err := s.dialNode(ctx, nodeID)
+		return client, err
+	}
+	remoteRequest := serverpb.HotRangesRequest{NodeID: "local", TenantID: req.TenantID}
+	nodeFn := func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error) {
+		status := client.(serverpb.StatusClient)
+		nodeResp, err := status.HotRangesV2(ctx, &remoteRequest)
+		if err != nil {
+			return nil, err
+		}
+		return nodeResp.Ranges, nil
 	}
 	responseFn := func(nodeID roachpb.NodeID, resp interface{}) {
 		if resp == nil {
@@ -2539,10 +2685,17 @@ func decodeTableID(codec keys.SQLCodec, key roachpb.Key) (roachpb.Key, uint32, b
 	return remaining, tableID, true
 }
 
-func (s *statusServer) localHotRanges(ctx context.Context) serverpb.HotRangesResponse_NodeResponse {
+func (s *systemStatusServer) localHotRanges(
+	ctx context.Context, tenantID roachpb.TenantID,
+) serverpb.HotRangesResponse_NodeResponse {
 	var resp serverpb.HotRangesResponse_NodeResponse
 	err := s.stores.VisitStores(func(store *kvserver.Store) error {
-		ranges := store.HottestReplicas()
+		var ranges []kvserver.HotReplicaInfo
+		if tenantID.IsSet() {
+			ranges = store.HottestReplicasByTenant(tenantID)
+		} else {
+			ranges = store.HottestReplicas()
+		}
 		storeResp := &serverpb.HotRangesResponse_StoreResponse{
 			StoreID:   store.StoreID(),
 			HotRanges: make([]serverpb.HotRangesResponse_HotRange, len(ranges)),
@@ -2559,6 +2712,7 @@ func (s *statusServer) localHotRanges(ctx context.Context) serverpb.HotRangesRes
 			storeResp.HotRanges[i].ReadsPerSecond = r.ReadKeysPerSecond
 			storeResp.HotRanges[i].WriteBytesPerSecond = r.WriteBytesPerSecond
 			storeResp.HotRanges[i].ReadBytesPerSecond = r.ReadBytesPerSecond
+			storeResp.HotRanges[i].CPUTimePerSecond = r.CPUTimePerSecond
 		}
 		resp.Stores = append(resp.Stores, storeResp)
 		return nil
@@ -2569,15 +2723,59 @@ func (s *statusServer) localHotRanges(ctx context.Context) serverpb.HotRangesRes
 	return resp
 }
 
+func (s *statusServer) KeyVisSamples(
+	ctx context.Context, req *serverpb.KeyVisSamplesRequest,
+) (*serverpb.KeyVisSamplesResponse, error) {
+
+	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+		return nil, err
+	}
+
+	uniqueKeys, err := keyvisstorage.ReadKeys(ctx, s.internalExecutor)
+	if err != nil {
+		return nil, err
+	}
+
+	prettyForKeyString := make(map[string]string)
+	prettyForUUID := make(map[string]string)
+	sorted := make([]string, 0)
+	sortedPretty := make([]string, 0)
+
+	for keyUUID, keyBytes := range uniqueKeys {
+		s := string(keyBytes)
+		pretty := keyBytes.String()
+		prettyForKeyString[s] = pretty
+		sorted = append(sorted, s)
+		prettyForUUID[keyUUID] = pretty
+	}
+
+	sort.Strings(sorted)
+	for _, s := range sorted {
+		sortedPretty = append(sortedPretty, prettyForKeyString[s])
+	}
+
+	// read samples
+	samples, err := keyvisstorage.ReadSamples(ctx, s.internalExecutor)
+	if err != nil {
+		return nil, err
+	}
+
+	return &serverpb.KeyVisSamplesResponse{
+		PrettyKeyForUuid: prettyForUUID,
+		SortedPrettyKeys: sortedPretty,
+		Samples:          samples,
+	}, nil
+}
+
 // Range returns rangeInfos for all nodes in the cluster about a specific
 // range. It also returns the range history for that range as well.
 func (s *statusServer) Range(
 	ctx context.Context, req *serverpb.RangeRequest,
 ) (*serverpb.RangeResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+	if err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
@@ -2585,7 +2783,7 @@ func (s *statusServer) Range(
 
 	response := &serverpb.RangeResponse{
 		RangeID:           roachpb.RangeID(req.RangeId),
-		NodeID:            s.gossip.NodeID.Get(),
+		NodeID:            roachpb.NodeID(s.serverIterator.getID()),
 		ResponsesByNodeID: make(map[roachpb.NodeID]serverpb.RangeResponse_NodeResponse),
 	}
 
@@ -2639,7 +2837,7 @@ func (s *statusServer) ListLocalSessions(
 		return nil, err
 	}
 	for i := range sessions {
-		sessions[i].NodeID = s.gossip.NodeID.Get()
+		sessions[i].NodeID = roachpb.NodeID(s.serverIterator.getID())
 	}
 	return &serverpb.ListSessionsResponse{Sessions: sessions}, nil
 }
@@ -2655,7 +2853,7 @@ func (s *statusServer) iterateNodes(
 	responseFn func(nodeID roachpb.NodeID, resp interface{}),
 	errorFn func(nodeID roachpb.NodeID, nodeFnError error),
 ) error {
-	nodeStatuses, err := s.nodesStatusWithLiveness(ctx)
+	nodeStatuses, err := s.serverIterator.getAllNodes(ctx)
 	if err != nil {
 		return err
 	}
@@ -2672,14 +2870,14 @@ func (s *statusServer) iterateNodes(
 
 	nodeQuery := func(ctx context.Context, nodeID roachpb.NodeID) {
 		var client interface{}
-		err := contextutil.RunWithTimeout(ctx, "dial node", base.NetworkTimeout, func(ctx context.Context) error {
+		err := contextutil.RunWithTimeout(ctx, "dial node", base.DialTimeout, func(ctx context.Context) error {
 			var err error
 			client, err = dialFn(ctx, nodeID)
 			return err
 		})
 		if err != nil {
 			err = errors.Wrapf(err, "failed to dial into node %d (%s)",
-				nodeID, nodeStatuses[nodeID].livenessStatus)
+				nodeID, nodeStatuses[serverID(nodeID)])
 			responseChan <- nodeResponse{nodeID: nodeID, err: err}
 			return
 		}
@@ -2687,7 +2885,7 @@ func (s *statusServer) iterateNodes(
 		res, err := nodeFn(ctx, client, nodeID)
 		if err != nil {
 			err = errors.Wrapf(err, "error requesting %s from node %d (%s)",
-				errorCtx, nodeID, nodeStatuses[nodeID].livenessStatus)
+				errorCtx, nodeID, nodeStatuses[serverID(nodeID)])
 		}
 		responseChan <- nodeResponse{nodeID: nodeID, response: res, err: err}
 	}
@@ -2705,7 +2903,7 @@ func (s *statusServer) iterateNodes(
 				Sem:        sem,
 				WaitForSem: true,
 			},
-			func(ctx context.Context) { nodeQuery(ctx, nodeID) },
+			func(ctx context.Context) { nodeQuery(ctx, roachpb.NodeID(nodeID)) },
 		); err != nil {
 			return err
 		}
@@ -2747,7 +2945,7 @@ func (s *statusServer) paginatedIterateNodes(
 	if limit == 0 {
 		return paginationState{}, s.iterateNodes(ctx, errorCtx, dialFn, nodeFn, responseFn, errorFn)
 	}
-	nodeStatuses, err := s.nodesStatusWithLiveness(ctx)
+	nodeStatuses, err := s.serverIterator.getAllNodes(ctx)
 	if err != nil {
 		return paginationState{}, err
 	}
@@ -2758,7 +2956,7 @@ func (s *statusServer) paginatedIterateNodes(
 		nodeIDs = append(nodeIDs, requestedNodes...)
 	} else {
 		for nodeID := range nodeStatuses {
-			nodeIDs = append(nodeIDs, nodeID)
+			nodeIDs = append(nodeIDs, roachpb.NodeID(nodeID))
 		}
 	}
 	// Sort all nodes by IDs, as this is what mergeNodeIDs expects.
@@ -2865,7 +3063,7 @@ func (s *statusServer) listSessionsHelper(
 func (s *statusServer) ListSessions(
 	ctx context.Context, req *serverpb.ListSessionsRequest,
 ) (*serverpb.ListSessionsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, _, err := s.privilegeChecker.getUserAndRole(ctx); err != nil {
@@ -2886,17 +3084,26 @@ func (s *statusServer) ListSessions(
 func (s *statusServer) CancelSession(
 	ctx context.Context, req *serverpb.CancelSessionRequest,
 ) (*serverpb.CancelSessionResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	nodeID, local, err := s.parseNodeID(req.NodeId)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, err.Error())
+	sessionIDBytes := req.SessionID
+	if len(sessionIDBytes) != 16 {
+		return &serverpb.CancelSessionResponse{
+			Error: fmt.Sprintf("session ID %v malformed", sessionIDBytes),
+		}, nil
 	}
-
+	sessionID := clusterunique.IDFromBytes(sessionIDBytes)
+	nodeID := sessionID.GetNodeID()
+	local := nodeID == int32(s.serverIterator.getID())
 	if !local {
-		status, err := s.dialNode(ctx, nodeID)
+		status, err := s.dialNode(ctx, roachpb.NodeID(nodeID))
 		if err != nil {
+			if errors.Is(err, sqlinstance.NonExistentInstanceError) {
+				return &serverpb.CancelSessionResponse{
+					Error: fmt.Sprintf("session ID %s not found", sessionID),
+				}, nil
+			}
 			return nil, serverError(ctx, err)
 		}
 		return status.CancelSession(ctx, req)
@@ -2907,17 +3114,21 @@ func (s *statusServer) CancelSession(
 		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
-	if err := s.checkCancelPrivilege(ctx, reqUsername, findSessionBySessionID(req.SessionID)); err != nil {
+	session, ok := s.sessionRegistry.GetSessionByID(sessionID)
+	if !ok {
+		return &serverpb.CancelSessionResponse{
+			Error: fmt.Sprintf("session ID %s not found", sessionID),
+		}, nil
+	}
+
+	if err := s.checkCancelPrivilege(ctx, reqUsername, session.SessionUser()); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
-	r, err := s.sessionRegistry.CancelSession(req.SessionID)
-	if err != nil {
-		return nil, serverError(ctx, err)
-	}
-	return r, nil
+	session.CancelSession()
+	return &serverpb.CancelSessionResponse{Canceled: true}, nil
 }
 
 // CancelQuery responds to a query cancellation request, and cancels
@@ -2925,16 +3136,27 @@ func (s *statusServer) CancelSession(
 func (s *statusServer) CancelQuery(
 	ctx context.Context, req *serverpb.CancelQueryRequest,
 ) (*serverpb.CancelQueryResponse, error) {
-	nodeID, local, err := s.parseNodeID(req.NodeId)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	queryID, err := clusterunique.IDFromString(req.QueryID)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, err.Error())
+		return &serverpb.CancelQueryResponse{
+			Error: errors.Wrapf(err, "query ID %s malformed", queryID).Error(),
+		}, nil
 	}
+
+	nodeID := queryID.GetNodeID()
+	local := nodeID == int32(s.serverIterator.getID())
 	if !local {
 		// This request needs to be forwarded to another node.
-		ctx = propagateGatewayMetadata(ctx)
-		ctx = s.AnnotateCtx(ctx)
-		status, err := s.dialNode(ctx, nodeID)
+		status, err := s.dialNode(ctx, roachpb.NodeID(nodeID))
 		if err != nil {
+			if errors.Is(err, sqlinstance.NonExistentInstanceError) {
+				return &serverpb.CancelQueryResponse{
+					Error: fmt.Sprintf("query ID %s not found", queryID),
+				}, nil
+			}
 			return nil, serverError(ctx, err)
 		}
 		return status.CancelQuery(ctx, req)
@@ -2945,18 +3167,23 @@ func (s *statusServer) CancelQuery(
 		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
-	if err := s.checkCancelPrivilege(ctx, reqUsername, findSessionByQueryID(req.QueryID)); err != nil {
+	session, ok := s.sessionRegistry.GetSessionByQueryID(queryID)
+	if !ok {
+		return &serverpb.CancelQueryResponse{
+			Error: fmt.Sprintf("query ID %s not found", queryID),
+		}, nil
+	}
+
+	if err := s.checkCancelPrivilege(ctx, reqUsername, session.SessionUser()); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
-	output := &serverpb.CancelQueryResponse{}
-	output.Canceled, err = s.sessionRegistry.CancelQuery(req.QueryID)
-	if err != nil {
-		output.Error = err.Error()
-	}
-	return output, nil
+	isCanceled := session.CancelQuery(queryID)
+	return &serverpb.CancelQueryResponse{
+		Canceled: isCanceled,
+	}, nil
 }
 
 // CancelQueryByKey responds to a pgwire query cancellation request, and cancels
@@ -2978,7 +3205,7 @@ func (s *statusServer) CancelQueryByKey(
 	// second. But if an attacker crafts the CancelRequests to all target the
 	// same SQLInstance, then that one instance would have to process 100*X
 	// requests per second.
-	alloc, err := pgwirecancel.CancelSemaphore.TryAcquire(ctx, 1)
+	alloc, err := s.cancelSemaphore.TryAcquire(ctx, 1)
 	if err != nil {
 		return nil, status.Errorf(codes.ResourceExhausted, "exceeded rate limit of pgwire cancellation requests")
 	}
@@ -2993,16 +3220,22 @@ func (s *statusServer) CancelQueryByKey(
 	}()
 
 	if local {
-		resp = &serverpb.CancelQueryByKeyResponse{}
-		resp.Canceled, err = s.sessionRegistry.CancelQueryByKey(req.CancelQueryKey)
-		if err != nil {
-			resp.Error = err.Error()
+		cancelQueryKey := req.CancelQueryKey
+		session, ok := s.sessionRegistry.GetSessionByCancelKey(cancelQueryKey)
+		if !ok {
+			return &serverpb.CancelQueryByKeyResponse{
+				Error: fmt.Sprintf("session for cancel key %d not found", cancelQueryKey),
+			}, nil
 		}
-		return resp, nil
+
+		isCanceled := session.CancelActiveQueries()
+		return &serverpb.CancelQueryByKeyResponse{
+			Canceled: isCanceled,
+		}, nil
 	}
 
 	// This request needs to be forwarded to another node.
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	client, err := s.dialNode(ctx, roachpb.NodeID(req.SQLInstanceID))
 	if err != nil {
@@ -3016,7 +3249,7 @@ func (s *statusServer) CancelQueryByKey(
 func (s *statusServer) ListContentionEvents(
 	ctx context.Context, req *serverpb.ListContentionEventsRequest,
 ) (*serverpb.ListContentionEventsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	// Check permissions early to avoid fan-out to all nodes.
@@ -3063,7 +3296,7 @@ func (s *statusServer) ListContentionEvents(
 func (s *statusServer) ListDistSQLFlows(
 	ctx context.Context, request *serverpb.ListDistSQLFlowsRequest,
 ) (*serverpb.ListDistSQLFlowsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	// Check permissions early to avoid fan-out to all nodes.
@@ -3155,7 +3388,7 @@ func mergeDistSQLRemoteFlows(a, b []serverpb.DistSQLRemoteFlows) []serverpb.Dist
 func (s *statusServer) ListExecutionInsights(
 	ctx context.Context, req *serverpb.ListExecutionInsightsRequest,
 ) (*serverpb.ListExecutionInsightsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	// Check permissions early to avoid fan-out to all nodes.
@@ -3215,53 +3448,55 @@ func (s *statusServer) ListExecutionInsights(
 // SpanStats requests the total statistics stored on a node for a given key
 // span, which may include multiple ranges.
 func (s *statusServer) SpanStats(
-	ctx context.Context, req *serverpb.SpanStatsRequest,
-) (*serverpb.SpanStatsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx context.Context, req *roachpb.SpanStatsRequest,
+) (*roachpb.SpanStatsResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
+	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+		// NB: not using serverError() here since the priv checker
+		// already returns a proper gRPC error status.
+		return nil, err
+	}
+	return s.sqlServer.tenantConnect.SpanStats(ctx, req)
+}
 
+func (s *systemStatusServer) SpanStats(
+	ctx context.Context, req *roachpb.SpanStatsRequest,
+) (*roachpb.SpanStatsResponse, error) {
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
-	nodeID, local, err := s.parseNodeID(req.NodeID)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, err.Error())
+	// If the cluster's active version is less than 23.1 return a mixed version error.
+	if !s.st.Version.IsActive(ctx, clusterversion.V23_1) {
+		return nil, errors.New(MixedVersionErr)
 	}
 
-	if !local {
-		status, err := s.dialNode(ctx, nodeID)
-		if err != nil {
-			return nil, serverError(ctx, err)
+	// If we receive a request using the old format.
+	if isLegacyRequest(req) {
+		// We want to force 23.1 callers to use the new format (e.g. Spans field).
+		if req.NodeID == "0" {
+			return nil, errors.New(UnexpectedLegacyRequest)
 		}
-		return status.SpanStats(ctx, req)
+		// We want to error if we receive a legacy request from a 22.2
+		// node (e.g. during a mixed-version fanout).
+		return nil, errors.New(MixedVersionErr)
+	}
+	if len(req.Spans) > int(roachpb.SpanStatsBatchLimit.Get(&s.st.SV)) {
+		return nil, errors.Newf(exceedSpanLimitPlaceholder, len(req.Spans), int(roachpb.SpanStatsBatchLimit.Get(&s.st.SV)))
 	}
 
-	output := &serverpb.SpanStatsResponse{}
-	err = s.stores.VisitStores(func(store *kvserver.Store) error {
-		result, err := store.ComputeStatsForKeySpan(req.StartKey.Next(), req.EndKey)
-		if err != nil {
-			return err
-		}
-		output.TotalStats.Add(result.MVCC)
-		output.RangeCount += int32(result.ReplicaCount)
-		output.ApproximateDiskBytes += result.ApproximateDiskBytes
-		return nil
-	})
-	if err != nil {
-		return nil, serverError(ctx, err)
-	}
-
-	return output, nil
+	return s.getSpanStatsInternal(ctx, req)
 }
 
 // Diagnostics returns an anonymized diagnostics report.
 func (s *statusServer) Diagnostics(
 	ctx context.Context, req *serverpb.DiagnosticsRequest,
 ) (*diagnosticspb.DiagnosticReport, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
@@ -3276,17 +3511,17 @@ func (s *statusServer) Diagnostics(
 		return status.Diagnostics(ctx, req)
 	}
 
-	return s.admin.server.sqlServer.diagnosticsReporter.CreateReport(ctx, telemetry.ReadOnly), nil
+	return s.sqlServer.diagnosticsReporter.CreateReport(ctx, telemetry.ReadOnly), nil
 }
 
 // Stores returns details for each store.
-func (s *statusServer) Stores(
+func (s *systemStatusServer) Stores(
 	ctx context.Context, req *serverpb.StoresRequest,
 ) (*serverpb.StoresResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+	if err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
@@ -3311,7 +3546,7 @@ func (s *statusServer) Stores(
 			StoreID: store.Ident.StoreID,
 		}
 
-		envStats, err := store.Engine().GetEnvStats()
+		envStats, err := store.TODOEngine().GetEnvStats()
 		if err != nil {
 			return err
 		}
@@ -3369,28 +3604,6 @@ func marshalJSONResponse(value interface{}) (*serverpb.JSONResponse, error) {
 	return &serverpb.JSONResponse{Data: data}, nil
 }
 
-func userFromContext(ctx context.Context) (res username.SQLUsername, err error) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return username.RootUserName(), nil
-	}
-	usernames, ok := md[webSessionUserKeyStr]
-	if !ok {
-		// If the incoming context has metadata but no attached web session user,
-		// it's a gRPC / internal SQL connection which has root on the cluster.
-		return username.RootUserName(), nil
-	}
-	if len(usernames) != 1 {
-		log.Warningf(ctx, "context's incoming metadata contains unexpected number of usernames: %+v ", md)
-		return res, fmt.Errorf(
-			"context's incoming metadata contains unexpected number of usernames: %+v ", md)
-	}
-	// At this point the user is already logged in, so we can assume
-	// the username has been normalized already.
-	username := username.MakeSQLUsernameFromPreNormalizedString(usernames[0])
-	return username, nil
-}
-
 type systemInfoOnce struct {
 	once sync.Once
 	info serverpb.SystemInfo
@@ -3433,7 +3646,7 @@ func (si *systemInfoOnce) systemInfo(ctx context.Context) serverpb.SystemInfo {
 func (s *statusServer) JobRegistryStatus(
 	ctx context.Context, req *serverpb.JobRegistryStatusRequest,
 ) (*serverpb.JobRegistryStatusResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
@@ -3454,11 +3667,11 @@ func (s *statusServer) JobRegistryStatus(
 		return status.JobRegistryStatus(ctx, req)
 	}
 
-	remoteNodeID := s.gossip.NodeID.Get()
+	remoteNodeID := roachpb.NodeID(s.serverIterator.getID())
 	resp := &serverpb.JobRegistryStatusResponse{
 		NodeID: remoteNodeID,
 	}
-	for _, jID := range s.admin.server.sqlServer.jobRegistry.CurrentlyRunningJobs() {
+	for _, jID := range s.sqlServer.jobRegistry.CurrentlyRunningJobs() {
 		job := serverpb.JobRegistryStatusResponse_Job{
 			Id: int64(jID),
 		}
@@ -3472,7 +3685,7 @@ func (s *statusServer) JobRegistryStatus(
 func (s *statusServer) JobStatus(
 	ctx context.Context, req *serverpb.JobStatusRequest,
 ) (*serverpb.JobStatusResponse, error) {
-	ctx = s.AnnotateCtx(propagateGatewayMetadata(ctx))
+	ctx = s.AnnotateCtx(forwardSQLIdentityThroughRPCCalls(ctx))
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
 		// NB: not using serverError() here since the priv checker
@@ -3480,7 +3693,7 @@ func (s *statusServer) JobStatus(
 		return nil, err
 	}
 
-	j, err := s.admin.server.sqlServer.jobRegistry.LoadJob(ctx, jobspb.JobID(req.JobId))
+	j, err := s.sqlServer.jobRegistry.LoadJob(ctx, jobspb.JobID(req.JobId))
 	if err != nil {
 		if je := (*jobs.JobNotFoundError)(nil); errors.As(err, &je) {
 			return nil, status.Errorf(codes.NotFound, "%v", err)
@@ -3505,7 +3718,7 @@ func (s *statusServer) JobStatus(
 func (s *statusServer) TxnIDResolution(
 	ctx context.Context, req *serverpb.TxnIDResolutionRequest,
 ) (*serverpb.TxnIDResolutionResponse, error) {
-	ctx = s.AnnotateCtx(propagateGatewayMetadata(ctx))
+	ctx = s.AnnotateCtx(forwardSQLIdentityThroughRPCCalls(ctx))
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
 		return nil, err
 	}
@@ -3529,7 +3742,7 @@ func (s *statusServer) TxnIDResolution(
 func (s *statusServer) TransactionContentionEvents(
 	ctx context.Context, req *serverpb.TransactionContentionEventsRequest,
 ) (*serverpb.TransactionContentionEventsResponse, error) {
-	ctx = s.AnnotateCtx(propagateGatewayMetadata(ctx))
+	ctx = s.AnnotateCtx(forwardSQLIdentityThroughRPCCalls(ctx))
 
 	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
@@ -3549,7 +3762,7 @@ func (s *statusServer) TransactionContentionEvents(
 		}
 	}
 
-	if s.gossip.NodeID.Get() == 0 {
+	if roachpb.NodeID(s.serverIterator.getID()) == 0 {
 		return nil, status.Errorf(codes.Unavailable, "nodeID not set")
 	}
 

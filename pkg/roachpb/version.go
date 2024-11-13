@@ -11,6 +11,7 @@
 package roachpb
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -48,6 +49,11 @@ func (v Version) LessEq(otherV Version) bool {
 	return v.Equal(otherV) || v.Less(otherV)
 }
 
+// AtLeast returns true if the receiver is greater than or requal to the parameter.
+func (v Version) AtLeast(otherV Version) bool {
+	return !otherV.Less(v)
+}
+
 // String implements the fmt.Stringer interface.
 func (v Version) String() string { return redact.StringWithoutMarkers(v) }
 
@@ -58,6 +64,19 @@ func (v Version) SafeFormat(p redact.SafePrinter, _ rune) {
 		return
 	}
 	p.Printf("%d.%d-%d", v.Major, v.Minor, v.Internal)
+}
+
+// PrettyPrint returns the value in a format that makes it apparent whether or
+// not it is a fence version.
+func (v Version) PrettyPrint() string {
+	// If we're a version greater than v20.2 and have an odd internal version,
+	// we're a fence version. See fenceVersionFor in pkg/upgrade to understand
+	// what these are.
+	fenceVersion := !v.LessEq(Version{Major: 20, Minor: 2}) && (v.Internal%2) == 1
+	if !fenceVersion {
+		return v.String()
+	}
+	return fmt.Sprintf("%v(fence)", v)
 }
 
 // ParseVersion parses a Version from a string of the form

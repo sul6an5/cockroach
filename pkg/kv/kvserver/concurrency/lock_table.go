@@ -19,10 +19,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -96,11 +98,6 @@ type waitingState struct {
 	// Represents the action that the request was trying to perform when
 	// it hit the conflict. E.g. was it trying to read or write?
 	guardAccess spanset.SpanAccess
-
-	// lockWaitStart represents the timestamp when the request started waiting on
-	// the lock that this waitingState refers to. If multiple consecutive states
-	// refer to the same lock, they share the same lockWaitStart.
-	lockWaitStart time.Time
 }
 
 // String implements the fmt.Stringer interface.
@@ -156,6 +153,7 @@ type treeMu struct {
 
 	// For constraining memory consumption. We need better memory accounting
 	// than this.
+	// TODO(nvanbenschoten): use an atomic.Int64.
 	numLocks int64
 
 	// For dampening the frequency with which we enforce lockTableImpl.maxLocks.
@@ -232,6 +230,7 @@ type lockTableImpl struct {
 	//   reservation at A.
 	// Now in the queues for A and B req1 is behind req3 and vice versa and
 	// this deadlock has been created entirely due to the lock table's behavior.
+	// TODO(nvanbenschoten): use an atomic.Uint64.
 	seqNum uint64
 
 	// locks contains the btree objects (wrapped in the treeMu structure) that
@@ -535,12 +534,6 @@ func (g *lockTableGuardImpl) CurState() waitingState {
 
 func (g *lockTableGuardImpl) updateStateLocked(newState waitingState) {
 	g.mu.state = newState
-	switch newState.kind {
-	case waitFor, waitForDistinguished, waitSelf, waitElsewhere:
-		g.mu.state.lockWaitStart = g.mu.curLockWaitStart
-	default:
-		g.mu.state.lockWaitStart = time.Time{}
-	}
 }
 
 func (g *lockTableGuardImpl) CheckOptimisticNoConflicts(spanSet *spanset.SpanSet) (ok bool) {
@@ -592,16 +585,38 @@ func (g *lockTableGuardImpl) IsKeyLockedByConflictingTxn(
 	l := iter.Cur()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	lockHolderTxn, lockHolderTS := l.getLockHolder()
-	if lockHolderTxn != nil && g.isSameTxn(lockHolderTxn) {
-		// Already locked by this txn.
+	if l.isEmptyLock() {
+		// The lock is empty but has not yet been deleted.
 		return false, nil
 	}
-	if strength == lock.None && g.ts.Less(lockHolderTS) {
+	if !l.holder.locked {
+		// Key reserved.
+		if strength == lock.None {
+			// Non-locking reads only care about locks, not reservations.
+			return false, nil
+		}
+		if g.isSameTxn(l.reservation.txn) {
+			// Already reserved by this txn.
+			return false, nil
+		}
+		// "If the key is reserved, nil is returned."
+		return true, nil
+	}
+	// Key locked.
+	txn, ts := l.getLockHolder()
+	if txn == nil {
+		panic("non-empty lockState with nil lock holder and nil reservation")
+	}
+	if strength == lock.None && g.ts.Less(ts) {
 		// Non-locking read below lock's timestamp.
 		return false, nil
 	}
-	return true, lockHolderTxn
+	if g.isSameTxn(txn) {
+		// Already locked by this txn.
+		return false, nil
+	}
+	// "If the key is locked, the lock holder is also returned."
+	return true, txn
 }
 
 func (g *lockTableGuardImpl) notify() {
@@ -759,7 +774,7 @@ type lockHolderInfo struct {
 	// the lock is continuously held by a succession of different TxnMetas, the
 	// epoch must be monotonic and the ts (derived from txn.WriteTimestamp for
 	// some calls, and request.ts for other calls) must be monotonic. After ts
-	// is intialized, the timestamps inside txn are not used.
+	// is initialized, the timestamps inside txn are not used.
 	txn *enginepb.TxnMeta
 
 	// All the TxnSeqs in the current epoch at which this lock has been
@@ -863,7 +878,7 @@ type lockWaitQueue struct {
 	// seqnums but at another key req2 wants to read and req1 wants to write and
 	// since req2 does not wait in the queue it acquires a read reservation
 	// before req1. See the discussion at the end of this comment section on how
-	// the behavior will extend when we start supporting Shared and Upgrade
+	// the behavior will extend when we start supporting Shared and Update
 	// locks.
 	//
 	// Non-transactional requests can do both reads and writes but cannot be
@@ -926,7 +941,7 @@ type lockWaitQueue struct {
 	//   This is a deadlock caused by the lock table unless req2 partially
 	//   breaks the reservation at A.
 	//
-	// Extension for Shared and Upgrade locks:
+	// Extension for Shared and Update locks:
 	// There are 3 aspects to consider: holders; reservers; the dependencies
 	// that need to be captured when waiting.
 	//
@@ -1386,6 +1401,25 @@ func (l *lockState) isEmptyLock() bool {
 		return true
 	}
 	return false
+}
+
+// assertEmptyLock asserts that the lockState is empty. This condition must hold
+// for a lock to be safely removed from the tree. If it does not hold, requests
+// with stale snapshots of the btree will still be able to enter the lock's
+// wait-queue, after which point they will never hear of lock updates.
+// REQUIRES: l.mu is locked.
+func (l *lockState) assertEmptyLock() {
+	if !l.isEmptyLock() {
+		panic("lockState is not empty")
+	}
+}
+
+// assertEmptyLockUnlocked is like assertEmptyLock, but it locks the lockState.
+// REQUIRES: l.mu is not locked.
+func (l *lockState) assertEmptyLockUnlocked() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.assertEmptyLock()
 }
 
 // Returns the duration of time the lock has been tracked as held in the lock table.
@@ -2048,15 +2082,15 @@ func (l *lockState) tryClearLock(force bool) bool {
 	if l.notRemovable > 0 && !force {
 		return false
 	}
-	replicatedHeld := l.holder.locked && l.holder.holder[lock.Replicated].txn != nil
 
-	// Remove unreplicated holder.
-	l.holder.holder[lock.Unreplicated] = lockHolderInfo{}
+	// Clear lock holder. While doing so, determine which waitingState to
+	// transition waiters to.
 	var waitState waitingState
+	replicatedHeld := l.holder.locked && l.holder.holder[lock.Replicated].txn != nil
 	if replicatedHeld && !force {
 		lockHolderTxn, _ := l.getLockHolder()
-		// Note that none of the current waiters can be requests
-		// from lockHolderTxn.
+		// Note that none of the current waiters can be requests from lockHolderTxn,
+		// so they will never be told to waitElsewhere on themselves.
 		waitState = waitingState{
 			kind:        waitElsewhere,
 			txn:         lockHolderTxn,
@@ -2067,11 +2101,11 @@ func (l *lockState) tryClearLock(force bool) bool {
 	} else {
 		// !replicatedHeld || force. Both are handled as doneWaiting since the
 		// system is no longer tracking the lock that was possibly held.
-		l.clearLockHolder()
 		waitState = waitingState{kind: doneWaiting}
 	}
+	l.clearLockHolder()
 
-	l.distinguishedWaiter = nil
+	// Clear reservation.
 	if l.reservation != nil {
 		g := l.reservation
 		g.mu.Lock()
@@ -2079,6 +2113,8 @@ func (l *lockState) tryClearLock(force bool) bool {
 		g.mu.Unlock()
 		l.reservation = nil
 	}
+
+	// Clear waitingReaders.
 	for e := l.waitingReaders.Front(); e != nil; {
 		g := e.Value.(*lockTableGuardImpl)
 		curr := e
@@ -2092,6 +2128,7 @@ func (l *lockState) tryClearLock(force bool) bool {
 		g.mu.Unlock()
 	}
 
+	// Clear queuedWriters.
 	waitState.guardAccess = spanset.SpanReadWrite
 	for e := l.queuedWriters.Front(); e != nil; {
 		qg := e.Value.(*queuedGuard)
@@ -2108,6 +2145,12 @@ func (l *lockState) tryClearLock(force bool) bool {
 		delete(g.mu.locks, l)
 		g.mu.Unlock()
 	}
+
+	// Clear distinguishedWaiter.
+	l.distinguishedWaiter = nil
+
+	// The lockState must now be empty.
+	l.assertEmptyLock()
 	return true
 }
 
@@ -2393,6 +2436,7 @@ func (l *lockState) lockIsFree() (gc bool) {
 	}
 
 	if l.queuedWriters.Len() == 0 {
+		l.assertEmptyLock()
 		return true
 	}
 
@@ -2413,6 +2457,27 @@ func (l *lockState) lockIsFree() (gc bool) {
 	// Tell the active waiters who they are waiting for.
 	l.informActiveWaiters()
 	return false
+}
+
+// Delete removes the specified lock from the tree.
+// REQUIRES: t.mu is locked.
+func (t *treeMu) Delete(l *lockState) {
+	if buildutil.CrdbTestBuild {
+		l.assertEmptyLockUnlocked()
+	}
+	t.btree.Delete(l)
+}
+
+// Reset removes all locks from the tree.
+// REQUIRES: t.mu is locked.
+func (t *treeMu) Reset() {
+	if buildutil.CrdbTestBuild {
+		iter := t.MakeIter()
+		for iter.First(); iter.Valid(); iter.Next() {
+			iter.Cur().assertEmptyLockUnlocked()
+		}
+	}
+	t.btree.Reset()
 }
 
 func (t *treeMu) nextLockSeqNum() (seqNum uint64, checkMaxLocks bool) {
@@ -2958,10 +3023,10 @@ func (t *lockTableImpl) QueryLockTableState(
 			// Check if adding the lock would exceed our byte or count limits,
 			// though we must ensure we return at least one lock.
 			if len(lockTableState) > 0 && opts.TargetBytes > 0 && (numBytes+nextByteSize) > opts.TargetBytes {
-				resumeState.ResumeReason = roachpb.RESUME_BYTE_LIMIT
+				resumeState.ResumeReason = kvpb.RESUME_BYTE_LIMIT
 				break
 			} else if len(lockTableState) > 0 && opts.MaxLocks > 0 && numLocks >= opts.MaxLocks {
-				resumeState.ResumeReason = roachpb.RESUME_KEY_LIMIT
+				resumeState.ResumeReason = kvpb.RESUME_KEY_LIMIT
 				break
 			}
 

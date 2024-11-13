@@ -21,18 +21,23 @@ import { Button } from "src/button";
 import { Loading } from "src/loading";
 import { SqlBox, SqlBoxSize } from "src/sql";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
-import { TimestampToMoment } from "src/util";
-import { DATE_FORMAT_24_UTC } from "src/util/format";
-import { getMatchParamByName } from "src/util/query";
+import {
+  TimestampToMoment,
+  idAttr,
+  DATE_FORMAT_24_TZ,
+  getMatchParamByName,
+} from "src/util";
 
 import { HighwaterTimestamp } from "src/jobs/util/highwaterTimestamp";
 import { JobStatusCell } from "src/jobs/util/jobStatusCell";
+import { isTerminalState } from "../util/jobOptions";
 
 import { commonStyles } from "src/common";
 import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
 import jobStyles from "src/jobs/jobs.module.scss";
 
 import classNames from "classnames/bind";
+import { Timestamp } from "../../timestamp";
 
 const cardCx = classNames.bind(summaryCardStyles);
 const jobCx = classNames.bind(jobStyles);
@@ -52,24 +57,37 @@ export type JobDetailsProps = JobDetailsStateProps &
   RouteComponentProps<unknown>;
 
 export class JobDetails extends React.Component<JobDetailsProps> {
+  refreshDataInterval: NodeJS.Timeout;
+
   constructor(props: JobDetailsProps) {
     super(props);
   }
 
   private refresh(): void {
+    if (isTerminalState(this.props.job?.status)) {
+      clearInterval(this.refreshDataInterval);
+      return;
+    }
+
     this.props.refreshJob(
       new cockroach.server.serverpb.JobRequest({
-        job_id: Long.fromString(getMatchParamByName(this.props.match, "id")),
+        job_id: Long.fromString(getMatchParamByName(this.props.match, idAttr)),
       }),
     );
   }
 
   componentDidMount(): void {
-    this.refresh();
+    if (!this.props.job) {
+      this.refresh();
+    }
+    // Refresh every 10s.
+    this.refreshDataInterval = setInterval(() => this.refresh(), 10 * 1000);
   }
 
-  componentDidUpdate(): void {
-    this.refresh();
+  componentWillUnmount(): void {
+    if (this.refreshDataInterval) {
+      clearInterval(this.refreshDataInterval);
+    }
   }
 
   prevPage = (): void => this.props.history.goBack();
@@ -82,7 +100,11 @@ export class JobDetails extends React.Component<JobDetailsProps> {
       <>
         <Row gutter={24}>
           <Col className="gutter-row" span={24}>
-            <SqlBox value={job.description} size={SqlBoxSize.custom} />
+            <SqlBox
+              value={job.description}
+              size={SqlBoxSize.custom}
+              format={true}
+            />
           </Col>
         </Row>
         <Row gutter={24}>
@@ -95,7 +117,7 @@ export class JobDetails extends React.Component<JobDetailsProps> {
                   <h3 className={jobCx("summary--card--title", "secondary")}>
                     Next Planned Execution Time:
                   </h3>
-                  {nextRun.format(DATE_FORMAT_24_UTC)}
+                  <Timestamp time={nextRun} format={DATE_FORMAT_24_TZ} />
                 </>
               )}
             </SummaryCard>
@@ -104,15 +126,21 @@ export class JobDetails extends React.Component<JobDetailsProps> {
             <SummaryCard className={cardCx("summary-card")}>
               <SummaryCardItem
                 label="Creation Time"
-                value={TimestampToMoment(job.created).format(
-                  DATE_FORMAT_24_UTC,
-                )}
+                value={
+                  <Timestamp
+                    time={TimestampToMoment(job.created)}
+                    format={DATE_FORMAT_24_TZ}
+                  />
+                }
               />
               <SummaryCardItem
                 label="Last Execution Time"
-                value={TimestampToMoment(job.last_run).format(
-                  DATE_FORMAT_24_UTC,
-                )}
+                value={
+                  <Timestamp
+                    time={TimestampToMoment(job.last_run)}
+                    format={DATE_FORMAT_24_TZ}
+                  />
+                }
               />
               <SummaryCardItem
                 label="Execution Count"
@@ -139,7 +167,7 @@ export class JobDetails extends React.Component<JobDetailsProps> {
 
   render(): React.ReactElement {
     const isLoading = !this.props.job || this.props.jobLoading;
-    const error = this.props.job && this.props.jobError;
+    const error = this.props.jobError;
     return (
       <div className={jobCx("job-details")}>
         <Helmet title={"Details | Job"} />
@@ -155,7 +183,7 @@ export class JobDetails extends React.Component<JobDetailsProps> {
             Jobs
           </Button>
           <h3 className={jobCx("page--header__title")}>{`Job ID: ${String(
-            getMatchParamByName(this.props.match, "id"),
+            getMatchParamByName(this.props.match, idAttr),
           )}`}</h3>
         </div>
         <section className={jobCx("section section--container")}>

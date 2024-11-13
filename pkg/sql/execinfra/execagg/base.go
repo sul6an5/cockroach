@@ -11,6 +11,7 @@
 package execagg
 
 import (
+	"context"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -74,6 +75,7 @@ func GetAggregateInfo(
 //
 // evalCtx will not be mutated.
 func GetAggregateConstructor(
+	ctx context.Context,
 	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 	aggInfo *execinfrapb.AggregatorSpec_Aggregation,
@@ -92,11 +94,11 @@ func GetAggregateConstructor(
 	for j, argument := range aggInfo.Arguments {
 		h := execinfrapb.ExprHelper{}
 		// Pass nil types and row - there are no variables in these expressions.
-		if err = h.Init(argument, nil /* types */, semaCtx, evalCtx); err != nil {
+		if err = h.Init(ctx, argument, nil /* types */, semaCtx, evalCtx); err != nil {
 			err = errors.Wrapf(err, "%s", argument)
 			return
 		}
-		d, err = h.Eval(nil /* row */)
+		d, err = h.Eval(ctx, nil /* row */)
 		if err != nil {
 			err = errors.Wrapf(err, "%s", argument)
 			return

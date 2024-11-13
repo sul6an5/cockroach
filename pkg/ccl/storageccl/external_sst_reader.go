@@ -16,7 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
@@ -73,7 +73,7 @@ type StoreFile struct {
 func newMemPebbleSSTReader(
 	ctx context.Context,
 	storeFiles []StoreFile,
-	encryption *roachpb.FileEncryptionOptions,
+	encryption *kvpb.FileEncryptionOptions,
 	iterOps storage.IterOptions,
 ) (storage.SimpleMVCCIterator, error) {
 
@@ -97,7 +97,7 @@ func newMemPebbleSSTReader(
 		}
 		inMemorySSTs = append(inMemorySSTs, content)
 	}
-	return storage.NewPebbleMultiMemSSTIterator(inMemorySSTs, false, iterOps)
+	return storage.NewMultiMemSSTIterator(inMemorySSTs, false, iterOps)
 }
 
 // ExternalSSTReader returns a PebbleSSTIterator for the SSTs in external storage,
@@ -112,12 +112,12 @@ func newMemPebbleSSTReader(
 func ExternalSSTReader(
 	ctx context.Context,
 	storeFiles []StoreFile,
-	encryption *roachpb.FileEncryptionOptions,
+	encryption *kvpb.FileEncryptionOptions,
 	iterOpts storage.IterOptions,
 ) (storage.SimpleMVCCIterator, error) {
 	// TODO(jackson): Change the interface to accept a two-dimensional
 	// [][]StoreFiles slice, and propagate that structure to
-	// NewPebbleSSTIterator.
+	// NewSSTIterator.
 
 	if !remoteSSTs.Get(&storeFiles[0].Store.Settings().SV) {
 		return newMemPebbleSSTReader(ctx, storeFiles, encryption, iterOpts)
@@ -168,7 +168,7 @@ func ExternalSSTReader(
 	// NB: It's okay to pass forwardOnly=true, because this function returns a
 	// SimpleMVCCIterator which does not provide an interface for reverse
 	// iteration.
-	return storage.NewPebbleSSTIterator(readerLevels, iterOpts, true /* forwardOnly */)
+	return storage.NewSSTIterator(readerLevels, iterOpts, true /* forwardOnly */)
 }
 
 type sstReader struct {

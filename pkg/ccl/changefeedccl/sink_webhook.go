@@ -17,11 +17,9 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -36,23 +34,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-const (
-	applicationTypeJSON = `application/json`
-	applicationTypeCSV  = `text/csv`
-	authorizationHeader = `Authorization`
-)
-
-func isWebhookSink(u *url.URL) bool {
-	switch u.Scheme {
-	// allow HTTP here but throw an error later to make it clear HTTPS is required
-	case changefeedbase.SinkSchemeWebhookHTTP, changefeedbase.SinkSchemeWebhookHTTPS:
-		return true
-	default:
-		return false
-	}
-}
-
-type webhookSink struct {
+type deprecatedWebhookSink struct {
 	// Webhook configuration.
 	parallelism int
 	retryCfg    retry.Options
@@ -80,8 +62,12 @@ type webhookSink struct {
 	workerCtx   context.Context
 	workerGroup ctxgroup.Group
 	exitWorkers func() // Signaled to shut down all workers.
-	eventsChans []chan []messagePayload
+	eventsChans []chan []deprecatedMessagePayload
 	metrics     metricsRecorder
+}
+
+func (s *deprecatedWebhookSink) getConcreteType() sinkType {
+	return sinkTypeWebhook
 }
 
 type webhookSinkPayload struct {
@@ -96,7 +82,7 @@ type encodedPayload struct {
 	mvcc     hlc.Timestamp
 }
 
-func encodePayloadJSONWebhook(messages []messagePayload) (encodedPayload, error) {
+func encodePayloadJSONWebhook(messages []deprecatedMessagePayload) (encodedPayload, error) {
 	result := encodedPayload{
 		emitTime: timeutil.Now(),
 	}
@@ -125,7 +111,7 @@ func encodePayloadJSONWebhook(messages []messagePayload) (encodedPayload, error)
 	return result, err
 }
 
-func encodePayloadCSVWebhook(messages []messagePayload) (encodedPayload, error) {
+func encodePayloadCSVWebhook(messages []deprecatedMessagePayload) (encodedPayload, error) {
 	result := encodedPayload{
 		emitTime: timeutil.Now(),
 	}
@@ -146,7 +132,7 @@ func encodePayloadCSVWebhook(messages []messagePayload) (encodedPayload, error) 
 	return result, nil
 }
 
-type messagePayload struct {
+type deprecatedMessagePayload struct {
 	// Payload message fields.
 	key      []byte
 	val      []byte
@@ -158,15 +144,15 @@ type messagePayload struct {
 // webhookMessage contains either messagePayload or a flush request.
 type webhookMessage struct {
 	flushDone *chan struct{}
-	payload   messagePayload
+	payload   deprecatedMessagePayload
 }
 
 type batch struct {
-	buffer      []messagePayload
+	buffer      []deprecatedMessagePayload
 	bufferBytes int
 }
 
-func (b *batch) addToBuffer(m messagePayload) {
+func (b *batch) addToBuffer(m deprecatedMessagePayload) {
 	b.bufferBytes += len(m.val)
 	b.buffer = append(b.buffer, m)
 }
@@ -179,36 +165,6 @@ func (b *batch) reset() {
 type batchConfig struct {
 	Bytes, Messages int          `json:",omitempty"`
 	Frequency       jsonDuration `json:",omitempty"`
-}
-
-type jsonMaxRetries int
-
-func (j *jsonMaxRetries) UnmarshalJSON(b []byte) error {
-	var i int64
-	// try to parse as int
-	i, err := strconv.ParseInt(string(b), 10, 64)
-	if err == nil {
-		if i <= 0 {
-			return errors.Errorf("max retry count must be a positive integer. use 'inf' for infinite retries.")
-		}
-		*j = jsonMaxRetries(i)
-	} else {
-		// if that fails, try to parse as string (only accept 'inf')
-		var s string
-		// using unmarshal here to remove quotes around the string
-		if err := json.Unmarshal(b, &s); err != nil {
-			return err
-		}
-		if strings.ToLower(s) == "inf" {
-			// if used wants infinite retries, set to zero as retry.Options interprets this as infinity
-			*j = 0
-		} else if n, err := strconv.Atoi(s); err == nil { // also accept ints as strings
-			*j = jsonMaxRetries(n)
-		} else {
-			return errors.Errorf("max retries must be either a positive int or 'inf' for infinite retries.")
-		}
-	}
-	return nil
 }
 
 // wrapper structs to unmarshal json, retry.Options will be the actual config
@@ -235,7 +191,7 @@ type webhookSinkConfig struct {
 	Retry retryConfig `json:",omitempty"`
 }
 
-func (s *webhookSink) getWebhookSinkConfig(
+func (s *deprecatedWebhookSink) getWebhookSinkConfig(
 	jsonStr changefeedbase.SinkSpecificJSONConfig,
 ) (batchCfg batchConfig, retryCfg retry.Options, err error) {
 	retryCfg = defaultRetryConfig()
@@ -253,20 +209,21 @@ func (s *webhookSink) getWebhookSinkConfig(
 	// don't support negative values
 	if cfg.Flush.Messages < 0 || cfg.Flush.Bytes < 0 || cfg.Flush.Frequency < 0 ||
 		cfg.Retry.Max < 0 || cfg.Retry.Backoff < 0 {
-		return batchCfg, retryCfg, errors.Errorf("invalid option value %s, all config values must be non-negative", changefeedbase.OptWebhookSinkConfig)
+		return batchCfg, retryCfg, errors.Errorf("invalid sink config, all values must be non-negative")
 	}
 
 	// errors if other batch values are set, but frequency is not
 	if (cfg.Flush.Messages > 0 || cfg.Flush.Bytes > 0) && cfg.Flush.Frequency == 0 {
-		return batchCfg, retryCfg, errors.Errorf("invalid option value %s, flush frequency is not set, messages may never be sent", changefeedbase.OptWebhookSinkConfig)
+		return batchCfg, retryCfg, errors.Errorf("invalid sink config, Flush.Frequency is not set, messages may never be sent")
 	}
 
 	retryCfg.MaxRetries = int(cfg.Retry.Max)
 	retryCfg.InitialBackoff = time.Duration(cfg.Retry.Backoff)
+	retryCfg.MaxBackoff = 30 * time.Second
 	return cfg.Flush, retryCfg, nil
 }
 
-func makeWebhookSink(
+func makeDeprecatedWebhookSink(
 	ctx context.Context,
 	u sinkURL,
 	encodingOpts changefeedbase.EncodingOptions,
@@ -289,18 +246,16 @@ func makeWebhookSink(
 	}
 
 	switch encodingOpts.Envelope {
-	case changefeedbase.OptEnvelopeWrapped:
+	case changefeedbase.OptEnvelopeWrapped, changefeedbase.OptEnvelopeBare:
 	default:
 		return nil, errors.Errorf(`this sink is incompatible with %s=%s`,
 			changefeedbase.OptEnvelope, encodingOpts.Envelope)
 	}
 
-	if !encodingOpts.KeyInValue {
-		return nil, errors.Errorf(`this sink requires the WITH %s option`, changefeedbase.OptKeyInValue)
-	}
+	encodingOpts.TopicInValue = true
 
-	if !encodingOpts.TopicInValue {
-		return nil, errors.Errorf(`this sink requires the WITH %s option`, changefeedbase.OptTopicInValue)
+	if encodingOpts.Envelope != changefeedbase.OptEnvelopeBare {
+		encodingOpts.KeyInValue = true
 	}
 
 	var connTimeout time.Duration
@@ -310,7 +265,7 @@ func makeWebhookSink(
 
 	ctx, cancel := context.WithCancel(ctx)
 
-	sink := &webhookSink{
+	sink := &deprecatedWebhookSink{
 		workerCtx:   ctx,
 		authHeader:  opts.AuthHeader,
 		exitWorkers: cancel,
@@ -327,7 +282,7 @@ func makeWebhookSink(
 	}
 
 	// TODO(yevgeniy): Establish HTTP connection in Dial().
-	sink.client, err = makeWebhookClient(u, connTimeout)
+	sink.client, err = deprecatedMakeWebhookClient(u, connTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +303,7 @@ func makeWebhookSink(
 	return sink, nil
 }
 
-func makeWebhookClient(u sinkURL, timeout time.Duration) (*httputil.Client, error) {
+func deprecatedMakeWebhookClient(u sinkURL, timeout time.Duration) (*httputil.Client, error) {
 	client := &httputil.Client{
 		Client: &http.Client{
 			Timeout: timeout,
@@ -415,30 +370,19 @@ func makeWebhookClient(u sinkURL, timeout time.Duration) (*httputil.Client, erro
 	return client, nil
 }
 
-func defaultRetryConfig() retry.Options {
-	opts := retry.Options{
-		InitialBackoff: 500 * time.Millisecond,
-		MaxRetries:     3,
-		Multiplier:     2,
-	}
-	// max backoff should be initial * 2 ^ maxRetries
-	opts.MaxBackoff = opts.InitialBackoff * time.Duration(int(math.Pow(2.0, float64(opts.MaxRetries))))
-	return opts
-}
-
 // defaultWorkerCount() is the number of CPU's on the machine
 func defaultWorkerCount() int {
 	return system.NumCPU()
 }
 
-func (s *webhookSink) Dial() error {
+func (s *deprecatedWebhookSink) Dial() error {
 	s.setupWorkers()
 	return nil
 }
 
-func (s *webhookSink) setupWorkers() {
+func (s *deprecatedWebhookSink) setupWorkers() {
 	// setup events channels to send to workers and the worker group
-	s.eventsChans = make([]chan []messagePayload, s.parallelism)
+	s.eventsChans = make([]chan []deprecatedMessagePayload, s.parallelism)
 	s.workerGroup = ctxgroup.WithContext(s.workerCtx)
 	s.batchChan = make(chan webhookMessage)
 
@@ -453,7 +397,7 @@ func (s *webhookSink) setupWorkers() {
 		return nil
 	})
 	for i := 0; i < s.parallelism; i++ {
-		s.eventsChans[i] = make(chan []messagePayload)
+		s.eventsChans[i] = make(chan []deprecatedMessagePayload)
 		j := i
 		s.workerGroup.GoCtx(func(ctx context.Context) error {
 			s.workerLoop(j)
@@ -462,7 +406,7 @@ func (s *webhookSink) setupWorkers() {
 	}
 }
 
-func (s *webhookSink) shouldSendBatch(b batch) bool {
+func (s *deprecatedWebhookSink) shouldSendBatch(b batch) bool {
 	// similar to sarama, send batch if:
 	// everything is zero (default)
 	// any one of the conditions are met UNLESS the condition is zero which means never batch
@@ -481,8 +425,8 @@ func (s *webhookSink) shouldSendBatch(b batch) bool {
 	}
 }
 
-func (s *webhookSink) splitAndSendBatch(batch []messagePayload) error {
-	workerBatches := make([][]messagePayload, s.parallelism)
+func (s *deprecatedWebhookSink) splitAndSendBatch(batch []deprecatedMessagePayload) error {
+	workerBatches := make([][]deprecatedMessagePayload, s.parallelism)
 	for _, msg := range batch {
 		// split batch into per-worker batches
 		i := s.workerIndex(msg.key)
@@ -501,8 +445,9 @@ func (s *webhookSink) splitAndSendBatch(batch []messagePayload) error {
 	return nil
 }
 
-// flushWorkers sends flush request to each worker and waits for each one to acknowledge.
-func (s *webhookSink) flushWorkers(done chan struct{}) error {
+// flushWorkers sends flush request to each worker and waits for each one to
+// acknowledge.
+func (s *deprecatedWebhookSink) flushWorkers(done chan struct{}) error {
 	for i := 0; i < len(s.eventsChans); i++ {
 		// Ability to write a nil message to events channel indicates that
 		// the worker has processed all other messages.
@@ -523,7 +468,7 @@ func (s *webhookSink) flushWorkers(done chan struct{}) error {
 
 // batchWorker ingests messages from EmitRow into a batch and splits them into
 // per-worker batches to be sent separately
-func (s *webhookSink) batchWorker() {
+func (s *deprecatedWebhookSink) batchWorker() {
 	var batchTracker batch
 	batchTimer := s.ts.NewTimer()
 	defer batchTimer.Stop()
@@ -576,7 +521,7 @@ func (s *webhookSink) batchWorker() {
 	}
 }
 
-func (s *webhookSink) workerLoop(workerIndex int) {
+func (s *deprecatedWebhookSink) workerLoop(workerIndex int) {
 	for {
 		select {
 		case <-s.workerCtx.Done():
@@ -611,14 +556,14 @@ func (s *webhookSink) workerLoop(workerIndex int) {
 	}
 }
 
-func (s *webhookSink) sendMessageWithRetries(ctx context.Context, reqBody []byte) error {
+func (s *deprecatedWebhookSink) sendMessageWithRetries(ctx context.Context, reqBody []byte) error {
 	requestFunc := func() error {
 		return s.sendMessage(ctx, reqBody)
 	}
 	return retry.WithMaxAttempts(ctx, s.retryCfg, s.retryCfg.MaxRetries+1, requestFunc)
 }
 
-func (s *webhookSink) sendMessage(ctx context.Context, reqBody []byte) error {
+func (s *deprecatedWebhookSink) sendMessage(ctx context.Context, reqBody []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url.String(), bytes.NewReader(reqBody))
 	if err != nil {
 		return err
@@ -656,13 +601,14 @@ func (s *webhookSink) sendMessage(ctx context.Context, reqBody []byte) error {
 // deterministically assigned to the same worker. Since we have a channel per
 // worker, we can ensure per-worker ordering and therefore guarantee per-key
 // ordering.
-func (s *webhookSink) workerIndex(key []byte) uint32 {
+func (s *deprecatedWebhookSink) workerIndex(key []byte) uint32 {
 	return crc32.ChecksumIEEE(key) % uint32(s.parallelism)
 }
 
-// exitWorkersWithError saves the first error message encountered by webhook workers,
+// exitWorkersWithError saves the first error message encountered by webhook
+// workers,
 // and requests all workers to terminate.
-func (s *webhookSink) exitWorkersWithError(err error) {
+func (s *deprecatedWebhookSink) exitWorkersWithError(err error) {
 	// errChan has buffer size 1, first error will be saved to the buffer and
 	// subsequent errors will be ignored
 	select {
@@ -673,7 +619,7 @@ func (s *webhookSink) exitWorkersWithError(err error) {
 }
 
 // sinkError checks to see if any errors occurred inside workers go routines.
-func (s *webhookSink) sinkError() error {
+func (s *deprecatedWebhookSink) sinkError() error {
 	select {
 	case err := <-s.errChan:
 		return err
@@ -682,7 +628,7 @@ func (s *webhookSink) sinkError() error {
 	}
 }
 
-func (s *webhookSink) EmitRow(
+func (s *deprecatedWebhookSink) EmitRow(
 	ctx context.Context,
 	topic TopicDescriptor,
 	key, value []byte,
@@ -700,7 +646,7 @@ func (s *webhookSink) EmitRow(
 	case err := <-s.errChan:
 		return err
 	case s.batchChan <- webhookMessage{
-		payload: messagePayload{
+		payload: deprecatedMessagePayload{
 			key:      key,
 			val:      value,
 			alloc:    alloc,
@@ -712,7 +658,7 @@ func (s *webhookSink) EmitRow(
 	return nil
 }
 
-func (s *webhookSink) EmitResolvedTimestamp(
+func (s *deprecatedWebhookSink) EmitResolvedTimestamp(
 	ctx context.Context, encoder Encoder, resolved hlc.Timestamp,
 ) error {
 	defer s.metrics.recordResolvedCallback()()
@@ -743,7 +689,7 @@ func (s *webhookSink) EmitResolvedTimestamp(
 	return nil
 }
 
-func (s *webhookSink) Flush(ctx context.Context) error {
+func (s *deprecatedWebhookSink) Flush(ctx context.Context) error {
 	s.metrics.recordFlushRequestCallback()()
 
 	// Send flush request.
@@ -766,7 +712,7 @@ func (s *webhookSink) Flush(ctx context.Context) error {
 	}
 }
 
-func (s *webhookSink) Close() error {
+func (s *deprecatedWebhookSink) Close() error {
 	s.exitWorkers()
 	// ignore errors here since we're closing the sink anyway
 	_ = s.workerGroup.Wait()

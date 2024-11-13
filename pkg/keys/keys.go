@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -61,8 +62,11 @@ func StoreGossipKey() roachpb.Key {
 	return MakeStoreKey(localStoreGossipSuffix, nil)
 }
 
-// StoreClusterVersionKey returns a store-local key for the cluster version.
-func StoreClusterVersionKey() roachpb.Key {
+// DeprecatedStoreClusterVersionKey returns a store-local key for the cluster version.
+//
+// We no longer use this key, but still write it out for interoperability with
+// older versions.
+func DeprecatedStoreClusterVersionKey() roachpb.Key {
 	return MakeStoreKey(localStoreClusterVersionSuffix, nil)
 }
 
@@ -122,6 +126,19 @@ func DecodeStoreCachedSettingsKey(key roachpb.Key) (settingKey roachpb.Key, err 
 		return nil, errors.Errorf("invalid key has trailing garbage: %q", detail)
 	}
 	return
+}
+
+// StoreLossOfQuorumRecoveryStatusKey is a key used for storing results of loss
+// of quorum recovery plan application.
+func StoreLossOfQuorumRecoveryStatusKey() roachpb.Key {
+	return MakeStoreKey(localStoreLossOfQuorumRecoveryStatusSuffix, nil)
+}
+
+// StoreLossOfQuorumRecoveryCleanupActionsKey is a key used for storing data for
+// post recovery cleanup actions node would perform after restart if plan was
+// applied.
+func StoreLossOfQuorumRecoveryCleanupActionsKey() roachpb.Key {
+	return MakeStoreKey(localStoreLossOfQuorumRecoveryCleanupActionsSuffix, nil)
 }
 
 // StoreUnsafeReplicaRecoveryKey creates a key for loss of quorum replica
@@ -374,7 +391,7 @@ func MakeRangeKey(key, suffix, detail roachpb.RKey) roachpb.Key {
 	if len(suffix) != localSuffixLength {
 		panic(fmt.Sprintf("suffix len(%q) != %d", suffix, localSuffixLength))
 	}
-	buf := MakeRangeKeyPrefix(key)
+	buf := makeRangeKeyPrefixWithExtraCapacity(key, len(suffix)+len(detail))
 	buf = append(buf, suffix...)
 	buf = append(buf, detail...)
 	return buf
@@ -382,8 +399,14 @@ func MakeRangeKey(key, suffix, detail roachpb.RKey) roachpb.Key {
 
 // MakeRangeKeyPrefix creates a key prefix under which all range-local keys
 // can be found.
+// gcassert:inline
 func MakeRangeKeyPrefix(key roachpb.RKey) roachpb.Key {
-	buf := make(roachpb.Key, 0, len(LocalRangePrefix)+len(key)+1)
+	return makeRangeKeyPrefixWithExtraCapacity(key, 0)
+}
+
+func makeRangeKeyPrefixWithExtraCapacity(key roachpb.RKey, extra int) roachpb.Key {
+	keyLen := len(LocalRangePrefix) + encoding.EncodeBytesSize(key)
+	buf := make(roachpb.Key, 0, keyLen+extra)
 	buf = append(buf, LocalRangePrefix...)
 	buf = encoding.EncodeBytesAscending(buf, key)
 	return buf
@@ -422,11 +445,7 @@ func RangeDescriptorKey(key roachpb.RKey) roachpb.Key {
 // transaction key and ID. The base key is encoded in order to
 // guarantee that all transaction records for a range sort together.
 func TransactionKey(key roachpb.Key, txnID uuid.UUID) roachpb.Key {
-	rk, err := Addr(key)
-	if err != nil {
-		panic(err)
-	}
-	return MakeRangeKey(rk, LocalTransactionSuffix, roachpb.RKey(txnID.GetBytes()))
+	return MakeRangeKey(MustAddr(key), LocalTransactionSuffix, txnID.GetBytes())
 }
 
 // QueueLastProcessedKey returns a range-local key for last processed
@@ -453,10 +472,7 @@ func RangeProbeKey(key roachpb.RKey) roachpb.Key {
 // For a scan [start, end) the corresponding lock table scan is
 // [LTSK(start), LTSK(end)).
 func LockTableSingleKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
-	// The +3 accounts for the bytesMarker and terminator. Note that this is a
-	// lower-bound, since the escaping done by EncodeBytesAscending depends on
-	// what bytes are in the key. But we expect this to be usually accurate.
-	keyLen := len(LocalRangeLockTablePrefix) + len(LockTableSingleKeyInfix) + len(key) + 3
+	keyLen := len(LocalRangeLockTablePrefix) + len(LockTableSingleKeyInfix) + encoding.EncodeBytesSize(key)
 	if cap(buf) < keyLen {
 		buf = make([]byte, 0, keyLen)
 	} else {
@@ -468,6 +484,24 @@ func LockTableSingleKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
 	buf = append(buf, LocalRangeLockTablePrefix...)
 	buf = append(buf, LockTableSingleKeyInfix...)
 	buf = encoding.EncodeBytesAscending(buf, key)
+	return buf, buf
+}
+
+// LockTableSingleNextKey is equivalent to LockTableSingleKey(key.Next(), buf)
+// but avoids an extra allocation in cases where key.Next() must allocate.
+func LockTableSingleNextKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
+	keyLen := len(LocalRangeLockTablePrefix) + len(LockTableSingleKeyInfix) + encoding.EncodeNextBytesSize(key)
+	if cap(buf) < keyLen {
+		buf = make([]byte, 0, keyLen)
+	} else {
+		buf = buf[:0]
+	}
+	// Don't unwrap any local prefix on key using Addr(key). This allow for
+	// doubly-local lock table keys. For example, local range descriptor keys can
+	// be locked during split and merge transactions.
+	buf = append(buf, LocalRangeLockTablePrefix...)
+	buf = append(buf, LockTableSingleKeyInfix...)
+	buf = encoding.EncodeNextBytesAscending(buf, key)
 	return buf, buf
 }
 
@@ -934,13 +968,13 @@ func EnsureSafeSplitKey(key roachpb.Key) (roachpb.Key, error) {
 }
 
 // Range returns a key range encompassing the key ranges of all requests.
-func Range(reqs []roachpb.RequestUnion) (roachpb.RSpan, error) {
+func Range(reqs []kvpb.RequestUnion) (roachpb.RSpan, error) {
 	from := roachpb.RKeyMax
 	to := roachpb.RKeyMin
 	for _, arg := range reqs {
 		req := arg.GetInner()
 		h := req.Header()
-		if !roachpb.IsRange(req) && len(h.EndKey) != 0 {
+		if !kvpb.IsRange(req) && len(h.EndKey) != 0 {
 			return roachpb.RSpan{}, errors.Errorf("end key specified for non-range operation: %s", req)
 		}
 

@@ -69,7 +69,7 @@ func TestSafeFormatKey_SystemTenant(t *testing.T) {
 		{
 			"namespace table handled as standard system tenant table",
 			keys.NamespaceTableMin,
-			"/Table/30",
+			"/NamespaceTable/30",
 		},
 		{
 			"table index without index key",
@@ -105,6 +105,14 @@ func TestSafeFormatKey_SystemTenant(t *testing.T) {
 			makeKey(tenSysCodec.TablePrefix(42), []byte{0x12, 'a', 0x00, 0x03}),
 			`/Table/42/‹???›`,
 		},
+		{
+			"marks safe reserved key prefix",
+			makeKey(keys.Meta1Prefix,
+				tenSysCodec.TablePrefix(42),
+				encoding.EncodeStringAscending(nil, "California"),
+				encoding.EncodeStringAscending(nil, "Los Angeles")),
+			`/Meta1/Table/42/‹"California"›/‹"Los Angeles"›`,
+		},
 	}
 
 	for _, test := range testCases {
@@ -114,17 +122,16 @@ func TestSafeFormatKey_SystemTenant(t *testing.T) {
 	}
 }
 
-func TestSafeFormatKey_UnsupportedKeyspace(t *testing.T) {
-	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+func TestSafeFormatKey_Basic(t *testing.T) {
 	testCases := []struct {
 		name string
 		key  roachpb.Key
 		exp  string
 	}{
 		{
-			"key-spaces without a safe format function implementation are fully redacted",
-			keys.MakeRangeKeyPrefix(roachpb.RKey(ten5Codec.TablePrefix(42))),
-			`‹/Local/Range/Tenant/5/Table/42›`,
+			"ensure constants get redacted",
+			makeKey(keys.Meta2Prefix, roachpb.Key("foo")),
+			`/Meta2/‹"foo"›`,
 		},
 	}
 
@@ -136,7 +143,7 @@ func TestSafeFormatKey_UnsupportedKeyspace(t *testing.T) {
 }
 
 func TestSafeFormatKey_AppTenant(t *testing.T) {
-	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	testCases := []struct {
 		name string
 		key  roachpb.Key
@@ -201,7 +208,7 @@ func TestSafeFormatKey_AppTenant(t *testing.T) {
 
 func TestPrettyPrint(t *testing.T) {
 	tenSysCodec := keys.SystemSQLCodec
-	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	tm, _ := time.Parse(time.RFC3339Nano, "2016-03-30T13:40:35.053725008Z")
 	duration := duration.MakeDuration(1*time.Second.Nanoseconds(), 1, 1)
 	durationAsc, _ := encoding.EncodeDurationAscending(nil, duration)
@@ -226,10 +233,12 @@ func TestPrettyPrint(t *testing.T) {
 		// local
 		{keys.StoreIdentKey(), "/Local/Store/storeIdent", revertSupportUnknown},
 		{keys.StoreGossipKey(), "/Local/Store/gossipBootstrap", revertSupportUnknown},
-		{keys.StoreClusterVersionKey(), "/Local/Store/clusterVersion", revertSupportUnknown},
+		{keys.DeprecatedStoreClusterVersionKey(), "/Local/Store/clusterVersion", revertSupportUnknown},
 		{keys.StoreNodeTombstoneKey(123), "/Local/Store/nodeTombstone/n123", revertSupportUnknown},
 		{keys.StoreCachedSettingsKey(roachpb.Key("a")), `/Local/Store/cachedSettings/"a"`, revertSupportUnknown},
 		{keys.StoreUnsafeReplicaRecoveryKey(loqRecoveryID), fmt.Sprintf(`/Local/Store/lossOfQuorumRecovery/applied/%s`, loqRecoveryID), revertSupportUnknown},
+		{keys.StoreLossOfQuorumRecoveryStatusKey(), "/Local/Store/lossOfQuorumRecovery/status", revertSupportUnknown},
+		{keys.StoreLossOfQuorumRecoveryCleanupActionsKey(), "/Local/Store/lossOfQuorumRecovery/cleanup", revertSupportUnknown},
 
 		{keys.AbortSpanKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortSpan/%q`, txnID), revertSupportUnknown},
 		{keys.RangeAppliedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeAppliedState", revertSupportUnknown},
@@ -542,7 +551,7 @@ func massagePrettyPrintedSpanForTest(span string, dirs []encoding.Direction) str
 
 func TestPrettyPrintRange(t *testing.T) {
 	tenSysCodec := keys.SystemSQLCodec
-	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	key := makeKey([]byte("a"))
 	key2 := makeKey([]byte("z"))
 	tableKey := makeKey(tenSysCodec.TablePrefix(61), encoding.EncodeVarintAscending(nil, 4))

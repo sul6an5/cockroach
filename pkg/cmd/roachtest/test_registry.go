@@ -14,17 +14,15 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/internal/team"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
-	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 var loadTeams = func() (team.Map, error) {
@@ -41,33 +39,22 @@ type testRegistryImpl struct {
 	instanceType string // optional
 	zones        string
 	preferSSD    bool
-	// buildVersion is the version of the Cockroach binary that tests will run against.
-	buildVersion version.Version
+
+	promRegistry *prometheus.Registry
 }
 
 // makeTestRegistry constructs a testRegistryImpl and configures it with opts.
 func makeTestRegistry(
 	cloud string, instanceType string, zones string, preferSSD bool,
-) (testRegistryImpl, error) {
-	r := testRegistryImpl{
+) testRegistryImpl {
+	return testRegistryImpl{
 		cloud:        cloud,
 		instanceType: instanceType,
 		zones:        zones,
 		preferSSD:    preferSSD,
 		m:            make(map[string]*registry.TestSpec),
+		promRegistry: prometheus.NewRegistry(),
 	}
-	v := buildTag
-	if v == "" {
-		var err error
-		v, err = loadBuildVersion()
-		if err != nil {
-			return testRegistryImpl{}, err
-		}
-	}
-	if err := r.setBuildVersion(v); err != nil {
-		return testRegistryImpl{}, err
-	}
-	return r, nil
 }
 
 // Add adds a test to the registry.
@@ -154,51 +141,40 @@ func (r *testRegistryImpl) prepareSpec(spec *registry.TestSpec) error {
 
 	return nil
 }
+func (r *testRegistryImpl) PromFactory() promauto.Factory {
+	return promauto.With(r.promRegistry)
+}
 
 // GetTests returns all the tests that match the given regexp.
 // Skipped tests are included, and tests that don't match their minVersion spec
 // are also included but marked as skipped.
 func (r testRegistryImpl) GetTests(
 	ctx context.Context, filter *registry.TestFilter,
-) []registry.TestSpec {
+) ([]registry.TestSpec, []registry.TestSpec) {
 	var tests []registry.TestSpec
+	var tagMismatch []registry.TestSpec
 	for _, t := range r.m {
-		if !t.MatchOrSkip(filter) {
-			continue
+		switch t.Match(filter) {
+		case registry.Matched:
+			tests = append(tests, *t)
+		case registry.FailedTags:
+			tagMismatch = append(tagMismatch, *t)
+		case registry.FailedFilter:
 		}
-		tests = append(tests, *t)
 	}
 	sort.Slice(tests, func(i, j int) bool {
 		return tests[i].Name < tests[j].Name
 	})
-	return tests
+	sort.Slice(tagMismatch, func(i, j int) bool {
+		return tagMismatch[i].Name < tagMismatch[j].Name
+	})
+	return tests, tagMismatch
 }
 
 // List lists tests that match one of the filters.
 func (r testRegistryImpl) List(ctx context.Context, filters []string) []registry.TestSpec {
-	filter := registry.NewTestFilter(filters)
-	tests := r.GetTests(ctx, filter)
+	filter := registry.NewTestFilter(filters, true)
+	tests, _ := r.GetTests(ctx, filter)
 	sort.Slice(tests, func(i, j int) bool { return tests[i].Name < tests[j].Name })
 	return tests
-}
-
-func (r *testRegistryImpl) setBuildVersion(buildTag string) error {
-	v, err := version.Parse(buildTag)
-	if err != nil {
-		return err
-	}
-	r.buildVersion = *v
-	return err
-}
-
-func loadBuildVersion() (string, error) {
-	cmd := exec.Command("git", "describe", "--abbrev=0", "--tags", "--match=v[0-9]*")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", errors.Wrapf(
-			err, "failed to get version tag from git. Are you running in the "+
-				"cockroach repo directory? err=%s, out=%s",
-			err, out)
-	}
-	return strings.TrimSpace(string(out)), nil
 }

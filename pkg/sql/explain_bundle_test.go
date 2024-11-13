@@ -98,7 +98,20 @@ CREATE TABLE s.a (a INT PRIMARY KEY);`)
 		// The bundle url is inside the error detail.
 		var pqErr *pq.Error
 		_ = errors.As(err, &pqErr)
-		checkBundle(t, fmt.Sprintf("%+v", pqErr.Detail), "", nil, base, plans, "distsql.html")
+		checkBundle(t, fmt.Sprintf("%+v", pqErr.Detail), "", nil, base, plans, "distsql.html errors.txt")
+	})
+
+	// #92920 Make sure schema and opt files are created.
+	t.Run("memo-reset", func(t *testing.T) {
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) CREATE TABLE t (i int)")
+		checkBundle(t, fmt.Sprint(rows), "", func(name, contents string) error {
+			if name == "opt.txt" {
+				if contents == noPlan {
+					return errors.Errorf("opt.txt empty")
+				}
+			}
+			return nil
+		}, base, plans, "distsql.html vec.txt vec-v.txt")
 	})
 
 	// Verify that we can issue the statement with prepare (which can happen
@@ -248,6 +261,70 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		if !warningFound {
 			t.Fatalf("warning not found in %v", rows)
 		}
+	})
+
+	t.Run("foreign keys", func(t *testing.T) {
+		r.Exec(t, "CREATE TABLE parent (pk INT PRIMARY KEY, v INT);")
+		r.Exec(t, "CREATE TABLE child (pk INT PRIMARY KEY, fk INT REFERENCES parent(pk));")
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM child")
+		checkBundle(
+			t, fmt.Sprint(rows), "child", func(name, contents string) error {
+				if name == "schema.sql" {
+					reg := regexp.MustCompile("CREATE TABLE public.parent")
+					if reg.FindString(contents) == "" {
+						return errors.Newf(
+							"could not find 'CREATE TABLE public.parent' in schema.sql:\n%s", contents)
+					}
+				}
+				return nil
+			},
+			base, plans, "stats-defaultdb.public.parent.sql", "stats-defaultdb.public.child.sql",
+			"distsql.html vec.txt vec-v.txt",
+		)
+	})
+
+	t.Run("redact", func(t *testing.T) {
+		r.Exec(t, "CREATE TABLE pterosaur (cardholder STRING PRIMARY KEY, cardno INT, INDEX (cardno));")
+		r.Exec(t, "INSERT INTO pterosaur VALUES ('pterodactyl', 5555555555554444);")
+		r.Exec(t, "CREATE STATISTICS jurassic FROM pterosaur;")
+		r.Exec(t, "CREATE FUNCTION test_redact() RETURNS STRING AS $body$ SELECT 'pterodactyl' $body$ LANGUAGE sql;")
+		rows := r.QueryStr(t,
+			"EXPLAIN ANALYZE (DEBUG, REDACT) SELECT max(cardno), test_redact() FROM pterosaur WHERE cardholder = 'pterodactyl'",
+		)
+		verboten := []string{"pterodactyl", "5555555555554444", fmt.Sprintf("%x", 5555555555554444)}
+		checkBundle(
+			t, fmt.Sprint(rows), "", func(name, contents string) error {
+				lowerContents := strings.ToLower(contents)
+				for _, pii := range verboten {
+					if strings.Contains(lowerContents, pii) {
+						return errors.Newf("file %s contained %q:\n%s\n", name, pii, contents)
+					}
+				}
+				return nil
+			},
+			plans, "statement.sql stats-defaultdb.public.pterosaur.sql env.sql vec.txt vec-v.txt",
+		)
+	})
+
+	t.Run("udfs", func(t *testing.T) {
+		r.Exec(t, "CREATE FUNCTION add(a INT, b INT) RETURNS INT IMMUTABLE LEAKPROOF LANGUAGE SQL AS 'SELECT a + b';")
+		r.Exec(t, "CREATE FUNCTION subtract(a INT, b INT) RETURNS INT IMMUTABLE LEAKPROOF LANGUAGE SQL AS 'SELECT a - b';")
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT add(3, 4);")
+		checkBundle(
+			t, fmt.Sprint(rows), "add", func(name, contents string) error {
+				if name == "schema.sql" {
+					reg := regexp.MustCompile("add")
+					if reg.FindString(contents) == "" {
+						return errors.Errorf("could not find definition for 'add' function in schema.sql")
+					}
+					reg = regexp.MustCompile("subtract")
+					if reg.FindString(contents) != "" {
+						return errors.Errorf("Found irrelevant user defined function 'substract' in schema.sql")
+					}
+				}
+				return nil
+			}, base, plans,
+			"distsql-1-subquery.html distsql-2-main-query.html vec-1-subquery-v.txt vec-1-subquery.txt vec-2-main-query-v.txt vec-2-main-query.txt")
 	})
 }
 

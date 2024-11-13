@@ -8,9 +8,8 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
+import moment from "moment-timezone";
 import { TimeScale, TimeScaleOption, TimeScaleOptions } from "./timeScaleTypes";
-import { dateFormat, timeFormat } from "./timeScaleDropdown";
 
 /**
  * timeScale1hMinOptions is a preconfigured set of time scales with 1h minimum that can be
@@ -93,7 +92,7 @@ export const defaultTimeScaleSelected: TimeScale = {
 // Since this value is used on componentDidUpdate, we don't want a refresh
 // to happen every millisecond, so we set the millisecond value to 0.
 export const toDateRange = (ts: TimeScale): [moment.Moment, moment.Moment] => {
-  const end = ts.fixedWindowEnd
+  const end = ts?.fixedWindowEnd
     ? moment.utc(ts.fixedWindowEnd)
     : moment().utc();
   const endRounded = end.set({ millisecond: 0 });
@@ -154,20 +153,6 @@ export const findClosestTimeScale = (
     : { ...data[0], key: "Custom" };
 };
 
-export const timeScaleToString = (ts: TimeScale): string => {
-  const [start, end] = toRoundedDateRange(ts);
-  const endDayIsToday = moment.utc(end).isSame(moment.utc(), "day");
-  const startEndOnSameDay = end.isSame(start, "day");
-  const omitDayFormat = endDayIsToday && startEndOnSameDay;
-  const dateStart = omitDayFormat ? "" : start.format(dateFormat);
-  const dateEnd =
-    omitDayFormat || startEndOnSameDay ? "" : end.format(dateFormat);
-  const timeStart = start.format(timeFormat);
-  const timeEnd = end.format(timeFormat);
-
-  return `${dateStart} ${timeStart} to ${dateEnd} ${timeEnd} (UTC)`;
-};
-
 /**
  * Create a fixed TimeScale object from a date range.
  * @param range date range containing start and end as moment objects
@@ -191,3 +176,15 @@ export const createTimeScaleFromDateRange = (
 
   return timeScale;
 };
+
+export function timeScaleRangeToObj(ts: TimeScale): {
+  start?: moment.Moment;
+  end?: moment.Moment;
+} {
+  if (ts === null) return {};
+  const [startTime, endTime] = toDateRange(ts);
+  return {
+    start: startTime,
+    end: endTime,
+  };
+}

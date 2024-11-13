@@ -15,14 +15,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/faketreeeval"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
@@ -33,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/kylelemons/godebug/diff"
 	"github.com/stretchr/testify/require"
@@ -58,7 +61,7 @@ func WithBuilderDependenciesFromTestServer(
 	)
 	defer cleanup()
 	planner := ip.(interface {
-		Txn() *kv.Txn
+		InternalSQLTxn() descs.Txn
 		Descriptors() *descs.Collection
 		SessionData() *sessiondata.SessionData
 		resolver.SchemaResolver
@@ -67,16 +70,21 @@ func WithBuilderDependenciesFromTestServer(
 		scbuild.FeatureChecker
 	})
 
+	refProviderFactory, refCleanup := sql.NewReferenceProviderFactoryForTest(
+		"test", planner.InternalSQLTxn().KV(), username.RootUserName(), &execCfg, "defaultdb",
+	)
+	defer refCleanup()
+
 	// Use "defaultdb" as current database.
 	planner.SessionData().Database = "defaultdb"
 	// For setting up a builder inside tests we will ensure that the new schema
 	// changer will allow non-fully implemented operations.
 	planner.SessionData().NewSchemaChangerMode = sessiondatapb.UseNewSchemaChangerUnsafe
+	planner.SessionData().EnableUniqueWithoutIndexConstraints = true
 	fn(scdeps.NewBuilderDependencies(
 		execCfg.NodeInfo.LogicalClusterID(),
 		execCfg.Codec,
-		planner.Txn(),
-		planner.Descriptors(),
+		planner.InternalSQLTxn(),
 		sql.NewSkippingCacheSchemaResolver, /* schemaResolverFactory */
 		planner,                            /* authAccessor */
 		planner,                            /* astFormatter */
@@ -84,8 +92,10 @@ func WithBuilderDependenciesFromTestServer(
 		planner.SessionData(),
 		execCfg.Settings,
 		nil, /* statements */
-		execCfg.InternalExecutor,
 		&faketreeeval.DummyClientNoticeSender{},
+		sql.NewSchemaChangerBuildEventLogger(planner.InternalSQLTxn(), &execCfg),
+		refProviderFactory,
+		descidgen.NewGenerator(s.ClusterSettings(), s.Codec(), s.DB()),
 	))
 }
 
@@ -95,15 +105,15 @@ func WithBuilderDependenciesFromTestServer(
 // decoding that into a map[string]interface{}. The function will be called
 // for every object in the decoded map recursively.
 func ProtoToYAML(
-	m protoutil.Message, emitDefaults bool, rewrites func(interface{}),
+	m protoutil.Message, emitDefaults bool, rewrites ...func(interface{}),
 ) (string, error) {
 	target, err := scviz.ToMap(m, emitDefaults)
 	if err != nil {
 		return "", err
 	}
 	scviz.WalkMap(target, scviz.RewriteEmbeddedIntoParent)
-	if rewrites != nil {
-		scviz.WalkMap(target, rewrites)
+	for _, rewrite := range rewrites {
+		scviz.WalkMap(target, rewrite)
 	}
 	out, err := yaml.Marshal(target)
 	if err != nil {
@@ -151,12 +161,12 @@ func Diff(a, b string, args DiffArgs) string {
 
 // ProtoDiff generates an indented summary of the diff between two protos'
 // YAML representations. See ProtoToYAML for documentation on rewrites.
-func ProtoDiff(a, b protoutil.Message, args DiffArgs, rewrites func(interface{})) string {
+func ProtoDiff(a, b protoutil.Message, args DiffArgs, rewrites ...func(interface{})) string {
 	toYAML := func(m protoutil.Message) string {
 		if m == nil {
 			return ""
 		}
-		str, err := ProtoToYAML(m, false /* emitDefaults */, rewrites)
+		str, err := ProtoToYAML(m, false /* emitDefaults */, rewrites...)
 		if err != nil {
 			panic(err)
 		}
@@ -167,10 +177,15 @@ func ProtoDiff(a, b protoutil.Message, args DiffArgs, rewrites func(interface{})
 }
 
 // MakePlan is a convenient alternative to calling scplan.MakePlan in tests.
-func MakePlan(t *testing.T, state scpb.CurrentState, phase scop.Phase) scplan.Plan {
-	plan, err := scplan.MakePlan(state, scplan.Params{
+func MakePlan(
+	t *testing.T, state scpb.CurrentState, phase scop.Phase, memAcc *mon.BoundAccount,
+) scplan.Plan {
+	plan, err := scplan.MakePlan(context.Background(), state, scplan.Params{
+		Ctx:                        context.Background(),
+		ActiveVersion:              clusterversion.TestingClusterVersion,
 		ExecutionPhase:             phase,
 		SchemaChangerJobIDSupplier: func() jobspb.JobID { return 1 },
+		MemAcc:                     memAcc,
 	})
 	require.NoError(t, err)
 	return plan
@@ -194,7 +209,7 @@ func TruncateJobOps(plan *scplan.Plan) {
 }
 
 // TableNameFromStmt fetch table name from a statement.
-func TableNameFromStmt(stmt parser.Statement) string {
+func TableNameFromStmt(stmt statements.Statement[tree.Statement]) string {
 	tableName := ""
 	switch node := stmt.AST.(type) {
 	case *tree.CreateTable:

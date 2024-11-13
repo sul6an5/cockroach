@@ -25,11 +25,16 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestutils"
@@ -38,13 +43,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,24 +61,95 @@ import (
 // given testing knobs.
 type NewClusterFunc func(
 	t *testing.T, knobs *scexec.TestingKnobs,
-) (_ *gosql.DB, cleanup func())
+) (_ serverutils.TestServerInterface, _ *gosql.DB, cleanup func())
+
+// NewMixedClusterFunc provides functionality to construct a new cluster
+// given testing knobs.
+type NewMixedClusterFunc func(
+	t *testing.T, knobs *scexec.TestingKnobs, downlevelVersion bool,
+) (_ serverutils.TestServerInterface, _ *gosql.DB, cleanup func())
 
 // SingleNodeCluster is a NewClusterFunc.
-func SingleNodeCluster(t *testing.T, knobs *scexec.TestingKnobs) (*gosql.DB, func()) {
+func SingleNodeCluster(
+	t *testing.T, knobs *scexec.TestingKnobs,
+) (serverutils.TestServerInterface, *gosql.DB, func()) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disabled due to a failure in TestBackupRestore. Tracked with #76378.
 		DisableDefaultTestTenant: true,
 		Knobs: base.TestingKnobs{
 			SQLDeclarativeSchemaChanger: knobs,
-			JobsTestingKnobs:            jobs.NewTestingKnobsWithShortIntervals(),
+			JobsTestingKnobs:            newJobsKnobs(),
 			SQLExecutor: &sql.ExecutorTestingKnobs{
 				UseTransactionalDescIDGenerator: true,
 			},
 		},
 	})
-	return db, func() {
+
+	return s, db, func() {
 		s.Stopper().Stop(context.Background())
 	}
+}
+
+// SingleNodeMixedCluster is a NewClusterFunc.
+func SingleNodeMixedCluster(
+	t *testing.T, knobs *scexec.TestingKnobs, downlevelVersion bool,
+) (serverutils.TestServerInterface, *gosql.DB, func()) {
+	targetVersion := clusterversion.TestingBinaryVersion
+	if downlevelVersion {
+		targetVersion = clusterversion.ByKey(clusterversion.V22_2)
+	}
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		// Disabled due to a failure in TestBackupRestore. Tracked with #76378.
+		DisableDefaultTestTenant: true,
+		Knobs: base.TestingKnobs{
+			Server: &server.TestingKnobs{
+				BinaryVersionOverride:          targetVersion,
+				DisableAutomaticVersionUpgrade: make(chan struct{}),
+			},
+			SQLDeclarativeSchemaChanger: knobs,
+			JobsTestingKnobs:            newJobsKnobs(),
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				UseTransactionalDescIDGenerator: true,
+			},
+		},
+	})
+
+	return s, db, func() {
+		s.Stopper().Stop(context.Background())
+	}
+}
+
+// newJobsKnobs constructs jobs.TestingKnobs for the end-to-end tests.
+func newJobsKnobs() *jobs.TestingKnobs {
+	jobKnobs := jobs.NewTestingKnobsWithShortIntervals()
+
+	// We want to force the process of marking the job as successful
+	// to fail sometimes. This will ensure that the schema change job
+	// is idempotent.
+	var injectedFailures = struct {
+		syncutil.Mutex
+		m map[jobspb.JobID]struct{}
+	}{
+		m: make(map[jobspb.JobID]struct{}),
+	}
+	jobKnobs.BeforeUpdate = func(orig, updated jobs.JobMetadata) error {
+		sc := orig.Payload.GetNewSchemaChange()
+		if sc == nil {
+			return nil
+		}
+		if orig.Status != jobs.StatusRunning || updated.Status != jobs.StatusSucceeded {
+			return nil
+		}
+		injectedFailures.Lock()
+		defer injectedFailures.Unlock()
+		if _, ok := injectedFailures.m[orig.ID]; !ok {
+			injectedFailures.m[orig.ID] = struct{}{}
+			log.Infof(context.Background(), "injecting failure while marking job succeeded")
+			return errors.New("injected failure when marking succeeded")
+		}
+		return nil
+	}
+	return jobKnobs
 }
 
 // EndToEndSideEffects is a data-driven test runner that executes DDL statements in the
@@ -82,33 +162,44 @@ func EndToEndSideEffects(t *testing.T, relPath string, newCluster NewClusterFunc
 	skip.UnderStress(t)
 	skip.UnderStressRace(t)
 	ctx := context.Background()
-	path := testutils.RewritableDataPath(t, relPath)
+	path := datapathutils.RewritableDataPath(t, relPath)
 	// Create a test cluster.
-	db, cleanup := newCluster(t, nil /* knobs */)
+	s, db, cleanup := newCluster(t, nil /* knobs */)
 	tdb := sqlutils.MakeSQLRunner(db)
 	defer cleanup()
 	numTestStatementsObserved := 0
-	var setupStmts parser.Statements
+	var setupStmts statements.Statements
 	datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-		stmts, err := parser.Parse(d.Input)
-		require.NoError(t, err)
-		require.NotEmpty(t, stmts)
-		execStmts := func() {
-			for _, stmt := range stmts {
-				tdb.Exec(t, stmt.SQL)
+		parseStmts := func() (statements.Statements, func()) {
+			sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
+			stmts, err := parser.Parse(d.Input)
+			require.NoError(t, err)
+			require.NotEmpty(t, stmts)
+			return stmts, func() {
+				for _, stmt := range stmts {
+					tdb.Exec(t, stmt.SQL)
+				}
+				waitForSchemaChangesToSucceed(t, tdb)
 			}
-			waitForSchemaChangesToSucceed(t, tdb)
 		}
-
 		switch d.Cmd {
 		case "setup":
+			stmts, execStmts := parseStmts()
 			a := prettyNamespaceDump(t, tdb)
 			execStmts()
 			b := prettyNamespaceDump(t, tdb)
 			setupStmts = stmts
 			return sctestutils.Diff(a, b, sctestutils.DiffArgs{CompactLevel: 1})
-
+		case "stage-exec":
+			fallthrough
+		case "stage-query":
+			// Both of these commands are DML injections, which is not relevant
+			// for end-to-end testing. We don't actually execute statements here.
+			// So return the original output, these will get rewritten in
+			// cumulativeTest.
+			return d.Expected
 		case "test":
+			stmts, execStmts := parseStmts()
 			require.Lessf(t, numTestStatementsObserved, 1, "only one test per-file.")
 			numTestStatementsObserved++
 			stmtSqls := make([]string, 0, len(stmts))
@@ -125,6 +216,14 @@ func EndToEndSideEffects(t *testing.T, relPath string, newCluster NewClusterFunc
 			// The schema changer test dependencies do not hold any reference to the
 			// test cluster, here the SQLRunner is only used to populate the mocked
 			// catalog state.
+			// Set up a reference provider factory for the purpose of proper
+			// dependency resolution.
+			execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+			refFactory, refFactoryCleanup := sql.NewReferenceProviderFactoryForTest(
+				"test" /* opName */, kv.NewTxn(context.Background(), s.DB(), s.NodeID()), username.RootUserName(), &execCfg, "defaultdb",
+			)
+			defer refFactoryCleanup()
+
 			deps = sctestdeps.NewTestDependencies(
 				sctestdeps.WithDescriptors(sctestdeps.ReadDescriptorsFromDB(ctx, t, tdb).Catalog),
 				sctestdeps.WithNamespace(sctestdeps.ReadNamespaceFromDB(t, tdb).Catalog),
@@ -136,6 +235,7 @@ func EndToEndSideEffects(t *testing.T, relPath string, newCluster NewClusterFunc
 					// changer will allow non-fully implemented operations.
 					sd.NewSchemaChangerMode = sessiondatapb.UseNewSchemaChangerUnsafe
 					sd.ApplicationName = ""
+					sd.EnableUniqueWithoutIndexConstraints = true // this allows `ADD UNIQUE WITHOUT INDEX` in the testing suite.
 				})),
 				sctestdeps.WithTestingKnobs(&scexec.TestingKnobs{
 					BeforeStage: func(p scplan.Plan, stageIdx int) error {
@@ -145,6 +245,8 @@ func EndToEndSideEffects(t *testing.T, relPath string, newCluster NewClusterFunc
 				}),
 				sctestdeps.WithStatements(stmtSqls...),
 				sctestdeps.WithComments(sctestdeps.ReadCommentsFromDB(t, tdb)),
+				sctestdeps.WithIDGenerator(s),
+				sctestdeps.WithReferenceProviderFactory(refFactory),
 			)
 			stmtStates := execStatementWithTestDeps(ctx, t, deps, stmts...)
 			var fileNameSuffix string
@@ -176,7 +278,7 @@ const (
 func checkExplainDiagrams(
 	t *testing.T,
 	path string,
-	setupStmts, stmts parser.Statements,
+	setupStmts, stmts statements.Statements,
 	explainedStmt, fileNameSuffix string,
 	state scpb.CurrentState,
 	inRollback, rewrite bool,
@@ -236,6 +338,7 @@ func checkExplainDiagrams(
 		action = writePlanToFile
 	}
 	params := scplan.Params{
+		ActiveVersion:              clusterversion.TestingClusterVersion,
 		ExecutionPhase:             scop.StatementPhase,
 		SchemaChangerJobIDSupplier: func() jobspb.JobID { return 1 },
 	}
@@ -243,7 +346,7 @@ func checkExplainDiagrams(
 		params.InRollback = true
 		params.ExecutionPhase = scop.PostCommitNonRevertiblePhase
 	}
-	pl, err := scplan.MakePlan(state, params)
+	pl, err := scplan.MakePlan(context.Background(), state, params)
 	require.NoErrorf(t, err, "%s: %s", fileNameSuffix, explainedStmt)
 	action(explainDir, "ddl", pl.ExplainCompact)
 	action(explainVerboseDir, "ddl, verbose", pl.ExplainVerbose)
@@ -264,7 +367,10 @@ func replaceNonDeterministicOutput(text string) string {
 // execStatementWithTestDeps executes the DDL statement using the declarative
 // schema changer with testing dependencies injected.
 func execStatementWithTestDeps(
-	ctx context.Context, t *testing.T, deps *sctestdeps.TestState, stmts ...parser.Statement,
+	ctx context.Context,
+	t *testing.T,
+	deps *sctestdeps.TestState,
+	stmts ...statements.Statement[tree.Statement],
 ) (stateAfterBuildingEachStatement []scpb.CurrentState) {
 	var jobID jobspb.JobID
 	var state scpb.CurrentState
@@ -275,7 +381,7 @@ func execStatementWithTestDeps(
 		deps.IncrementPhase()
 		deps.LogSideEffectf("# begin %s", deps.Phase())
 		for _, stmt := range stmts {
-			state, err = scbuild.Build(ctx, deps, state, stmt.AST)
+			state, err = scbuild.Build(ctx, deps, state, stmt.AST, nil /* memAcc */)
 			require.NoError(t, err, "error in builder")
 			stateAfterBuildingEachStatement = append(stateAfterBuildingEachStatement, state)
 			state, _, err = scrun.RunStatementPhase(ctx, s.TestingKnobs(), s, state)
@@ -293,9 +399,8 @@ func execStatementWithTestDeps(
 		// Run post-commit phase in mock schema change job.
 		deps.IncrementPhase()
 		deps.LogSideEffectf("# begin %s", deps.Phase())
-		const rollback = false
 		err = scrun.RunSchemaChangesInJob(
-			ctx, deps.TestingKnobs(), deps.ClusterSettings(), deps, jobID, job.DescriptorIDs, rollback,
+			ctx, deps.TestingKnobs(), deps, jobID, job.DescriptorIDs, nil, /* rollbackCause */
 		)
 		require.NoError(t, err, "error in mock schema change job execution")
 		deps.LogSideEffectf("# end %s", deps.Phase())

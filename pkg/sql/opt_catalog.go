@@ -17,12 +17,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -68,7 +69,18 @@ type optCatalog struct {
 	tn tree.TableName
 }
 
-var _ cat.Catalog = &optCatalog{}
+var _ cat.Catalog = (*optCatalog)(nil)
+
+// optPlanningCatalog is a thin wrapper over cat.Catalog
+// with few additional planner specific methods.
+type optPlanningCatalog interface {
+	cat.Catalog
+	init(planner *planner)
+	reset()
+	fullyQualifiedNameWithTxn(
+		ctx context.Context, ds cat.DataSource, txn *kv.Txn,
+	) (cat.DataSourceName, error)
+}
 
 // init initializes an optCatalog instance (which the caller can pre-allocate).
 // The instance can be used across multiple queries, but reset() should be
@@ -135,15 +147,7 @@ func (os *optSchema) Name() *cat.SchemaName {
 func (os *optSchema) GetDataSourceNames(
 	ctx context.Context,
 ) ([]cat.DataSourceName, descpb.IDs, error) {
-	return resolver.GetObjectNamesAndIDs(
-		ctx,
-		os.planner.Txn(),
-		os.planner,
-		os.planner.ExecCfg().Codec,
-		os.database,
-		os.name.Schema(),
-		true, /* explicitPrefix */
-	)
+	return os.planner.GetObjectNamesAndIDs(ctx, os.database, os.schema)
 }
 
 func (os *optSchema) getDescriptorForPermissionsCheck() catalog.Descriptor {
@@ -227,7 +231,10 @@ func (oc *optCatalog) ResolveDataSource(
 	}
 
 	oc.tn = *name
-	lflags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveAnyTableKind)
+	lflags := tree.ObjectLookupFlags{
+		Required:          true,
+		DesiredObjectKind: tree.TableObject,
+	}
 	prefix, desc, err := resolver.ResolveExistingTableObject(ctx, oc.planner, &oc.tn, lflags)
 	if err != nil {
 		return nil, cat.DataSourceName{}, err
@@ -258,10 +265,11 @@ func (oc *optCatalog) ResolveIndex(
 			ctx,
 			oc.planner,
 			name,
-			oc.planner.Txn(),
-			oc.planner.EvalContext().Codec,
-			true, /* required */
-			true, /* requireActiveIndex */
+			tree.IndexLookupFlags{
+				Required:              true,
+				IncludeNonActiveIndex: flags.IncludeNonActiveIndexes,
+				IncludeOfflineTable:   flags.IncludeOfflineTables,
+			},
 		)
 	})
 	if err != nil {
@@ -303,7 +311,7 @@ func (oc *optCatalog) ResolveDataSourceByID(
 	tableLookup, err := oc.planner.LookupTableByID(ctx, descpb.ID(dataSourceID))
 
 	if err != nil {
-		isAdding := catalog.HasAddingTableError(err)
+		isAdding := catalog.HasAddingDescriptorError(err)
 		if errors.Is(err, catalog.ErrDescriptorNotFound) || isAdding {
 			return nil, isAdding, sqlerrors.NewUndefinedRelationError(&tree.TableRef{TableID: int64(dataSourceID)})
 		}
@@ -336,7 +344,7 @@ func (oc *optCatalog) ResolveFunction(
 
 func (oc *optCatalog) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (string, *tree.Overload, error) {
+) (*tree.FunctionName, *tree.Overload, error) {
 	return oc.planner.ResolveFunctionByOID(ctx, oid)
 }
 
@@ -374,6 +382,9 @@ func getDescForDataSource(o cat.DataSource) (catalog.TableDescriptor, error) {
 
 // CheckPrivilege is part of the cat.Catalog interface.
 func (oc *optCatalog) CheckPrivilege(ctx context.Context, o cat.Object, priv privilege.Kind) error {
+	if o.ID() == 0 {
+		return oc.planner.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, priv)
+	}
 	desc, err := getDescFromCatalogObjectForPermissions(o)
 	if err != nil {
 		return err
@@ -429,7 +440,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	}
 
 	dbID := desc.GetParentID()
-	dbDesc, err := oc.planner.Descriptors().Direct().MustGetDatabaseDescByID(ctx, txn, dbID)
+	dbDesc, err := oc.planner.Descriptors().ByID(txn).WithoutNonPublic().Get().Database(ctx, dbID)
 	if err != nil {
 		return cat.DataSourceName{}, err
 	}
@@ -439,7 +450,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	if scID == keys.PublicSchemaID {
 		scName = tree.PublicSchemaName
 	} else {
-		scDesc, err := oc.planner.Descriptors().Direct().MustGetSchemaDescByID(ctx, txn, scID)
+		scDesc, err := oc.planner.Descriptors().ByID(txn).WithoutNonPublic().Get().Schema(ctx, scID)
 		if err != nil {
 			return cat.DataSourceName{}, err
 		}
@@ -455,7 +466,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 
 // RoleExists is part of the cat.Catalog interface.
 func (oc *optCatalog) RoleExists(ctx context.Context, role username.SQLUsername) (bool, error) {
-	return RoleExists(ctx, oc.planner.ExecCfg().InternalExecutor, oc.planner.Txn(), role)
+	return RoleExists(ctx, oc.planner.InternalSQLTxn(), role)
 }
 
 // dataSourceForDesc returns a data source wrapper for the given descriptor.
@@ -779,6 +790,7 @@ func newOptTable(
 		// "stored" from the perspective of the optimizer because they are
 		// written to the primary index and all secondary indexes.
 		if !col.IsVirtual() || pkCols.Contains(col.GetID()) {
+			cd := col.ColumnDesc()
 			ot.columns[col.Ordinal()].Init(
 				col.Ordinal(),
 				cat.StableID(col.GetID()),
@@ -787,20 +799,23 @@ func newOptTable(
 				col.GetType(),
 				col.IsNullable(),
 				visibility,
-				col.ColumnDesc().DefaultExpr,
-				col.ColumnDesc().ComputeExpr,
-				col.ColumnDesc().OnUpdateExpr,
+				cd.DefaultExpr,
+				cd.ComputeExpr,
+				cd.OnUpdateExpr,
 				mapGeneratedAsIdentityType(col.GetGeneratedAsIdentityType()),
-				col.ColumnDesc().GeneratedAsIdentitySequenceOption,
+				cd.GeneratedAsIdentitySequenceOption,
 			)
 		} else {
-			// Note: a WriteOnly or DeleteOnly mutation column doesn't require any
-			// special treatment inside the optimizer, other than having the correct
-			// visibility.
+			// We need to propagate the mutation state for computed columns, so that
+			// the optimizer can correctly determine if these columns should be
+			// accessible. We need this to be propagated since virtual columns may
+			// depend on other columns, and in cascaded drop operations their accessibility
+			// will be impacted.
 			ot.columns[col.Ordinal()].InitVirtualComputed(
 				col.Ordinal(),
 				cat.StableID(col.GetID()),
 				col.ColName(),
+				kind,
 				col.GetType(),
 				col.IsNullable(),
 				visibility,
@@ -820,9 +835,10 @@ func newOptTable(
 	// This check is done for upgrade purposes. We need to avoid adding the
 	// system column if the table has a column with this name for some reason.
 	for _, sysCol := range ot.desc.SystemColumns() {
-		found, _ := desc.FindColumnWithName(sysCol.ColName())
+		found := catalog.FindColumnByTreeName(desc, sysCol.ColName())
 		if found == nil || found.IsSystemColumn() {
 			col, ord := newColumn()
+			cd := sysCol.ColumnDesc()
 			col.Init(
 				ord,
 				cat.StableID(sysCol.GetID()),
@@ -831,11 +847,11 @@ func newOptTable(
 				sysCol.GetType(),
 				sysCol.IsNullable(),
 				cat.MaybeHidden(sysCol.IsHidden()),
-				sysCol.ColumnDesc().DefaultExpr,
-				sysCol.ColumnDesc().ComputeExpr,
-				sysCol.ColumnDesc().OnUpdateExpr,
+				cd.DefaultExpr,
+				cd.ComputeExpr,
+				cd.OnUpdateExpr,
 				mapGeneratedAsIdentityType(sysCol.GetGeneratedAsIdentityType()),
-				sysCol.ColumnDesc().GeneratedAsIdentitySequenceOption,
+				cd.GeneratedAsIdentitySequenceOption,
 			)
 		}
 	}
@@ -847,17 +863,16 @@ func newOptTable(
 
 	// Add unique without index constraints. Constraints for implicitly
 	// partitioned unique indexes will be added below.
-	ot.uniqueConstraints = make([]optUniqueConstraint, 0, len(ot.desc.GetUniqueWithoutIndexConstraints()))
-	for i := range ot.desc.GetUniqueWithoutIndexConstraints() {
-		u := &ot.desc.GetUniqueWithoutIndexConstraints()[i]
-		ot.uniqueConstraints = append(ot.uniqueConstraints, optUniqueConstraint{
-			name:         u.Name,
+	ot.uniqueConstraints = make([]optUniqueConstraint, len(ot.desc.EnforcedUniqueConstraintsWithoutIndex()))
+	for i, u := range ot.desc.EnforcedUniqueConstraintsWithoutIndex() {
+		ot.uniqueConstraints[i] = optUniqueConstraint{
+			name:         u.GetName(),
 			table:        ot.ID(),
-			columns:      u.ColumnIDs,
-			predicate:    u.Predicate,
+			columns:      u.CollectKeyColumnIDs().Ordered(),
+			predicate:    u.GetPredicate(),
 			withoutIndex: true,
-			validity:     u.Validity,
-		})
+			validity:     u.GetConstraintValidity(),
+		}
 	}
 
 	// Build the indexes.
@@ -950,34 +965,32 @@ func newOptTable(
 		}
 	}
 
-	_ = ot.desc.ForeachOutboundFK(func(fk *descpb.ForeignKeyConstraint) error {
+	for _, fk := range ot.desc.OutboundForeignKeys() {
 		ot.outboundFKs = append(ot.outboundFKs, optForeignKeyConstraint{
-			name:              fk.Name,
+			name:              fk.GetName(),
 			originTable:       ot.ID(),
-			originColumns:     fk.OriginColumnIDs,
-			referencedTable:   cat.StableID(fk.ReferencedTableID),
-			referencedColumns: fk.ReferencedColumnIDs,
-			validity:          fk.Validity,
-			match:             fk.Match,
-			deleteAction:      fk.OnDelete,
-			updateAction:      fk.OnUpdate,
+			originColumns:     fk.ForeignKeyDesc().OriginColumnIDs,
+			referencedTable:   cat.StableID(fk.GetReferencedTableID()),
+			referencedColumns: fk.ForeignKeyDesc().ReferencedColumnIDs,
+			validity:          fk.GetConstraintValidity(),
+			match:             tree.CompositeKeyMatchMethodType[fk.Match()],
+			deleteAction:      tree.ForeignKeyReferenceActionType[fk.OnDelete()],
+			updateAction:      tree.ForeignKeyReferenceActionType[fk.OnUpdate()],
 		})
-		return nil
-	})
-	_ = ot.desc.ForeachInboundFK(func(fk *descpb.ForeignKeyConstraint) error {
+	}
+	for _, fk := range ot.desc.InboundForeignKeys() {
 		ot.inboundFKs = append(ot.inboundFKs, optForeignKeyConstraint{
-			name:              fk.Name,
-			originTable:       cat.StableID(fk.OriginTableID),
-			originColumns:     fk.OriginColumnIDs,
+			name:              fk.GetName(),
+			originTable:       cat.StableID(fk.GetOriginTableID()),
+			originColumns:     fk.ForeignKeyDesc().OriginColumnIDs,
 			referencedTable:   ot.ID(),
-			referencedColumns: fk.ReferencedColumnIDs,
-			validity:          fk.Validity,
-			match:             fk.Match,
-			deleteAction:      fk.OnDelete,
-			updateAction:      fk.OnUpdate,
+			referencedColumns: fk.ForeignKeyDesc().ReferencedColumnIDs,
+			validity:          fk.GetConstraintValidity(),
+			match:             tree.CompositeKeyMatchMethodType[fk.Match()],
+			deleteAction:      tree.ForeignKeyReferenceActionType[fk.OnDelete()],
+			updateAction:      tree.ForeignKeyReferenceActionType[fk.OnUpdate()],
 		})
-		return nil
-	})
+	}
 
 	ot.primaryFamily.init(ot, &desc.GetFamilies()[0])
 	ot.families = make([]optFamily, len(desc.GetFamilies())-1)
@@ -1011,12 +1024,12 @@ func newOptTable(
 		}
 	}
 	// Move all existing and synthesized checks into the opt table.
-	activeChecks := desc.ActiveChecks()
+	activeChecks := desc.EnforcedCheckConstraints()
 	ot.checkConstraints = make([]cat.CheckConstraint, 0, len(activeChecks)+len(synthesizedChecks))
 	for i := range activeChecks {
 		ot.checkConstraints = append(ot.checkConstraints, cat.CheckConstraint{
-			Constraint: activeChecks[i].Expr,
-			Validated:  activeChecks[i].Validity == descpb.ConstraintValidity_Validated,
+			Constraint: activeChecks[i].GetExpr(),
+			Validated:  activeChecks[i].GetConstraintValidity() == descpb.ConstraintValidity_Validated,
 		})
 	}
 	ot.checkConstraints = append(ot.checkConstraints, synthesizedChecks...)
@@ -1299,6 +1312,12 @@ func (ot *optTable) IsRegionalByRow() bool {
 	return localityConfig.GetRegionalByRow() != nil
 }
 
+// IsMultiregion is part of the cat.Table interface.
+func (ot *optTable) IsMultiregion() bool {
+	localityConfig := ot.desc.GetLocalityConfig()
+	return localityConfig != nil
+}
+
 // HomeRegionColName is part of the cat.Table interface.
 func (ot *optTable) HomeRegionColName() (colName string, ok bool) {
 	localityConfig := ot.desc.GetLocalityConfig()
@@ -1568,7 +1587,7 @@ func (oi *optIndex) NonInvertedPrefixColumnCount() int {
 func (oi *optIndex) Column(i int) cat.IndexColumn {
 	ord := oi.columnOrds[i]
 	// Only key columns have a direction.
-	descending := i < oi.idx.NumKeyColumns() && oi.idx.GetKeyColumnDirection(i) == catpb.IndexColumn_DESC
+	descending := i < oi.idx.NumKeyColumns() && oi.idx.GetKeyColumnDirection(i) == catenumpb.IndexColumn_DESC
 	return cat.IndexColumn{
 		Column:     oi.tab.Column(ord),
 		Descending: descending,
@@ -1753,9 +1772,24 @@ func (os *optTableStat) HistogramType() *types.T {
 	return os.stat.HistogramData.ColumnType
 }
 
+// IsPartial is part of the cat.TableStatistic interface.
+func (os *optTableStat) IsPartial() bool {
+	return os.stat.IsPartial()
+}
+
+// IsMerged is part of the cat.TableStatistic interface.
+func (os *optTableStat) IsMerged() bool {
+	return os.stat.IsMerged()
+}
+
 // IsForecast is part of the cat.TableStatistic interface.
 func (os *optTableStat) IsForecast() bool {
-	return os.stat.Name == jobspb.ForecastStatsName
+	return os.stat.IsForecast()
+}
+
+// IsAuto is part of the cat.TableStatistic interface.
+func (os *optTableStat) IsAuto() bool {
+	return os.stat.IsAuto()
 }
 
 // optFamily is a wrapper around descpb.ColumnFamilyDescriptor that keeps a
@@ -1882,9 +1916,9 @@ type optForeignKeyConstraint struct {
 	referencedColumns []descpb.ColumnID
 
 	validity     descpb.ConstraintValidity
-	match        descpb.ForeignKeyReference_Match
-	deleteAction catpb.ForeignKeyAction
-	updateAction catpb.ForeignKeyAction
+	match        tree.CompositeKeyMatchMethod
+	deleteAction tree.ReferenceAction
+	updateAction tree.ReferenceAction
 }
 
 var _ cat.ForeignKeyConstraint = &optForeignKeyConstraint{}
@@ -1943,17 +1977,17 @@ func (fk *optForeignKeyConstraint) Validated() bool {
 
 // MatchMethod is part of the cat.ForeignKeyConstraint interface.
 func (fk *optForeignKeyConstraint) MatchMethod() tree.CompositeKeyMatchMethod {
-	return descpb.ForeignKeyReferenceMatchValue[fk.match]
+	return fk.match
 }
 
 // DeleteReferenceAction is part of the cat.ForeignKeyConstraint interface.
 func (fk *optForeignKeyConstraint) DeleteReferenceAction() tree.ReferenceAction {
-	return descpb.ForeignKeyReferenceActionType[fk.deleteAction]
+	return fk.deleteAction
 }
 
 // UpdateReferenceAction is part of the cat.ForeignKeyConstraint interface.
 func (fk *optForeignKeyConstraint) UpdateReferenceAction() tree.ReferenceAction {
-	return descpb.ForeignKeyReferenceActionType[fk.updateAction]
+	return fk.updateAction
 }
 
 // optVirtualTable is similar to optTable but is used with virtual tables.
@@ -2047,6 +2081,7 @@ func newOptVirtualTable(
 		nil, /* generatedAsIdentitySequenceOption */
 	)
 	for i, d := range desc.PublicColumns() {
+		cd := d.ColumnDesc()
 		ot.columns[i+1].Init(
 			i+1,
 			cat.StableID(d.GetID()),
@@ -2055,11 +2090,11 @@ func newOptVirtualTable(
 			d.GetType(),
 			d.IsNullable(),
 			cat.MaybeHidden(d.IsHidden()),
-			d.ColumnDesc().DefaultExpr,
-			d.ColumnDesc().ComputeExpr,
-			d.ColumnDesc().OnUpdateExpr,
+			cd.DefaultExpr,
+			cd.ComputeExpr,
+			cd.OnUpdateExpr,
 			mapGeneratedAsIdentityType(d.GetGeneratedAsIdentityType()),
-			d.ColumnDesc().GeneratedAsIdentitySequenceOption,
+			cd.GeneratedAsIdentitySequenceOption,
 		)
 	}
 
@@ -2201,15 +2236,15 @@ func (ot *optVirtualTable) Statistic(i int) cat.TableStatistic {
 
 // CheckCount is part of the cat.Table interface.
 func (ot *optVirtualTable) CheckCount() int {
-	return len(ot.desc.ActiveChecks())
+	return len(ot.desc.EnforcedCheckConstraints())
 }
 
 // Check is part of the cat.Table interface.
 func (ot *optVirtualTable) Check(i int) cat.CheckConstraint {
-	check := ot.desc.ActiveChecks()[i]
+	check := ot.desc.EnforcedCheckConstraints()[i]
 	return cat.CheckConstraint{
-		Constraint: check.Expr,
-		Validated:  check.Validity == descpb.ConstraintValidity_Validated,
+		Constraint: check.GetExpr(),
+		Validated:  check.GetConstraintValidity() == descpb.ConstraintValidity_Validated,
 	}
 }
 
@@ -2275,6 +2310,11 @@ func (ot *optVirtualTable) IsGlobalTable() bool {
 
 // IsRegionalByRow is part of the cat.Table interface.
 func (ot *optVirtualTable) IsRegionalByRow() bool {
+	return false
+}
+
+// IsMultiregion is part of the cat.Table interface.
+func (ot *optVirtualTable) IsMultiregion() bool {
 	return false
 }
 
@@ -2425,7 +2465,11 @@ func (oi *optVirtualIndex) InvertedColumn() cat.IndexColumn {
 
 // Predicate is part of the cat.Index interface.
 func (oi *optVirtualIndex) Predicate() (string, bool) {
-	return "", false
+	if oi.idx == nil {
+		return "", false
+	}
+	pred := oi.idx.GetPredicate()
+	return pred, pred != ""
 }
 
 // Zone is part of the cat.Index interface.
@@ -2557,10 +2601,7 @@ func collectTypes(col catalog.Column) (descpb.IDs, error) {
 
 	ids := make(descpb.IDs, 0, len(visitor.OIDs))
 	for collectedOid := range visitor.OIDs {
-		id, err := typedesc.UserDefinedTypeOIDToID(collectedOid)
-		if err != nil {
-			return nil, err
-		}
+		id := typedesc.UserDefinedTypeOIDToID(collectedOid)
 		ids = append(ids, id)
 	}
 	return ids, nil

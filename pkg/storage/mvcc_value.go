@@ -146,42 +146,20 @@ var disableSimpleValueEncoding = util.ConstantWithMetamorphicTestBool(
 	"mvcc-value-disable-simple-encoding", false)
 
 // DisableMetamorphicSimpleValueEncoding disables the disableSimpleValueEncoding
-// metamorphic bool and emptyValueHeader value for the duration of a test,
-// resetting it at the end.
-func DisableMetamorphicSimpleValueEncoding(t *testing.T) {
+// metamorphic bool for the duration of a test, resetting it at the end.
+func DisableMetamorphicSimpleValueEncoding(t testing.TB) {
 	t.Helper()
 	if disableSimpleValueEncoding {
 		disableSimpleValueEncoding = false
-		oldHeader := emptyValueHeader
-		emptyValueHeader = enginepb.MVCCValueHeader{}
-
 		t.Cleanup(func() {
 			disableSimpleValueEncoding = true
-			emptyValueHeader = oldHeader
 		})
 	}
 }
 
-var emptyValueHeader = func() enginepb.MVCCValueHeader {
-	var h enginepb.MVCCValueHeader
-	// Hacky: we don't have room in the mid-stack inlining budget in either
-	// encodedMVCCValueSize or EncodeMVCCValue to add to the simple encoding
-	// condition (e.g. `&& !disableSimpleValueEncoding`). So to have the same
-	// effect, we replace the empty value header with a header we never expect
-	// to see. We never expect LocalTimestamp to be set to MaxClockTimestamp
-	// because if it was set to that value, LocalTimestampNeeded would never
-	// return true.
-	if disableSimpleValueEncoding {
-		h.LocalTimestamp = hlc.MaxClockTimestamp
-	}
-	return h
-}()
-
 // encodedMVCCValueSize returns the size of the MVCCValue when encoded.
-//
-//gcassert:inline
 func encodedMVCCValueSize(v MVCCValue) int {
-	if v.MVCCValueHeader == emptyValueHeader {
+	if v.MVCCValueHeader.IsEmpty() && !disableSimpleValueEncoding {
 		return len(v.Value.RawBytes)
 	}
 	return extendedPreludeSize + v.MVCCValueHeader.Size() + len(v.Value.RawBytes)
@@ -190,22 +168,20 @@ func encodedMVCCValueSize(v MVCCValue) int {
 // EncodeMVCCValue encodes an MVCCValue into its Pebble representation. See the
 // comment on MVCCValue for a description of the encoding scheme.
 //
-//gcassert:inline
+// TODO(erikgrinaker): This could mid-stack inline when we compared
+// v.MVCCValueHeader == enginepb.MVCCValueHeader{} instead of IsEmpty(), but
+// struct comparisons have a significant performance regression in Go 1.19 which
+// negates the inlining gain. Reconsider this with Go 1.20. See:
+// https://github.com/cockroachdb/cockroach/issues/88818
 func EncodeMVCCValue(v MVCCValue) ([]byte, error) {
-	if v.MVCCValueHeader == emptyValueHeader {
+	if v.MVCCValueHeader.IsEmpty() && !disableSimpleValueEncoding {
 		// Simple encoding. Use the roachpb.Value encoding directly with no
 		// modification. No need to re-allocate or copy.
 		return v.Value.RawBytes, nil
 	}
+
 	// Extended encoding. Wrap the roachpb.Value encoding with a header containing
 	// MVCC-level metadata. Requires a re-allocation and copy.
-	return encodeExtendedMVCCValue(v)
-}
-
-// encodeExtendedMVCCValue implements the extended MVCCValue encoding. It is
-// split from EncodeMVCCValue to allow that function to qualify for mid-stack
-// inlining, which avoids a function call for the simple encoding.
-func encodeExtendedMVCCValue(v MVCCValue) ([]byte, error) {
 	headerLen := v.MVCCValueHeader.Size()
 	headerSize := extendedPreludeSize + headerLen
 	valueSize := headerSize + len(v.Value.RawBytes)
@@ -244,6 +220,15 @@ func DecodeMVCCValue(buf []byte) (MVCCValue, error) {
 	return decodeExtendedMVCCValue(buf)
 }
 
+// DecodeMVCCValueAndErr is a helper that can be called using the ([]byte,
+// error) pair returned from the iterator UnsafeValue(), Value() methods.
+func DecodeMVCCValueAndErr(buf []byte, err error) (MVCCValue, error) {
+	if err != nil {
+		return MVCCValue{}, err
+	}
+	return DecodeMVCCValue(buf)
+}
+
 // Static error definitions, to permit inlining.
 var errMVCCValueMissingTag = errors.Errorf("invalid encoded mvcc value, missing tag")
 var errMVCCValueMissingHeader = errors.Errorf("invalid encoded mvcc value, missing header")
@@ -277,16 +262,36 @@ func decodeExtendedMVCCValue(buf []byte) (MVCCValue, error) {
 	if len(buf) < int(headerSize) {
 		return MVCCValue{}, errMVCCValueMissingHeader
 	}
-	var header enginepb.MVCCValueHeader
+	var v MVCCValue
 	// NOTE: we don't use protoutil to avoid passing header through an interface,
 	// which would cause a heap allocation and incur the cost of dynamic dispatch.
-	if err := header.Unmarshal(buf[extendedPreludeSize:headerSize]); err != nil {
+	if err := v.MVCCValueHeader.Unmarshal(buf[extendedPreludeSize:headerSize]); err != nil {
 		return MVCCValue{}, errors.Wrapf(err, "unmarshaling MVCCValueHeader")
 	}
-	var v MVCCValue
-	v.LocalTimestamp = header.LocalTimestamp
 	v.Value.RawBytes = buf[headerSize:]
 	return v, nil
+}
+
+// EncodedMVCCValueIsTombstone is faster than decoding a MVCCValue and then
+// calling MVCCValue.IsTombstone. It should be used when the caller does not
+// need a decoded value.
+//
+//gcassert:inline
+func EncodedMVCCValueIsTombstone(buf []byte) (bool, error) {
+	if len(buf) == 0 {
+		return true, nil
+	}
+	if len(buf) <= tagPos {
+		return false, errMVCCValueMissingTag
+	}
+	if buf[tagPos] != extendedEncodingSentinel {
+		return false, nil
+	}
+	headerSize := extendedPreludeSize + binary.BigEndian.Uint32(buf)
+	if len(buf) < int(headerSize) {
+		return false, errMVCCValueMissingHeader
+	}
+	return len(buf) == int(headerSize), nil
 }
 
 func init() {

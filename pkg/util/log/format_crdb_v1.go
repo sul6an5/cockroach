@@ -12,12 +12,14 @@ package log
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -314,14 +316,24 @@ func formatLogEntryInternalV1(
 	// the static size of tmp. But we do have an upper bound.
 	buf.Grow(len(entry.Tags) + 14 + len(entry.Message))
 
-	// Display the tags if set.
-	if len(entry.Tags) != 0 {
-		buf.Write(cp[ttycolor.Blue])
+	// We must always tag with tenant ID if present.
+	buf.Write(cp[ttycolor.Blue])
+	if entry.TenantID != "" || len(entry.Tags) != 0 {
 		buf.WriteByte('[')
-		buf.WriteString(entry.Tags)
+		if entry.TenantID != "" {
+			buf.WriteByte(TenantIDLogTagKey)
+			buf.WriteString(entry.TenantID)
+			if len(entry.Tags) != 0 {
+				buf.WriteByte(',')
+			}
+		}
+		// Display the tags if set.
+		if len(entry.Tags) != 0 {
+			buf.WriteString(entry.Tags)
+		}
 		buf.WriteString("] ")
-		buf.Write(cp[ttycolor.Reset])
 	}
+	buf.Write(cp[ttycolor.Reset])
 
 	// Display the counter if set and enabled.
 	if showCounter && entry.Counter > 0 {
@@ -417,9 +429,26 @@ func (d *entryDecoderV1) Decode(entry *logpb.Entry) error {
 
 		// Process the context tags.
 		redactable := len(m[6]) != 0
-		if len(m[7]) != 0 {
+		// Look for a tenant ID tag. Default to system otherwise.
+		entry.TenantID = serverident.SystemTenantID
+		tagsToProcess := m[7]
+		if len(tagsToProcess) != 0 && bytes.HasPrefix(tagsToProcess, tenantIDLogTagBytePrefix) {
+			commaIndex := bytes.IndexByte(tagsToProcess, ',')
+			if commaIndex >= 0 {
+				// More tags exist than just the tenant ID tag.
+				entry.TenantID = string(tagsToProcess[1:commaIndex])
+				tagsToProcess = tagsToProcess[commaIndex+1:]
+			} else {
+				// We only have a tenant ID tag.
+				entry.TenantID = string(tagsToProcess[1:])
+				tagsToProcess = []byte{}
+			}
+		}
+
+		// Process any remaining tags.
+		if len(tagsToProcess) != 0 {
 			r := redactablePackage{
-				msg:        m[7],
+				msg:        tagsToProcess,
 				redactable: redactable,
 			}
 			r = d.sensitiveEditor(r)

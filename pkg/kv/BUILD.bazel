@@ -20,6 +20,7 @@ go_library(
         "//pkg/base",
         "//pkg/keys",
         "//pkg/kv/kvbase",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/closedts",
         "//pkg/roachpb",
         "//pkg/settings",
@@ -42,6 +43,7 @@ go_library(
         "//pkg/util/uuid",
         "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -64,6 +66,7 @@ go_test(
         "//pkg/base",
         "//pkg/config/zonepb",
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/kv/kvserver/kvserverbase",
@@ -81,6 +84,7 @@ go_test(
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
+        "//pkg/util/encoding",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",

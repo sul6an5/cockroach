@@ -13,7 +13,6 @@ package colexec
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -30,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,6 +44,7 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -129,16 +130,18 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
 	}
+	rng, _ := randutil.NewTestRand()
 
 	batch := testAllocator.NewMemBatchWithMaxCapacity([]*types.T{types.Int})
 	col := batch.ColVec(0).Int64()
 
 	for i := 0; i < coldata.BatchSize(); i++ {
-		if float64(i) < float64(coldata.BatchSize())*selectivity {
+		if float64(i) < float64(coldata.BatchSize())*0.5 {
 			col[i] = -1
 		} else {
 			col[i] = 1
@@ -147,7 +150,7 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 
 	if hasNulls {
 		for i := 0; i < coldata.BatchSize(); i++ {
-			if rand.Float64() < nullProbability {
+			if rng.Float64() < 0.1 {
 				batch.ColVec(0).Nulls().SetNull(i)
 			}
 		}

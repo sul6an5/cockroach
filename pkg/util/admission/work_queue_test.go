@@ -21,10 +21,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -56,9 +57,12 @@ func (b *builderWithMu) stringAndReset() string {
 }
 
 type testGranter struct {
-	name                  string
-	buf                   *builderWithMu
-	r                     requester
+	gk   grantKind
+	name string
+	buf  *builderWithMu
+	r    requester
+
+	// Configurable knobs for tests.
 	returnValueFromTryGet bool
 	additionalTokens      int64
 }
@@ -66,21 +70,26 @@ type testGranter struct {
 var _ granterWithStoreWriteDone = &testGranter{}
 
 func (tg *testGranter) grantKind() grantKind {
-	return slot
+	return tg.gk
 }
+
 func (tg *testGranter) tryGet(count int64) bool {
 	tg.buf.printf("tryGet%s: returning %t", tg.name, tg.returnValueFromTryGet)
 	return tg.returnValueFromTryGet
 }
+
 func (tg *testGranter) returnGrant(count int64) {
 	tg.buf.printf("returnGrant%s %d", tg.name, count)
 }
+
 func (tg *testGranter) tookWithoutPermission(count int64) {
 	tg.buf.printf("tookWithoutPermission%s %d", tg.name, count)
 }
+
 func (tg *testGranter) continueGrantChain(grantChainID grantChainID) {
 	tg.buf.printf("continueGrantChain%s %d", tg.name, grantChainID)
 }
+
 func (tg *testGranter) grant(grantChainID grantChainID) {
 	rv := tg.r.granted(grantChainID)
 	if rv > 0 {
@@ -92,6 +101,7 @@ func (tg *testGranter) grant(grantChainID grantChainID) {
 	}
 	tg.buf.printf("granted%s: returned %d", tg.name, rv)
 }
+
 func (tg *testGranter) storeWriteDone(
 	originalTokens int64, doneInfo StoreWorkDoneInfo,
 ) (additionalTokens int64) {
@@ -178,19 +188,21 @@ func TestWorkQueueBasic(t *testing.T) {
 	initialTime := timeutil.FromUnixMicros(int64(100) * int64(time.Millisecond/time.Microsecond))
 	var timeSource *timeutil.ManualTime
 	var st *cluster.Settings
-	datadriven.RunTest(t, testutils.TestDataPath(t, "work_queue"),
+	registry := metric.NewRegistry()
+	metrics := makeWorkQueueMetrics("", registry)
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "work_queue"),
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "init":
 				closeFn()
-				tg = &testGranter{buf: &buf}
+				tg = &testGranter{gk: slot, buf: &buf}
 				opts := makeWorkQueueOptions(KVWork)
 				timeSource = timeutil.NewManualTime(initialTime)
 				opts.timeSource = timeSource
 				opts.disableEpochClosingGoroutine = true
 				st = cluster.MakeTestingClusterSettings()
 				q = makeWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()),
-					KVWork, tg, st, opts).(*WorkQueue)
+					KVWork, tg, st, metrics, opts).(*WorkQueue)
 				tg.r = q
 				wrkMap.resetMap()
 				return ""
@@ -313,7 +325,7 @@ func TestWorkQueueBasic(t *testing.T) {
 func scanTenantID(t *testing.T, d *datadriven.TestData) roachpb.TenantID {
 	var id int
 	d.ScanArgs(t, "tenant", &id)
-	return roachpb.MakeTenantID(uint64(id))
+	return roachpb.MustMakeTenantID(uint64(id))
 }
 
 // TestWorkQueueTokenResetRace induces racing between tenantInfo.used
@@ -326,10 +338,12 @@ func TestWorkQueueTokenResetRace(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var buf builderWithMu
-	tg := &testGranter{buf: &buf}
+	tg := &testGranter{gk: slot, buf: &buf}
 	st := cluster.MakeTestingClusterSettings()
+	registry := metric.NewRegistry()
+	metrics := makeWorkQueueMetrics("", registry)
 	q := makeWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()), SQLKVResponseWork, tg,
-		st, makeWorkQueueOptions(SQLKVResponseWork)).(*WorkQueue)
+		st, metrics, makeWorkQueueOptions(SQLKVResponseWork)).(*WorkQueue)
 	tg.r = q
 	createTime := int64(0)
 	stopCh := make(chan struct{})
@@ -344,7 +358,7 @@ func TestWorkQueueTokenResetRace(t *testing.T) {
 			select {
 			case <-ticker.C:
 				ctx, cancel := context.WithCancel(context.Background())
-				work2 := &testWork{tenantID: roachpb.MakeTenantID(tenantID), cancel: cancel}
+				work2 := &testWork{tenantID: roachpb.MustMakeTenantID(tenantID), cancel: cancel}
 				tenantID++
 				go func(ctx context.Context, w *testWork, createTime int64) {
 					enabled, err := q.Admit(ctx, WorkInfo{
@@ -449,13 +463,13 @@ func TestPriorityStates(t *testing.T) {
 		})
 }
 
-func tryScanWorkClass(t *testing.T, d *datadriven.TestData) workClass {
-	wc := regularWorkClass
+func tryScanWorkClass(t *testing.T, d *datadriven.TestData) admissionpb.WorkClass {
+	wc := admissionpb.RegularWorkClass
 	if d.HasArg("elastic") {
 		var b bool
 		d.ScanArgs(t, "elastic", &b)
 		if b {
-			wc = elasticWorkClass
+			wc = admissionpb.ElasticWorkClass
 		}
 	}
 	return wc
@@ -482,7 +496,7 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 		}
 	}
 	defer closeFn()
-	var tg [numWorkClasses]*testGranter
+	var tg [admissionpb.NumWorkClasses]*testGranter
 	var wrkMap workMap
 	var buf builderWithMu
 	var st *cluster.Settings
@@ -490,27 +504,29 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 		q.mu.Lock()
 		defer q.mu.Unlock()
 		return fmt.Sprintf("regular workqueue: %s\nelastic workqueue: %s\nstats:%+v\nestimates:%+v",
-			q.q[regularWorkClass].String(), q.q[elasticWorkClass].String(), q.mu.stats,
+			q.q[admissionpb.RegularWorkClass].String(), q.q[admissionpb.ElasticWorkClass].String(), q.mu.stats,
 			q.mu.estimates)
 	}
 
-	datadriven.RunTest(t, testutils.TestDataPath(t, "store_work_queue"),
+	registry := metric.NewRegistry()
+	metrics := makeWorkQueueMetrics("", registry)
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "store_work_queue"),
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "init":
 				closeFn()
-				tg[regularWorkClass] = &testGranter{name: " regular", buf: &buf}
-				tg[elasticWorkClass] = &testGranter{name: " elastic", buf: &buf}
+				tg[admissionpb.RegularWorkClass] = &testGranter{gk: token, name: " regular", buf: &buf}
+				tg[admissionpb.ElasticWorkClass] = &testGranter{gk: token, name: " elastic", buf: &buf}
 				opts := makeWorkQueueOptions(KVWork)
 				opts.usesTokens = true
 				opts.timeSource = timeutil.NewManualTime(timeutil.FromUnixMicros(0))
 				opts.disableEpochClosingGoroutine = true
 				st = cluster.MakeTestingClusterSettings()
-				q = makeStoreWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()),
-					[numWorkClasses]granterWithStoreWriteDone{tg[regularWorkClass], tg[elasticWorkClass]},
-					st, opts).(*StoreWorkQueue)
-				tg[regularWorkClass].r = q.getRequesters()[regularWorkClass]
-				tg[elasticWorkClass].r = q.getRequesters()[elasticWorkClass]
+				q = makeStoreWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()), roachpb.StoreID(1),
+					[admissionpb.NumWorkClasses]granterWithStoreWriteDone{tg[admissionpb.RegularWorkClass], tg[admissionpb.ElasticWorkClass]},
+					st, metrics, opts, nil /* testing knobs */).(*StoreWorkQueue)
+				tg[admissionpb.RegularWorkClass].r = q.getRequesters()[admissionpb.RegularWorkClass]
+				tg[admissionpb.ElasticWorkClass].r = q.getRequesters()[admissionpb.ElasticWorkClass]
 				wrkMap.resetMap()
 				return ""
 

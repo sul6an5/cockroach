@@ -15,7 +15,9 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
@@ -28,17 +30,17 @@ import (
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.PushTxn, declareKeysPushTransaction, PushTxn)
+	RegisterReadWriteCommand(kvpb.PushTxn, declareKeysPushTransaction, PushTxn)
 }
 
 func declareKeysPushTransaction(
 	rs ImmutableRangeState,
-	_ *roachpb.Header,
-	req roachpb.Request,
+	_ *kvpb.Header,
+	req kvpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
-	pr := req.(*roachpb.PushTxnRequest)
+	pr := req.(*kvpb.PushTxnRequest)
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.TransactionKey(pr.PusheeTxn.Key, pr.PusheeTxn.ID)})
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.AbortSpanKey(rs.GetRangeID(), pr.PusheeTxn.ID)})
 }
@@ -108,11 +110,11 @@ func declareKeysPushTransaction(
 // purge records for which the transaction coordinator must have found out
 // via its heartbeats that the transaction has failed.
 func PushTxn(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.PushTxnRequest)
+	args := cArgs.Args.(*kvpb.PushTxnRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.PushTxnResponse)
+	reply := resp.(*kvpb.PushTxnResponse)
 
 	if h.Txn != nil {
 		return result.Result{}, ErrTransactionUnsupported
@@ -192,7 +194,7 @@ func PushTxn(
 	// If we're trying to move the timestamp forward, and it's already
 	// far enough forward, return success.
 	pushType := args.PushType
-	if pushType == roachpb.PUSH_TIMESTAMP && args.PushTo.LessEq(reply.PusheeTxn.WriteTimestamp) {
+	if pushType == kvpb.PUSH_TIMESTAMP && args.PushTo.LessEq(reply.PusheeTxn.WriteTimestamp) {
 		// Trivial noop.
 		return result.Result{}, nil
 	}
@@ -219,14 +221,12 @@ func PushTxn(
 		reply.PusheeTxn.Status = roachpb.PENDING
 		reply.PusheeTxn.InFlightWrites = nil
 		// If the pusher is aware that the pushee's currently recorded attempt
-		// at a parallel commit failed but the transaction's epoch has not yet
-		// been incremented, upgrade PUSH_TIMESTAMPs to PUSH_ABORTs. We don't
-		// want to move the transaction back to PENDING in the same epoch, as
-		// this is not (currently) allowed by the recovery protocol. We also
-		// don't want to move the transaction to a new timestamp while retaining
-		// the STAGING status, as this could allow the transaction to enter an
-		// implicit commit state without its knowledge, leading to atomicity
-		// violations.
+		// at a parallel commit failed, upgrade PUSH_TIMESTAMPs to PUSH_ABORTs.
+		// We don't want to move the transaction back to PENDING, as this is not
+		// (currently) allowed by the recovery protocol. We also don't want to
+		// move the transaction to a new timestamp while retaining the STAGING
+		// status, as this could allow the transaction to enter an implicit
+		// commit state without its knowledge, leading to atomicity violations.
 		//
 		// This has no effect on pushes that fail with a TransactionPushError.
 		// Such pushes will still wait on the pushee to retry its commit and
@@ -236,8 +236,8 @@ func PushTxn(
 		// cases, the push acts the same as a short-circuited transaction
 		// recovery process, because the transaction recovery procedure always
 		// finalizes target transactions, even if initiated by a PUSH_TIMESTAMP.
-		if !knownHigherEpoch && pushType == roachpb.PUSH_TIMESTAMP {
-			pushType = roachpb.PUSH_ABORT
+		if pushType == kvpb.PUSH_TIMESTAMP {
+			pushType = kvpb.PUSH_ABORT
 		}
 	}
 
@@ -249,9 +249,9 @@ func PushTxn(
 		reason = "pushee is expired"
 		// When cleaning up, actually clean up (as opposed to simply pushing
 		// the garbage in the path of future writers).
-		pushType = roachpb.PUSH_ABORT
+		pushType = kvpb.PUSH_ABORT
 		pusherWins = true
-	case pushType == roachpb.PUSH_TOUCH:
+	case pushType == kvpb.PUSH_TOUCH:
 		// If just attempting to cleanup old or already-committed txns,
 		// pusher always fails.
 		pusherWins = false
@@ -281,13 +281,13 @@ func PushTxn(
 	// attempting to finalize it.
 	recoverOnFailedPush := cArgs.EvalCtx.EvalKnobs().RecoverIndeterminateCommitsOnFailedPushes
 	if reply.PusheeTxn.Status == roachpb.STAGING && (pusherWins || recoverOnFailedPush) {
-		err := roachpb.NewIndeterminateCommitError(reply.PusheeTxn)
+		err := kvpb.NewIndeterminateCommitError(reply.PusheeTxn)
 		log.VEventf(ctx, 1, "%v", err)
 		return result.Result{}, err
 	}
 
 	if !pusherWins {
-		err := roachpb.NewTransactionPushError(reply.PusheeTxn)
+		err := kvpb.NewTransactionPushError(reply.PusheeTxn)
 		log.VEventf(ctx, 1, "%v", err)
 		return result.Result{}, err
 	}
@@ -297,37 +297,48 @@ func PushTxn(
 
 	// Determine what to do with the pushee, based on the push type.
 	switch pushType {
-	case roachpb.PUSH_ABORT:
+	case kvpb.PUSH_ABORT:
 		// If aborting the transaction, set the new status.
 		reply.PusheeTxn.Status = roachpb.ABORTED
-		// If the transaction record was already present, forward the timestamp
-		// to accommodate AbortSpan GC. See method comment for details.
+		// Forward the timestamp to accommodate AbortSpan GC. See method comment for
+		// details.
+		reply.PusheeTxn.WriteTimestamp.Forward(reply.PusheeTxn.LastActive())
+		// If the transaction record was already present, persist the updates to it.
+		// If not, then we don't want to create it. This could allow for finalized
+		// transactions to be revived. Instead, we obey the invariant that only the
+		// transaction's own coordinator can issue requests that create its
+		// transaction record. To ensure that a timestamp push or an abort is
+		// respected for transactions without transaction records, we rely on markers
+		// in the timestamp cache.
 		if ok {
-			reply.PusheeTxn.WriteTimestamp.Forward(reply.PusheeTxn.LastActive())
+			txnRecord := reply.PusheeTxn.AsRecord()
+			if err := storage.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &txnRecord); err != nil {
+				return result.Result{}, err
+			}
 		}
-	case roachpb.PUSH_TIMESTAMP:
+	case kvpb.PUSH_TIMESTAMP:
+		if existTxn.Status != roachpb.PENDING {
+			return result.Result{}, errors.AssertionFailedf(
+				"PUSH_TIMESTAMP succeeded against non-PENDING txn: %v", existTxn)
+		}
 		// Otherwise, update timestamp to be one greater than the request's
-		// timestamp. This new timestamp will be use to update the read timestamp
-		// cache. If the transaction record was not already present then we rely on
-		// the timestamp cache to prevent the record from ever being written with a
-		// timestamp beneath this timestamp.
+		// timestamp. This new timestamp will be used to update the read timestamp
+		// cache. We rely on the timestamp cache to prevent the record from ever
+		// being committed with a timestamp beneath this timestamp.
 		reply.PusheeTxn.WriteTimestamp.Forward(args.PushTo)
+		// If the transaction record was already present, continue to update the
+		// transaction record until all nodes are running v23.1. v22.2 nodes won't
+		// know to check the timestamp cache again on commit to learn about any
+		// successful timestamp pushes.
+		// TODO(nvanbenschoten): remove this logic in v23.2.
+		if ok && !cArgs.EvalCtx.ClusterSettings().Version.IsActive(ctx, clusterversion.V23_1) {
+			txnRecord := reply.PusheeTxn.AsRecord()
+			if err := storage.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &txnRecord); err != nil {
+				return result.Result{}, err
+			}
+		}
 	default:
 		return result.Result{}, errors.AssertionFailedf("unexpected push type: %v", pushType)
-	}
-
-	// If the transaction record was already present, persist the updates to it.
-	// If not, then we don't want to create it. This could allow for finalized
-	// transactions to be revived. Instead, we obey the invariant that only the
-	// transaction's own coordinator can issue requests that create its
-	// transaction record. To ensure that a timestamp push or an abort is
-	// respected for transactions without transaction records, we rely on markers
-	// in the timestamp cache.
-	if ok {
-		txnRecord := reply.PusheeTxn.AsRecord()
-		if err := storage.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &txnRecord); err != nil {
-			return result.Result{}, err
-		}
 	}
 
 	result := result.Result{}

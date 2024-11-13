@@ -11,7 +11,7 @@
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import moment from "moment";
+import moment from "moment-timezone";
 import { Link } from "react-router-dom";
 import { isUndefined } from "lodash";
 
@@ -30,8 +30,7 @@ import {
   refreshStatementDiagnosticsRequests,
 } from "src/redux/apiReducers";
 import "./statementDiagnosticsHistoryView.styl";
-import { cockroach } from "src/js/protos";
-import IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 import { statementDiagnostics } from "src/util/docs";
 import { summarize } from "src/util/sql/summarize";
 import { trackDownloadDiagnosticsBundle } from "src/util/analytics";
@@ -46,10 +45,11 @@ import {
   SortedTable,
   SortSetting,
   ColumnDescriptor,
+  util,
+  Timestamp,
 } from "@cockroachlabs/cluster-ui";
 import { cancelStatementDiagnosticsReportAction } from "src/redux/statements";
 import { trackCancelDiagnosticsBundleAction } from "src/redux/analyticsActions";
-import { DATE_FORMAT_24_UTC } from "src/util/format";
 
 type StatementDiagnosticsHistoryViewProps = MapStateToProps &
   MapDispatchToProps;
@@ -92,15 +92,16 @@ class StatementDiagnosticsHistoryView extends React.Component<
   StatementDiagnosticsHistoryViewProps,
   StatementDiagnosticsHistoryViewState
 > {
-  columns: ColumnDescriptor<IStatementDiagnosticsReport>[] = [
+  columns: ColumnDescriptor<clusterUiApi.StatementDiagnosticsReport>[] = [
     {
       title: "Activated on",
       name: "activated_on",
-      cell: record =>
-        moment
-          .utc(record.requested_at.seconds.toNumber() * 1000)
-          .format(DATE_FORMAT_24_UTC),
-      sort: record => moment(record.requested_at.seconds.toNumber() * 1000),
+      cell: record => (
+        <Timestamp time={record.requested_at} format={util.DATE_FORMAT_24_TZ} />
+      ),
+      sort: record => {
+        return moment.utc(record.requested_at).unix();
+      },
     },
     {
       title: "Statement",
@@ -248,6 +249,7 @@ class StatementDiagnosticsHistoryView extends React.Component<
         {this.renderTableTitle()}
         <StatementDiagnosticsHistoryTable
           className="statements-table"
+          tableWrapperClassName="sorted-table"
           data={dataSource}
           columns={this.columns}
           loading={loading}
@@ -278,14 +280,16 @@ class StatementDiagnosticsHistoryView extends React.Component<
 
 interface MapStateToProps {
   loading: boolean;
-  diagnosticsReports: IStatementDiagnosticsReport[];
+  diagnosticsReports: clusterUiApi.StatementDiagnosticsReport[];
   getStatementByFingerprint: (
     fingerprint: string,
   ) => ReturnType<typeof selectStatementByFingerprint>;
 }
 
 interface MapDispatchToProps {
-  onDiagnosticCancelRequest: (report: IStatementDiagnosticsReport) => void;
+  onDiagnosticCancelRequest: (
+    report: clusterUiApi.StatementDiagnosticsReport,
+  ) => void;
   refresh: () => void;
 }
 
@@ -297,8 +301,10 @@ const mapStateToProps = (state: AdminUIState): MapStateToProps => ({
 });
 
 const mapDispatchToProps = (dispatch: AppDispatch): MapDispatchToProps => ({
-  onDiagnosticCancelRequest: (report: IStatementDiagnosticsReport) => {
-    dispatch(cancelStatementDiagnosticsReportAction(report.id));
+  onDiagnosticCancelRequest: (
+    report: clusterUiApi.StatementDiagnosticsReport,
+  ) => {
+    dispatch(cancelStatementDiagnosticsReportAction({ requestId: report.id }));
     dispatch(trackCancelDiagnosticsBundleAction(report.statement_fingerprint));
   },
   refresh: () => {

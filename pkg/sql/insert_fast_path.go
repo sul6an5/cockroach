@@ -14,6 +14,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -26,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -69,7 +70,7 @@ type insertFastPathRun struct {
 	inputBuf tree.Datums
 
 	// fkBatch accumulates the FK existence checks.
-	fkBatch roachpb.BatchRequest
+	fkBatch kvpb.BatchRequest
 	// fkSpanInfo keeps track of information for each fkBatch.Request entry.
 	fkSpanInfo []insertFastPathFKSpanInfo
 
@@ -106,7 +107,7 @@ func (c *insertFastPathFKCheck) init(params runParams) error {
 	codec := params.ExecCfg().Codec
 	c.keyPrefix = rowenc.MakeIndexKeyPrefix(codec, c.tabDesc.GetID(), c.idx.GetID())
 	c.spanBuilder.Init(params.EvalContext(), codec, c.tabDesc, c.idx)
-	c.spanSplitter = span.MakeSplitter(c.tabDesc, c.idx, util.FastIntSet{} /* neededColOrdinals */)
+	c.spanSplitter = span.MakeSplitter(c.tabDesc, c.idx, intsets.Fast{} /* neededColOrdinals */)
 
 	if len(c.InsertCols) > idx.numLaxKeyCols {
 		return errors.AssertionFailedf(
@@ -188,9 +189,9 @@ func (r *insertFastPathRun) addFKChecks(
 			log.VEventf(ctx, 2, "FKScan %s", span)
 		}
 		reqIdx := len(r.fkBatch.Requests)
-		r.fkBatch.Requests = append(r.fkBatch.Requests, roachpb.RequestUnion{})
-		r.fkBatch.Requests[reqIdx].MustSetInner(&roachpb.ScanRequest{
-			RequestHeader: roachpb.RequestHeaderFromSpan(span),
+		r.fkBatch.Requests = append(r.fkBatch.Requests, kvpb.RequestUnion{})
+		r.fkBatch.Requests[reqIdx].MustSetInner(&kvpb.ScanRequest{
+			RequestHeader: kvpb.RequestHeaderFromSpan(span),
 		})
 		r.fkSpanInfo = append(r.fkSpanInfo, insertFastPathFKSpanInfo{
 			check:  c,
@@ -209,13 +210,14 @@ func (n *insertFastPathNode) runFKChecks(params runParams) error {
 	defer n.run.fkBatch.Reset()
 
 	// Run the FK checks batch.
-	br, err := params.p.txn.Send(params.ctx, n.run.fkBatch)
+	ba := n.run.fkBatch.ShallowCopy()
+	br, err := params.p.txn.Send(params.ctx, ba)
 	if err != nil {
 		return err.GoError()
 	}
 
 	for i := range br.Responses {
-		resp := br.Responses[i].GetInner().(*roachpb.ScanResponse)
+		resp := br.Responses[i].GetInner().(*kvpb.ScanResponse)
 		if len(resp.Rows) == 0 {
 			// No results for lookup; generate the violation error.
 			info := n.run.fkSpanInfo[i]
@@ -246,7 +248,7 @@ func (n *insertFastPathNode) startExec(params runParams) error {
 			}
 		}
 		maxSpans := len(n.run.fkChecks) * len(n.input)
-		n.run.fkBatch.Requests = make([]roachpb.RequestUnion, 0, maxSpans)
+		n.run.fkBatch.Requests = make([]kvpb.RequestUnion, 0, maxSpans)
 		n.run.fkSpanInfo = make([]insertFastPathFKSpanInfo, 0, maxSpans)
 		if len(n.input) > 1 {
 			n.run.fkSpanMap = make(map[string]struct{}, maxSpans)
@@ -281,7 +283,7 @@ func (n *insertFastPathNode) BatchedNext(params runParams) (bool, error) {
 		inputRow := n.run.inputRow(rowIdx)
 		for col, typedExpr := range tupleRow {
 			var err error
-			inputRow[col], err = eval.Expr(params.EvalContext(), typedExpr)
+			inputRow[col], err = eval.Expr(params.ctx, params.EvalContext(), typedExpr)
 			if err != nil {
 				err = interceptAlterColumnTypeParseError(n.run.insertCols, col, err)
 				return false, err

@@ -19,12 +19,10 @@ ARCH=$(uname -m)
 # Add third-party APT repositories.
 apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 0EBFCD88
 cat > /etc/apt/sources.list.d/docker.list <<EOF
-deb https://download.docker.com/linux/ubuntu bionic stable
+deb https://download.docker.com/linux/ubuntu focal stable
 EOF
-# Git 2.7, which ships with Xenial, has a bug where submodule metadata sometimes
-# uses absolute paths instead of relative paths, which means the affected
-# submodules cannot be mounted in Docker containers. Use the latest version of
-# Git until we upgrade to a newer Ubuntu distribution.
+# This was necessary for a bug back in Xenial.
+# TODO(#90203): Determine if this is still necessary.
 add-apt-repository ppa:git-core/ppa
 apt-get update --yes
 
@@ -49,6 +47,14 @@ apt-get install --yes \
   python3 \
   unzip
 
+# Enable support for executing binaries of all architectures via qemu emulation
+# (necessary for building arm64 Docker images)
+apt-get install --yes qemu binfmt-support qemu-user-static
+
+# Verify that both of the platforms we support Docker for can be built.
+docker run --attach=stdout --attach=stderr --platform=linux/amd64 --rm --pull=always registry.access.redhat.com/ubi8/ubi-minimal uname -p
+docker run --attach=stdout --attach=stderr --platform=linux/arm64 --rm --pull=always registry.access.redhat.com/ubi8/ubi-minimal uname -p
+
 case $ARCH in
     x86_64) WHICH=x86_64; SHASUM=97bf730372f9900b2dfb9206fccbcf92f5c7f3b502148b832e77451aa0f9e0e6 ;;
     aarch64) WHICH=aarch64; SHASUM=77620f99e9d5f39cf4a49294c6a68c89a978ecef144894618974b9958efe3c2a ;;
@@ -61,9 +67,9 @@ tar --strip-components=1 -C /usr -xzf /tmp/cmake.tar.gz
 rm -f /tmp/cmake.tar.gz
 
 if [ $ARCH = x86_64 ]; then
-    curl -fsSL https://dl.google.com/go/go1.19.1.linux-amd64.tar.gz > /tmp/go.tgz
+    curl -fsSL https://dl.google.com/go/go1.19.4.linux-amd64.tar.gz > /tmp/go.tgz
     sha256sum -c - <<EOF
-acc512fbab4f716a8f97a8b3fbaa9ddd39606a28be6c2515ef7c6c6311acffde  /tmp/go.tgz
+c9c08f783325c4cf840a94333159cc937f05f75d36a8b307951d5bd959cf2ab8  /tmp/go.tgz
 EOF
     tar -C /usr/local -zxf /tmp/go.tgz && rm /tmp/go.tgz
 
@@ -165,17 +171,9 @@ if [ $ARCH = x86_64 ]; then
     git submodule update --init --recursive
     for branch in $(git branch --all --list --sort=-committerdate 'origin/release-*' | head -n1) master
     do
-        # Clean out all non-checked-in files. This is because of the check-in of
-        # the generated execgen files. Once we are no longer building 20.1 builds,
-        # the `git clean -dxf` line can be removed.
-        git clean -dxf
-
         git checkout "$branch"
-        # Stupid submodules.
-        rm -rf vendor; git checkout vendor; git submodule update --init --recursive
-        COCKROACH_BUILDER_CCACHE=1 build/builder.sh make test testrace TESTTIMEOUT=45m TESTS=-
         # TODO(benesch): store the acceptanceversion somewhere more accessible.
-       docker pull $(git grep cockroachdb/acceptance -- '*.go' | sed -E 's/.*"([^"]*).*"/\1/') || true
+        docker pull $(git grep cockroachdb/acceptance -- '*.go' | sed -E 's/.*"([^"]*).*"/\1/') || true
     done
     cd -
 fi

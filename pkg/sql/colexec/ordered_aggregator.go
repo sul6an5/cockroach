@@ -141,7 +141,9 @@ var _ colexecop.ResettableOperator = &orderedAggregator{}
 var _ colexecop.ClosableOperator = &orderedAggregator{}
 
 // NewOrderedAggregator creates an ordered aggregator.
-func NewOrderedAggregator(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+func NewOrderedAggregator(
+	ctx context.Context, args *colexecagg.NewAggregatorArgs,
+) colexecop.ResettableOperator {
 	for _, aggFn := range args.Spec.Aggregations {
 		if aggFn.FilterColIdx != nil {
 			colexecerror.InternalError(errors.AssertionFailedf("filtering ordered aggregation is not supported"))
@@ -154,7 +156,7 @@ func NewOrderedAggregator(args *colexecagg.NewAggregatorArgs) colexecop.Resettab
 	// We will be reusing the same aggregate functions, so we use 1 as the
 	// allocation size.
 	funcsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
-		args, args.Spec.Aggregations, 1 /* allocSize */, colexecagg.OrderedAggKind,
+		ctx, args, args.Spec.Aggregations, 1 /* allocSize */, colexecagg.OrderedAggKind,
 	)
 	if err != nil {
 		colexecerror.InternalError(err)
@@ -190,7 +192,7 @@ func (a *orderedAggregator) Next() coldata.Batch {
 		switch a.state {
 		case orderedAggregatorAggregating:
 			if a.scratch.shouldResetInternalBatch {
-				a.allocator.ResetBatch(a.scratch)
+				a.scratch.ResetInternalBatch()
 				a.scratch.shouldResetInternalBatch = false
 			}
 			if a.scratch.resumeIdx >= coldata.BatchSize() {
@@ -325,7 +327,7 @@ func (a *orderedAggregator) Next() coldata.Batch {
 				if a.unsafeBatch == nil {
 					a.unsafeBatch = a.allocator.NewMemBatchWithFixedCapacity(a.outputTypes, coldata.BatchSize())
 				} else {
-					a.allocator.ResetBatch(a.unsafeBatch)
+					a.unsafeBatch.ResetInternalBatch()
 				}
 				a.allocator.PerformOperation(a.unsafeBatch.ColVecs(), func() {
 					for i := 0; i < len(a.outputTypes); i++ {
@@ -351,7 +353,7 @@ func (a *orderedAggregator) Next() coldata.Batch {
 				// the source and the destination would be the same, and
 				// resetting it would lead to the loss of data.
 				newResumeIdx := a.scratch.resumeIdx - coldata.BatchSize()
-				a.allocator.ResetBatch(a.scratch.tempBuffer)
+				a.scratch.tempBuffer.ResetInternalBatch()
 				a.allocator.PerformOperation(a.scratch.tempBuffer.ColVecs(), func() {
 					for i := 0; i < len(a.outputTypes); i++ {
 						a.scratch.tempBuffer.ColVec(i).Copy(
@@ -363,7 +365,7 @@ func (a *orderedAggregator) Next() coldata.Batch {
 						)
 					}
 				})
-				a.allocator.ResetBatch(a.scratch)
+				a.scratch.ResetInternalBatch()
 				a.allocator.PerformOperation(a.scratch.ColVecs(), func() {
 					for i := 0; i < len(a.outputTypes); i++ {
 						a.scratch.ColVec(i).Copy(

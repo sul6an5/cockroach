@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -26,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -52,13 +51,6 @@ var (
 		"sql.ttl.default_delete_batch_size",
 		"default amount of rows to delete in a single query during a TTL job",
 		100,
-		settings.PositiveInt,
-	).WithPublic()
-	defaultRangeConcurrency = settings.RegisterIntSetting(
-		settings.TenantWritable,
-		"sql.ttl.default_range_concurrency",
-		"default amount of ranges to process at once during a TTL delete",
-		1,
 		settings.PositiveInt,
 	).WithPublic()
 	defaultDeleteRateLimit = settings.RegisterIntSetting(
@@ -111,16 +103,17 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 	}
 	aost := details.Cutoff.Add(aostDuration)
 
+	ttlSpecAOST := aost
+	// Set ttlSpec.AOST to 0 to avoid overriding 0 duration in tests.
+	if knobs.AOSTDuration != nil {
+		ttlSpecAOST = time.Time{}
+	}
+
 	var rowLevelTTL catpb.RowLevelTTL
 	var relationName string
 	var entirePKSpan roachpb.Span
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		desc, err := descsCol.GetImmutableTableByID(
-			ctx,
-			txn,
-			details.TableID,
-			tree.ObjectLookupFlagsWithRequired(),
-		)
+		desc, err := descsCol.ByIDWithLeased(txn).WithoutNonPublic().Get().Table(ctx, details.TableID)
 		if err != nil {
 			return err
 		}
@@ -144,7 +137,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 			return errors.Newf("ttl jobs on table %s are currently paused", tree.Name(desc.GetName()))
 		}
 
-		tn, err := descs.GetTableNameByDesc(ctx, txn, descsCol, desc)
+		tn, err := descs.GetObjectName(ctx, txn, descsCol, desc)
 		if err != nil {
 			return errors.Wrapf(err, "error fetching table relation name for TTL")
 		}
@@ -156,10 +149,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		return err
 	}
 
-	ttlExpr := colinfo.DefaultTTLExpirationExpr
-	if rowLevelTTL.HasExpirationExpr() {
-		ttlExpr = "(" + rowLevelTTL.ExpirationExpr + ")"
-	}
+	ttlExpr := rowLevelTTL.GetTTLExpr()
 
 	labelMetrics := rowLevelTTL.LabelMetrics
 	group := ctxgroup.WithContext(ctx)
@@ -229,46 +219,49 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		}
 
 		jobID := t.job.ID()
-		rangeConcurrency := getRangeConcurrency(settingsValues, rowLevelTTL)
 		selectBatchSize := getSelectBatchSize(settingsValues, rowLevelTTL)
 		deleteBatchSize := getDeleteBatchSize(settingsValues, rowLevelTTL)
 		deleteRateLimit := getDeleteRateLimit(settingsValues, rowLevelTTL)
 		newTTLSpec := func(spans []roachpb.Span) *execinfrapb.TTLSpec {
 			return &execinfrapb.TTLSpec{
-				JobID:                       jobID,
-				RowLevelTTLDetails:          details,
-				AOST:                        aost,
+				JobID:              jobID,
+				RowLevelTTLDetails: details,
+				// Set AOST in case of mixed 22.2.0/22.2.1+ cluster where the job started on a 22.2.1+ node.
+				AOST:                        ttlSpecAOST,
 				TTLExpr:                     ttlExpr,
 				Spans:                       spans,
-				RangeConcurrency:            rangeConcurrency,
 				SelectBatchSize:             selectBatchSize,
 				DeleteBatchSize:             deleteBatchSize,
 				DeleteRateLimit:             deleteRateLimit,
 				LabelMetrics:                rowLevelTTL.LabelMetrics,
 				PreDeleteChangeTableVersion: knobs.PreDeleteChangeTableVersion,
 				PreSelectStatement:          knobs.PreSelectStatement,
+				AOSTDuration:                aostDuration,
 			}
 		}
 
-		if !execCfg.Settings.Version.IsActive(ctx, clusterversion.TTLDistSQL) {
-			var spans []roachpb.Span
-			for _, spanPartition := range spanPartitions {
-				spans = append(spans, spanPartition.Spans...)
-			}
-			tp := ttlProcessor{
-				ttlSpec: *newTTLSpec(spans),
-				ttlProcessorOverride: &ttlProcessorOverride{
-					descsCol:       evalCtx.Descs,
-					db:             execCfg.DB,
-					codec:          execCfg.Codec,
-					jobRegistry:    execCfg.JobRegistry,
-					sqlInstanceID:  execCfg.NodeInfo.NodeID.SQLInstanceID(),
-					settingsValues: settingsValues,
-					ie:             execCfg.InternalExecutor,
-				},
-			}
-			return tp.work(ctx)
+		jobSpanCount := 0
+		for _, spanPartition := range spanPartitions {
+			jobSpanCount += len(spanPartition.Spans)
 		}
+
+		jobRegistry := execCfg.JobRegistry
+		if err := jobRegistry.UpdateJobWithTxn(
+			ctx,
+			jobID,
+			nil,  /* txn */
+			true, /* useReadLock */
+			func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+				progress := md.Progress
+				rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
+				rowLevelTTL.JobSpanCount = int64(jobSpanCount)
+				ju.UpdateProgress(progress)
+				return nil
+			},
+		); err != nil {
+			return err
+		}
+
 		sqlInstanceIDToTTLSpec := make(map[base.SQLInstanceID]*execinfrapb.TTLSpec, len(spanPartitions))
 		for _, spanPartition := range spanPartitions {
 			sqlInstanceIDToTTLSpec[spanPartition.SQLInstanceID] = newTTLSpec(spanPartition.Spans)
@@ -294,7 +287,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		)
 		physicalPlan.PlanToStreamColMap = []int{}
 
-		distSQLPlanner.FinalizePlan(planCtx, physicalPlan)
+		sql.FinalizePlan(ctx, planCtx, physicalPlan)
 
 		metadataCallbackWriter := sql.NewMetadataOnlyMetadataCallbackWriter()
 
@@ -306,14 +299,12 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 			nil, /* txn */
 			nil, /* clockUpdater */
 			evalCtx.Tracing,
-			execCfg.ContentionRegistry,
-			nil, /* testingPushCallback */
 		)
 		defer distSQLReceiver.Release()
 
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := *evalCtx
-		cleanup := distSQLPlanner.Run(
+		distSQLPlanner.Run(
 			ctx,
 			planCtx,
 			nil, /* txn */
@@ -322,7 +313,6 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 			&evalCtxCopy,
 			nil, /* finishedSetupFn */
 		)
-		defer cleanup()
 
 		return metadataCallbackWriter.Err()
 	}()
@@ -357,14 +347,6 @@ func getDeleteBatchSize(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
 		bs = defaultDeleteBatchSize.Get(sv)
 	}
 	return bs
-}
-
-func getRangeConcurrency(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
-	rc := ttl.RangeConcurrency
-	if rc == 0 {
-		rc = defaultRangeConcurrency.Get(sv)
-	}
-	return rc
 }
 
 func getDeleteRateLimit(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {

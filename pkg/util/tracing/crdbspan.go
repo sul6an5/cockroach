@@ -72,11 +72,15 @@ type crdbSpan struct {
 }
 
 type childRef struct {
-	spanRef
+	_spanRef spanRef
 	// collectRecording is set if this child's recording should be included in the
 	// parent's recording. This is usually the case, except for children created
 	// with the WithDetachedRecording() option.
 	collectRecording bool
+}
+
+func (c childRef) span() *crdbSpan {
+	return c._spanRef.i.crdb
 }
 
 type crdbSpanMu struct {
@@ -142,33 +146,45 @@ type recordingState struct {
 	// but its 'swap' method requires the mutex.
 	recordingType atomicRecordingType
 
-	logs sizeLimitedBuffer // of *tracingpb.LogRecords
-	// structured accumulates StructuredRecord's. It will contain the events
-	// recorded on this span, and also the ones recorded on children that
-	// finished while this parent span's recording was not verbose.
-	structured sizeLimitedBuffer
+	logs sizeLimitedBuffer[*tracingpb.LogRecord]
+	// structured accumulates StructuredRecord's.
+	//
+	// Note that structured events that originally belonged to child spans but
+	// bubbled up to this parent in various ways (e.g. children finished while
+	// this span was not recording verbosely, or children that were dropped from a
+	// verbose recording because of the span limit) are not part of this buffer;
+	// they're in finishedChildren.Root.StructuredRecords.
+	structured sizeLimitedBuffer[*tracingpb.StructuredRecord]
 
 	// notifyParentOnStructuredEvent is true if the span's parent has asked to be
 	// notified of every StructuredEvent recording on this span.
 	notifyParentOnStructuredEvent bool
 
-	// dropped is true if the span has capped out it's memory limits for
-	// logs and structured events, and has had to drop some. It's used to
-	// annotate recordings with the _dropped tag, when applicable.
-	dropped bool
+	// droppedLogs is set if the span has capped out its memory limits for logs
+	// and structured events, and had to drop some. It's used to annotate
+	// recordings with the _dropped_logs tag, when applicable.
+	//
+	// NOTE: The _dropped_logs tag applies exclusively to logs directly pertaining
+	// to this span. It does not apply to structured logs belonging to child spans
+	// that were dropped because of the limit on the number of spans in the
+	// recording. We move the structured logs from such spans into the parent if
+	// there's room. If there isn't, they are silently dropped.
+	droppedLogs bool
 
 	// finishedChildren contains the recordings of finished children (and
 	// grandchildren recursively). This includes remote child span recordings
 	// that were manually imported, as well as recordings from local children
 	// that Finish()ed.
 	//
-	// Only child spans that finished while this span was in the
-	// RecordingVerbose mode are included here. For children finished while this
-	// span is not in RecordingVerbose, only their structured events are copied
-	// to structured above.
+	// Only child spans that finished while this span was in the RecordingVerbose
+	// mode are included here. Structured events from children finished while this
+	// parent was in RecordingStructured mode are stored
+	// finishedChildren.Root.Structured.
 	//
-	// The spans are not maintained in a particular order.
-	finishedChildren []tracingpb.RecordedSpan
+	// It's convenient to store finishedChildren as a Trace, even though the
+	// finishedChildren.Root will only be initialized when the span finishes
+	// (other that Root.Structured, which can accumulate events from children).
+	finishedChildren Trace
 
 	// childrenMetadata is a mapping from operation to the aggregated metadata of
 	// that operation.
@@ -184,8 +200,8 @@ type recordingState struct {
 // scratch, if not nil, represents pre-allocated space that the Buffer takes
 // ownership of. The whole backing array of the provided slice is taken over,
 // included elements and available capacity.
-func makeSizeLimitedBuffer(limit int64, scratch []interface{}) sizeLimitedBuffer {
-	return sizeLimitedBuffer{
+func makeSizeLimitedBuffer[T any](limit int64, scratch []T) sizeLimitedBuffer[T] {
+	return sizeLimitedBuffer[T]{
 		bytesLimit: limit,
 		Buffer:     ring.MakeBuffer(scratch),
 	}
@@ -193,10 +209,345 @@ func makeSizeLimitedBuffer(limit int64, scratch []interface{}) sizeLimitedBuffer
 
 // sizeLimitedBuffer is a wrapper on top of ring.Buffer that keeps track of the
 // memory size of its elements.
-type sizeLimitedBuffer struct {
-	ring.Buffer
+type sizeLimitedBuffer[T any] struct {
+	ring.Buffer[T]
 	bytesSize  int64
 	bytesLimit int64
+}
+
+// Trace represents the recording of a span and all its descendents.
+type Trace struct {
+	Root tracingpb.RecordedSpan
+	// Children are the traces of the child spans. The slice is kept sorted by
+	// child start time.
+	//
+	// Children are added via addChildren(). Once a child is added to a Trace, the
+	// Trace takes ownership; only the Trace can modify that child, since it needs
+	// to maintain the NumSpans and StructuredRecordsSizeBytes bookkeeping.
+	Children []Trace
+	// NumSpans tracks the number of spans in the recording: 1 for the root plus
+	// the size of the child traces recursively.
+	NumSpans int
+	// StructuredRecordsSizeBytes tracks the total size of structured logs in Root
+	// and all the Children, recursively.
+	StructuredRecordsSizeBytes int64
+
+	// DroppedDirectChildren maintains info about whether any direct children were
+	// omitted from Children because of recording limits.
+	//
+	// When set, DroppedDirectChildren and DroppedIndirectChildren are also
+	// reflected in corresponding tags on Root.
+	DroppedDirectChildren bool
+	// DroppedIndirectChildren maintains info about whether any indirect children
+	// were omitted from Children because of recording limits.
+	DroppedIndirectChildren bool
+}
+
+// MakeTrace constructs a Trace.
+func MakeTrace(root tracingpb.RecordedSpan) Trace {
+	return Trace{
+		Root:                       root,
+		NumSpans:                   1,
+		StructuredRecordsSizeBytes: root.StructuredRecordsSizeBytes,
+	}
+}
+
+func (t *Trace) String() string {
+	return tracingpb.Recording(t.Flatten()).String()
+}
+
+// trimSpans reduces the size of the trace to maxSpans. If t.NumSpans <= maxSpans,
+// this is a no-op. Otherwise, spans will be dropped from the trace until the
+// size is exactly maxSpans.
+//
+// Structured events from the dropped spans are moved to the first non-dropped
+// parent. Note that trimStructuredEvents() can be used to reduce the size of
+// events.
+func (t *Trace) trimSpans(maxSpans int) {
+	if t.NumSpans <= maxSpans {
+		return
+	}
+	t.trimSpansRecursive(t.NumSpans-maxSpans, true /* isRoot */)
+}
+
+func (t *Trace) trimSpansRecursive(toDrop int, isRoot bool) {
+	if toDrop <= 0 {
+		toDrop := toDrop // copy escaping to the heap
+		panic(fmt.Sprintf("invalid toDrop < 0: %d", toDrop))
+	}
+	if t.NumSpans <= toDrop {
+		panic(fmt.Sprintf("NumSpans expected to be > toDrop; NumSpans: %d, toDrop: %d", t.NumSpans, toDrop))
+	}
+
+	// Look at the spans ordered by size descendingly, so that we drop the fewest children
+	// possible.
+	childrenIdx := make([]int, len(t.Children))
+	for i := range t.Children {
+		childrenIdx[i] = i
+	}
+	sort.Slice(childrenIdx, func(i, j int) bool {
+		return t.Children[childrenIdx[i]].NumSpans >= t.Children[childrenIdx[j]].NumSpans
+	})
+	// We'll eliminate some children completely (the largest ones), and we'll
+	// recurse into the next one.
+	// Figure out how many spans we're going to drop completely (we might not have
+	// to drop any).
+	spansToDrop := 0
+	total := 0
+	recurseIdx := -1
+	for _, idx := range childrenIdx {
+		if total+t.Children[idx].NumSpans <= toDrop {
+			spansToDrop++
+			total += t.Children[idx].NumSpans
+		} else {
+			break
+		}
+	}
+	// If we need to drop some more spans, but we don't have to completely drop
+	// the next fattest child, recurse into the next child.
+	toDropFromNextChild := toDrop - total
+	if toDropFromNextChild > 0 {
+		// Note: we know that childrenIdx[spansToDrop] is not out of bounds; if
+		// toDropFromNextChild > 0, there must be at least one more child after
+		// spansToDrop.
+		recurseIdx = childrenIdx[spansToDrop]
+		if t.Children[recurseIdx].NumSpans < toDropFromNextChild {
+			panic("expected next child to have enough spans")
+		}
+		t.Children[recurseIdx].trimSpansRecursive(toDropFromNextChild, false /* isRoot */)
+		t.NumSpans -= toDropFromNextChild
+		t.DroppedIndirectChildren = true
+		if isRoot {
+			// The original recursive root Trace `t`'s Root member is expected to have independently allocated
+			// tags structures. However, child spans are potentially share memory for tags, logs, and stats
+			// information across goroutines which are not protected by a mutex. See (*Trace).PartialClone for
+			// more details - deep copying these structures is avoided to reduce allocations.
+			//
+			// To avoid multiple goroutines racing to add tags to child spans with unprotected tags structures,
+			// we only indicate on the recursive root Trace's Root member that indirect children have been dropped.
+			t.Root.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_indirect_children", "")
+		}
+	}
+
+	if spansToDrop > 0 {
+		t.DroppedDirectChildren = true
+		if isRoot {
+			// The original recursive root Trace `t`'s Root member is expected to have independently allocated
+			// tags structures. However, child spans are potentially share memory for tags, logs, and stats
+			// information across goroutines which are not protected by a mutex. See (*Trace).PartialClone for
+			// more details - deep copying these structures is avoided to reduce allocations.
+			//
+			// To avoid multiple goroutines racing to add tags to child spans with unprotected tags structures,
+			// we only indicate on the recursive root Trace's Root member that children have been dropped.
+			t.Root.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_children", "")
+		}
+		// We're going to drop the fattest spansToDrop spans.
+		childrenToDropIdx := childrenIdx[:spansToDrop]
+
+		// Sort the indexes of the children to drop ascendingly, so that we can
+		// remove them easily while maintaining the existing order for the children
+		// that stay.
+		sort.Ints(childrenToDropIdx)
+		newChildren := make([]Trace, 0, len(t.Children)-spansToDrop)
+		j := 0 // This will iterate over childrenToDropIdx
+		for i := range t.Children {
+			if j < len(childrenToDropIdx) && i == childrenToDropIdx[j] {
+				// We need to drop this child.
+				j++
+				// Copy the structured events from the dropped child to the parent.
+				// Note that t.StructuredRecordsSizeBytes doesn't change.
+				buf := t.Children[i].appendStructuredEventsRecursively(nil /* buffer */)
+				for i := range buf {
+					t.Root.AddStructuredRecord(buf[i])
+				}
+			} else {
+				// This child is not dropped; copy it over to newChildren.
+				newChildren = append(newChildren, t.Children[i])
+			}
+		}
+		t.Children = newChildren
+		t.NumSpans -= total
+	}
+}
+
+// trimStructuredEvents drops structured records as needed in order to make the total
+// size of events in t <= maxBytes.
+//
+// The method works recursively. Events are dropped first from the spans with
+// the largest events size.
+func (t *Trace) trimStructuredEvents(maxBytes int64) int64 {
+	toDrop := t.StructuredRecordsSizeBytes - maxBytes
+	if toDrop <= 0 {
+		return 0
+	}
+
+	// Look at the spans ordered by structured size descendingly; we'll drop
+	// events from the fattest child first.
+	childrenIdx := make([]int, len(t.Children)+1)
+	for i := range t.Children {
+		childrenIdx[i] = i
+	}
+	childrenIdx[len(t.Children)] = -1 // Represent the root.
+	sort.Slice(childrenIdx, func(i, j int) bool {
+		var leftSize, rightSize int64
+		if childrenIdx[i] == -1 {
+			leftSize = t.Root.StructuredRecordsSizeBytes
+		} else {
+			leftSize = t.Children[childrenIdx[i]].StructuredRecordsSizeBytes
+		}
+		if childrenIdx[j] == -1 {
+			rightSize = t.Root.StructuredRecordsSizeBytes
+		} else {
+			rightSize = t.Children[childrenIdx[j]].StructuredRecordsSizeBytes
+		}
+		return leftSize >= rightSize
+	})
+
+	droppedTotal := int64(0)
+	for _, idx := range childrenIdx {
+		var dropped int64
+		if idx == -1 {
+			// This is the root.
+			dropped = t.Root.TrimStructured(t.Root.StructuredRecordsSizeBytes - toDrop)
+		} else {
+			child := &t.Children[idx]
+			dropped = child.trimStructuredEvents(child.StructuredRecordsSizeBytes - toDrop)
+		}
+		droppedTotal += dropped
+		toDrop -= dropped
+		if toDrop <= 0 {
+			break
+		}
+	}
+
+	t.StructuredRecordsSizeBytes -= droppedTotal
+	return droppedTotal
+}
+
+// addChildren adds child traces to t. After adding the children, the trace is
+// trimmed to maxSpans (if 0, no trimming occurs). If spans are dropped because
+// of the maxSpans limit, the structured messages from dropped spans are copied
+// into their parents. However, the total size of structured logs across t is
+// limited to maxStructuredBytes (if not zero). If records need to be dropped
+// because of this limit, they're dropped from the span with the largest size
+// first.
+//
+// The list of children is kept sorted.
+func (t *Trace) addChildren(children []Trace, maxSpans int, maxStructuredBytes int64) {
+
+	// Figure out if we'll need to re-sort the children. We won't need to do it if
+	// we're adding a single child that belongs in the last position.
+	needSort := false
+	if len(t.Children) > 0 {
+		needSort = !(len(children) == 1 &&
+			children[0].Root.StartTime.After(
+				t.Children[len(t.Children)-1].Root.StartTime))
+	}
+	for i := range children {
+		c := &children[i]
+		t.NumSpans += c.NumSpans
+		t.StructuredRecordsSizeBytes += c.StructuredRecordsSizeBytes
+		t.Children = append(t.Children, *c)
+	}
+	if needSort {
+		t.sortChildren()
+	}
+	if maxSpans > 0 {
+		t.trimSpans(maxSpans)
+	}
+	if maxStructuredBytes > 0 {
+		t.trimStructuredEvents(maxStructuredBytes)
+	}
+}
+
+// sortChildren sorts the children in the trace by start time.
+func (t *Trace) sortChildren() {
+	toSort := sortPoolTraces.Get().(*[]Trace) // avoids allocations in sort.Sort
+	*toSort = t.Children
+	sort.Slice(*toSort, func(i, j int) bool {
+		return (*toSort)[i].Root.StartTime.Before((*toSort)[j].Root.StartTime)
+	})
+	*toSort = nil
+	sortPoolTraces.Put(toSort)
+}
+
+var sortPoolTraces = sync.Pool{
+	New: func() interface{} {
+		return &[]Trace{}
+	},
+}
+
+// Empty returns true if the receiver is not initialized.
+func (t *Trace) Empty() bool {
+	return len(t.Children) == 0 && t.Root.StartTime == time.Time{}
+}
+
+func (t *Trace) appendStructuredEventsRecursively(
+	buffer []tracingpb.StructuredRecord,
+) []tracingpb.StructuredRecord {
+	buffer = append(buffer, t.Root.StructuredRecords...)
+	for i := range t.Children {
+		buffer = t.Children[i].appendStructuredEventsRecursively(buffer)
+	}
+	return buffer
+}
+
+func (t *Trace) appendSpansRecursively(buffer []tracingpb.RecordedSpan) []tracingpb.RecordedSpan {
+	buffer = append(buffer, t.Root)
+	for i := range t.Children {
+		buffer = t.Children[i].appendSpansRecursively(buffer)
+	}
+	return buffer
+}
+
+// Flatten flattens the trace into a slice of spans. The root is the first span,
+// and parents come before children. Otherwise, the spans are not sorted.
+//
+// See SortSpans() for sorting the result in order to turn it into a
+// tracingpb.Recording.
+func (t *Trace) Flatten() []tracingpb.RecordedSpan {
+	if t.Empty() {
+		return nil
+	}
+	return t.appendSpansRecursively(nil /* buffer */)
+}
+
+// ToRecording converts the Trace to a tracingpb.Recording by flattening it and
+// sorting the spans.
+func (t *Trace) ToRecording() tracingpb.Recording {
+	spans := t.Flatten()
+	// sortSpans sorts the spans by StartTime, except the first Span (the root of
+	// this recording) which stays in place.
+	toSort := sortPoolRecordings.Get().(*tracingpb.Recording) // avoids allocations in sort.Sort
+	*toSort = spans[1:]
+	sort.Sort(toSort)
+	*toSort = nil
+	sortPoolRecordings.Put(toSort)
+	return spans
+}
+
+var sortPoolRecordings = sync.Pool{
+	New: func() interface{} {
+		return &tracingpb.Recording{}
+	},
+}
+
+// PartialClone performs a deep copy of the trace. The immutable slices are not
+// copied: logs, tags and stats.
+func (t *Trace) PartialClone() Trace {
+	r := *t
+	// The structured logs need copying since the slice is mutable: new logs can
+	// be added to the source when spans are added to the trace but the trace is
+	// over the span limit. Technically, simply adding to the slice is safe if we
+	// made a shallow copy of the slice, but we're being defensive here as we
+	// might go beyond simply adding logs in the future.
+	r.Root.StructuredRecords = make([]tracingpb.StructuredRecord, len(t.Root.StructuredRecords))
+	copy(r.Root.StructuredRecords, t.Root.StructuredRecords)
+	r.Children = make([]Trace, len(t.Children))
+	for i := range t.Children {
+		r.Children[i] = t.Children[i].PartialClone()
+	}
+	return r
 }
 
 // Discard zeroes out *buf. If nobody else is referencing the backing storage
@@ -206,8 +557,8 @@ type sizeLimitedBuffer struct {
 // Note that Discard does not modify the backing storage (i.e. it does not nil
 // out the elements). So, if anyone still has a reference to the storage, then
 // the elements cannot be GCed.
-func (buf *sizeLimitedBuffer) Discard() {
-	*buf = sizeLimitedBuffer{}
+func (buf *sizeLimitedBuffer[T]) Discard() {
+	*buf = sizeLimitedBuffer[T]{}
 }
 
 // finish marks the span as finished. Further operations on the span are not
@@ -306,10 +657,10 @@ func (s *crdbSpan) finish() bool {
 		children = make([]spanRef, len(s.mu.openChildren))
 		for i := range s.mu.openChildren {
 			c := &s.mu.openChildren[i]
-			c.parentFinished()
+			c.span().parentFinished()
 			// Move ownership of the child reference, and also nil out the pointer to
 			// the child, making it available for GC.
-			children[i] = c.spanRef.move()
+			children[i] = c._spanRef.move()
 		}
 		s.mu.openChildren = nil // The children were moved away.
 		s.mu.Unlock()
@@ -330,18 +681,6 @@ func (s *crdbSpan) recordingType() tracingpb.RecordingType {
 	return s.mu.recording.recordingType.load()
 }
 
-// enableRecording start recording on the Span. From now on, log events and
-// child spans will be stored.
-func (s *crdbSpan) enableRecording(recType tracingpb.RecordingType) {
-	if recType == tracingpb.RecordingOff || s.recordingType() == recType {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mu.recording.recordingType.swap(recType)
-}
-
 // TraceID is part of the RegistrySpan interface.
 func (s *crdbSpan) TraceID() tracingpb.TraceID {
 	return s.traceID
@@ -356,14 +695,12 @@ func (s *crdbSpan) SpanID() tracingpb.SpanID {
 //
 // finishing indicates whether s is in the process of finishing. If it isn't,
 // the recording will include an "_unfinished" tag.
-func (s *crdbSpan) GetRecording(
-	recType tracingpb.RecordingType, finishing bool,
-) tracingpb.Recording {
+func (s *crdbSpan) GetRecording(recType tracingpb.RecordingType, finishing bool) Trace {
 	return s.getRecordingImpl(recType, false /* includeDetachedChildren */, finishing)
 }
 
 // GetFullRecording is part of the RegistrySpan interface.
-func (s *crdbSpan) GetFullRecording(recType tracingpb.RecordingType) tracingpb.Recording {
+func (s *crdbSpan) GetFullRecording(recType tracingpb.RecordingType) Trace {
 	return s.getRecordingImpl(recType, true /* includeDetachedChildren */, false /* finishing */)
 }
 
@@ -373,14 +710,14 @@ func (s *crdbSpan) GetFullRecording(recType tracingpb.RecordingType) tracingpb.R
 // the recording will include an "_unfinished" tag.
 func (s *crdbSpan) getRecordingImpl(
 	recType tracingpb.RecordingType, includeDetachedChildren bool, finishing bool,
-) tracingpb.Recording {
+) Trace {
 	switch recType {
 	case tracingpb.RecordingVerbose:
 		return s.getVerboseRecording(includeDetachedChildren, finishing)
 	case tracingpb.RecordingStructured:
-		return s.getStructuredRecording(includeDetachedChildren)
+		return MakeTrace(s.getStructuredRecording(includeDetachedChildren))
 	case tracingpb.RecordingOff:
-		return nil
+		return Trace{}
 	default:
 		panic("unreachable")
 	}
@@ -402,80 +739,86 @@ func rollupChildrenMetadata(
 //
 // finishing indicates whether s is in the process of finishing. If it isn't,
 // the recording will include an "_unfinished" tag.
-func (s *crdbSpan) getVerboseRecording(
-	includeDetachedChildren bool, finishing bool,
-) tracingpb.Recording {
+func (s *crdbSpan) getVerboseRecording(includeDetachedChildren bool, finishing bool) Trace {
 	if s == nil {
-		return nil // noop span
+		return Trace{} // noop span
 	}
 
-	var result tracingpb.Recording
+	var result Trace
 	var childrenMetadata map[string]tracingpb.OperationMetadata
-	{
+	func() {
 		s.mu.Lock()
-		// The capacity here is approximate since we don't know how many
-		// grandchildren there are.
-		result = make(tracingpb.Recording, 0, 1+len(s.mu.openChildren)+len(s.mu.recording.finishedChildren))
-		result = append(result, s.getRecordingNoChildrenLocked(tracingpb.RecordingVerbose, finishing))
-		result = append(result, s.mu.recording.finishedChildren...)
+		defer s.mu.Unlock()
 
-		childrenMetadata = make(map[string]tracingpb.OperationMetadata)
+		// Make a clone of the finished children, to avoid working on and returning
+		// a trace that aliases s.mu.recording.finishedChildren. We're going to
+		// modify the trace below, when adding open children to it, and
+		// s.mu.recording.finishedChildren will also evolve after we return the
+		// copy, so we can't allow for aliases.
+		result = s.mu.recording.finishedChildren.PartialClone()
+		// result.Root.StructuredRecords might have accumulated entries from spans
+		// that were trimmed from finishedChildren. Save them so we can re-insert
+		// them below.
+		oldEvents := result.Root.StructuredRecords
+		result.StructuredRecordsSizeBytes -= result.Root.StructuredRecordsSizeBytes
+		result.Root = s.getRecordingNoChildrenLocked(tracingpb.RecordingVerbose, finishing)
+		result.StructuredRecordsSizeBytes += result.Root.StructuredRecordsSizeBytes
+		for i := range oldEvents {
+			size := int64(oldEvents[i].Size())
+			if result.StructuredRecordsSizeBytes+size < maxStructuredBytesPerTrace {
+				result.Root.AddStructuredRecord(oldEvents[i])
+				result.StructuredRecordsSizeBytes += size
+			}
+		}
 
 		// Copy over the OperationMetadata collected from s' finished children.
+		childrenMetadata = make(map[string]tracingpb.OperationMetadata)
 		rollupChildrenMetadata(childrenMetadata, s.mu.recording.childrenMetadata)
 
 		// We recurse on s' open children to get their verbose recordings, and to
 		// aggregate OperationMetadata from their children, both finished and open.
+		now := s.tracer.now()
+		openRecordings := make([]Trace, 0, len(s.mu.openChildren))
 		for _, openChild := range s.mu.openChildren {
 			if openChild.collectRecording || includeDetachedChildren {
-				openChildSp := openChild.Span.i.crdb
+				openChildSp := openChild.span()
 				openChildRecording := openChildSp.getVerboseRecording(includeDetachedChildren, false /* finishing */)
-				result = append(result, openChildRecording...)
+				openRecordings = append(openRecordings, openChildRecording)
 
 				// Record an entry for openChilds' OperationMetadata.
-				rootOpenChild := openChildRecording[0]
-				prevMetadata := childrenMetadata[rootOpenChild.Operation]
-				prevMetadata.Count++
-				prevMetadata.ContainsUnfinished = !rootOpenChild.Finished
-				prevMetadata.Duration += rootOpenChild.Duration
-				childrenMetadata[rootOpenChild.Operation] = prevMetadata
+				op := openChildSp.operation
+				meta := childrenMetadata[op]
+				meta.Count++
+				meta.ContainsUnfinished = true
+				meta.Duration += now.Sub(openChildSp.startTime)
+				childrenMetadata[op] = meta
 
 				// Copy over the OperationMetadata collected recursively from openChilds'
 				// children.
-				rollupChildrenMetadata(childrenMetadata, openChildRecording[0].ChildrenMetadata)
+				rollupChildrenMetadata(childrenMetadata, openChildRecording.Root.ChildrenMetadata)
 			}
 		}
-	}
-
-	s.mu.Unlock()
+		result.addChildren(openRecordings, maxRecordedSpansPerTrace, maxStructuredBytesPerTrace)
+	}()
 
 	// Copy over the OperationMetadata collected from s' children into the root of
 	// the recording.
 	if len(childrenMetadata) != 0 {
-		rootSpan := &result[0]
-		rootSpan.ChildrenMetadata = childrenMetadata
+		result.Root.ChildrenMetadata = childrenMetadata
 	}
 
-	// Sort the spans by StartTime, except the first Span (the root of this
-	// recording) which stays in place.
-	toSort := sortPool.Get().(*tracingpb.Recording) // avoids allocations in sort.Sort
-	*toSort = result[1:]
-	sort.Sort(toSort)
-	*toSort = nil
-	sortPool.Put(toSort)
 	return result
 }
 
-// getStructuredRecording returns the structured events in this span and in all
-// the children. The results are returned as a Recording for the caller's
-// convenience (and for optimizing memory allocations). The Recording will have
-// exactly one span corresponding to the receiver, with all events hanging from
-// this span (even if the events had been recorded on different spans).
-// This span will also have a `childrenMetadata` map that will contain an entry
-// for all children in s' Recording.
+// getStructuredRecording returns a shallow copy of the structured events in
+// this span and in all the children. The returned span will contain all
+// structured events across the receiver and all its children. The returned span
+// will also have its `childrenMetadata` populated with data for all the
+// children.
 //
-// The caller does not take ownership of the events.
-func (s *crdbSpan) getStructuredRecording(includeDetachedChildren bool) tracingpb.Recording {
+// The caller does not take ownership of the events; the event payloads must be
+// treated as immutable since they're shared with the receiver.
+func (s *crdbSpan) getStructuredRecording(includeDetachedChildren bool) tracingpb.RecordedSpan {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -484,10 +827,15 @@ func (s *crdbSpan) getStructuredRecording(includeDetachedChildren bool) tracingp
 		false, // finishing - since we're only asking for the structured recording, the argument doesn't matter
 	)
 
+	// Wipe the root's records. We're going to re-add them.
+	res.StructuredRecordsSizeBytes = 0
+	res.StructuredRecords = res.StructuredRecords[:0]
 	// Recursively fetch the StructuredEvents for s' and its children, both
 	// finished and open.
-	res.StructuredRecords = s.getStructuredEventsRecursivelyLocked(res.StructuredRecords[:0],
-		includeDetachedChildren)
+	buf := s.appendStructuredEventsRecursivelyLocked(res.StructuredRecords, includeDetachedChildren)
+	for i := range buf {
+		res.AddStructuredRecord(buf[i])
+	}
 
 	// Recursively fetch the OperationMetadata for s' children, both finished and
 	// open.
@@ -495,27 +843,26 @@ func (s *crdbSpan) getStructuredRecording(includeDetachedChildren bool) tracingp
 	s.getChildrenMetadataRecursivelyLocked(res.ChildrenMetadata,
 		false /* includeRootMetadata */, includeDetachedChildren)
 
-	return tracingpb.Recording{res}
+	return res
 }
 
 // recordFinishedChildren adds the spans in childRecording to s' recording.
 //
 // s takes ownership of childRecording; the caller is not allowed to use them anymore.
-func (s *crdbSpan) recordFinishedChildren(childRecording tracingpb.Recording) {
-	if len(childRecording) == 0 {
+func (s *crdbSpan) recordFinishedChildren(childRecording Trace) {
+	if childRecording.Empty() {
 		return
 	}
 
 	// Notify the event listeners registered with s of the StructuredEvents on the
 	// children being added to s.
-	for _, span := range childRecording {
-		for _, record := range span.StructuredRecords {
-			var d types.DynamicAny
-			if err := types.UnmarshalAny(record.Payload, &d); err != nil {
-				continue
-			}
-			s.notifyEventListeners(d.Message.(protoutil.Message))
+	events := childRecording.appendStructuredEventsRecursively(nil)
+	for _, record := range events {
+		var d types.DynamicAny
+		if err := types.UnmarshalAny(record.Payload, &d); err != nil {
+			continue
 		}
+		s.notifyEventListeners(d.Message.(protoutil.Message))
 	}
 
 	s.mu.Lock()
@@ -523,14 +870,12 @@ func (s *crdbSpan) recordFinishedChildren(childRecording tracingpb.Recording) {
 	s.recordFinishedChildrenLocked(childRecording)
 }
 
-// s takes ownership of childRecording; the caller is not allowed to use them
+// s takes ownership of childRec; the caller is not allowed to use them
 // anymore.
-func (s *crdbSpan) recordFinishedChildrenLocked(childRecording tracingpb.Recording) {
-	if len(childRecording) == 0 {
+func (s *crdbSpan) recordFinishedChildrenLocked(childRec Trace) {
+	if childRec.Empty() {
 		return
 	}
-
-	rootChild := &childRecording[0]
 
 	// Depending on the type of recording, we either keep all the information
 	// received, or only the structured events.
@@ -540,21 +885,15 @@ func (s *crdbSpan) recordFinishedChildrenLocked(childRecording tracingpb.Recordi
 		// usually already the case, except with DistSQL traces where remote
 		// processors run in spans that FollowFrom an RPC Span that we don't
 		// collect.
-		rootChild.ParentSpanID = s.spanID
-
-		if len(s.mu.recording.finishedChildren)+len(childRecording) <= maxRecordedSpansPerTrace {
-			s.mu.recording.finishedChildren = append(s.mu.recording.finishedChildren, childRecording...)
-			break
-		}
-
-		// We don't have space for this recording. Let's collect just the structured
-		// records by falling through.
-		fallthrough
+		childRec.Root.ParentSpanID = s.spanID
+		s.mu.recording.finishedChildren.addChildren([]Trace{childRec}, maxRecordedSpansPerTrace, maxStructuredBytesPerTrace)
 	case tracingpb.RecordingStructured:
-		for ci := range childRecording {
-			child := &childRecording[ci]
-			for i := range child.StructuredRecords {
-				s.recordInternalLocked(&child.StructuredRecords[i], &s.mu.recording.structured)
+		buf := childRec.appendStructuredEventsRecursively(nil /* buffer */)
+		for i := range buf {
+			event := &buf[i]
+			if s.mu.recording.finishedChildren.StructuredRecordsSizeBytes+int64(event.MemorySize()) < maxStructuredBytesPerTrace {
+				size := s.mu.recording.finishedChildren.Root.AddStructuredRecord(*event)
+				s.mu.recording.finishedChildren.StructuredRecordsSizeBytes += size
 			}
 		}
 	case tracingpb.RecordingOff:
@@ -563,7 +902,7 @@ func (s *crdbSpan) recordFinishedChildrenLocked(childRecording tracingpb.Recordi
 		panic(fmt.Sprintf("unrecognized recording mode: %v", s.recordingType()))
 	}
 
-	// Update s' ChildrenMetadata to capture all the spans in `childRecording`.
+	// Update s' ChildrenMetadata to capture all the spans in childRec.
 	//
 	// As an example where we are done finishing `child`:
 	//
@@ -575,11 +914,11 @@ func (s *crdbSpan) recordFinishedChildrenLocked(childRecording tracingpb.Recordi
 	// {child: 2s, grandchild: 1s}
 	//
 	// Record finished rootChilds' metadata.
-	s.mu.recording.childrenMetadata[rootChild.Operation] =
-		s.mu.recording.childrenMetadata[rootChild.Operation].Combine(
+	s.mu.recording.childrenMetadata[childRec.Root.Operation] =
+		s.mu.recording.childrenMetadata[childRec.Root.Operation].Combine(
 			tracingpb.OperationMetadata{
 				Count:              1,
-				Duration:           rootChild.Duration,
+				Duration:           childRec.Root.Duration,
 				ContainsUnfinished: false,
 			})
 
@@ -587,7 +926,7 @@ func (s *crdbSpan) recordFinishedChildrenLocked(childRecording tracingpb.Recordi
 	//
 	// GetRecording(...) is responsible for recursively capturing the metadata for
 	// rootChilds' open and finished children.
-	rollupChildrenMetadata(s.mu.recording.childrenMetadata, rootChild.ChildrenMetadata)
+	rollupChildrenMetadata(s.mu.recording.childrenMetadata, childRec.Root.ChildrenMetadata)
 }
 
 func (s *crdbSpan) setTagLocked(key string, value attribute.Value) {
@@ -673,18 +1012,10 @@ func (s *crdbSpan) record(msg redact.RedactableString) {
 		return
 	}
 
-	var now time.Time
-	if clock := s.tracer.testing.Clock; clock != nil {
-		now = clock.Now()
-	} else {
-		now = timeutil.Now()
-	}
-	logRecord := &tracingpb.LogRecord{
-		Time:    now,
+	recordInternal(s, &tracingpb.LogRecord{
+		Time:    s.tracer.now(),
 		Message: msg,
-	}
-
-	s.recordInternal(logRecord, &s.mu.recording.logs)
+	}, &s.mu.recording.logs)
 }
 
 // recordStructured includes a structured event in s' recording.
@@ -700,17 +1031,11 @@ func (s *crdbSpan) recordStructured(item Structured) {
 		return
 	}
 
-	var now time.Time
-	if clock := s.tracer.testing.Clock; clock != nil {
-		now = clock.Now()
-	} else {
-		now = time.Now()
-	}
 	sr := &tracingpb.StructuredRecord{
-		Time:    now,
+		Time:    s.tracer.now(),
 		Payload: p,
 	}
-	s.recordInternal(sr, &s.mu.recording.structured)
+	recordInternal(s, sr, &s.mu.recording.structured)
 
 	// If there are any listener's registered with this span, notify them of the
 	// Structured event being recorded.
@@ -728,53 +1053,45 @@ type memorySizable interface {
 	MemorySize() int
 }
 
-func (s *crdbSpan) recordInternal(payload memorySizable, buffer *sizeLimitedBuffer) {
+func recordInternal[PL memorySizable](s *crdbSpan, payload PL, buffer *sizeLimitedBuffer[PL]) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.recordInternalLocked(payload, buffer)
-}
-
-func (s *crdbSpan) recordInternalLocked(payload memorySizable, buffer *sizeLimitedBuffer) {
 	size := int64(payload.MemorySize())
 	if size > buffer.bytesLimit {
 		// The incoming payload alone blows past the memory limit. Let's just
 		// drop it.
-		s.mu.recording.dropped = true
+		s.mu.recording.droppedLogs = true
 		return
 	}
 
 	buffer.bytesSize += size
 	if buffer.bytesSize > buffer.bytesLimit {
-		s.mu.recording.dropped = true
+		s.mu.recording.droppedLogs = true
 	}
 	for buffer.bytesSize > buffer.bytesLimit {
-		first := buffer.GetFirst().(memorySizable)
+		first := buffer.GetFirst()
 		buffer.RemoveFirst()
 		buffer.bytesSize -= int64(first.MemorySize())
 	}
 	buffer.AddLast(payload)
 }
 
-// getStructuredEventsRecursivelyLocked returns the structured events
-// accumulated by s' and its finished and still-open children.
-func (s *crdbSpan) getStructuredEventsRecursivelyLocked(
+// appendStructuredEventsRecursivelyLocked appends the structured events
+// accumulated by s' and its finished and still-open children to buffer, and
+// returns the resulting slice.
+func (s *crdbSpan) appendStructuredEventsRecursivelyLocked(
 	buffer []tracingpb.StructuredRecord, includeDetachedChildren bool,
 ) []tracingpb.StructuredRecord {
-	buffer = s.getStructuredEventsLocked(buffer)
+	buffer = s.appendStructuredEventsLocked(buffer)
 	for _, c := range s.mu.openChildren {
 		if c.collectRecording || includeDetachedChildren {
-			sp := c.Span.i.crdb
+			sp := c.span()
 			sp.mu.Lock()
-			buffer = sp.getStructuredEventsRecursivelyLocked(buffer, includeDetachedChildren)
+			buffer = sp.appendStructuredEventsRecursivelyLocked(buffer, includeDetachedChildren)
 			sp.mu.Unlock()
 		}
 	}
-	for _, c := range s.mu.recording.finishedChildren {
-		for i := range c.StructuredRecords {
-			buffer = append(buffer, c.StructuredRecords[i])
-		}
-	}
-	return buffer
+	return s.mu.recording.finishedChildren.appendStructuredEventsRecursively(buffer)
 }
 
 // getChildrenMetadataRecursivelyLocked populates `childrenMetadata` with
@@ -806,7 +1123,7 @@ func (s *crdbSpan) getChildrenMetadataRecursivelyLocked(
 	// For each of s' open children, recurse to collect their metadata.
 	for _, c := range s.mu.openChildren {
 		if c.collectRecording || includeDetachedChildren {
-			sp := c.Span.i.crdb
+			sp := c.span()
 			sp.mu.Lock()
 			sp.getChildrenMetadataRecursivelyLocked(childrenMetadata,
 				true /*includeRootMetadata */, includeDetachedChildren)
@@ -815,12 +1132,12 @@ func (s *crdbSpan) getChildrenMetadataRecursivelyLocked(
 	}
 }
 
-func (s *crdbSpan) getStructuredEventsLocked(
+func (s *crdbSpan) appendStructuredEventsLocked(
 	buffer []tracingpb.StructuredRecord,
 ) []tracingpb.StructuredRecord {
 	numEvents := s.mu.recording.structured.Len()
 	for i := 0; i < numEvents; i++ {
-		event := s.mu.recording.structured.Get(i).(*tracingpb.StructuredRecord)
+		event := s.mu.recording.structured.Get(i)
 		buffer = append(buffer, *event)
 	}
 	return buffer
@@ -854,35 +1171,10 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 		// -1 indicates an unfinished Span. For a recording it's better to put some
 		// duration in it, otherwise tools get confused. For example, we export
 		// recordings to Jaeger, and spans with a zero duration don't look nice.
-		rs.Duration = time.Since(rs.StartTime)
+		rs.Duration = timeutil.Since(rs.StartTime)
 		rs.Finished = false
 	} else {
 		rs.Finished = true
-	}
-
-	addTagGroup := func(name string) *tracingpb.TagGroup {
-		rs.TagGroups = append(rs.TagGroups,
-			tracingpb.TagGroup{
-				Name: name,
-			})
-		return &rs.TagGroups[len(rs.TagGroups)-1]
-	}
-
-	addTag := func(k, v string) {
-		if rs.Tags == nil {
-			rs.Tags = make(map[string]string)
-		}
-		rs.Tags[k] = v
-
-		tagGroup := rs.FindTagGroup(tracingpb.AnonymousTagGroupName)
-		if tagGroup == nil {
-			tagGroup = addTagGroup(tracingpb.AnonymousTagGroupName)
-		}
-
-		tagGroup.Tags = append(tagGroup.Tags, tracingpb.Tag{
-			Key:   k,
-			Value: v,
-		})
 	}
 
 	// If the span is not verbose, optimize by avoiding the tags.
@@ -895,47 +1187,47 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 	wantTags := recordingType == tracingpb.RecordingVerbose
 	if wantTags {
 		if !finishing && !s.mu.finished {
-			addTag("_unfinished", "1")
+			rs.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_unfinished", "1")
 		}
 		if s.recordingType() == tracingpb.RecordingVerbose {
-			addTag("_verbose", "1")
+			rs.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_verbose", "1")
 		}
-		if s.mu.recording.dropped {
-			addTag("_dropped", "1")
+		if s.mu.recording.droppedLogs {
+			rs.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_logs", "")
+		}
+		if s.mu.recording.finishedChildren.DroppedDirectChildren {
+			rs.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_children", "")
+		}
+		if s.mu.recording.finishedChildren.DroppedIndirectChildren {
+			rs.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_indirect_children", "")
 		}
 	}
 
 	if numEvents := s.mu.recording.structured.Len(); numEvents != 0 {
-		rs.StructuredRecords = make([]tracingpb.StructuredRecord, numEvents)
+		rs.StructuredRecords = make([]tracingpb.StructuredRecord, 0, numEvents)
 		for i := 0; i < numEvents; i++ {
-			event := s.mu.recording.structured.Get(i).(*tracingpb.StructuredRecord)
-			rs.StructuredRecords[i] = *event
+			event := s.mu.recording.structured.Get(i)
+			rs.AddStructuredRecord(*event)
 		}
 	}
 
 	if wantTags {
 		if s.logTags != nil {
 			setLogTags(s.logTags.Get(), func(remappedKey string, tag *logtags.Tag) {
-				addTag(remappedKey, tag.ValueStr())
+				rs.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag(remappedKey, tag.ValueStr())
 			})
 		}
 		for _, kv := range s.mu.tags {
 			// We encode the tag values as strings.
-			addTag(string(kv.Key), kv.Value.Emit())
+			rs.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag(string(kv.Key), kv.Value.Emit())
 		}
 		for _, tg := range s.getLazyTagGroupsLocked() {
 			if tg.Name == tracingpb.AnonymousTagGroupName {
 				for _, tag := range tg.Tags {
-					addTag(tag.Key, tag.Value)
+					rs.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag(tag.Key, tag.Value)
 				}
 			} else {
 				rs.TagGroups = append(rs.TagGroups, *tg)
-				if rs.Tags == nil {
-					rs.Tags = make(map[string]string)
-				}
-				for _, tag := range tg.Tags {
-					rs.Tags[tag.Key] = tag.Value
-				}
 			}
 		}
 
@@ -950,7 +1242,7 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 	if numLogs := s.mu.recording.logs.Len(); numLogs != 0 {
 		rs.Logs = make([]tracingpb.LogRecord, numLogs)
 		for i := 0; i < numLogs; i++ {
-			lr := s.mu.recording.logs.Get(i).(*tracingpb.LogRecord)
+			lr := s.mu.recording.logs.Get(i)
 			rs.Logs[i] = *lr
 		}
 	}
@@ -1027,7 +1319,7 @@ func (s *crdbSpan) addChildLocked(child *Span, collectChildRec bool) bool {
 
 	s.mu.openChildren = append(
 		s.mu.openChildren,
-		childRef{spanRef: makeSpanRef(child), collectRecording: collectChildRec},
+		childRef{_spanRef: makeSpanRef(child), collectRecording: collectChildRec},
 	)
 	return true
 }
@@ -1050,7 +1342,7 @@ func (s *crdbSpan) childFinished(child *crdbSpan) {
 	var childIdx int
 	found := false
 	for i, c := range s.mu.openChildren {
-		sp := c.Span.i.crdb
+		sp := c.span()
 		if sp == child {
 			childIdx = i
 			found = true
@@ -1091,7 +1383,7 @@ func (s *crdbSpan) childFinished(child *crdbSpan) {
 
 	collectChildRec := s.mu.openChildren[childIdx].collectRecording
 	// Drop the child's reference.
-	if s.mu.openChildren[childIdx].decRef() {
+	if s.mu.openChildren[childIdx]._spanRef.decRef() {
 		// We're going to use the child below, so we don't want it to be
 		// re-allocated yet. It shouldn't be re-allocated, because each span holds a
 		// reference to itself that's only dropped at the end of Span.Finish() (and
@@ -1127,11 +1419,11 @@ func (s *crdbSpan) parentFinished() {
 // visitOpenChildren calls the visitor for every open child. The receiver's lock
 // is held for the duration of the iteration, so the visitor should be quick.
 // The visitor is not allowed to hold on to children after it returns.
-func (s *crdbSpan) visitOpenChildren(visitor func(child *Span)) {
+func (s *crdbSpan) visitOpenChildren(visitor func(child *crdbSpan)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, c := range s.mu.openChildren {
-		visitor(c.spanRef.Span)
+		visitor(c.span())
 	}
 }
 
@@ -1142,7 +1434,7 @@ func (s *crdbSpan) SetRecordingType(to tracingpb.RecordingType) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, child := range s.mu.openChildren {
-		child.SetRecordingType(to)
+		child.span().SetRecordingType(to)
 	}
 }
 
@@ -1170,12 +1462,6 @@ func (s *crdbSpan) setGoroutineID(gid int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.mu.goroutineID = uint64(gid)
-}
-
-var sortPool = sync.Pool{
-	New: func() interface{} {
-		return &tracingpb.Recording{}
-	},
 }
 
 type atomicRecordingType tracingpb.RecordingType

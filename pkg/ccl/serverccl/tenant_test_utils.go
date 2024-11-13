@@ -93,17 +93,11 @@ type TestTenant interface {
 var _ TestTenant = &testTenant{}
 
 func newTestTenant(
-	t *testing.T,
-	server serverutils.TestServerInterface,
-	tenantID roachpb.TenantID,
-	knobs base.TestingKnobs,
+	t *testing.T, server serverutils.TestServerInterface, args base.TestTenantArgs,
 ) TestTenant {
 	t.Helper()
 
-	tenantParams := tests.CreateTestTenantParams(tenantID)
-	tenantParams.TestingKnobs = knobs
-
-	tenant, tenantConn := serverutils.StartTenant(t, server, tenantParams)
+	tenant, tenantConn := serverutils.StartTenant(t, server, args)
 	sqlDB := sqlutils.MakeSQLRunner(tenantConn)
 	status := tenant.StatusServer().(serverpb.SQLStatusServer)
 	sqlStats := tenant.PGServer().(*pgwire.Server).SQLServer.
@@ -149,6 +143,8 @@ var _ TenantTestHelper = &tenantTestHelper{}
 func NewTestTenantHelper(
 	t *testing.T, tenantClusterSize int, knobs base.TestingKnobs,
 ) TenantTestHelper {
+	t.Helper()
+
 	t.Helper()
 
 	params, _ := tests.CreateTestServerParams()
@@ -229,8 +225,9 @@ func newTenantClusterHelper(
 
 	var cluster tenantCluster = make([]TestTenant, tenantClusterSize)
 	for i := 0; i < tenantClusterSize; i++ {
-		cluster[i] =
-			newTestTenant(t, server, roachpb.MakeTenantID(tenantID), knobs)
+		args := tests.CreateTestTenantParams(roachpb.MustMakeTenantID(tenantID))
+		args.TestingKnobs = knobs
+		cluster[i] = newTestTenant(t, server, args)
 	}
 
 	return cluster
@@ -250,7 +247,7 @@ func (c tenantCluster) TenantHTTPClient(t *testing.T, idx serverIdx, isAdmin boo
 	if isAdmin {
 		client, err = c.Tenant(idx).GetTenant().GetAdminHTTPClient()
 	} else {
-		client, err = c.Tenant(idx).GetTenant().GetAuthenticatedHTTPClient(false)
+		client, err = c.Tenant(idx).GetTenant().GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
 	}
 	require.NoError(t, err)
 	return &httpClient{t: t, client: client, baseURL: c[idx].GetTenant().AdminURL()}
@@ -294,6 +291,14 @@ type httpClient struct {
 	baseURL string
 }
 
+func (c *httpClient) GetClient() http.Client {
+	return c.client
+}
+
+func (c *httpClient) GetBaseURL() string {
+	return c.baseURL
+}
+
 func (c *httpClient) GetJSON(path string, response protoutil.Message) {
 	err := httputil.GetJSON(c.client, c.baseURL+path, response)
 	require.NoError(c.t, err)
@@ -312,6 +317,10 @@ func (c *httpClient) PostJSONChecked(
 	path string, request protoutil.Message, response protoutil.Message,
 ) error {
 	return httputil.PostJSON(c.client, c.baseURL+path, request, response)
+}
+
+func (c *httpClient) PostJSONRawChecked(path string, request []byte) (*http.Response, error) {
+	return httputil.PostJSONRaw(c.client, c.baseURL+path, request)
 }
 
 func (c *httpClient) Close() {

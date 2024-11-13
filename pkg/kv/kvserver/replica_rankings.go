@@ -12,8 +12,14 @@ package kvserver
 
 import (
 	"container/heap"
+	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"go.etcd.io/raft/v3"
 )
 
 const (
@@ -21,87 +27,163 @@ const (
 	numTopReplicasToTrack = 128
 )
 
-type replicaWithStats struct {
-	repl *Replica
-	qps  float64
-	// TODO(aayush): Include writes-per-second and logicalBytes of storage?
+// CandidateReplica is a replica that is being tracked as a potential candidate
+// for rebalancing activities. It maintains a set of methods that enable
+// querying it's state and processing a rebalancing action if taken.
+type CandidateReplica interface {
+	// OwnsValidLease returns whether this replica is the current valid
+	// leaseholder.
+	OwnsValidLease(context.Context, hlc.ClockTimestamp) bool
+	// StoreID returns the Replica's StoreID.
+	StoreID() roachpb.StoreID
+	// GetRangeID returns the Range ID.
+	GetRangeID() roachpb.RangeID
+	// RaftStatus returns the current raft status of the replica. It returns
+	// nil if the Raft group has not been initialized yet.
+	RaftStatus() *raft.Status
+	// GetFirstIndex returns the index of the first entry in the replica's Raft
+	// log.
+	GetFirstIndex() uint64
+	// DescAndSpanConfig returns the authoritative range descriptor as well
+	// as the span config for the replica.
+	DescAndSpanConfig() (*roachpb.RangeDescriptor, roachpb.SpanConfig)
+	// Desc returns the authoritative range descriptor.
+	Desc() *roachpb.RangeDescriptor
+	// RangeUsageInfo returns usage information (sizes and traffic) needed by
+	// the allocator to make rebalancing decisions for a given range.
+	RangeUsageInfo() allocator.RangeUsageInfo
+	// AdminTransferLease transfers the LeaderLease to another replica.
+	AdminTransferLease(ctx context.Context, target roachpb.StoreID, bypassSafetyChecks bool) error
+	// Repl returns the underlying replica for this CandidateReplica. It is
+	// only used for determining timeouts in production code and not the
+	// simulator.
+	//
+	// TODO(kvoli): Remove this method. Refactor the timeout calculation to
+	// avoid needing the replica ref.
+	Repl() *Replica
+	// String implements the string interface.
+	String() string
 }
 
-// replicaRankings maintains top-k orderings of the replicas in a store by QPS.
-type replicaRankings struct {
+type candidateReplica struct {
+	*Replica
+	usage allocator.RangeUsageInfo
+}
+
+// RangeUsageInfo returns usage information (sizes and traffic) needed by
+// the allocator to make rebalancing decisions for a given range.
+func (cr candidateReplica) RangeUsageInfo() allocator.RangeUsageInfo {
+	return cr.usage
+}
+
+// Replica returns the underlying replica for this CandidateReplica. It is
+// only used for determining timeouts in production code and not the
+// simulator.
+func (cr candidateReplica) Repl() *Replica {
+	return cr.Replica
+}
+
+// ReplicaRankings maintains top-k orderings of the replicas in a store by QPS.
+type ReplicaRankings struct {
 	mu struct {
 		syncutil.Mutex
-		qpsAccumulator *rrAccumulator
-		byQPS          []replicaWithStats
+		dimAccumulator *RRAccumulator
+		byDim          []CandidateReplica
 	}
 }
 
-func newReplicaRankings() *replicaRankings {
-	return &replicaRankings{}
+// NewReplicaRankings returns a new ReplicaRankings struct.
+func NewReplicaRankings() *ReplicaRankings {
+	return &ReplicaRankings{}
 }
 
-func (rr *replicaRankings) newAccumulator() *rrAccumulator {
-	res := &rrAccumulator{}
-	res.qps.val = func(r replicaWithStats) float64 { return r.qps }
+// NewReplicaAccumulator returns a new rrAccumulator.
+//
+// TODO(kvoli): When adding another load dimension to be balanced upon, it will
+// be necessary to clarify the semantics of this API. This is especially true
+// since the UI is coupled to this function.
+func NewReplicaAccumulator(dims ...load.Dimension) *RRAccumulator {
+	res := &RRAccumulator{
+		dims: map[load.Dimension]*rrPriorityQueue{},
+	}
+	for _, dim := range dims {
+		res.dims[dim] = &rrPriorityQueue{}
+		res.dims[dim].val = func(r CandidateReplica) float64 {
+			return r.RangeUsageInfo().Load().Dim(dim)
+		}
+	}
 	return res
 }
 
-func (rr *replicaRankings) update(acc *rrAccumulator) {
+// Update sets the accumulator for replica tracking to be the passed in value.
+func (rr *ReplicaRankings) Update(acc *RRAccumulator) {
 	rr.mu.Lock()
-	rr.mu.qpsAccumulator = acc
+	rr.mu.dimAccumulator = acc
 	rr.mu.Unlock()
 }
 
-func (rr *replicaRankings) topQPS() []replicaWithStats {
+// TopLoad returns the highest load CandidateReplicas that are tracked.
+func (rr *ReplicaRankings) TopLoad(dimension load.Dimension) []CandidateReplica {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 	// If we have a new set of data, consume it. Otherwise, just return the most
 	// recently consumed data.
-	if rr.mu.qpsAccumulator != nil && rr.mu.qpsAccumulator.qps.Len() > 0 {
-		rr.mu.byQPS = consumeAccumulator(&rr.mu.qpsAccumulator.qps)
+	if rr.mu.dimAccumulator != nil && rr.mu.dimAccumulator.dims[dimension].Len() > 0 {
+		rr.mu.byDim = consumeAccumulator(rr.mu.dimAccumulator.dims[dimension])
 	}
-	return rr.mu.byQPS
+	return rr.mu.byDim
 }
 
-// rrAccumulator is used to update the replicas tracked by replicaRankings.
-// The typical pattern should be to call replicaRankings.newAccumulator, add
+// RRAccumulator is used to update the replicas tracked by ReplicaRankings.
+// The typical pattern should be to call NewAccumulator, add
 // all the replicas you care about to the accumulator using addReplica, then
-// pass the accumulator back to the replicaRankings using the update method.
+// pass the accumulator back to the ReplicaRankings using the update method.
 // This method of loading the new rankings all at once avoids interfering with
 // any consumers that are concurrently reading from the rankings, and also
 // prevents concurrent loaders of data from messing with each other -- the last
 // `update`d accumulator will win.
-type rrAccumulator struct {
-	qps rrPriorityQueue
+type RRAccumulator struct {
+	dims map[load.Dimension]*rrPriorityQueue
 }
 
-func (a *rrAccumulator) addReplica(repl replicaWithStats) {
+// AddReplica adds a replica to the replica accumulator.
+func (a *RRAccumulator) AddReplica(repl CandidateReplica) {
+	for dim := range a.dims {
+		a.addReplicaForDimension(repl, dim)
+
+	}
+}
+
+func (a *RRAccumulator) addReplicaForDimension(repl CandidateReplica, dim load.Dimension) {
+	rr := a.dims[dim]
 	// If the heap isn't full, just push the new replica and return.
-	if a.qps.Len() < numTopReplicasToTrack {
-		heap.Push(&a.qps, repl)
+	if rr.Len() < numTopReplicasToTrack {
+
+		heap.Push(a.dims[dim], repl)
 		return
 	}
 
 	// Otherwise, conditionally push if the new replica is more deserving than
 	// the current tip of the heap.
-	if repl.qps > a.qps.entries[0].qps {
-		heap.Pop(&a.qps)
-		heap.Push(&a.qps, repl)
+	if rr.val(repl) > rr.val(rr.entries[0]) {
+		heap.Pop(rr)
+		heap.Push(rr, repl)
 	}
+
 }
 
-func consumeAccumulator(pq *rrPriorityQueue) []replicaWithStats {
+func consumeAccumulator(pq *rrPriorityQueue) []CandidateReplica {
 	length := pq.Len()
-	sorted := make([]replicaWithStats, length)
+	sorted := make([]CandidateReplica, length)
 	for i := 1; i <= length; i++ {
-		sorted[length-i] = heap.Pop(pq).(replicaWithStats)
+		sorted[length-i] = heap.Pop(pq).(CandidateReplica)
 	}
 	return sorted
 }
 
 type rrPriorityQueue struct {
-	entries []replicaWithStats
-	val     func(replicaWithStats) float64
+	entries []CandidateReplica
+	val     func(CandidateReplica) float64
 }
 
 func (pq rrPriorityQueue) Len() int { return len(pq.entries) }
@@ -115,7 +197,7 @@ func (pq rrPriorityQueue) Swap(i, j int) {
 }
 
 func (pq *rrPriorityQueue) Push(x interface{}) {
-	item := x.(replicaWithStats)
+	item := x.(CandidateReplica)
 	pq.entries = append(pq.entries, item)
 }
 
@@ -125,4 +207,93 @@ func (pq *rrPriorityQueue) Pop() interface{} {
 	item := old[n-1]
 	pq.entries = old[0 : n-1]
 	return item
+}
+
+// ReplicaRankingMap maintains top-k orderings of the replicas per tenant in a
+// store by QPS.
+//
+// TODO(kvoli): The separation between this struct and ReplicaRankings is
+// problematic in that a separation now exists between what the cluster cares
+// about w.r.t "hotness" and maintaining compatibility with the UI which
+// expects QPS ranked replicas. The per-tenant rankings is logical for tenant
+// UI parity, however useless in the current form for being used with cluster
+// rebalancing or new signals. We should clarify what a good end state is, if
+// different signals than QPS may be used by the system to rebalance in some
+// but not all cases.
+type ReplicaRankingMap struct {
+	mu struct {
+		syncutil.Mutex
+		items RRAccumulatorByTenant
+	}
+}
+
+// NewReplicaRankingsMap returns a new ReplicaRankingMap struct.
+func NewReplicaRankingsMap() *ReplicaRankingMap {
+	return &ReplicaRankingMap{}
+}
+
+// NewTenantReplicaAccumulator returns a new RRAccumulatorByTenant.
+func NewTenantReplicaAccumulator() *RRAccumulatorByTenant {
+	return &RRAccumulatorByTenant{}
+}
+
+// Update sets the accumulator for replica tracking to be the passed in value.
+func (rr *ReplicaRankingMap) Update(acc *RRAccumulatorByTenant) {
+	rr.mu.Lock()
+	rr.mu.items = *acc
+	rr.mu.Unlock()
+}
+
+// TopQPS returns the highest QPS CandidateReplicas that are tracked.
+func (rr *ReplicaRankingMap) TopQPS(tenantID roachpb.TenantID) []CandidateReplica {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	r, ok := rr.mu.items[tenantID]
+	if !ok {
+		return []CandidateReplica{}
+	}
+	if r.Len() > 0 {
+		r.entries = consumeAccumulator(&r)
+		rr.mu.items[tenantID] = r
+	}
+	return r.entries
+}
+
+// RRAccumulatorByTenant accumulates replicas per tenant to update the replicas tracked by ReplicaRankingMap.
+// It should be used in the same way as RRAccumulator (see doc string).
+type RRAccumulatorByTenant map[roachpb.TenantID]rrPriorityQueue
+
+// AddReplica adds a replica to the replica accumulator.
+func (a RRAccumulatorByTenant) AddReplica(repl CandidateReplica) {
+	// Do not consider ranges as hot when they are accessed once or less times.
+	if repl.RangeUsageInfo().QueriesPerSecond <= 1 {
+		return
+	}
+
+	tID, ok := repl.Repl().TenantID()
+	if !ok {
+		return
+	}
+
+	r, ok := a[tID]
+	if !ok {
+		q := rrPriorityQueue{
+			val: func(r CandidateReplica) float64 { return r.RangeUsageInfo().QueriesPerSecond },
+		}
+		heap.Push(&q, repl)
+		a[tID] = q
+		return
+	}
+
+	if r.Len() < numTopReplicasToTrack {
+		heap.Push(&r, repl)
+		a[tID] = r
+		return
+	}
+
+	if repl.RangeUsageInfo().QueriesPerSecond > r.entries[0].RangeUsageInfo().QueriesPerSecond {
+		heap.Pop(&r)
+		heap.Push(&r, repl)
+		a[tID] = r
+	}
 }

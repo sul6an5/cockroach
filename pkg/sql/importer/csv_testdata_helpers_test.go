@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/errors"
@@ -42,7 +42,7 @@ func makeShadowKeyTestFile(t testing.TB, numRowsImportedBefore int, suffix strin
 		t.Fatal(errors.Errorf("table has no existing rows to shadow"))
 	}
 	padding := 10
-	dir := testutils.TestDataPath(t, "csv")
+	dir := datapathutils.TestDataPath(t, "csv")
 	fileName := filepath.Join(dir, fmt.Sprintf("shadow-data%s", suffix))
 	f, err := os.Create(fileName)
 	if err != nil {
@@ -73,7 +73,7 @@ func makeShadowKeyTestFile(t testing.TB, numRowsImportedBefore int, suffix strin
 }
 
 func makeDupWithSameValueFile(t testing.TB, suffix string) {
-	dir := testutils.TestDataPath(t, "csv")
+	dir := datapathutils.TestDataPath(t, "csv")
 	fileName := filepath.Join(dir, fmt.Sprintf("dup-key-same-value%s", suffix))
 	f, err := os.Create(fileName)
 	if err != nil {
@@ -104,20 +104,20 @@ func getTestFiles(numFiles int) csvTestFiles {
 		suffix = "-race"
 	}
 	for i := 0; i < numFiles; i++ {
-		testFiles.files = append(testFiles.files, fmt.Sprintf(`'nodelocal://0/%s'`, fmt.Sprintf("data-%d%s", i, suffix)+"?nonsecret=nosecrets"))
-		testFiles.gzipFiles = append(testFiles.gzipFiles, fmt.Sprintf(`'nodelocal://0/%s'`, fmt.Sprintf("data-%d%s.gz", i, suffix)+"?AWS_SESSION_TOKEN=secrets"))
-		testFiles.bzipFiles = append(testFiles.bzipFiles, fmt.Sprintf(`'nodelocal://0/%s'`, fmt.Sprintf("data-%d%s.bz2", i, suffix)))
-		testFiles.filesWithOpts = append(testFiles.filesWithOpts, fmt.Sprintf(`'nodelocal://0/%s'`, fmt.Sprintf("data-%d-opts%s", i, suffix)))
-		testFiles.filesWithDups = append(testFiles.filesWithDups, fmt.Sprintf(`'nodelocal://0/%s'`, fmt.Sprintf("data-%d-dup%s", i, suffix)))
+		testFiles.files = append(testFiles.files, fmt.Sprintf(`'nodelocal://1/%s'`, fmt.Sprintf("data-%d%s", i, suffix)+"?nonsecret=nosecrets"))
+		testFiles.gzipFiles = append(testFiles.gzipFiles, fmt.Sprintf(`'nodelocal://1/%s'`, fmt.Sprintf("data-%d%s.gz", i, suffix)+"?AWS_SESSION_TOKEN=secrets"))
+		testFiles.bzipFiles = append(testFiles.bzipFiles, fmt.Sprintf(`'nodelocal://1/%s'`, fmt.Sprintf("data-%d%s.bz2", i, suffix)))
+		testFiles.filesWithOpts = append(testFiles.filesWithOpts, fmt.Sprintf(`'nodelocal://1/%s'`, fmt.Sprintf("data-%d-opts%s", i, suffix)))
+		testFiles.filesWithDups = append(testFiles.filesWithDups, fmt.Sprintf(`'nodelocal://1/%s'`, fmt.Sprintf("data-%d-dup%s", i, suffix)))
 	}
 
-	testFiles.fileWithDupKeySameValue = append(testFiles.fileWithDupKeySameValue, fmt.Sprintf(`'nodelocal://0/%s'`, fmt.Sprintf("dup-key-same-value%s", suffix)))
-	testFiles.fileWithShadowKeys = append(testFiles.fileWithShadowKeys, fmt.Sprintf(`'nodelocal://0/%s'`, fmt.Sprintf("shadow-data%s", suffix)))
+	testFiles.fileWithDupKeySameValue = append(testFiles.fileWithDupKeySameValue, fmt.Sprintf(`'nodelocal://1/%s'`, fmt.Sprintf("dup-key-same-value%s", suffix)))
+	testFiles.fileWithShadowKeys = append(testFiles.fileWithShadowKeys, fmt.Sprintf(`'nodelocal://1/%s'`, fmt.Sprintf("shadow-data%s", suffix)))
 
 	wildcardFileName := "data-[0-9]"
-	testFiles.filesUsingWildcard = append(testFiles.filesUsingWildcard, fmt.Sprintf(`'nodelocal://0/%s%s'`, wildcardFileName, suffix))
-	testFiles.gzipFilesUsingWildcard = append(testFiles.gzipFilesUsingWildcard, fmt.Sprintf(`'nodelocal://0/%s%s.gz'`, wildcardFileName, suffix))
-	testFiles.bzipFilesUsingWildcard = append(testFiles.gzipFilesUsingWildcard, fmt.Sprintf(`'nodelocal://0/%s%s.bz2'`, wildcardFileName, suffix))
+	testFiles.filesUsingWildcard = append(testFiles.filesUsingWildcard, fmt.Sprintf(`'nodelocal://1/%s%s'`, wildcardFileName, suffix))
+	testFiles.gzipFilesUsingWildcard = append(testFiles.gzipFilesUsingWildcard, fmt.Sprintf(`'nodelocal://1/%s%s.gz'`, wildcardFileName, suffix))
+	testFiles.bzipFilesUsingWildcard = append(testFiles.gzipFilesUsingWildcard, fmt.Sprintf(`'nodelocal://1/%s%s.bz2'`, wildcardFileName, suffix))
 
 	return testFiles
 }
@@ -202,7 +202,7 @@ func makeCSVData(
 	t testing.TB, numFiles, rowsPerFile, numRaceFiles, rowsPerRaceFile int,
 ) csvTestFiles {
 	if rewriteCSVTestData {
-		dir := testutils.TestDataPath(t, "csv")
+		dir := datapathutils.TestDataPath(t, "csv")
 		if err := os.RemoveAll(dir); err != nil {
 			t.Fatal(err)
 		}

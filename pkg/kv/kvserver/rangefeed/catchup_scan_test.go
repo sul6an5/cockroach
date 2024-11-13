@@ -15,16 +15,22 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+// smallEngineBlocks configures Pebble with a block size of 1 byte, to provoke
+// bugs in time-bound iterators.
+var smallEngineBlocks = util.ConstantWithMetamorphicTestBool("small-engine-blocks", false)
 
 // TODO(erikgrinaker): This should be migrated to a data-driven test harness for
 // end-to-end rangefeed testing, with more exhaustive test cases. See:
@@ -91,7 +97,7 @@ func TestCatchupScan(t *testing.T) {
 	kv2_2_2 := makeKTV(testKey2, ts2, testValue2)
 	kv2_5_3 := makeKTV(testKey2, ts5, testValue3)
 
-	eng := storage.NewDefaultInMemForTesting()
+	eng := storage.NewDefaultInMemForTesting(storage.If(smallEngineBlocks, storage.BlockSize(1)))
 	defer eng.Close()
 	// Put with no intent.
 	for _, kv := range []storage.MVCCKeyValue{kv1_1_1, kv1_2_2, kv1_3_3, kv2_1_1, kv2_2_2, kv2_5_3} {
@@ -106,17 +112,17 @@ func TestCatchupScan(t *testing.T) {
 	}
 	testutils.RunTrueAndFalse(t, "withDiff", func(t *testing.T, withDiff bool) {
 		span := roachpb.Span{Key: testKey1, EndKey: roachpb.KeyMax}
-		iter := NewCatchUpIterator(eng, span, ts1, nil)
+		iter := NewCatchUpIterator(eng, span, ts1, nil, nil)
 		defer iter.Close()
-		var events []roachpb.RangeFeedValue
+		var events []kvpb.RangeFeedValue
 		// ts1 here is exclusive, so we do not want the versions at ts1.
-		require.NoError(t, iter.CatchUpScan(func(e *roachpb.RangeFeedEvent) error {
+		require.NoError(t, iter.CatchUpScan(ctx, func(e *kvpb.RangeFeedEvent) error {
 			events = append(events, *e.Val)
 			return nil
 		}, withDiff))
 		require.Equal(t, 4, len(events))
 		checkEquality := func(
-			kv storage.MVCCKeyValue, prevKV storage.MVCCKeyValue, event roachpb.RangeFeedValue) {
+			kv storage.MVCCKeyValue, prevKV storage.MVCCKeyValue, event kvpb.RangeFeedValue) {
 			require.Equal(t, string(kv.Key.Key), string(event.Key))
 			require.Equal(t, kv.Key.Timestamp, event.Value.Timestamp)
 			require.Equal(t, string(kv.Value), string(event.Value.RawBytes))
@@ -141,7 +147,7 @@ func TestCatchupScanInlineError(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	eng := storage.NewDefaultInMemForTesting()
+	eng := storage.NewDefaultInMemForTesting(storage.If(smallEngineBlocks, storage.BlockSize(1)))
 	defer eng.Close()
 
 	// Write an inline value.
@@ -149,10 +155,10 @@ func TestCatchupScanInlineError(t *testing.T) {
 
 	// Run a catchup scan across the span and watch it error.
 	span := roachpb.Span{Key: keys.LocalMax, EndKey: keys.MaxKey}
-	iter := NewCatchUpIterator(eng, span, hlc.Timestamp{}, nil)
+	iter := NewCatchUpIterator(eng, span, hlc.Timestamp{}, nil, nil)
 	defer iter.Close()
 
-	err := iter.CatchUpScan(nil, false)
+	err := iter.CatchUpScan(ctx, nil, false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unexpected inline value")
 }
@@ -167,7 +173,7 @@ func TestCatchupScanSeesOldIntent(t *testing.T) {
 	// [#85886]: https://github.com/cockroachdb/cockroach/issues/85886
 
 	ctx := context.Background()
-	eng := storage.NewDefaultInMemForTesting()
+	eng := storage.NewDefaultInMemForTesting(storage.If(smallEngineBlocks, storage.BlockSize(1)))
 	defer eng.Close()
 
 	// b -> version @ 1100 (visible)
@@ -189,11 +195,11 @@ func TestCatchupScanSeesOldIntent(t *testing.T) {
 
 	// Run a catchup scan across the span and watch it succeed.
 	span := roachpb.Span{Key: keys.LocalMax, EndKey: keys.MaxKey}
-	iter := NewCatchUpIterator(eng, span, tsCutoff, nil)
+	iter := NewCatchUpIterator(eng, span, tsCutoff, nil, nil)
 	defer iter.Close()
 
 	keys := map[string]struct{}{}
-	require.NoError(t, iter.CatchUpScan(func(e *roachpb.RangeFeedEvent) error {
+	require.NoError(t, iter.CatchUpScan(ctx, func(e *kvpb.RangeFeedEvent) error {
 		keys[string(e.Val.Key)] = struct{}{}
 		return nil
 	}, true /* withDiff */))

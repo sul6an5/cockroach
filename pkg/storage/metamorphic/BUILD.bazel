@@ -16,6 +16,7 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/storage",
@@ -28,6 +29,7 @@ go_library(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_pebble//:pebble",
         "@com_github_cockroachdb_pebble//bloom",
+        "@com_github_cockroachdb_pebble//objstorage",
         "@com_github_cockroachdb_pebble//vfs",
     ],
 )
@@ -47,6 +49,7 @@ go_test(
     deps = [
         "//pkg/settings/cluster",
         "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/skip",
         "//pkg/util/leaktest",
         "//pkg/util/log",

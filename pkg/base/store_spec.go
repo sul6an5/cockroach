@@ -262,8 +262,10 @@ type StoreSpec struct {
 	// separated key-value syntax ("key1=value1; key2=value2").
 	RocksDBOptions string
 	// PebbleOptions contains Pebble-specific options in the same format as a
-	// Pebble OPTIONS file but treating any whitespace as a newline:
-	// (Eg, "[Options] delete_range_flush_delay=2s flush_split_bytes=4096")
+	// Pebble OPTIONS file. For example:
+	// [Options]
+	// delete_range_flush_delay=2s
+	// flush_split_bytes=4096
 	PebbleOptions string
 	// EncryptionOptions is a serialized protobuf set by Go CCL code and passed
 	// through to C CCL code to set up encryption-at-rest.  Must be set if and
@@ -368,7 +370,7 @@ var fractionRegex = regexp.MustCompile(`^([-]?([0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-
 //   - provisioned-rate=disk-name=<disk-name>[:bandwidth=<bandwidth-bytes/s>] The
 //     provisioned-rate can be used for admission control for operations on the
 //     store. The bandwidth is optional, and if unspecified, a cluster setting
-//     (kv.store.admission.provisioned_bandwidth) will be used.
+//     (kvadmission.store.provisioned_bandwidth) will be used.
 //
 // Note that commas are forbidden within any field name or value.
 func NewStoreSpec(value string) (StoreSpec, error) {
@@ -406,11 +408,7 @@ func NewStoreSpec(value string) (StoreSpec, error) {
 
 		switch field {
 		case pathField:
-			var err error
-			ss.Path, err = GetAbsoluteStorePath(pathField, value)
-			if err != nil {
-				return StoreSpec{}, err
-			}
+			ss.Path = value
 		case "size":
 			var err error
 			var minBytesAllowed int64 = MinimumStoreSize

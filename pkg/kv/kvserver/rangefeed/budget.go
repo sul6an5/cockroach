@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -89,6 +88,8 @@ func putPooledBudgetAllocation(ba *SharedBudgetAllocation) {
 	budgetAllocationSyncPool.Put(ba)
 }
 
+var budgetClosedError = errors.Errorf("budget closed")
+
 // FeedBudget is memory budget for RangeFeed that wraps BoundAccount
 // and provides ability to wait for downstream to release budget and
 // to send individual events that exceed total budget size.
@@ -117,7 +118,7 @@ type FeedBudget struct {
 		closed bool
 	}
 	// Maximum amount of memory to use by feed. We use separate limit here to
-	// avoid creating BytesMontior with a limit per feed.
+	// avoid creating BytesMonitor with a limit per feed.
 	limit int64
 	// Channel to notify that memory was returned to the budget.
 	replenishC chan interface{}
@@ -163,8 +164,7 @@ func (f *FeedBudget) TryGet(ctx context.Context, amount int64) (*SharedBudgetAll
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.mu.closed {
-		log.Info(ctx, "trying to get allocation from already closed budget")
-		return nil, errors.Errorf("budget unexpectedly closed")
+		return nil, budgetClosedError
 	}
 	var err error
 	if f.mu.memBudget.Used()+amount > f.limit {
@@ -195,7 +195,11 @@ func (f *FeedBudget) WaitAndGet(
 			// Since we share budget with other components, it is also possible that
 			// it was returned and we are not notified by our feed channel, so we try
 			// for the last time.
-			return f.TryGet(ctx, amount)
+			err := ctx.Err()
+			if errors.Is(err, context.DeadlineExceeded) {
+				return f.TryGet(ctx, amount)
+			}
+			return nil, err
 		case <-f.stopC:
 			// We are already stopped, current allocation is already freed so, do
 			// nothing.

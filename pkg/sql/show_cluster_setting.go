@@ -19,11 +19,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -56,11 +57,11 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 
 			// The (slight ab)use of WithMaxAttempts achieves convenient context cancellation.
 			return retry.WithMaxAttempts(ctx, retry.Options{}, math.MaxInt32, func() error {
-				return p.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-					datums, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
+				return p.execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+					datums, err := txn.QueryRowEx(
 						ctx, "read-setting",
-						txn,
-						sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+						txn.KV(),
+						sessiondata.RootUserSessionDataOverride,
 						"SELECT value FROM system.settings WHERE name = $1", name,
 					)
 					if err != nil {
@@ -93,14 +94,14 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 					}
 
 					localRawVal := []byte(s.Get(&st.SV))
-					if !bytes.Equal(localRawVal, kvRawVal) {
+					if err := checkClusterSettingValuesAreEquivalent(
+						localRawVal, kvRawVal,
+					); err != nil {
 						// NB: errors.Wrapf(nil, ...) returns nil.
 						// nolint:errwrap
-						return errors.Errorf(
-							"value differs between local setting (%v) and KV (%v); try again later (%v after %s)",
-							localRawVal, kvRawVal, ctx.Err(), timeutil.Since(tBegin))
+						return errors.WithHintf(err, "try again later (%v after %v)",
+							ctx.Err(), timeutil.Since(tBegin))
 					}
-
 					res = string(kvRawVal)
 					return nil
 				})
@@ -112,13 +113,48 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 	return res, nil
 }
 
+// checkClusterSettingValuesAreEquivalent returns an error if the cluster
+// setting values are not equivalent. Equivalent cluster setting values
+// are either the byte-for-byte identical, or the local value is the successor
+// to the kv value and the local value is a fence version.
+//
+// The in-memory version gets pushed to the fence but the fence is not persisted,
+// so, while migrations are ongoing, we won't see these values match. In practice
+// this is a problem these days because the migrations take a long time.
+func checkClusterSettingValuesAreEquivalent(localRawVal, kvRawVal []byte) error {
+	if bytes.Equal(localRawVal, kvRawVal) {
+		return nil
+	}
+	type cv = clusterversion.ClusterVersion
+	maybeDecodeVersion := func(data []byte) (cv, any, bool) {
+		if len(data) == 0 {
+			return cv{}, data, false
+		}
+		var v cv
+		if err := protoutil.Unmarshal(data, &v); err != nil {
+			return cv{}, data, false
+		}
+		return v, v, true
+	}
+	decodedLocal, localVal, localOk := maybeDecodeVersion(localRawVal)
+	decodedKV, kvVal, kvOk := maybeDecodeVersion(kvRawVal)
+	if localOk && kvOk && decodedLocal.Internal%2 == 1 /* isFence */ {
+		predecessor := decodedLocal
+		predecessor.Internal--
+		if predecessor.Equal(decodedKV) {
+			return nil
+		}
+	}
+	return errors.Errorf(
+		"value differs between local setting (%v) and KV (%v)",
+		localVal, kvVal)
+}
+
 func (p *planner) ShowClusterSetting(
 	ctx context.Context, n *tree.ShowClusterSetting,
 ) (planNode, error) {
 	name := strings.ToLower(n.Name)
-	val, ok := settings.Lookup(
-		name, settings.LookupForLocalAccess, p.ExecCfg().Codec.ForSystemTenant(),
-	)
+	setting, ok := settings.LookupForLocalAccess(name, p.ExecCfg().Codec.ForSystemTenant())
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
 	}
@@ -127,9 +163,15 @@ func (p *planner) ShowClusterSetting(
 		return nil, err
 	}
 
-	setting, ok := val.(settings.NonMaskedSetting)
-	if !ok {
-		return nil, errors.AssertionFailedf("setting is masked: %v", name)
+	if strings.HasPrefix(n.Name, "sql.defaults") {
+		p.BufferClientNotice(
+			ctx,
+			errors.WithHintf(
+				pgnotice.Newf("using global default %s is not recommended", n.Name),
+				"use the `ALTER ROLE ... SET` syntax to control session variable defaults at a finer-grained level. See: %s",
+				docs.URL("alter-role.html#set-default-session-variable-values-for-a-role"),
+			),
+		)
 	}
 
 	columns, err := getShowClusterSettingPlanColumns(setting, name)
@@ -155,7 +197,7 @@ func getShowClusterSettingPlanColumns(
 	switch val.(type) {
 	case *settings.IntSetting:
 		dType = types.Int
-	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.VersionSetting, *settings.EnumSetting:
+	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.VersionSetting, *settings.EnumSetting, *settings.ProtobufSetting:
 		dType = types.String
 	case *settings.BoolSetting:
 		dType = types.Bool
@@ -197,7 +239,7 @@ func planShowClusterSetting(
 					}
 					d = tree.NewDInt(tree.DInt(v))
 				case *settings.StringSetting, *settings.EnumSetting,
-					*settings.ByteSizeSetting, *settings.VersionSetting:
+					*settings.ByteSizeSetting, *settings.VersionSetting, *settings.ProtobufSetting:
 					v, err := val.DecodeToString(encoded)
 					if err != nil {
 						return nil, err

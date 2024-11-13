@@ -40,7 +40,77 @@ func DecodeTenantPrefix(key roachpb.Key) ([]byte, roachpb.TenantID, error) {
 	if err != nil {
 		return nil, roachpb.TenantID{}, err
 	}
-	return rem, roachpb.MakeTenantID(tenID), nil
+	return rem, roachpb.MustMakeTenantID(tenID), nil
+}
+
+// DecodeTenantPrefixE determines the tenant ID from the key prefix, returning
+// the remainder of the key (with the prefix removed) and the decoded tenant ID.
+// Unlike DecodeTenantPrefix, it returns an error rather than panicking if the
+// tenant ID is invalid.
+func DecodeTenantPrefixE(key roachpb.Key) ([]byte, roachpb.TenantID, error) {
+	if len(key) == 0 { // key.Equal(roachpb.RKeyMin)
+		return nil, roachpb.SystemTenantID, nil
+	}
+	if key[0] != tenantPrefixByte {
+		return key, roachpb.SystemTenantID, nil
+	}
+	rem, tenID, err := encoding.DecodeUvarintAscending(key[1:])
+	if err != nil {
+		return nil, roachpb.TenantID{}, err
+	}
+	id, err := roachpb.MakeTenantID(tenID)
+	if err != nil {
+		return rem, roachpb.TenantID{}, err
+	}
+	return rem, id, nil
+}
+
+// StripTenantPrefix removes the tenant prefix from the provided key. This
+// function should be used instead of sqlDecoder.StripTenantPrefix, if the user
+// cannot instantiate a codec that operates on a single tenant.
+func StripTenantPrefix(key roachpb.Key) ([]byte, error) {
+	var err error
+	if len(key) == 0 { // key.Equal(roachpb.RKeyMin)
+		return nil, nil
+	}
+	if key[0] != tenantPrefixByte {
+		return key, nil
+	}
+	key, _, err = encoding.DecodeUvarintAscending(key[1:])
+	return key, err
+}
+
+// StripTablePrefix removes the table and tenant prefix from the provided key.
+// This function should be used instead of sqlDecoder.DecodeTablePrefix, if the
+// user cannot instantiate a codec that operates on a single tenant.
+func StripTablePrefix(key roachpb.Key) ([]byte, error) {
+	var err error
+	key, err = StripTenantPrefix(key)
+	if err != nil {
+		return nil, err
+	}
+	if encoding.PeekType(key) != encoding.Int {
+		return nil, errors.Errorf("invalid table key prefix: %q", key)
+	}
+	key, _, err = encoding.DecodeUvarintAscending(key)
+	return key, err
+}
+
+// StripIndexPrefix removes the index, table and tenant prefix from the provided
+// key. This function should be used instead of sqlDecoder.DecodeIndexPrefix, if
+// the user cannot instantiate a codec that operates on a single tenant.
+func StripIndexPrefix(key roachpb.Key) ([]byte, error) {
+	var err error
+	// StripTablePrefix automatically removes the tenant prefix as well.
+	key, err = StripTablePrefix(key)
+	if err != nil {
+		return nil, err
+	}
+	if encoding.PeekType(key) != encoding.Int {
+		return nil, errors.Errorf("invalid index key prefix: %q", key)
+	}
+	key, _, err = encoding.DecodeUvarintAscending(key)
+	return key, err
 }
 
 // SQLCodec provides methods for encoding SQL table keys bound to a given
@@ -99,6 +169,12 @@ func (e sqlEncoder) TenantPrefix() roachpb.Key {
 	return *e.buf
 }
 
+// TenantSpan returns a span representing the tenant's keyspace.
+func (e sqlEncoder) TenantSpan() roachpb.Span {
+	key := *e.buf
+	return roachpb.Span{Key: key, EndKey: key.PrefixEnd()}
+}
+
 // TablePrefix returns the key prefix used for the table's data.
 func (e sqlEncoder) TablePrefix(tableID uint32) roachpb.Key {
 	k := e.TenantPrefix()
@@ -141,38 +217,10 @@ func (e sqlEncoder) SequenceKey(tableID uint32) roachpb.Key {
 	return k
 }
 
-// DescIDSequenceKey returns the key used for the descriptor ID sequence.
-func (e sqlEncoder) DescIDSequenceKey() roachpb.Key {
-	if e.ForSystemTenant() {
-		// To maintain backwards compatibility, the system tenant uses a
-		// separate, non-SQL, key to store its descriptor ID sequence.
-		return descIDGenerator
-	}
-	return e.SequenceKey(DescIDSequenceID)
-}
-
-// ZoneKeyPrefix returns the key prefix for id's row in the system.zones table.
-func (e sqlEncoder) ZoneKeyPrefix(id uint32) roachpb.Key {
-	k := e.IndexPrefix(ZonesTableID, ZonesTablePrimaryIndexID)
-	return encoding.EncodeUvarintAscending(k, uint64(id))
-}
-
-// ZoneKey returns the key for id's entry in the system.zones table.
-func (e sqlEncoder) ZoneKey(id uint32) roachpb.Key {
-	k := e.ZoneKeyPrefix(id)
-	return MakeFamilyKey(k, uint32(ZonesTableConfigColumnID))
-}
-
 // StartupMigrationKeyPrefix returns the key prefix to store all startup
 // migration details.
 func (e sqlEncoder) StartupMigrationKeyPrefix() roachpb.Key {
 	return append(e.TenantPrefix(), StartupMigrationPrefix...)
-}
-
-// StartupMigrationLeaseKey returns the key that nodes must take a lease on in
-// order to run startup migration upgrades on the cluster.
-func (e sqlEncoder) StartupMigrationLeaseKey() roachpb.Key {
-	return append(e.TenantPrefix(), StartupMigrationLease...)
 }
 
 // unexpected to avoid colliding with sqlEncoder.tenantPrefix.
@@ -246,11 +294,11 @@ func (d sqlDecoder) DecodeDescMetadataID(key roachpb.Key) (uint32, error) {
 // DecodeTenantMetadataID decodes a tenant ID from a tenant metadata key.
 func (d sqlDecoder) DecodeTenantMetadataID(key roachpb.Key) (roachpb.TenantID, error) {
 	// Extract table and index ID from key.
-	remaining, tableID, _, err := d.DecodeIndexPrefix(key)
+	remaining, tableID, indexID, err := d.DecodeIndexPrefix(key)
 	if err != nil {
 		return roachpb.TenantID{}, err
 	}
-	if tableID != TenantsTableID {
+	if tableID != TenantsTableID || indexID != TenantsTablePrimaryKeyIndexID {
 		return roachpb.TenantID{}, errors.Errorf("key is not a tenant table entry: %v", key)
 	}
 	// Extract the tenant ID.
@@ -258,7 +306,23 @@ func (d sqlDecoder) DecodeTenantMetadataID(key roachpb.Key) (roachpb.TenantID, e
 	if err != nil {
 		return roachpb.TenantID{}, err
 	}
-	return roachpb.MakeTenantID(id), nil
+	return roachpb.MustMakeTenantID(id), nil
+}
+
+// DecodeZoneConfigMetadataID decodes a descriptor id from zones key.
+func (d sqlDecoder) DecodeZoneConfigMetadataID(key roachpb.Key) ([]byte, uint32, error) {
+	remaining, tableID, indexID, err := d.DecodeIndexPrefix(key)
+	if err != nil {
+		return nil, 0, err
+	}
+	if tableID != ZonesTableID || indexID != ZonesTablePrimaryIndexID {
+		return nil, 0, errors.Errorf("key is not a zones table entry: %v", key)
+	}
+	remaining, id, err := encoding.DecodeUvarintAscending(remaining)
+	if err != nil {
+		return nil, 0, err
+	}
+	return remaining, uint32(id), nil
 }
 
 // RewriteSpanToTenantPrefix updates the passed Span, potentially in-place, to

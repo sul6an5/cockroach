@@ -81,16 +81,17 @@ func newFileUploadMachine(
 	conn pgwirebase.Conn,
 	n *tree.CopyFrom,
 	txnOpt copyTxnOpt,
-	execCfg *ExecutorConfig,
+	p *planner,
 	parentMon *mon.BytesMonitor,
 ) (f *fileUploadMachine, retErr error) {
 	if len(n.Columns) != 0 {
 		return nil, errors.New("expected 0 columns specified for file uploads")
 	}
 	c := &copyMachine{
-		conn: conn,
+		conn:   conn,
+		txnOpt: txnOpt,
 		// The planner will be prepared before use.
-		p: &planner{execCfg: execCfg},
+		p: p,
 	}
 	f = &fileUploadMachine{
 		c: c,
@@ -98,7 +99,7 @@ func newFileUploadMachine(
 
 	// We need a planner to do the initial planning, even if a planner
 	// is not required after that.
-	cleanup := c.p.preparePlannerForCopy(ctx, &txnOpt, false /* finalBatch */, c.implicitTxn)
+	cleanup := c.p.preparePlannerForCopy(ctx, &c.txnOpt, false /* finalBatch */, c.implicitTxn)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
 	}()
@@ -113,11 +114,7 @@ func newFileUploadMachine(
 	if n.Options.Destination == nil {
 		return nil, errors.Newf("destination required")
 	}
-	destFn, err := f.c.p.TypeAsString(ctx, n.Options.Destination, "COPY")
-	if err != nil {
-		return nil, err
-	}
-	dest, err := destFn()
+	dest, err := f.c.p.ExprEvaluator("COPY").String(ctx, n.Options.Destination)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +151,7 @@ func newFileUploadMachine(
 	c.format = tree.CopyFormatText
 	c.null = `\N`
 	c.delimiter = '\t'
-	c.rows.Init(c.rowsMemAcc, colinfo.ColTypeInfoFromResCols(c.resultColumns), copyBatchRowSize)
+	c.rows.Init(c.rowsMemAcc, colinfo.ColTypeInfoFromResCols(c.resultColumns), CopyBatchRowSize)
 	c.scratchRow = make(tree.Datums, len(c.resultColumns))
 	return
 }

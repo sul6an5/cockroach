@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -57,27 +58,26 @@ func TestDuplicateHandling(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	expectRevisionCount := func(startKey roachpb.Key, endKey roachpb.Key, count int) {
-		req := &roachpb.ExportRequest{
-			RequestHeader: roachpb.RequestHeader{
+		req := &kvpb.ExportRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    startKey,
 				EndKey: endKey,
 			},
-			MVCCFilter: roachpb.MVCCFilter_All,
+			MVCCFilter: kvpb.MVCCFilter_All,
 			StartTime:  hlc.Timestamp{},
-			ReturnSST:  true,
 		}
-		header := roachpb.Header{Timestamp: s.Clock().Now()}
+		header := kvpb.Header{Timestamp: s.Clock().Now()}
 		resp, err := kv.SendWrappedWith(ctx,
 			kvDB.NonTransactionalSender(), header, req)
 		require.NoError(t, err.GoError())
 		keyCount := 0
-		for _, file := range resp.(*roachpb.ExportResponse).Files {
+		for _, file := range resp.(*kvpb.ExportResponse).Files {
 			iterOpts := storage.IterOptions{
 				KeyTypes:   storage.IterKeyTypePointsOnly,
 				LowerBound: keys.LocalMax,
 				UpperBound: keys.MaxKey,
 			}
-			it, err := storage.NewPebbleMemSSTIterator(file.SST, false /* verify */, iterOpts)
+			it, err := storage.NewMemSSTIterator(file.SST, false /* verify */, iterOpts)
 			require.NoError(t, err)
 			defer it.Close()
 			for it.SeekGE(storage.NilKey); ; it.Next() {
@@ -277,27 +277,32 @@ func runTestImport(t *testing.T, batchSizeValue int64) {
 				return encoding.EncodeStringAscending(append([]byte{}, prefix...), fmt.Sprintf("k%d", i))
 			}
 
-			t.Logf("splitting at %s and %s", key(split1), key(split2))
-			require.NoError(t, kvDB.AdminSplit(ctx, key(split1), hlc.MaxTimestamp /* expirationTime */))
-			require.NoError(t, kvDB.AdminSplit(ctx, key(split2), hlc.MaxTimestamp /* expirationTime */))
+			t.Logf("splitting at %s", key(split1))
+			require.NoError(t, kvDB.AdminSplit(
+				ctx,
+				key(split1),
+				hlc.MaxTimestamp, /* expirationTime */
+			))
 
 			// We want to make sure our range-aware batching knows about one of our
-			// splits to exercise that codepath, but we also want to make sure we
+			// splits to exercise that code path, but we also want to make sure we
 			// still handle an unexpected split, so we make our own range cache and
-			// only populate it with one of our two splits.
-			mockCache := rangecache.NewRangeCache(s.ClusterSettings(), nil,
-				func() int64 { return 2 << 10 }, s.Stopper(), s.TracerI().(*tracing.Tracer))
-			addr, err := keys.Addr(key(0))
-			require.NoError(t, err)
-
-			tok, err := s.DistSenderI().(*kvcoord.DistSender).RangeDescriptorCache().LookupWithEvictionToken(
-				ctx, addr, rangecache.EvictionToken{}, false)
-			require.NoError(t, err)
-
-			r := roachpb.RangeInfo{
-				Desc: *tok.Desc(),
+			// populate it after the first split but before the second split.
+			ds := s.DistSenderI().(*kvcoord.DistSender)
+			mockCache := rangecache.NewRangeCache(s.ClusterSettings(), ds,
+				func() int64 { return 2 << 10 }, s.Stopper())
+			for _, k := range []int{0, split1} {
+				ent, err := ds.RangeDescriptorCache().Lookup(ctx, keys.MustAddr(key(k)))
+				require.NoError(t, err)
+				mockCache.Insert(ctx, roachpb.RangeInfo{Desc: *ent.Desc()})
 			}
-			mockCache.Insert(ctx, r)
+
+			t.Logf("splitting at %s", key(split2))
+			require.NoError(t, kvDB.AdminSplit(
+				ctx,
+				key(split2),
+				hlc.MaxTimestamp, /* expirationTime */
+			))
 
 			ts := hlc.Timestamp{WallTime: 100}
 			mem := mon.NewUnlimitedMonitor(ctx, "lots", mon.MemoryResource, nil, nil, 0, nil)

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -260,7 +261,7 @@ type replicaInQueue interface {
 	IsDestroyed() (DestroyReason, error)
 	Desc() *roachpb.RangeDescriptor
 	maybeInitializeRaftGroup(context.Context)
-	redirectOnOrAcquireLease(context.Context) (kvserverpb.LeaseStatus, *roachpb.Error)
+	redirectOnOrAcquireLease(context.Context) (kvserverpb.LeaseStatus, *kvpb.Error)
 	LeaseStatusAt(context.Context, hlc.ClockTimestamp) kvserverpb.LeaseStatus
 }
 
@@ -275,6 +276,12 @@ type queueImpl interface {
 	// We return a boolean to indicate if the Replica was processed successfully
 	// (vs. it being a no-op or an error).
 	process(context.Context, *Replica, spanconfig.StoreReader) (processed bool, err error)
+
+	// processScheduled is called after async task was created to run process.
+	// This function is called by the process loop synchronously. This method is
+	// called regardless of process being called or not since replica validity
+	// checks are done asynchronously.
+	postProcessScheduled(ctx context.Context, replica replicaInQueue, priority float64)
 
 	// timer returns a duration to wait between processing the next item
 	// from the queue. The duration of the last processing of a replica
@@ -315,13 +322,13 @@ type queueConfig struct {
 	// (if not already initialized) when deciding whether to process this
 	// replica.
 	needsRaftInitialized bool
-	// needsSystemConfig controls whether this queue requires a valid copy of the
-	// system config to operate on a replica. Not all queues require it, and it's
+	// needsSpanConfigs controls whether this queue requires a valid copy of the
+	// span configs to operate on a replica. Not all queues require it, and it's
 	// unsafe for certain queues to wait on it. For example, a raft snapshot may
-	// be needed in order to make it possible for the system config to become
-	// available (as observed in #16268), so the raft snapshot queue can't
-	// require the system config to already be available.
-	needsSystemConfig bool
+	// be needed in order to make it possible for the span config range to
+	// become available (as observed in #16268), so the raft snapshot queue
+	// can't require the span configs to already be available.
+	needsSpanConfigs bool
 	// acceptsUnsplitRanges controls whether this queue can process ranges that
 	// need to be split due to zone config settings. Ranges are checked before
 	// calling queueImpl.shouldQueue and queueImpl.process.
@@ -371,7 +378,7 @@ type queueConfig struct {
 //
 // Replicas are added asynchronously through `MaybeAddAsync` or `AddAsync`.
 // MaybeAddAsync checks the various requirements selected by the queue config
-// (needsSystemConfig, needsLease, acceptsUnsplitRanges) as well as the
+// (needsSpanConfigs, needsLease, acceptsUnsplitRanges) as well as the
 // queueImpl's `shouldQueue`. AddAsync does not check any of this and accept a
 // priority directly instead of getting it from `shouldQueue`. These methods run
 // with shared a maximum concurrency of `addOrMaybeAddSemSize`. If the maximum
@@ -466,9 +473,9 @@ func newBaseQueue(name string, impl queueImpl, store *Store, cfg queueConfig) *b
 	ambient := store.cfg.AmbientCtx
 	ambient.AddLogTag(name, nil)
 
-	if !cfg.acceptsUnsplitRanges && !cfg.needsSystemConfig {
+	if !cfg.acceptsUnsplitRanges && !cfg.needsSpanConfigs {
 		log.Fatalf(ambient.AnnotateCtx(context.Background()),
-			"misconfigured queue: acceptsUnsplitRanges=false requires needsSystemConfig=true; got %+v", cfg)
+			"misconfigured queue: acceptsUnsplitRanges=false requires needsSpanConfigs=true; got %+v", cfg)
 	}
 
 	bq := baseQueue{
@@ -632,12 +639,12 @@ func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.
 	ctx = repl.AnnotateCtx(ctx)
 	// Load the system config if it's needed.
 	var confReader spanconfig.StoreReader
-	if bq.needsSystemConfig {
+	if bq.needsSpanConfigs {
 		var err error
 		confReader, err = bq.store.GetConfReader(ctx)
 		if err != nil {
-			if errors.Is(err, errSysCfgUnavailable) && log.V(1) {
-				log.Warningf(ctx, "unable to retrieve system config, skipping: %v", err)
+			if errors.Is(err, errSpanConfigsUnavailable) && log.V(1) {
+				log.Warningf(ctx, "unable to retrieve span configs, skipping: %v", err)
 			}
 			return
 		}
@@ -659,13 +666,20 @@ func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.
 		repl.maybeInitializeRaftGroup(ctx)
 	}
 
-	if !bq.acceptsUnsplitRanges && confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey) {
-		// Range needs to be split due to span configs, but queue does not
-		// accept unsplit ranges.
-		if log.V(1) {
-			log.Infof(ctx, "split needed; not adding")
+	if !bq.acceptsUnsplitRanges {
+		// Queue does not accept unsplit ranges. Check to see if the range needs to
+		// be split because of spanconfigs.
+		needsSplit, err := confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey)
+		if err != nil {
+			log.Warningf(ctx, "unable to compute whether split is needed; not adding")
+			return
 		}
-		return
+		if needsSplit {
+			if log.V(1) {
+				log.Infof(ctx, "split needed; not adding")
+			}
+			return
+		}
 	}
 
 	if bq.needsLease {
@@ -687,7 +701,8 @@ func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.
 	if !should {
 		return
 	}
-	if _, err := bq.addInternal(ctx, repl.Desc(), repl.ReplicaID(), priority); !isExpectedQueueError(err) {
+	_, err := bq.addInternal(ctx, repl.Desc(), repl.ReplicaID(), priority)
+	if !isExpectedQueueError(err) {
 		log.Errorf(ctx, "unable to add: %+v", err)
 	}
 }
@@ -853,7 +868,7 @@ func (bq *baseQueue) processLoop(stopper *stop.Stopper) {
 					// Acquire from the process semaphore.
 					bq.processSem <- struct{}{}
 
-					repl := bq.pop()
+					repl, priority := bq.pop()
 					if repl != nil {
 						annotatedCtx := repl.AnnotateCtx(ctx)
 						if stopper.RunAsyncTaskEx(annotatedCtx, stop.TaskOpts{
@@ -875,6 +890,7 @@ func (bq *baseQueue) processLoop(stopper *stop.Stopper) {
 							<-bq.processSem
 							return
 						}
+						bq.impl.postProcessScheduled(ctx, repl, priority)
 					} else {
 						// Release semaphore if no replicas were available.
 						<-bq.processSem
@@ -922,10 +938,10 @@ func (bq *baseQueue) recordProcessDuration(ctx context.Context, dur time.Duratio
 func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) error {
 	// Load the system config if it's needed.
 	var confReader spanconfig.StoreReader
-	if bq.needsSystemConfig {
+	if bq.needsSpanConfigs {
 		var err error
 		confReader, err = bq.store.GetConfReader(ctx)
-		if errors.Is(err, errSysCfgUnavailable) {
+		if errors.Is(err, errSpanConfigsUnavailable) {
 			if log.V(1) {
 				log.Warningf(ctx, "unable to retrieve conf reader, skipping: %v", err)
 			}
@@ -936,11 +952,18 @@ func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) er
 		}
 	}
 
-	if !bq.acceptsUnsplitRanges && confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey) {
-		// Range needs to be split due to zone configs, but queue does
-		// not accept unsplit ranges.
-		log.VEventf(ctx, 3, "split needed; skipping")
-		return nil
+	if !bq.acceptsUnsplitRanges {
+		// Queue does not accept unsplit ranges. Check to see if the range needs to
+		// be spilt because of a span config.
+		needsSplit, err := confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey)
+		if err != nil {
+			log.Warningf(ctx, "unable to compute NeedsSplit, skipping: %v", err)
+			return nil
+		}
+		if needsSplit {
+			log.VEventf(ctx, 3, "split needed; skipping")
+			return nil
+		}
 	}
 
 	ctx, span := tracing.EnsureChildSpan(ctx, bq.Tracer, bq.processOpName())
@@ -971,7 +994,7 @@ func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) er
 			if bq.needsLease {
 				if _, pErr := repl.redirectOnOrAcquireLease(ctx); pErr != nil {
 					switch v := pErr.GetDetail().(type) {
-					case *roachpb.NotLeaseHolderError, *roachpb.RangeNotFoundError:
+					case *kvpb.NotLeaseHolderError, *kvpb.RangeNotFoundError:
 						log.VEventf(ctx, 3, "%s; skipping", v)
 						return nil
 					default:
@@ -1174,6 +1197,7 @@ func (bq *baseQueue) addToPurgatoryLocked(
 	workerCtx := bq.AnnotateCtx(context.Background())
 	_ = stopper.RunAsyncTaskEx(workerCtx, stop.TaskOpts{TaskName: bq.name + ".purgatory", SpanOpt: stop.SterileRootSpan}, func(ctx context.Context) {
 		ticker := time.NewTicker(purgatoryReportInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-bq.impl.updateChan():
@@ -1260,24 +1284,26 @@ func (bq *baseQueue) processReplicasInPurgatory(
 // replicaItem corresponding to the returned Replica will be moved to the
 // "processing" state and should be cleaned up by calling
 // finishProcessingReplica once the Replica has finished processing.
-func (bq *baseQueue) pop() replicaInQueue {
+func (bq *baseQueue) pop() (replicaInQueue, float64) {
 	bq.mu.Lock()
 	for {
 		if bq.mu.priorityQ.Len() == 0 {
 			bq.mu.Unlock()
-			return nil
+			return nil, 0
 		}
 		item := heap.Pop(&bq.mu.priorityQ).(*replicaItem)
 		if item.processing {
 			log.Fatalf(bq.AnnotateCtx(context.Background()), "%s pulled processing item from heap: %v", bq.name, item)
 		}
+		// We are saving priority because the state is reset by setProcessing()
+		priority := item.priority
 		item.setProcessing()
 		bq.pending.Update(int64(bq.mu.priorityQ.Len()))
 		bq.mu.Unlock()
 
 		repl, _ := bq.getReplica(item.rangeID)
 		if repl != nil && item.replicaID == repl.ReplicaID() {
-			return repl
+			return repl, priority
 		}
 		// Replica not found or was recreated with a new replica ID, remove from
 		// set and try again.
@@ -1350,7 +1376,7 @@ func (bq *baseQueue) DrainQueue(stopper *stop.Stopper) {
 	defer bq.lockProcessing()()
 
 	ctx := bq.AnnotateCtx(context.Background())
-	for repl := bq.pop(); repl != nil; repl = bq.pop() {
+	for repl, _ := bq.pop(); repl != nil; repl, _ = bq.pop() {
 		annotatedCtx := repl.AnnotateCtx(ctx)
 		err := bq.processReplica(annotatedCtx, repl)
 		bq.finishProcessingReplica(annotatedCtx, stopper, repl, err)

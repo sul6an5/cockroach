@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -48,31 +48,27 @@ type gcJobForDB struct {
 	statement scop.StatementForDropJob
 }
 
-func (gj *gcJobs) AddNewGCJobForTable(
-	stmt scop.StatementForDropJob, table catalog.TableDescriptor,
-) {
+func (gj *gcJobs) AddNewGCJobForTable(stmt scop.StatementForDropJob, dbID, tableID descpb.ID) {
 	gj.tables = append(gj.tables, gcJobForTable{
-		parentID:  table.GetParentID(),
-		id:        table.GetID(),
+		parentID:  dbID,
+		id:        tableID,
 		statement: stmt,
 	})
 }
 
-func (gj *gcJobs) AddNewGCJobForDatabase(
-	stmt scop.StatementForDropJob, db catalog.DatabaseDescriptor,
-) {
+func (gj *gcJobs) AddNewGCJobForDatabase(stmt scop.StatementForDropJob, dbID descpb.ID) {
 	gj.dbs = append(gj.dbs, gcJobForDB{
-		id:        db.GetID(),
+		id:        dbID,
 		statement: stmt,
 	})
 }
 
 func (gj *gcJobs) AddNewGCJobForIndex(
-	stmt scop.StatementForDropJob, tbl catalog.TableDescriptor, index catalog.Index,
+	stmt scop.StatementForDropJob, tableID descpb.ID, indexID descpb.IndexID,
 ) {
 	gj.indexes = append(gj.indexes, gcJobForIndex{
-		tableID:   tbl.GetID(),
-		indexID:   index.GetID(),
+		tableID:   tableID,
+		indexID:   indexID,
 		statement: stmt,
 	})
 }
@@ -86,7 +82,7 @@ func (gj gcJobs) makeRecords(
 ) (dbZoneConfigsToRemove catalog.DescriptorIDSet, gcJobRecords []jobs.Record) {
 	type stmts struct {
 		s   []scop.StatementForDropJob
-		set util.FastIntSet
+		set intsets.Fast
 	}
 	addStmt := func(s *stmts, stmt scop.StatementForDropJob) {
 		if id := int(stmt.StatementID); !s.set.Contains(id) {

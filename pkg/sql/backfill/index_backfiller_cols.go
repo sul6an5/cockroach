@@ -12,8 +12,8 @@ package backfill
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -24,11 +24,11 @@ type indexBackfillerCols struct {
 	// colIdxMap maps ColumnIDs to indices into desc.Columns and desc.Mutations.
 	colIdxMap catalog.TableColMap
 
-	// cols are all writable (PUBLIC and DELETE_AND_WRITE_ONLY) columns in
+	// cols are all writable (PUBLIC and WRITE_ONLY) columns in
 	// the descriptor.
 	cols []catalog.Column
 
-	// addedCols are the columns in DELETE_AND_WRITE_ONLY being added as part of
+	// addedCols are the columns in WRITE_ONLY being added as part of
 	// this index which are not computed. The definition of being added is that
 	// the index being backfilled is a new primary index and the columns do not
 	// exist in the currently public primary index. Note that this should never
@@ -45,7 +45,7 @@ type indexBackfillerCols struct {
 
 	// valNeededForCol contains the indexes (into cols) of all columns that we
 	// need to fetch values for.
-	valNeededForCol util.FastIntSet
+	valNeededForCol intsets.Fast
 }
 
 // makeIndexBackfillColumns computes the set of writable columns and
@@ -103,7 +103,7 @@ func makeIndexBackfillColumns(
 	// Find the adding columns which are being added to new primary indexes.
 	var addedDefaultOrComputed catalog.TableColSet
 	for _, idx := range addedIndexes {
-		if idx.GetEncodingType() != descpb.PrimaryIndexEncoding {
+		if idx.GetEncodingType() != catenumpb.PrimaryIndexEncoding {
 			if !indexColumns(idx).Difference(computedVirtual).SubsetOf(primaryColumns) {
 				return indexBackfillerCols{}, errors.AssertionFailedf(
 					"secondary index for backfill contains physical column not present in " +
@@ -141,7 +141,7 @@ func makeIndexBackfillColumns(
 // because of references in expressions.
 func makeInitialValNeededForCol(
 	ib indexBackfillerCols, addedIndexes []catalog.Index,
-) (valNeededForCol util.FastIntSet) {
+) (valNeededForCol intsets.Fast) {
 	// Any columns we're going to eval, we don't need values for ahead of time.
 	toEval := func() catalog.TableColSet {
 		columnIDs := func(columns []catalog.Column) (s catalog.TableColSet) {
@@ -160,7 +160,7 @@ func makeInitialValNeededForCol(
 
 	for _, idx := range addedIndexes {
 		colIDs := idx.CollectKeyColumnIDs()
-		if idx.GetEncodingType() == descpb.PrimaryIndexEncoding {
+		if idx.GetEncodingType() == catenumpb.PrimaryIndexEncoding {
 			for _, col := range ib.cols {
 				if !col.IsVirtual() {
 					colIDs.Add(col.GetID())

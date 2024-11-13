@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/datadriven"
@@ -35,38 +36,38 @@ import (
 func TestMemo(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
 		memo.ExprFmtHideStats | memo.ExprFmtHideNotVisibleIndexInfo
-	runDataDrivenTest(t, testutils.TestDataPath(t, "memo"), flags)
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "memo"), flags)
 }
 
 func TestFormat(t *testing.T) {
-	runDataDrivenTest(t, testutils.TestDataPath(t, "format"), memo.ExprFmtShowAll)
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "format"), memo.ExprFmtShowAll)
 }
 
 func TestLogicalProps(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideQualifications | memo.ExprFmtHideStats |
 		memo.ExprFmtHideNotVisibleIndexInfo
-	runDataDrivenTest(t, testutils.TestDataPath(t, "logprops"), flags)
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "logprops"), flags)
 }
 
 func TestStats(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
 		memo.ExprFmtHideScalars | memo.ExprFmtHideNotVisibleIndexInfo
-	runDataDrivenTest(t, testutils.TestDataPath(t, "stats"), flags)
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "stats"), flags)
 }
 
 func TestStatsQuality(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
 		memo.ExprFmtHideScalars | memo.ExprFmtHideNotVisibleIndexInfo
-	runDataDrivenTest(t, testutils.TestDataPath(t, "stats_quality"), flags)
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "stats_quality"), flags)
 }
 
 func TestCompositeSensitive(t *testing.T) {
-	datadriven.RunTest(t, testutils.TestDataPath(t, "composite_sensitive"), func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "composite_sensitive"), func(t *testing.T, d *datadriven.TestData) string {
 		semaCtx := tree.MakeSemaContext()
 		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		var f norm.Factory
-		f.Init(&evalCtx, nil /* catalog */)
+		f.Init(context.Background(), &evalCtx, nil /* catalog */)
 		md := f.Metadata()
 
 		if d.Cmd != "composite-sensitive" {
@@ -146,6 +147,13 @@ func TestMemoIsStale(t *testing.T) {
 	// Initialize context with starting values.
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	evalCtx.SessionData().Database = "t"
+	// MakeTestingEvalContext created a fake planner that can only provide the
+	// memory monitor and will encounter a nil-pointer error when other methods
+	// are accessed. In this test, GetDatabaseSurvivalGoal method will be called
+	// which can handle a case of nil planner but cannot a case when the
+	// planner's GetMultiregionConfig is nil, so we nil out the planner.
+	evalCtx.Planner = nil
+	evalCtx.StreamManagerFactory = nil
 
 	var o xform.Optimizer
 	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT a, b+1 FROM abcview WHERE c='foo'")
@@ -292,6 +300,24 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().EnforceHomeRegion = false
 	notStale()
 
+	// Stale inequality lookup joins enabled.
+	evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
+	stale()
+	evalCtx.SessionData().VariableInequalityLookupJoinEnabled = false
+	notStale()
+
+	// Stale use limit ordering for streaming group by.
+	evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
+	stale()
+	evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = false
+	notStale()
+
+	// Stale use improved split disjunction for joins.
+	evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = false
+	notStale()
+
 	// Stale testing_optimizer_random_seed.
 	evalCtx.SessionData().TestingOptimizerRandomSeed = 100
 	stale()
@@ -310,6 +336,45 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().TestingOptimizerDisableRuleProbability = 0
 	notStale()
 
+	// Stale allow_ordinal_column_references.
+	evalCtx.SessionData().AllowOrdinalColumnReferences = true
+	stale()
+	evalCtx.SessionData().AllowOrdinalColumnReferences = false
+	notStale()
+
+	// Stale optimizer_use_improve_disjunction_stats.
+	evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = false
+	notStale()
+
+	// Stale optimizer_always_use_histograms.
+	evalCtx.SessionData().OptimizerAlwaysUseHistograms = true
+	stale()
+	evalCtx.SessionData().OptimizerAlwaysUseHistograms = false
+	notStale()
+
+	// Stale optimizer_hoist_uncorrelated_equality_subqueries.
+	evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries = true
+	stale()
+	evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries = false
+	notStale()
+
+	// Stale optimizer_use_improved_computed_column_filters_derivation.
+	evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = false
+	notStale()
+
+	// User no longer has access to view.
+	catalog.View(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abcview")).Revoked = true
+	_, err = o.Memo().IsStale(ctx, &evalCtx, catalog)
+	if exp := "user does not have privilege"; !testutils.IsError(err, exp) {
+		t.Fatalf("expected %q error, but got %+v", exp, err)
+	}
+	catalog.View(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abcview")).Revoked = false
+	notStale()
+
 	// Stale data sources and schema. Create new catalog so that data sources are
 	// recreated and can be modified independently.
 	catalog = testcat.New()
@@ -321,15 +386,6 @@ func TestMemoIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// User no longer has access to view.
-	catalog.View(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abcview")).Revoked = true
-	_, err = o.Memo().IsStale(ctx, &evalCtx, catalog)
-	if exp := "user does not have privilege"; !testutils.IsError(err, exp) {
-		t.Fatalf("expected %q error, but got %+v", exp, err)
-	}
-	catalog.View(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abcview")).Revoked = false
-	notStale()
 
 	// Table ID changes.
 	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabID = 1
@@ -362,7 +418,7 @@ func TestStatsAvailable(t *testing.T) {
 
 	testNotAvailable := func(expr memo.RelExpr) {
 		traverseExpr(expr, func(e memo.RelExpr) {
-			if e.Relational().Stats.Available {
+			if e.Relational().Statistics().Available {
 				t.Fatal("stats should not be available")
 			}
 		})
@@ -400,7 +456,7 @@ func TestStatsAvailable(t *testing.T) {
 
 	testAvailable := func(expr memo.RelExpr) {
 		traverseExpr(expr, func(e memo.RelExpr) {
-			if !e.Relational().Stats.Available {
+			if !e.Relational().Statistics().Available {
 				t.Fatal("stats should be available")
 			}
 		})

@@ -97,19 +97,27 @@ func TestMatchOverload(t *testing.T) {
 		Overloads: []tree.QualifiedOverload{
 			{
 				Schema:   "pg_catalog",
-				Overload: &tree.Overload{Oid: 1, IsUDF: false, Types: tree.ArgTypes{tree.ArgType{Typ: types.Int}}},
+				Overload: &tree.Overload{Oid: 1, IsUDF: false, Types: tree.ParamTypes{tree.ParamType{Typ: types.Int}}},
 			},
 			{
 				Schema:   "sc1",
-				Overload: &tree.Overload{Oid: 2, IsUDF: true, Types: tree.ArgTypes{tree.ArgType{Typ: types.Int}}},
+				Overload: &tree.Overload{Oid: 2, IsUDF: true, Types: tree.ParamTypes{tree.ParamType{Typ: types.Int}}},
 			},
 			{
 				Schema:   "sc1",
-				Overload: &tree.Overload{Oid: 3, IsUDF: true, Types: tree.ArgTypes{}},
+				Overload: &tree.Overload{Oid: 3, IsUDF: true, Types: tree.ParamTypes{}},
 			},
 			{
 				Schema:   "sc2",
-				Overload: &tree.Overload{Oid: 4, IsUDF: true, Types: tree.ArgTypes{tree.ArgType{Typ: types.Int}}},
+				Overload: &tree.Overload{Oid: 4, IsUDF: true, Types: tree.ParamTypes{tree.ParamType{Typ: types.Int}}},
+			},
+			{
+				Schema: "sc3",
+				Overload: &tree.Overload{Oid: 5, IsUDF: true,
+					Types: tree.ParamTypes{
+						tree.ParamType{Typ: types.Int2}, tree.ParamType{Typ: types.Int4},
+					},
+				},
 			},
 		},
 	}
@@ -190,6 +198,18 @@ func TestMatchOverload(t *testing.T) {
 			argTypes:    []*types.T{types.String},
 			path:        []string{"sc2", "sc1", "pg_catalog"},
 			expectedErr: `function f\(string\) does not exist`,
+		},
+		{
+			testName:    "multiple parameters exact match on same family type",
+			argTypes:    []*types.T{types.Int2, types.Int4},
+			path:        []string{"sc3", "sc3", "pg_catalog"},
+			expectedOid: 5,
+		},
+		{
+			testName:    "multiple parameters exact match on same family type not exists",
+			argTypes:    []*types.T{types.Int, types.Int4},
+			path:        []string{"sc3", "sc3", "pg_catalog"},
+			expectedErr: `function f\(int,int4\) does not exist: function undefined`,
 		},
 	}
 

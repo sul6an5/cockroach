@@ -14,14 +14,14 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 )
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.Scan, DefaultDeclareIsolatedKeys, Scan)
+	RegisterReadOnlyCommand(kvpb.Scan, DefaultDeclareIsolatedKeys, Scan)
 }
 
 // Scan scans the key range specified by start key through end key
@@ -29,41 +29,56 @@ func init() {
 // stores the number of scan results remaining for this batch
 // (MaxInt64 for no limit).
 func Scan(
-	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.ScanRequest)
+	args := cArgs.Args.(*kvpb.ScanRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.ScanResponse)
+	reply := resp.(*kvpb.ScanResponse)
 
 	var res result.Result
 	var scanRes storage.MVCCScanResult
 	var err error
 
 	opts := storage.MVCCScanOptions{
-		Inconsistent:     h.ReadConsistency != roachpb.CONSISTENT,
-		SkipLocked:       h.WaitPolicy == lock.WaitPolicy_SkipLocked,
-		Txn:              h.Txn,
-		Uncertainty:      cArgs.Uncertainty,
-		MaxKeys:          h.MaxSpanRequestKeys,
-		MaxIntents:       storage.MaxIntentsPerWriteIntentError.Get(&cArgs.EvalCtx.ClusterSettings().SV),
-		TargetBytes:      h.TargetBytes,
-		AllowEmpty:       h.AllowEmpty,
-		WholeRowsOfSize:  h.WholeRowsOfSize,
-		FailOnMoreRecent: args.KeyLocking != lock.None,
-		Reverse:          false,
-		MemoryAccount:    cArgs.EvalCtx.GetResponseMemoryAccount(),
-		LockTable:        cArgs.Concurrency,
+		Inconsistent:          h.ReadConsistency != kvpb.CONSISTENT,
+		SkipLocked:            h.WaitPolicy == lock.WaitPolicy_SkipLocked,
+		Txn:                   h.Txn,
+		ScanStats:             cArgs.ScanStats,
+		Uncertainty:           cArgs.Uncertainty,
+		MaxKeys:               h.MaxSpanRequestKeys,
+		MaxIntents:            storage.MaxIntentsPerWriteIntentError.Get(&cArgs.EvalCtx.ClusterSettings().SV),
+		TargetBytes:           h.TargetBytes,
+		AllowEmpty:            h.AllowEmpty,
+		WholeRowsOfSize:       h.WholeRowsOfSize,
+		FailOnMoreRecent:      args.KeyLocking != lock.None,
+		Reverse:               false,
+		MemoryAccount:         cArgs.EvalCtx.GetResponseMemoryAccount(),
+		LockTable:             cArgs.Concurrency,
+		DontInterleaveIntents: cArgs.DontInterleaveIntents,
 	}
 
 	switch args.ScanFormat {
-	case roachpb.BATCH_RESPONSE:
+	case kvpb.BATCH_RESPONSE:
 		scanRes, err = storage.MVCCScanToBytes(
 			ctx, reader, args.Key, args.EndKey, h.Timestamp, opts)
 		if err != nil {
 			return result.Result{}, err
 		}
 		reply.BatchResponses = scanRes.KVData
-	case roachpb.KEY_VALUES:
+	case kvpb.COL_BATCH_RESPONSE:
+		scanRes, err = storage.MVCCScanToCols(
+			ctx, reader, cArgs.Header.IndexFetchSpec, args.Key, args.EndKey,
+			h.Timestamp, opts, cArgs.EvalCtx.ClusterSettings(),
+		)
+		if err != nil {
+			return result.Result{}, err
+		}
+		if len(scanRes.ColBatches) > 0 {
+			reply.ColBatches.ColBatches = scanRes.ColBatches
+		} else {
+			reply.BatchResponses = scanRes.KVData
+		}
+	case kvpb.KEY_VALUES:
 		scanRes, err = storage.MVCCScan(
 			ctx, reader, args.Key, args.EndKey, h.Timestamp, opts)
 		if err != nil {
@@ -83,7 +98,7 @@ func Scan(
 		reply.ResumeNextBytes = scanRes.ResumeNextBytes
 	}
 
-	if h.ReadConsistency == roachpb.READ_UNCOMMITTED {
+	if h.ReadConsistency == kvpb.READ_UNCOMMITTED {
 		// NOTE: MVCCScan doesn't use a Prefix iterator, so we don't want to use
 		// one in CollectIntentRows either so that we're guaranteed to use the
 		// same cached iterator and observe a consistent snapshot of the engine.

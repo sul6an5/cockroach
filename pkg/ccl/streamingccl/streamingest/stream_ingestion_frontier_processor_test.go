@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
@@ -31,9 +32,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,11 +56,14 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 					// be adopted as the processors are being manually executed in the test.
 					DisableAdoptions: true,
 				},
+				// DisableAdoptions needs this.
+				UpgradeManager: &upgradebase.TestingKnobs{
+					DontUseJobs: true,
+				},
 			},
 		},
 	})
 	defer tc.Stopper().Stop(context.Background())
-	kvDB := tc.Server(0).DB()
 
 	st := cluster.MakeTestingClusterSettings()
 	JobCheckpointFrequency.Override(ctx, &st.SV, 200*time.Millisecond)
@@ -72,15 +78,15 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 	flowCtx := execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
 			Settings:          st,
-			DB:                kvDB,
+			DB:                tc.Server(0).InternalDB().(descs.DB),
 			JobRegistry:       registry,
 			BulkSenderLimiter: limit.MakeConcurrentRequestLimiter("test", math.MaxInt),
 		},
 		EvalCtx:     &evalCtx,
+		Mon:         evalCtx.TestingMon,
 		DiskMonitor: testDiskMonitor,
 	}
 
-	out := &distsqlutils.RowBuffer{}
 	post := execinfrapb.PostProcessSpec{}
 
 	var spec execinfrapb.StreamIngestionDataSpec
@@ -101,7 +107,7 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 	const tenantID = 20
 	sampleKV := func() roachpb.KeyValue {
 		key, err := keys.RewriteKeyToTenantPrefix(roachpb.Key("key_1"),
-			keys.MakeTenantPrefix(roachpb.MakeTenantID(tenantID)))
+			keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenantID)))
 		require.NoError(t, err)
 		return roachpb.KeyValue{Key: key, Value: v}
 	}
@@ -210,22 +216,24 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			topology := streamclient.Topology{
-				{
-					ID:                pa1,
-					SubscriptionToken: []byte(pa1),
-					SrcAddr:           streamingccl.PartitionAddress(pa1),
-					Spans:             []roachpb.Span{pa1Span},
-				},
-				{
-					ID:                pa2,
-					SubscriptionToken: []byte(pa2),
-					SrcAddr:           streamingccl.PartitionAddress(pa2),
-					Spans:             []roachpb.Span{pa2Span},
+				Partitions: []streamclient.PartitionInfo{
+					{
+						ID:                pa1,
+						SubscriptionToken: []byte(pa1),
+						SrcAddr:           streamingccl.PartitionAddress(pa1),
+						Spans:             []roachpb.Span{pa1Span},
+					},
+					{
+						ID:                pa2,
+						SubscriptionToken: []byte(pa2),
+						SrcAddr:           streamingccl.PartitionAddress(pa2),
+						Spans:             []roachpb.Span{pa2Span},
+					},
 				},
 			}
 
 			spec.PartitionSpecs = map[string]execinfrapb.StreamIngestionPartitionSpec{}
-			for _, partition := range topology {
+			for _, partition := range topology.Partitions {
 				spec.PartitionSpecs[partition.ID] = execinfrapb.StreamIngestionPartitionSpec{
 					PartitionID:       partition.ID,
 					SubscriptionToken: string(partition.SubscriptionToken),
@@ -234,12 +242,15 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 				}
 			}
 			spec.TenantRekey = execinfrapb.TenantRekey{
-				OldID: roachpb.MakeTenantID(tenantID),
-				NewID: roachpb.MakeTenantID(tenantID + 10),
+				OldID: roachpb.MustMakeTenantID(tenantID),
+				NewID: roachpb.MustMakeTenantID(tenantID + 10),
 			}
-			spec.StartTime = tc.frontierStartTime
+			spec.PreviousHighWaterTimestamp = tc.frontierStartTime
+			if tc.frontierStartTime.IsEmpty() {
+				spec.InitialScanTimestamp = hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+			}
 			spec.Checkpoint.ResolvedSpans = tc.jobCheckpoint
-			proc, err := newStreamIngestionDataProcessor(&flowCtx, 0 /* processorID */, spec, &post, out)
+			proc, err := newStreamIngestionDataProcessor(ctx, &flowCtx, 0 /* processorID */, spec, &post)
 			require.NoError(t, err)
 			sip, ok := proc.(*streamIngestionProcessor)
 			if !ok {
@@ -290,8 +301,9 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 
 			frontierPost := execinfrapb.PostProcessSpec{}
 			frontierOut := distsqlutils.RowBuffer{}
-			frontierProc, err := newStreamIngestionFrontierProcessor(&flowCtx, 0, /* processorID*/
-				frontierSpec, sip, &frontierPost, &frontierOut)
+			frontierProc, err := newStreamIngestionFrontierProcessor(
+				ctx, &flowCtx, 0 /* processorID*/, frontierSpec, sip, &frontierPost,
+			)
 			require.NoError(t, err)
 			fp, ok := frontierProc.(*streamIngestionFrontier)
 			if !ok {
@@ -321,8 +333,8 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 				require.NoError(t, err)
 				progress := job.Progress().Progress
 				if progress == nil {
-					if !heartbeatTs.Equal(spec.StartTime) {
-						t.Fatalf("heartbeat %v should equal start time of %v", heartbeatTs, spec.StartTime)
+					if !heartbeatTs.Equal(spec.InitialScanTimestamp) {
+						t.Fatalf("heartbeat %v should equal start time of %v", heartbeatTs, spec.InitialScanTimestamp)
 					}
 				} else {
 					persistedHighwater := *progress.(*jobspb.Progress_HighWater).HighWater
@@ -330,7 +342,7 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 				}
 			})
 
-			fp.Run(ctxWithCancel)
+			fp.Run(ctxWithCancel, &frontierOut)
 
 			if !frontierOut.ProducerClosed() {
 				t.Fatal("producer for StreamFrontierProcessor not closed")

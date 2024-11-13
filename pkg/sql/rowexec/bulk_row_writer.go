@@ -14,6 +14,7 @@ import (
 	"context"
 	"sync/atomic"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -41,31 +42,29 @@ type bulkRowWriter struct {
 	tableDesc      catalog.TableDescriptor
 	spec           execinfrapb.BulkRowWriterSpec
 	input          execinfra.RowSource
-	output         execinfra.RowReceiver
-	summary        roachpb.BulkOpSummary
+	summary        kvpb.BulkOpSummary
 }
 
 var _ execinfra.Processor = &bulkRowWriter{}
 var _ execinfra.RowSource = &bulkRowWriter{}
 
 func newBulkRowWriterProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.BulkRowWriterSpec,
 	input execinfra.RowSource,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	c := &bulkRowWriter{
 		flowCtx:        flowCtx,
 		processorID:    processorID,
 		batchIdxAtomic: 0,
-		tableDesc:      flowCtx.TableDescriptor(&spec.Table),
+		tableDesc:      flowCtx.TableDescriptor(ctx, &spec.Table),
 		spec:           spec,
 		input:          input,
-		output:         output,
 	}
 	if err := c.Init(
-		c, &execinfrapb.PostProcessSpec{}, CTASPlanResultTypes, flowCtx, processorID, output,
+		ctx, c, &execinfrapb.PostProcessSpec{}, CTASPlanResultTypes, flowCtx, processorID,
 		nil /* memMonitor */, execinfra.ProcStateOpts{InputsToDrain: []execinfra.RowSource{input}},
 	); err != nil {
 		return nil, err
@@ -104,7 +103,7 @@ func (sp *bulkRowWriter) work(ctx context.Context) error {
 	semaCtx := tree.MakeSemaContext()
 	conv, err := row.NewDatumRowConverter(
 		ctx, &semaCtx, sp.tableDesc, nil /* targetColNames */, sp.EvalCtx, kvCh, nil,
-		/* seqChunkProvider */ sp.flowCtx.GetRowMetrics(), sp.flowCtx.Cfg.DB,
+		/* seqChunkProvider */ sp.flowCtx.GetRowMetrics(), sp.flowCtx.Cfg.DB.KV(),
 	)
 	if err != nil {
 		return err
@@ -136,7 +135,7 @@ func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) 
 	writeTS := sp.spec.Table.CreateAsOfTime
 	const bufferSize = 64 << 20
 	adder, err := sp.flowCtx.Cfg.BulkAdder(
-		ctx, sp.flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
+		ctx, sp.flowCtx.Cfg.DB.KV(), writeTS, kvserverbase.BulkAdderOptions{
 			Name:          sp.tableDesc.GetName(),
 			MinBufferSize: bufferSize,
 			// We disallow shadowing here to ensure that we report errors when builds

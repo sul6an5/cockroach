@@ -15,13 +15,17 @@ import (
 	"math"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
@@ -37,10 +41,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/cockroachdb/cockroach/pkg/util/tochar"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
+
+var ErrNilTxnInClusterContext = errors.New("nil txn in cluster context")
 
 // Context defines the context in which to evaluate an expression, allowing
 // the retrieval of state such as the node ID or statement start time.
@@ -88,8 +95,13 @@ type Context struct {
 	// are no tiers, then the node's location is not known. Example:
 	//
 	//   [region=us,dc=east]
-	//
+	// The region entry in this variable is the gateway region.
 	Locality roachpb.Locality
+
+	// OriginalLocality is the initial Locality at the time the connection was
+	// established. Since Locality may be overridden in some paths, this provides
+	// a means of restoring the original Locality.
+	OriginalLocality roachpb.Locality
 
 	Tracer *tracing.Tracer
 
@@ -130,10 +142,15 @@ type Context struct {
 	// need to restore once we finish evaluating it.
 	iVarContainerStack []tree.IndexedVarContainer
 
-	// Context holds the context in which the expression is evaluated.
-	Context context.Context
+	// deprecatedContext holds the context in which the expression is evaluated.
+	//
+	// Deprecated: this field should not be used because an effort to remove it
+	// from Context is under way.
+	deprecatedContext context.Context
 
 	Planner Planner
+
+	StreamManagerFactory StreamManagerFactory
 
 	// Not using sql.JobExecContext type to avoid cycle dependency with sql package
 	JobExecContext interface{}
@@ -160,7 +177,8 @@ type Context struct {
 	// The transaction in which the statement is executing.
 	Txn *kv.Txn
 
-	ReCache *tree.RegexpCache
+	ReCache           *tree.RegexpCache
+	ToCharFormatCache *tochar.FormatCache
 
 	// TODO(mjibson): remove prepareOnly in favor of a 2-step prepare-exec solution
 	// that is also able to save the plan to skip work during the exec step.
@@ -175,7 +193,11 @@ type Context struct {
 
 	TestingKnobs TestingKnobs
 
-	Mon *mon.BytesMonitor
+	// TestingMon is a memory monitor that should be only used in tests. In
+	// production code consider using either the monitor of the planner or of
+	// the flow.
+	// TODO(yuzefovich): remove this.
+	TestingMon *mon.BytesMonitor
 
 	// SingleDatumAggMemAccount is a memory account that all aggregate builtins
 	// that store a single datum will share to account for the memory needed to
@@ -233,41 +255,78 @@ type Context struct {
 
 	// ChangefeedState stores the state (progress) of core changefeeds.
 	ChangefeedState ChangefeedState
+
+	// ParseHelper makes date parsing more efficient.
+	ParseHelper pgdate.ParseHelper
+
+	// RemoteRegions contains the slice of remote regions in a multiregion
+	// database which owns a table accessed by the current SQL request.
+	// This slice is only populated during the optbuild stage.
+	RemoteRegions catpb.RegionNames
 }
 
 // DescIDGenerator generates unique descriptor IDs.
 type DescIDGenerator interface {
+
+	// PeekNextUniqueDescID returns a lower bound to the next as-of-yet unassigned
+	// unique descriptor ID in the sequence.
+	PeekNextUniqueDescID(ctx context.Context) (catid.DescID, error)
+
+	// GenerateUniqueDescID returns the next available Descriptor ID and
+	// increments the counter.
 	GenerateUniqueDescID(ctx context.Context) (catid.DescID, error)
+
+	// IncrementDescID increments the descriptor ID counter by at least inc.
+	// It returns the first ID in the incremented range:
+	// <val> .. <val> + inc  are all available to the caller.
+	IncrementDescID(ctx context.Context, inc int64) (catid.DescID, error)
 }
 
 // RangeStatsFetcher is used to fetch RangeStats.
 type RangeStatsFetcher interface {
 
 	// RangeStats fetches the stats for the ranges which contain the passed keys.
-	RangeStats(ctx context.Context, keys ...roachpb.Key) ([]*roachpb.RangeStatsResponse, error)
+	RangeStats(ctx context.Context, keys ...roachpb.Key) ([]*kvpb.RangeStatsResponse, error)
 }
 
-var _ tree.ParseTimeContext = &Context{}
+var _ tree.ParseContext = &Context{}
 
 // ConsistencyCheckRunner is an interface embedded in eval.Context used by
 // crdb_internal.check_consistency.
 type ConsistencyCheckRunner interface {
 	CheckConsistency(
-		ctx context.Context, from, to roachpb.Key, mode roachpb.ChecksumMode,
-	) (*roachpb.CheckConsistencyResponse, error)
+		ctx context.Context, from, to roachpb.Key, mode kvpb.ChecksumMode,
+	) (*kvpb.CheckConsistencyResponse, error)
 }
 
 // RangeProber is an interface embedded in eval.Context used by
 // crdb_internal.probe_ranges.
 type RangeProber interface {
 	RunProbe(
-		ctx context.Context, key roachpb.Key, isWrite bool,
+		ctx context.Context, desc *roachpb.RangeDescriptor, isWrite bool,
 	) error
+}
+
+// SetDeprecatedContext updates the context.Context of this Context. Previously
+// stored context is returned.
+//
+// Deprecated: this method should not be used because an effort to remove the
+// context.Context from Context is under way.
+func (ec *Context) SetDeprecatedContext(ctx context.Context) context.Context {
+	oldCtx := ec.deprecatedContext
+	ec.deprecatedContext = ctx
+	return oldCtx
 }
 
 // UnwrapDatum encapsulates UnwrapDatum for use in the tree.CompareContext.
 func (ec *Context) UnwrapDatum(d tree.Datum) tree.Datum {
-	return UnwrapDatum(ec, d)
+	if ec == nil {
+		// When ec is nil, then eval.UnwrapDatum is equivalent to
+		// tree.UnwrapDOidWrapper. We have this special handling in order to not
+		// hit a nil pointer exception when accessing deprecatedContext field.
+		return tree.UnwrapDOidWrapper(d)
+	}
+	return UnwrapDatum(ec.deprecatedContext, ec, d)
 }
 
 // MustGetPlaceholderValue is part of the tree.CompareContext interface.
@@ -276,7 +335,7 @@ func (ec *Context) MustGetPlaceholderValue(p *tree.Placeholder) tree.Datum {
 	if !ok {
 		panic(errors.AssertionFailedf("fail"))
 	}
-	out, err := Expr(ec, e)
+	out, err := Expr(ec.deprecatedContext, ec, e)
 	if err != nil {
 		panic(errors.NewAssertionErrorWithWrappedErrf(err, "fail"))
 	}
@@ -309,12 +368,42 @@ func MakeTestingEvalContextWithMon(st *cluster.Settings, monitor *mon.BytesMonit
 		NodeID:           base.TestingIDContainer,
 	}
 	monitor.Start(context.Background(), nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
-	ctx.Mon = monitor
-	ctx.Context = context.TODO()
+	ctx.TestingMon = monitor
+	ctx.Planner = &fakePlannerWithMonitor{monitor: monitor}
+	ctx.StreamManagerFactory = &fakeStreamManagerFactory{}
+	ctx.deprecatedContext = context.TODO()
 	now := timeutil.Now()
 	ctx.SetTxnTimestamp(now)
 	ctx.SetStmtTimestamp(now)
 	return ctx
+}
+
+type fakePlannerWithMonitor struct {
+	Planner
+	monitor *mon.BytesMonitor
+}
+
+// Mon is part of the Planner interface.
+func (p *fakePlannerWithMonitor) Mon() *mon.BytesMonitor {
+	return p.monitor
+}
+
+// IsANSIDML is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) IsANSIDML() bool {
+	return false
+}
+
+// EnforceHomeRegion is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) EnforceHomeRegion() bool {
+	return false
+}
+
+// MaybeReallocateAnnotations is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) {
+}
+
+type fakeStreamManagerFactory struct {
+	StreamManagerFactory
 }
 
 // SessionData returns the SessionData the current EvalCtx should use to eval.
@@ -366,26 +455,36 @@ func NewTestingEvalContext(st *cluster.Settings) *Context {
 }
 
 // Stop closes out the EvalContext and must be called once it is no longer in use.
+//
+// Note: Stop is intended to gracefully handle panics. For this to work
+// properly, use `defer evalctx.Stop()`, i.e. have `Stop` be called by `defer` directly.
+//
+// If `Stop()` is called via an intermediate function (e.g. `defer
+// func() { ... evalCtx.Stop() ... }`) the panic will not be handled
+// gracefully and some memory monitors may complain that they are being shut down
+// with some allocated bytes remaining.
 func (ec *Context) Stop(c context.Context) {
 	if r := recover(); r != nil {
-		ec.Mon.EmergencyStop(c)
+		ec.TestingMon.EmergencyStop(c)
 		panic(r)
 	} else {
-		ec.Mon.Stop(c)
+		ec.TestingMon.Stop(c)
 	}
 }
 
 // FmtCtx creates a FmtCtx with the given options as well as the EvalContext's session data.
 func (ec *Context) FmtCtx(f tree.FmtFlags, opts ...tree.FmtCtxOption) *tree.FmtCtx {
+	applyOpts := make([]tree.FmtCtxOption, 0, 2+len(opts))
+	applyOpts = append(applyOpts, tree.FmtLocation(ec.GetLocation()))
 	if ec.SessionData() != nil {
-		opts = append(
-			[]tree.FmtCtxOption{tree.FmtDataConversionConfig(ec.SessionData().DataConversionConfig)},
-			opts...,
+		applyOpts = append(
+			applyOpts,
+			tree.FmtDataConversionConfig(ec.SessionData().DataConversionConfig),
 		)
 	}
 	return tree.NewFmtCtx(
 		f,
-		opts...,
+		append(applyOpts, opts...)...,
 	)
 }
 
@@ -402,12 +501,15 @@ func (ec *Context) GetStmtTimestamp() time.Time {
 
 // GetClusterTimestamp retrieves the current cluster timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
-func (ec *Context) GetClusterTimestamp() *tree.DDecimal {
+func (ec *Context) GetClusterTimestamp() (*tree.DDecimal, error) {
+	if ec.Txn == nil {
+		return nil, ErrNilTxnInClusterContext
+	}
 	ts := ec.Txn.CommitTimestamp()
 	if ts.IsEmpty() {
-		panic(errors.AssertionFailedf("zero cluster timestamp in txn"))
+		return nil, errors.AssertionFailedf("zero cluster timestamp in txn")
 	}
-	return TimestampToDecimalDatum(ts)
+	return TimestampToDecimalDatum(ts), nil
 }
 
 // HasPlaceholders returns true if this EvalContext's placeholders have been
@@ -501,13 +603,18 @@ func TimestampToInexactDTimestamp(ts hlc.Timestamp) *tree.DTimestamp {
 	return tree.MustMakeDTimestamp(timeutil.Unix(0, ts.WallTime), time.Microsecond)
 }
 
-// GetRelativeParseTime implements ParseTimeContext.
+// GetRelativeParseTime implements ParseContext.
 func (ec *Context) GetRelativeParseTime() time.Time {
 	ret := ec.TxnTimestamp
 	if ret.IsZero() {
 		ret = timeutil.Now()
 	}
 	return ret.In(ec.GetLocation())
+}
+
+// GetDateHelper implements ParseTimeContext.
+func (ec *Context) GetDateHelper() *pgdate.ParseHelper {
+	return &ec.ParseHelper
 }
 
 // GetTxnTimestamp retrieves the current transaction timestamp as per
@@ -583,17 +690,17 @@ func (ec *Context) GetIntervalStyle() duration.IntervalStyle {
 	return ec.SessionData().GetIntervalStyle()
 }
 
+// GetCollationEnv returns the collation env.
+func (ec *Context) GetCollationEnv() *tree.CollationEnvironment {
+	return &ec.CollationEnv
+}
+
 // GetDateStyle returns the session date style.
 func (ec *Context) GetDateStyle() pgdate.DateStyle {
 	if ec.SessionData() == nil {
 		return pgdate.DefaultDateStyle()
 	}
 	return ec.SessionData().GetDateStyle()
-}
-
-// Ctx returns the session's context.
-func (ec *Context) Ctx() context.Context {
-	return ec.Context
 }
 
 // BoundedStaleness returns true if this query uses bounded staleness.
@@ -628,10 +735,10 @@ func arrayOfType(typ *types.T) (*tree.DArray, error) {
 // UnwrapDatum returns the base Datum type for a provided datum, stripping
 // an *DOidWrapper if present. This is useful for cases like type switches,
 // where type aliases should be ignored.
-func UnwrapDatum(evalCtx *Context, d tree.Datum) tree.Datum {
+func UnwrapDatum(ctx context.Context, evalCtx *Context, d tree.Datum) tree.Datum {
 	d = tree.UnwrapDOidWrapper(d)
 	if p, ok := d.(*tree.Placeholder); ok && evalCtx != nil && evalCtx.HasPlaceholders() {
-		ret, err := Expr(evalCtx, p)
+		ret, err := Expr(ctx, evalCtx, p)
 		if err != nil {
 			// If we fail to evaluate the placeholder, it's because we don't have
 			// a placeholder available. Just return the placeholder and someone else
@@ -641,4 +748,74 @@ func UnwrapDatum(evalCtx *Context, d tree.Datum) tree.Datum {
 		return ret
 	}
 	return d
+}
+
+// StreamManagerFactory stores methods that return the streaming managers.
+type StreamManagerFactory interface {
+	GetReplicationStreamManager(ctx context.Context) (ReplicationStreamManager, error)
+	GetStreamIngestManager(ctx context.Context) (StreamIngestManager, error)
+}
+
+// ReplicationStreamManager represents a collection of APIs that streaming replication supports
+// on the production side.
+type ReplicationStreamManager interface {
+	// StartReplicationStream starts a stream replication job for the specified
+	// tenant on the producer side.
+	StartReplicationStream(ctx context.Context, tenantName roachpb.TenantName) (streampb.ReplicationProducerSpec, error)
+
+	// HeartbeatReplicationStream sends a heartbeat to the replication stream producer, indicating
+	// consumer has consumed until the given 'frontier' timestamp. This updates the producer job
+	// progress and extends its life, and the new producer progress will be returned.
+	// If 'frontier' is hlc.MaxTimestamp, returns the producer progress without updating it.
+	HeartbeatReplicationStream(
+		ctx context.Context,
+		streamID streampb.StreamID,
+		frontier hlc.Timestamp,
+	) (streampb.StreamReplicationStatus, error)
+
+	// StreamPartition starts streaming replication on the producer side for the partition specified
+	// by opaqueSpec which contains serialized streampb.StreamPartitionSpec protocol message and
+	// returns a value generator which yields events for the specified partition.
+	StreamPartition(
+		streamID streampb.StreamID,
+		opaqueSpec []byte,
+	) (ValueGenerator, error)
+
+	// GetReplicationStreamSpec gets a stream replication spec on the producer side.
+	GetReplicationStreamSpec(
+		ctx context.Context,
+		streamID streampb.StreamID,
+	) (*streampb.ReplicationStreamSpec, error)
+
+	// CompleteReplicationStream completes a replication stream job on the producer side.
+	// 'successfulIngestion' indicates whether the stream ingestion finished successfully and
+	// determines the fate of the producer job, succeeded or canceled.
+	CompleteReplicationStream(
+		ctx context.Context,
+		streamID streampb.StreamID,
+		successfulIngestion bool,
+	) error
+}
+
+// StreamIngestManager represents a collection of APIs that streaming replication supports
+// on the ingestion side.
+type StreamIngestManager interface {
+	// CompleteStreamIngestion signals a running stream ingestion job to complete on the consumer side.
+	CompleteStreamIngestion(
+		ctx context.Context,
+		ingestionJobID jobspb.JobID,
+		cutoverTimestamp hlc.Timestamp,
+	) error
+
+	// GetStreamIngestionStats gets a statistics summary for a stream ingestion job.
+	GetStreamIngestionStats(
+		ctx context.Context,
+		streamIngestionDetails jobspb.StreamIngestionDetails,
+		jobProgress jobspb.Progress,
+	) (*streampb.StreamIngestionStats, error)
+
+	GetReplicationStatsAndStatus(
+		ctx context.Context,
+		ingestionJobID jobspb.JobID,
+	) (*streampb.StreamIngestionStats, string, error)
 }

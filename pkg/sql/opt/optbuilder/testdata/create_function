@@ -108,9 +108,26 @@ create-function
       └── s
 
 build
-CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT * FROM ab $$
+CREATE FUNCTION f() RETURNS ab LANGUAGE SQL AS $$ SELECT * FROM ab $$
 ----
-error (42P13): return type mismatch in function declared to return int
+create-function
+ ├── CREATE FUNCTION f()
+ │   	RETURNS ab
+ │   	LANGUAGE SQL
+ │   	AS $$SELECT ab.a, ab.b FROM t.public.ab;$$
+ └── dependencies
+      └── ab [columns: a b]
+
+build
+CREATE FUNCTION f() RETURNS ab LANGUAGE SQL AS $$ SELECT * FROM (SELECT * from ab) $$
+----
+create-function
+ ├── CREATE FUNCTION f()
+ │   	RETURNS ab
+ │   	LANGUAGE SQL
+ │   	AS $$SELECT "?subquery1?".a, "?subquery1?".b FROM (SELECT ab.a, ab.b FROM t.public.ab) AS "?subquery1?";$$
+ └── dependencies
+      └── ab [columns: a b]
 
 build
 CREATE FUNCTION f() RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 1; END;

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -47,8 +48,9 @@ func ValidateComputedColumnExpression(
 	desc catalog.TableDescriptor,
 	d *tree.ColumnTableDef,
 	tn *tree.TableName,
-	context string,
+	context tree.SchemaExprContext,
 	semaCtx *tree.SemaContext,
+	version clusterversion.ClusterVersion,
 ) (serializedExpr string, _ *types.T, _ error) {
 	if d.HasDefaultExpr() {
 		return "", nil, pgerror.Newf(
@@ -103,6 +105,7 @@ func ValidateComputedColumnExpression(
 		semaCtx,
 		volatility.Immutable,
 		tn,
+		version,
 	)
 	if err != nil {
 		return "", nil, err
@@ -120,7 +123,7 @@ func ValidateComputedColumnExpression(
 				return
 			}
 			var col catalog.Column
-			if col, err = desc.FindColumnWithID(colID); err != nil {
+			if col, err = catalog.MustFindColumnByID(desc, colID); err != nil {
 				err = errors.WithAssertionFailure(err)
 				return
 			}
@@ -133,7 +136,7 @@ func ValidateComputedColumnExpression(
 			return "", nil, err
 		}
 		if len(mutationColumnNames) > 0 {
-			if context == "index element" {
+			if context == tree.ExpressionIndexElementExpr {
 				return "", nil, unimplemented.Newf(
 					"index element expression referencing mutation columns",
 					"index element expression referencing columns (%s) added in the current transaction",
@@ -254,7 +257,7 @@ func MakeComputedExprs(
 		if err != nil {
 			return nil, catalog.TableColSet{}, err
 		}
-		if typedExpr, err = txCtx.NormalizeExpr(evalCtx, typedExpr); err != nil {
+		if typedExpr, err = txCtx.NormalizeExpr(ctx, evalCtx, typedExpr); err != nil {
 			return nil, catalog.TableColSet{}, err
 		}
 		computedExprs = append(computedExprs, typedExpr)

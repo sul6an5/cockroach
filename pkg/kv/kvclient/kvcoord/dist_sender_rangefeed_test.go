@@ -12,6 +12,7 @@ package kvcoord_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -35,11 +38,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
-type wrapRangeFeedClientFn func(client roachpb.Internal_RangeFeedClient) roachpb.Internal_RangeFeedClient
+type wrapRangeFeedClientFn func(client kvpb.Internal_RangeFeedClient) kvpb.Internal_RangeFeedClient
 type testRangefeedClient struct {
 	rpc.RestrictedInternalClient
 	muxRangeFeedEnabled bool
@@ -48,8 +53,8 @@ type testRangefeedClient struct {
 }
 
 func (c *testRangefeedClient) RangeFeed(
-	ctx context.Context, args *roachpb.RangeFeedRequest, opts ...grpc.CallOption,
-) (roachpb.Internal_RangeFeedClient, error) {
+	ctx context.Context, args *kvpb.RangeFeedRequest, opts ...grpc.CallOption,
+) (kvpb.Internal_RangeFeedClient, error) {
 	defer c.count()
 
 	if c.muxRangeFeedEnabled && ctx.Value(useMuxRangeFeedCtxKey{}) != nil {
@@ -68,7 +73,7 @@ func (c *testRangefeedClient) RangeFeed(
 
 func (c *testRangefeedClient) MuxRangeFeed(
 	ctx context.Context, opts ...grpc.CallOption,
-) (roachpb.Internal_MuxRangeFeedClient, error) {
+) (kvpb.Internal_MuxRangeFeedClient, error) {
 	defer c.count()
 
 	if !c.muxRangeFeedEnabled || ctx.Value(useMuxRangeFeedCtxKey{}) == nil {
@@ -105,8 +110,8 @@ func (c *countConnectionsTransport) IsExhausted() bool {
 }
 
 func (c *countConnectionsTransport) SendNext(
-	ctx context.Context, request roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, request *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	return c.wrapped.SendNext(ctx, request)
 }
 
@@ -199,7 +204,7 @@ func rangeFeed(
 			opts = append(opts, kvcoord.WithMuxRangeFeed())
 			ctx = context.WithValue(ctx, useMuxRangeFeedCtxKey{}, struct{}{})
 		}
-		return ds.RangeFeed(ctx, []roachpb.Span{sp}, startFrom, false, events, opts...)
+		return ds.RangeFeed(ctx, []roachpb.Span{sp}, startFrom, events, opts...)
 	})
 	g.GoCtx(func(ctx context.Context) error {
 		for {
@@ -301,7 +306,7 @@ func TestBiDirectionalRangefeedNotUsedUntilUpgradeFinalilzed(t *testing.T) {
 	}
 
 	t.Run("rangefeed-stream-disabled-prior-to-version-upgrade", func(t *testing.T) {
-		noRfStreamVer := clusterversion.ByKey(clusterversion.RangefeedUseOneStreamPerNode - 1)
+		noRfStreamVer := clusterversion.ByKey(clusterversion.TODODelete_V22_2RangefeedUseOneStreamPerNode - 1)
 		tc, cleanup := startServerAtVer(noRfStreamVer)
 		defer cleanup()
 		runRangeFeed(tc)
@@ -310,7 +315,7 @@ func TestBiDirectionalRangefeedNotUsedUntilUpgradeFinalilzed(t *testing.T) {
 	t.Run("rangefeed-stream-disabled-via-environment", func(t *testing.T) {
 		defer kvcoord.TestingSetEnableMuxRangeFeed(false)()
 		// Even though we could use rangefeed stream, it's disabled via kill switch.
-		rfStreamVer := clusterversion.ByKey(clusterversion.RangefeedUseOneStreamPerNode)
+		rfStreamVer := clusterversion.ByKey(clusterversion.TODODelete_V22_2RangefeedUseOneStreamPerNode)
 		tc, cleanup := startServerAtVer(rfStreamVer)
 		defer cleanup()
 		runRangeFeed(tc, kvcoord.WithMuxRangeFeed())
@@ -379,13 +384,13 @@ func TestMuxRangeFeedConnectsToNodeOnce(t *testing.T) {
 }
 
 type blockRecvRangeFeedClient struct {
-	roachpb.Internal_RangeFeedClient
+	kvpb.Internal_RangeFeedClient
 	numRecvRemainingUntilBlocked int
 
 	ctxCanceled bool
 }
 
-func (b *blockRecvRangeFeedClient) Recv() (*roachpb.RangeFeedEvent, error) {
+func (b *blockRecvRangeFeedClient) Recv() (*kvpb.RangeFeedEvent, error) {
 	if !b.ctxCanceled {
 		ctx := b.Internal_RangeFeedClient.Context()
 		b.numRecvRemainingUntilBlocked--
@@ -402,7 +407,7 @@ func (b *blockRecvRangeFeedClient) Recv() (*roachpb.RangeFeedEvent, error) {
 	return b.Internal_RangeFeedClient.Recv()
 }
 
-var _ roachpb.Internal_RangeFeedClient = (*blockRecvRangeFeedClient)(nil)
+var _ kvpb.Internal_RangeFeedClient = (*blockRecvRangeFeedClient)(nil)
 
 func TestRestartsStuckRangeFeeds(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -411,7 +416,7 @@ func TestRestartsStuckRangeFeeds(t *testing.T) {
 	ctx := context.Background()
 
 	blockingClient := &blockRecvRangeFeedClient{}
-	var wrapRfClient wrapRangeFeedClientFn = func(client roachpb.Internal_RangeFeedClient) roachpb.Internal_RangeFeedClient {
+	var wrapRfClient wrapRangeFeedClientFn = func(client kvpb.Internal_RangeFeedClient) kvpb.Internal_RangeFeedClient {
 		blockingClient.Internal_RangeFeedClient = client
 		blockingClient.numRecvRemainingUntilBlocked = 1 // let first Recv through, then block
 		return blockingClient
@@ -452,4 +457,131 @@ func TestRestartsStuckRangeFeeds(t *testing.T) {
 
 	require.True(t, blockingClient.ctxCanceled)
 	require.EqualValues(t, 1, tc.Server(0).DistSenderI().(*kvcoord.DistSender).Metrics().RangefeedRestartStuck.Count())
+}
+
+func TestRestartsStuckRangeFeedsSecondImplementation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	type testKey struct{}
+
+	ctx := context.Background()
+
+	var canceled int32 // atomic
+
+	var doneErr = errors.New("gracefully terminating test")
+
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					TestingRangefeedFilter: func(args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink) *kvpb.Error {
+						md, ok := metadata.FromIncomingContext(stream.Context())
+						if (!ok || len(md[t.Name()]) == 0) && stream.Context().Value(testKey{}) == nil {
+							return nil
+						}
+						if atomic.LoadInt32(&canceled) != 0 {
+							return kvpb.NewError(doneErr)
+						}
+
+						t.Logf("intercepting %s", args)
+						// Send a first response to "arm" the stuck detector in DistSender.
+						if assert.NoError(t, stream.Send(&kvpb.RangeFeedEvent{Checkpoint: &kvpb.RangeFeedCheckpoint{
+							Span:       args.Span,
+							ResolvedTS: hlc.Timestamp{Logical: 1},
+						}})) {
+							t.Log("sent first event, now blocking")
+						}
+						select {
+						case <-time.After(testutils.DefaultSucceedsSoonDuration):
+							return kvpb.NewErrorf("timed out waiting for stuck rangefeed's ctx cancellation")
+						case <-stream.Context().Done():
+							t.Log("server side rangefeed canceled (as expected)")
+							atomic.StoreInt32(&canceled, 1)
+						}
+						return nil
+					},
+				},
+			},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	ts := tc.Server(0)
+	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	startTime := ts.Clock().Now()
+
+	for _, stmt := range []string{
+		`SET CLUSTER SETTING kv.rangefeed.enabled = true`,
+		`SET CLUSTER SETTING kv.rangefeed.range_stuck_threshold='1s'`,
+	} {
+		sqlDB.Exec(t, stmt)
+	}
+
+	span := func() roachpb.Span {
+		desc := tc.LookupRangeOrFatal(t, tc.ScratchRange(t))
+		t.Logf("r%d", desc.RangeID)
+		return desc.RSpan().AsRawSpanWithNoLocals()
+	}()
+
+	ds := ts.DistSenderI().(*kvcoord.DistSender)
+
+	// Use both gRPC metadata and a local ctx key to tag the context for the
+	// outgoing rangefeed. At time of writing, we're bypassing gRPC due to
+	// the local optimization, but it's not worth special casing on that.
+	ctx = metadata.AppendToOutgoingContext(ctx, t.Name(), "please block me")
+
+	rangeFeed := func(
+		t *testing.T,
+		ctx context.Context,
+		ds *kvcoord.DistSender,
+		sp roachpb.Span,
+		startFrom hlc.Timestamp,
+	) (_cancel func(), _wait func() error) {
+		events := make(chan kvcoord.RangeFeedMessage)
+		ctx, cancel := context.WithCancel(ctx)
+		{
+			origCancel := cancel
+			cancel = func() {
+				t.Helper()
+				t.Log("cancel invoked")
+				origCancel()
+			}
+		}
+
+		g := ctxgroup.WithContext(ctx)
+		g.GoCtx(func(ctx context.Context) error {
+			defer close(events)
+			err := ds.RangeFeed(ctx, []roachpb.Span{sp}, startFrom, events)
+			t.Logf("from RangeFeed: %v", err)
+			return err
+		})
+		g.GoCtx(func(ctx context.Context) error {
+			for {
+				select {
+				case <-ctx.Done():
+					return nil // expected
+				case ev := <-events:
+					t.Logf("from consumer: %+v", ev)
+				case <-time.After(testutils.DefaultSucceedsSoonDuration):
+					return errors.New("timed out waiting to consume events")
+				}
+			}
+		})
+
+		return cancel, g.Wait
+	}
+
+	cancel, wait := rangeFeed(t, context.WithValue(ctx, testKey{}, testKey{}), ds, span, startTime)
+	defer time.AfterFunc(testutils.DefaultSucceedsSoonDuration, cancel).Stop()
+	{
+		err := wait()
+		require.True(t, errors.Is(err, doneErr), "%+v", err)
+	}
+
+	require.EqualValues(t, 1, atomic.LoadInt32(&canceled))
+	// NB: We  really expect exactly 1 but with a 1s timeout, it's not inconceivable that
+	// on a particularly slow CI machine some unrelated rangefeed could also catch the occasional
+	// retry.
+	require.NotZero(t, ds.Metrics().RangefeedRestartStuck.Count())
 }

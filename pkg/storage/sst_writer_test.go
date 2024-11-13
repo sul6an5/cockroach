@@ -56,12 +56,12 @@ func makeIntTableKVs(numKeys, valueSize, maxRevisions int) []MVCCKeyValue {
 func makePebbleSST(t testing.TB, kvs []MVCCKeyValue, ingestion bool) []byte {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	f := &MemFile{}
+	f := &MemObject{}
 	var w SSTWriter
 	if ingestion {
 		w = MakeIngestionSSTWriter(ctx, st, f)
 	} else {
-		w = MakeBackupSSTWriter(ctx, st, f)
+		w = MakeBackupSSTWriter(ctx, st, &f.Buffer)
 	}
 	defer w.Close()
 
@@ -84,22 +84,22 @@ func TestMakeIngestionWriterOptions(t *testing.T) {
 		want sstable.TableFormat
 	}{
 		{
-			name: "before feature gate",
+			name: "22.2",
 			st: cluster.MakeTestingClusterSettingsWithVersions(
-				clusterversion.ByKey(clusterversion.EnablePebbleFormatVersionRangeKeys-1),
-				clusterversion.TestingBinaryMinSupportedVersion,
-				true,
-			),
-			want: sstable.TableFormatPebblev1,
-		},
-		{
-			name: "at feature gate",
-			st: cluster.MakeTestingClusterSettingsWithVersions(
-				clusterversion.ByKey(clusterversion.EnablePebbleFormatVersionRangeKeys),
+				clusterversion.ByKey(clusterversion.V22_2),
 				clusterversion.TestingBinaryMinSupportedVersion,
 				true,
 			),
 			want: sstable.TableFormatPebblev2,
+		},
+		{
+			name: "with value blocks",
+			st: func() *cluster.Settings {
+				st := cluster.MakeTestingClusterSettings()
+				ValueBlocksEnabled.Override(context.Background(), &st.SV, true)
+				return st
+			}(),
+			want: sstable.TableFormatPebblev3,
 		},
 	}
 
@@ -112,45 +112,6 @@ func TestMakeIngestionWriterOptions(t *testing.T) {
 	}
 }
 
-func TestSSTWriterRangeKeysUnsupported(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-
-	// Set up a version that doesn't support range keys.
-	version := clusterversion.ByKey(clusterversion.EnsurePebbleFormatVersionRangeKeys - 1)
-	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
-
-	writers := map[string]SSTWriter{
-		"ingestion": MakeIngestionSSTWriter(ctx, st, &MemFile{}),
-		"backup":    MakeBackupSSTWriter(ctx, st, &MemFile{}),
-	}
-
-	for name, w := range writers {
-		t.Run(name, func(t *testing.T) {
-			defer w.Close()
-
-			rangeKey := rangeKey("a", "b", 2)
-
-			// Put should error, but clears are noops.
-			err := w.PutMVCCRangeKey(rangeKey, MVCCValue{})
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "range keys not supported")
-
-			err = w.PutEngineRangeKey(rangeKey.StartKey, rangeKey.EndKey,
-				EncodeMVCCTimestampSuffix(rangeKey.Timestamp), nil)
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "range keys not supported")
-
-			require.NoError(t, w.ClearMVCCRangeKey(rangeKey))
-			require.NoError(t, w.ClearEngineRangeKey(rangeKey.StartKey, rangeKey.EndKey,
-				EncodeMVCCTimestampSuffix(rangeKey.Timestamp)))
-			require.NoError(t, w.ClearRawRange(rangeKey.StartKey, rangeKey.EndKey, false, true))
-		})
-	}
-}
-
 func TestSSTWriterRangeKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -159,7 +120,7 @@ func TestSSTWriterRangeKeys(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	sstFile := &MemFile{}
+	sstFile := &MemObject{}
 	sst := MakeIngestionSSTWriter(ctx, st, sstFile)
 	defer sst.Close()
 
@@ -175,7 +136,7 @@ func TestSSTWriterRangeKeys(t *testing.T) {
 
 	require.NoError(t, sst.Finish())
 
-	iter, err := NewPebbleMemSSTIterator(sstFile.Bytes(), false /* verify */, IterOptions{
+	iter, err := NewMemSSTIterator(sstFile.Bytes(), false /* verify */, IterOptions{
 		KeyTypes:   IterKeyTypePointsAndRanges,
 		UpperBound: keys.MaxKey,
 	})

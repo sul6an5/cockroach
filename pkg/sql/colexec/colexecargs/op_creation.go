@@ -36,6 +36,13 @@ var TestNewColOperator func(ctx context.Context, flowCtx *execinfra.FlowCtx, arg
 
 // OpWithMetaInfo stores a colexecop.Operator together with miscellaneous meta
 // information about the tree rooted in that operator.
+//
+// Note that at some point colexecop.Closers were also included into this
+// struct, but for ease of tracking we pulled them out to the flow-level.
+// Closers are different from the objects tracked here since we have a
+// convenient place to close them from the main goroutine whereas the stats
+// collection as well as metadata draining must happen in the goroutine that
+// "owns" these objects.
 // TODO(yuzefovich): figure out the story about pooling these objects.
 type OpWithMetaInfo struct {
 	Root colexecop.Operator
@@ -47,9 +54,6 @@ type OpWithMetaInfo struct {
 	// tree rooted in Root for which the responsibility of draining hasn't been
 	// claimed yet.
 	MetadataSources colexecop.MetadataSources
-	// ToClose are all colexecop.Closers that are present in the tree rooted in
-	// Root for which the responsibility of closing hasn't been claimed yet.
-	ToClose colexecop.Closers
 }
 
 // NewColOperatorArgs is a helper struct that encompasses all of the input
@@ -60,13 +64,15 @@ type NewColOperatorArgs struct {
 	StreamingMemAccount  *mon.BoundAccount
 	ProcessorConstructor execinfra.ProcessorConstructor
 	LocalProcessors      []execinfra.LocalProcessor
-	DiskQueueCfg         colcontainer.DiskQueueCfg
-	FDSemaphore          semaphore.Semaphore
-	ExprHelper           *ExprHelper
-	Factory              coldata.ColumnFactory
-	MonitorRegistry      *MonitorRegistry
-	TypeResolver         *descs.DistSQLTypeResolver
-	TestingKnobs         struct {
+	// any is actually a coldata.Batch, see physicalplan.PhysicalInfrastructure comments.
+	LocalVectorSources map[int32]any
+	DiskQueueCfg       colcontainer.DiskQueueCfg
+	FDSemaphore        semaphore.Semaphore
+	ExprHelper         *ExprHelper
+	Factory            coldata.ColumnFactory
+	MonitorRegistry    *MonitorRegistry
+	TypeResolver       *descs.DistSQLTypeResolver
+	TestingKnobs       struct {
 		// SpillingCallbackFn will be called when the spilling from an in-memory
 		// to disk-backed operator occurs. It should only be set in tests.
 		SpillingCallbackFn func()
@@ -100,8 +106,14 @@ type NewColOperatorResult struct {
 	// behind the stats collector interface. We need to track it separately from
 	// all other stats collectors since it requires special handling.
 	Columnarizer colexecop.VectorizedStatsCollector
-	ColumnTypes  []*types.T
-	Releasables  []execreleasable.Releasable
+	// TODO(yuzefovich): consider keeping the reference to the types in Release.
+	// This will also require changes to the planning code to actually reuse the
+	// slice if possible. This is not exactly trivial since there is no clear
+	// contract right now of whether or not a particular operator has to make a
+	// copy of the type schema if it needs to use it later.
+	ColumnTypes []*types.T
+	ToClose     colexecop.Closers
+	Releasables []execreleasable.Releasable
 }
 
 var _ execreleasable.Releasable = &NewColOperatorResult{}
@@ -150,11 +162,8 @@ func (r *NewColOperatorResult) Release() {
 		OpWithMetaInfo: OpWithMetaInfo{
 			StatsCollectors: r.StatsCollectors[:0],
 			MetadataSources: r.MetadataSources[:0],
-			ToClose:         r.ToClose[:0],
 		},
-		// There is no need to deeply reset the column types because these
-		// objects are very tiny in the grand scheme of things.
-		ColumnTypes: r.ColumnTypes[:0],
+		ToClose:     r.ToClose[:0],
 		Releasables: r.Releasables[:0],
 	}
 	newColOperatorResultPool.Put(r)

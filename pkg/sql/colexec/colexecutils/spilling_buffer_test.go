@@ -90,7 +90,7 @@ func TestSpillingBuffer(t *testing.T) {
 		// window into them.
 		var tuples *AppendOnlyBufferedBatch
 		// Create random input.
-		op := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
+		op, _ := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
 			NumBatches:        numBatches,
 			BatchSize:         inputBatchSize,
 			Nulls:             true,
@@ -120,7 +120,7 @@ func TestSpillingBuffer(t *testing.T) {
 		// Create buffer.
 		buf := NewSpillingBuffer(
 			spillingQueueUnlimitedAllocator, memoryLimit, queueCfg,
-			colexecop.NewTestingSemaphore(2), typs, testDiskAcc, colsToStore...,
+			colexecop.NewTestingSemaphore(2), typs, testDiskAcc, testMemAcc, colsToStore...,
 		)
 		if setInMemTuplesLimit {
 			buf.testingKnobs.maxTuplesStoredInMemory = numBatches * inputBatchSize / 2

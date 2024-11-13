@@ -24,6 +24,7 @@ import (
 	"go/constant"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/scanner"
@@ -37,60 +38,14 @@ func init() {
 	scanner.NewPlaceholderFn = func(s string) (interface{}, error) { return tree.NewPlaceholder(s) }
 }
 
-// Statement is the result of parsing a single statement. It contains the AST
-// node along with other information.
-type Statement struct {
-	// AST is the root of the AST tree for the parsed statement.
-	AST tree.Statement
-
-	// SQL is the original SQL from which the statement was parsed. Note that this
-	// is not appropriate for use in logging, as it may contain passwords and
-	// other sensitive data.
-	SQL string
-
-	// NumPlaceholders indicates the number of arguments to the statement (which
-	// are referenced through placeholders). This corresponds to the highest
-	// argument position (i.e. the x in "$x") that appears in the query.
-	//
-	// Note: where there are "gaps" in the placeholder positions, this number is
-	// based on the highest position encountered. For example, for `SELECT $3`,
-	// NumPlaceholders is 3. These cases are malformed and will result in a
-	// type-check error.
-	NumPlaceholders int
-
-	// NumAnnotations indicates the number of annotations in the tree. It is equal
-	// to the maximum annotation index.
-	NumAnnotations tree.AnnotationIdx
-}
-
-// Statements is a list of parsed statements.
-type Statements []Statement
-
-// String returns the AST formatted as a string.
-func (stmts Statements) String() string {
-	return stmts.StringWithFlags(tree.FmtSimple)
-}
-
-// StringWithFlags returns the AST formatted as a string (with the given flags).
-func (stmts Statements) StringWithFlags(flags tree.FmtFlags) string {
-	ctx := tree.NewFmtCtx(flags)
-	for i, s := range stmts {
-		if i > 0 {
-			ctx.WriteString("; ")
-		}
-		ctx.FormatNode(s.AST)
-	}
-	return ctx.CloseAndGetString()
-}
-
 // Parser wraps a scanner, parser and other utilities present in the parser
 // package.
 type Parser struct {
-	scanner    scanner.Scanner
+	scanner    scanner.SQLScanner
 	lexer      lexer
 	parserImpl sqlParserImpl
 	tokBuf     [8]sqlSymType
-	stmtBuf    [1]Statement
+	stmtBuf    [1]statements.Statement[tree.Statement]
 }
 
 // INT8 is the historical interpretation of INT. This should be left
@@ -112,34 +67,37 @@ func NakedIntTypeFromDefaultIntSize(defaultIntSize int32) *types.T {
 }
 
 // Parse parses the sql and returns a list of statements.
-func (p *Parser) Parse(sql string) (Statements, error) {
+func (p *Parser) Parse(sql string) (statements.Statements, error) {
 	return p.parseWithDepth(1, sql, defaultNakedIntType)
 }
 
 // ParseWithInt parses a sql statement string and returns a list of
 // Statements. The INT token will result in the specified TInt type.
-func (p *Parser) ParseWithInt(sql string, nakedIntType *types.T) (Statements, error) {
+func (p *Parser) ParseWithInt(sql string, nakedIntType *types.T) (statements.Statements, error) {
 	return p.parseWithDepth(1, sql, nakedIntType)
 }
 
-func (p *Parser) parseOneWithInt(sql string, nakedIntType *types.T) (Statement, error) {
+func (p *Parser) parseOneWithInt(
+	sql string, nakedIntType *types.T,
+) (statements.Statement[tree.Statement], error) {
 	stmts, err := p.parseWithDepth(1, sql, nakedIntType)
 	if err != nil {
-		return Statement{}, err
+		return statements.Statement[tree.Statement]{}, err
 	}
 	if len(stmts) != 1 {
-		return Statement{}, errors.AssertionFailedf("expected 1 statement, but found %d", len(stmts))
+		return statements.Statement[tree.Statement]{}, errors.AssertionFailedf("expected 1 statement, but found %d", len(stmts))
 	}
 	return stmts[0], nil
 }
 
 func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
-	var lval sqlSymType
 	tokens = p.tokBuf[:0]
+	tokens = append(tokens, sqlSymType{})
+	lval := &p.tokBuf[0]
 
 	// Scan the first token.
 	for {
-		p.scanner.Scan(&lval)
+		p.scanner.Scan(lval)
 		if lval.id == 0 {
 			return "", nil, true
 		}
@@ -151,7 +109,6 @@ func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
 	startPos := lval.pos
 	// We make the resulting token positions match the returned string.
 	lval.pos = 0
-	tokens = append(tokens, lval)
 	var preValID int32
 	// This is used to track the degree of nested `BEGIN ATOMIC ... END` function
 	// body context. When greater than zero, it means that we're scanning through
@@ -164,8 +121,9 @@ func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
 			return p.scanner.In()[startPos:], tokens, true
 		}
 		preValID = lval.id
-		posBeforeScan := p.scanner.Pos()
-		p.scanner.Scan(&lval)
+		tokens = append(tokens, sqlSymType{})
+		lval = &tokens[len(tokens)-1]
+		p.scanner.Scan(lval)
 
 		if preValID == BEGIN && lval.id == ATOMIC {
 			curFuncBodyCnt++
@@ -174,15 +132,22 @@ func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
 			curFuncBodyCnt--
 		}
 		if lval.id == 0 || (curFuncBodyCnt == 0 && lval.id == ';') {
-			return p.scanner.In()[startPos:posBeforeScan], tokens, (lval.id == 0)
+			endPos := p.scanner.Pos()
+			if lval.id == ';' {
+				// Don't include the ending semicolon, if there is one, in the raw SQL.
+				endPos--
+			}
+			tokens = tokens[:len(tokens)-1]
+			return p.scanner.In()[startPos:endPos], tokens, (lval.id == 0)
 		}
 		lval.pos -= startPos
-		tokens = append(tokens, lval)
 	}
 }
 
-func (p *Parser) parseWithDepth(depth int, sql string, nakedIntType *types.T) (Statements, error) {
-	stmts := Statements(p.stmtBuf[:0])
+func (p *Parser) parseWithDepth(
+	depth int, sql string, nakedIntType *types.T,
+) (statements.Statements, error) {
+	stmts := statements.Statements(p.stmtBuf[:0])
 	p.scanner.Init(sql)
 	defer p.scanner.Cleanup()
 	for {
@@ -204,7 +169,7 @@ func (p *Parser) parseWithDepth(depth int, sql string, nakedIntType *types.T) (S
 // parse parses a statement from the given scanned tokens.
 func (p *Parser) parse(
 	depth int, sql string, tokens []sqlSymType, nakedIntType *types.T,
-) (Statement, error) {
+) (statements.Statement[tree.Statement], error) {
 	p.lexer.init(sql, tokens, nakedIntType)
 	defer p.lexer.cleanup()
 	if p.parserImpl.Parse(&p.lexer) != 0 {
@@ -228,11 +193,13 @@ func (p *Parser) parse(
 			err = errors.WithTelemetry(err, tkeys...)
 		}
 
-		return Statement{}, err
+		return statements.Statement[tree.Statement]{}, err
 	}
-	return Statement{
+
+	return statements.Statement[tree.Statement]{
 		AST:             p.lexer.stmt,
 		SQL:             sql,
+		Comments:        p.scanner.Comments,
 		NumPlaceholders: p.lexer.numPlaceholders,
 		NumAnnotations:  p.lexer.numAnnotations,
 	}, nil
@@ -257,13 +224,13 @@ func unaryNegation(e tree.Expr) tree.Expr {
 }
 
 // Parse parses a sql statement string and returns a list of Statements.
-func Parse(sql string) (Statements, error) {
+func Parse(sql string) (statements.Statements, error) {
 	return ParseWithInt(sql, defaultNakedIntType)
 }
 
 // ParseWithInt parses a sql statement string and returns a list of
 // Statements. The INT token will result in the specified TInt type.
-func ParseWithInt(sql string, nakedIntType *types.T) (Statements, error) {
+func ParseWithInt(sql string, nakedIntType *types.T) (statements.Statements, error) {
 	var p Parser
 	return p.parseWithDepth(1, sql, nakedIntType)
 }
@@ -274,13 +241,15 @@ func ParseWithInt(sql string, nakedIntType *types.T) (Statements, error) {
 // used in various internal-execution paths where we might receive
 // bits of SQL from other nodes. In general,earwe expect that all
 // user-generated SQL has been run through the ParseWithInt() function.
-func ParseOne(sql string) (Statement, error) {
+func ParseOne(sql string) (statements.Statement[tree.Statement], error) {
 	return ParseOneWithInt(sql, defaultNakedIntType)
 }
 
 // ParseOneWithInt is similar to ParseOn but interprets the INT and SERIAL
 // types as the provided integer type.
-func ParseOneWithInt(sql string, nakedIntType *types.T) (Statement, error) {
+func ParseOneWithInt(
+	sql string, nakedIntType *types.T,
+) (statements.Statement[tree.Statement], error) {
 	var p Parser
 	return p.parseOneWithInt(sql, nakedIntType)
 }
@@ -319,6 +288,35 @@ func ParseTableName(sql string) (*tree.UnresolvedObjectName, error) {
 		return nil, errors.AssertionFailedf("expected an ALTER TABLE statement, but found %T", stmt)
 	}
 	return rename.Name, nil
+}
+
+// ParseTablePattern parses a table pattern. The table name must contain one
+// or more name parts, using the full input SQL syntax: each name
+// part containing special characters, or non-lowercase characters,
+// must be enclosed in double quote. The name may not be an invalid
+// table name (the caller is responsible for guaranteeing that only
+// valid table names are provided as input).
+// The last part may be '*' to denote a wildcard.
+func ParseTablePattern(sql string) (tree.TablePattern, error) {
+	// We wrap the name we want to parse into a dummy statement since our parser
+	// can only parse full statements.
+	stmt, err := ParseOne(fmt.Sprintf("GRANT SELECT ON TABLE %s TO admin", sql))
+	if err != nil {
+		return nil, err
+	}
+	grant, ok := stmt.AST.(*tree.Grant)
+	if !ok {
+		return nil, errors.AssertionFailedf("expected a GRANT statement, but found %T", stmt)
+	}
+	if len(grant.Targets.Tables.TablePatterns) == 0 {
+		return nil, errors.AssertionFailedf("expected at least one pattern")
+	}
+	u := grant.Targets.Tables.TablePatterns[0]
+	un, ok := u.(*tree.UnresolvedName)
+	if !ok {
+		return nil, errors.AssertionFailedf("expected an unresolved name, but found %T", u)
+	}
+	return un.NormalizeTablePattern()
 }
 
 // parseExprsWithInt parses one or more sql expressions.
@@ -396,6 +394,19 @@ func GetTypeFromValidSQLSyntax(sql string) (tree.ResolvableTypeReference, error)
 	expr, err := ParseExpr(fmt.Sprintf("1::%s", sql))
 	if err != nil {
 		return nil, err
+	}
+	return GetTypeFromCastOrCollate(expr)
+}
+
+// GetTypeFromCastOrCollate returns the type of the given tree.Expr. The method
+// assumes that the expression is either tree.CastExpr or tree.CollateExpr
+// (which wraps the tree.CastExpr).
+func GetTypeFromCastOrCollate(expr tree.Expr) (tree.ResolvableTypeReference, error) {
+	// COLLATE clause has lower precedence than the cast, so if we have
+	// something like `1::STRING COLLATE en`, it'll be parsed as
+	// CollateExpr(CastExpr).
+	if collate, ok := expr.(*tree.CollateExpr); ok {
+		return types.MakeCollatedString(types.String, collate.Locale), nil
 	}
 
 	cast, ok := expr.(*tree.CastExpr)

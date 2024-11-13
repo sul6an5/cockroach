@@ -19,6 +19,8 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -30,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -124,20 +125,22 @@ func runRefreshRangeBenchmark(b *testing.B, emk engineMaker, opts benchOptions) 
 	startKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(0)))
 	endKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(opts.dataOpts.numKeys)))
 
+	var refreshErr *kvpb.RefreshFailedError
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		func() {
-			var resp roachpb.RefreshRangeResponse
+			var resp kvpb.RefreshRangeResponse
 			_, err := batcheval.RefreshRange(ctx, eng, batcheval.CommandArgs{
 				EvalCtx: evalCtx,
-				Args: &roachpb.RefreshRangeRequest{
-					RequestHeader: roachpb.RequestHeader{
+				Args: &kvpb.RefreshRangeRequest{
+					RequestHeader: kvpb.RequestHeader{
 						Key:    startKey,
 						EndKey: endKey,
 					},
 					RefreshFrom: opts.refreshFrom,
 				},
-				Header: roachpb.Header{
+				Header: kvpb.Header{
 					Txn: &roachpb.Transaction{
 						TxnMeta: enginepb.TxnMeta{
 							WriteTimestamp: opts.refreshTo,
@@ -156,7 +159,7 @@ func runRefreshRangeBenchmark(b *testing.B, emk engineMaker, opts benchOptions) 
 				require.NoError(b, err)
 			} else {
 				require.Error(b, err)
-				require.Regexp(b, "encountered recently written committed value", err)
+				require.ErrorAs(b, err, &refreshErr)
 			}
 		}()
 	}
@@ -183,7 +186,6 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 	opts.FS = vfs.Default
 	opts.LBaseMaxBytes = lBaseMaxBytes
 	opts.ReadOnly = readOnly
-	opts.FormatMajorVersion = pebble.FormatBlockPropertyCollector
 	peb, err := storage.NewPebble(
 		context.Background(),
 		storage.PebbleConfig{
@@ -212,6 +214,9 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 func setupData(
 	ctx context.Context, b *testing.B, emk engineMaker, opts benchDataOptions,
 ) (storage.Engine, string) {
+	// Include the current version in the fixture name, or we may inadvertently
+	// run against a left-over fixture that is no longer supported.
+	verStr := fmt.Sprintf("v%s", clusterversion.TestingBinaryVersion.String())
 	orderStr := "linear"
 	if opts.randomKeyOrder {
 		orderStr = "random"
@@ -220,8 +225,9 @@ func setupData(
 	if opts.readOnlyEngine {
 		readOnlyStr = "_readonly"
 	}
-	loc := fmt.Sprintf("refresh_range_bench_data_%s%s_%d_%d_%d",
-		orderStr, readOnlyStr, opts.numKeys, opts.valueBytes, opts.lBaseMaxBytes)
+	loc := fmt.Sprintf("refresh_range_bench_data_%s_%s%s_%d_%d_%d",
+		verStr, orderStr, readOnlyStr, opts.numKeys, opts.valueBytes, opts.lBaseMaxBytes)
+
 	exists := true
 	if _, err := os.Stat(loc); oserror.IsNotExist(err) {
 		exists = false
@@ -229,13 +235,19 @@ func setupData(
 		b.Fatal(err)
 	}
 
+	absPath, err := filepath.Abs(loc)
+	if err != nil {
+		absPath = loc
+	}
+
 	if exists {
+		log.Infof(ctx, "using existing refresh range benchmark data: %s", absPath)
 		testutils.ReadAllFiles(filepath.Join(loc, "*"))
 		return emk(b, loc, opts.lBaseMaxBytes, opts.readOnlyEngine), loc
 	}
 
 	eng := emk(b, loc, opts.lBaseMaxBytes, false)
-	log.Infof(ctx, "creating refresh range benchmark data: %s", loc)
+	log.Infof(ctx, "creating refresh range benchmark data: %s", absPath)
 
 	// Generate the same data every time.
 	rng := rand.New(rand.NewSource(1449168817))

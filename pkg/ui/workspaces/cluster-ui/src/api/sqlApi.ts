@@ -15,7 +15,7 @@ export type SqlExecutionRequest = {
   execute?: boolean;
   timeout?: string; // Default 5s
   application_name?: string; // Defaults to '$ api-v2-sql'
-  database?: string; // Defaults to defaultDb
+  database?: string; // Defaults to system
   max_result_size?: number; // Default 10kib
 };
 
@@ -57,8 +57,15 @@ export type SqlExecutionErrorMessage = {
   message: string;
   code: string;
   severity: string;
-  source: { file: string; line: number; function: "string" };
+  source: { file: string; line: number; function: string };
 };
+
+export type SqlApiResponse<ResultType> = {
+  maxSizeReached: boolean;
+  results: ResultType;
+};
+
+export type SqlApiQueryResponse<Result> = Result & { error?: Error };
 
 export const SQL_API_PATH = "/api/v2/sql/";
 
@@ -71,6 +78,11 @@ export const SQL_API_PATH = "/api/v2/sql/";
 export function executeSql<RowType>(
   req: SqlExecutionRequest,
 ): Promise<SqlExecutionResponse<RowType>> {
+  // TODO(maryliag) remove this part of code when cloud is updated with
+  // a new CRDB release.
+  if (!req.database) {
+    req.database = FALLBACK_DB;
+  }
   return fetchDataJSON<SqlExecutionResponse<RowType>, SqlExecutionRequest>(
     SQL_API_PATH,
     req,
@@ -78,6 +90,9 @@ export function executeSql<RowType>(
 }
 
 export const INTERNAL_SQL_API_APP = "$ internal-console";
+export const LONG_TIMEOUT = "300s";
+export const LARGE_RESULT_SIZE = 50000; // 50 kib
+export const FALLBACK_DB = "system";
 
 /**
  * executeInternalSql executes the provided SQL statements with
@@ -99,4 +114,88 @@ export function executeInternalSql<RowType>(
   }
 
   return executeSql(req);
+}
+
+/**
+ * sqlResultsAreEmpty returns true if the provided result
+ * does not contain any rows.
+ * @param result the sql execution result returned by the server
+ * @returns
+ */
+export function sqlResultsAreEmpty(
+  result: SqlExecutionResponse<unknown>,
+): boolean {
+  return (
+    !result.execution?.txn_results?.length ||
+    result.execution.txn_results.every(txn => txnResultIsEmpty(txn))
+  );
+}
+
+// Error messages relating to upgrades in progress.
+// This is a temporary solution until we can use different queries for
+// different versions. For now we just try to give more info as to why
+// this page is unavailable for insights.
+const UPGRADE_RELATED_ERRORS = [
+  /relation "(.*)" does not exist/i,
+  /column "(.*)" does not exist/i,
+];
+
+export function isUpgradeError(message: string): boolean {
+  return UPGRADE_RELATED_ERRORS.some(err => message.search(err) !== -1);
+}
+
+/**
+ * errorMessage cleans the error message returned by the sqlApi,
+ * removing information not useful for the user.
+ * e.g. the error message
+ * "$executing stmt 1: run-query-via-api: only users with either MODIFYCLUSTERSETTING
+ * or VIEWCLUSTERSETTING privileges are allowed to show cluster settings"
+ * became
+ * "only users with either MODIFYCLUSTERSETTING or VIEWCLUSTERSETTING privileges are allowed to show cluster settings"
+ * and the error message
+ * "executing stmt 1: max result size exceeded"
+ * became
+ * "max result size exceeded"
+ * @param message
+ */
+export function sqlApiErrorMessage(message: string): string {
+  if (isUpgradeError(message)) {
+    return "This page may not be available during an upgrade.";
+  }
+
+  message = message.replace("run-query-via-api: ", "");
+  if (message.includes(":")) {
+    return message.split(":")[1];
+  }
+
+  return message;
+}
+
+export function isMaxSizeError(message: string): boolean {
+  return !!message?.includes("max result size exceeded");
+}
+
+export function formatApiResult<ResultType>(
+  results: ResultType,
+  error: SqlExecutionErrorMessage,
+  errorMessageContext: string,
+): SqlApiResponse<ResultType> {
+  const maxSizeError = isMaxSizeError(error?.message);
+
+  if (error && !maxSizeError) {
+    throw new Error(
+      `Error while ${errorMessageContext}: ${sqlApiErrorMessage(
+        error?.message,
+      )}`,
+    );
+  }
+
+  return {
+    maxSizeReached: maxSizeError,
+    results: results,
+  };
+}
+
+export function txnResultIsEmpty(txn_result: SqlTxnResult<unknown>): boolean {
+  return !txn_result.rows || txn_result.rows?.length === 0;
 }

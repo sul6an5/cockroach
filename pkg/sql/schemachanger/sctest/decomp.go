@@ -40,7 +40,7 @@ func DecomposeToElements(t *testing.T, dir string, newCluster NewClusterFunc) {
 	ctx := context.Background()
 	datadriven.Walk(t, dir, func(t *testing.T, path string) {
 		// Create a test cluster.
-		db, cleanup := newCluster(t, nil /* knobs */)
+		_, db, cleanup := newCluster(t, nil /* knobs */)
 		tdb := sqlutils.MakeSQLRunner(db)
 		defer cleanup()
 		// We need to disable the declarative schema changer so that we don't end
@@ -57,6 +57,7 @@ func runDecomposeTest(
 ) string {
 	switch d.Cmd {
 	case "setup":
+		sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
 		stmts, err := parser.Parse(d.Input)
 		require.NoError(t, err)
 		require.NotEmpty(t, stmts, "missing statement(s) for setup command")
@@ -71,7 +72,7 @@ func runDecomposeTest(
 		name := fields[0]
 		var desc catalog.Descriptor
 		allDescs := sctestdeps.ReadDescriptorsFromDB(ctx, t, tdb)
-		_ = allDescs.ForEachDescriptorEntry(func(d catalog.Descriptor) error {
+		_ = allDescs.ForEachDescriptor(func(d catalog.Descriptor) error {
 			if d.GetName() == name {
 				desc = d
 			}
@@ -85,7 +86,8 @@ func runDecomposeTest(
 		testDeps := sctestdeps.NewTestDependencies(
 			sctestdeps.WithComments(sctestdeps.ReadCommentsFromDB(t, tdb)),
 			sctestdeps.WithZoneConfigs(sctestdeps.ReadZoneConfigsFromDB(t, tdb, allDescs.Catalog)))
-		backRefs := scdecomp.WalkDescriptor(ctx, desc, allDescs.LookupDescriptorEntry, visitor, testDeps, testDeps)
+		backRefs := scdecomp.WalkDescriptor(ctx, desc, allDescs.LookupDescriptor, visitor,
+			testDeps, testDeps, testDeps.ClusterSettings().Version.ActiveVersion(ctx))
 		return marshalResult(t, m, backRefs)
 
 	default:
@@ -105,10 +107,10 @@ func marshalResult(
 			// Compute the struct field index of the element in the ElementProto
 			// to sort the elements in order of appearance in that message.
 			var ep scpb.ElementProto
-			ep.SetValue(e)
-			v := reflect.ValueOf(ep)
-			for i := 0; i < v.NumField(); i++ {
-				if !v.Field(i).IsNil() {
+			ep.SetElement(e)
+			v := reflect.ValueOf(ep.ElementOneOf).Elem()
+			for i, elemTypes := range scpb.GetElementOneOfProtos() {
+				if reflect.TypeOf(elemTypes).Elem() == v.Type() {
 					rank[e] = i
 					break
 				}

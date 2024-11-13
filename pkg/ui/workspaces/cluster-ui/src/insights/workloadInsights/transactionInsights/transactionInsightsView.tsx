@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import classNames from "classnames/bind";
 import { useHistory } from "react-router-dom";
 import {
@@ -23,6 +23,7 @@ import {
   defaultFilters,
   Filter,
   getFullFiltersAsStringRecord,
+  SelectedFilters,
 } from "src/queryFilter/filter";
 import { getWorkloadInsightEventFiltersFromURL } from "src/queryFilter/utils";
 import { Pagination } from "src/pagination";
@@ -30,35 +31,53 @@ import { queryByName, syncHistory } from "src/util/query";
 import { getTableSortFromURL } from "src/sortedtable/getTableSortFromURL";
 import { TableStatistics } from "src/tableStatistics";
 
-import { TransactionInsightEventsResponse } from "src/api/insightsApi";
 import {
   filterTransactionInsights,
   getAppsFromTransactionInsights,
-  getInsightsFromState,
   WorkloadInsightEventFilters,
+  TxnInsightEvent,
 } from "src/insights";
 import { EmptyInsightsTablePlaceholder } from "../util";
 import { TransactionInsightsTable } from "./transactionInsightsTable";
 import { InsightsError } from "../../insightsErrorComponent";
+import {
+  TimeScale,
+  defaultTimeScaleOptions,
+  TimeScaleDropdown,
+  timeScaleRangeToObj,
+} from "../../../timeScaleDropdown";
+import { TxnInsightsRequest } from "src/api";
 
 import styles from "src/statementsPage/statementsPage.module.scss";
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
+import { commonStyles } from "../../../common";
+import { useScheduleFunction } from "src/util/hooks";
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import { insights } from "src/util";
+import { Anchor } from "src/anchor";
 
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
 
 export type TransactionInsightsViewStateProps = {
-  transactions: TransactionInsightEventsResponse;
+  isDataValid: boolean;
+  lastUpdated: moment.Moment;
+  transactions: TxnInsightEvent[];
   transactionsError: Error | null;
+  insightTypes: string[];
   filters: WorkloadInsightEventFilters;
   sortSetting: SortSetting;
+  isLoading?: boolean;
   dropDownSelect?: React.ReactElement;
+  timeScale?: TimeScale;
+  maxSizeApiReached?: boolean;
 };
 
 export type TransactionInsightsViewDispatchProps = {
   onFiltersChange: (filters: WorkloadInsightEventFilters) => void;
   onSortChange: (ss: SortSetting) => void;
-  refreshTransactionInsights: () => void;
+  refreshTransactionInsights: (req: TxnInsightsRequest) => void;
+  setTimeScale: (ts: TimeScale) => void;
 };
 
 export type TransactionInsightsViewProps = TransactionInsightsViewStateProps &
@@ -71,14 +90,21 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
   props: TransactionInsightsViewProps,
 ) => {
   const {
+    isDataValid,
+    lastUpdated,
     sortSetting,
     transactions,
     transactionsError,
+    insightTypes,
     filters,
+    timeScale,
+    isLoading,
     refreshTransactionInsights,
     onFiltersChange,
     onSortChange,
+    setTimeScale,
     dropDownSelect,
+    maxSizeApiReached,
   } = props;
 
   const [pagination, setPagination] = useState<ISortedTablePagination>({
@@ -90,14 +116,22 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
     queryByName(history.location, INSIGHT_TXN_SEARCH_PARAM),
   );
 
+  const refresh = useCallback(() => {
+    const req = timeScaleRangeToObj(timeScale);
+    refreshTransactionInsights(req);
+  }, [refreshTransactionInsights, timeScale]);
+
+  const shouldPoll = timeScale.key !== "Custom";
+  const [refetch, clearPolling] = useScheduleFunction(
+    refresh,
+    shouldPoll, // Don't reschedule refresh if we have a custom time interval.
+    10 * 1000, // 10s polling interval
+    lastUpdated,
+  );
+
   useEffect(() => {
-    // Refresh every 10 seconds.
-    refreshTransactionInsights();
-    const interval = setInterval(refreshTransactionInsights, 10 * 1000);
-    return () => {
-      clearInterval(interval);
-    };
-  }, [refreshTransactionInsights]);
+    if (!isDataValid) refetch();
+  }, [isDataValid, refetch]);
 
   useEffect(() => {
     // We use this effect to sync settings defined on the URL (sort, filters),
@@ -173,9 +207,10 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
   const clearFilters = () =>
     onSubmitFilters({
       app: defaultFilters.app,
+      workloadInsightType: defaultFilters.workloadInsightType,
     });
 
-  const transactionInsights = getInsightsFromState(transactions);
+  const transactionInsights = transactions;
   const apps = getAppsFromTransactionInsights(
     transactionInsights,
     INTERNAL_APP_NAME_PREFIX,
@@ -186,6 +221,14 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
     filters,
     INTERNAL_APP_NAME_PREFIX,
     search,
+  );
+
+  const onTimeScaleChange = useCallback(
+    (ts: TimeScale) => {
+      clearPolling();
+      setTimeScale(ts);
+    },
+    [clearPolling, setTimeScale],
   );
 
   return (
@@ -206,15 +249,30 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
             onSubmitFilters={onSubmitFilters}
             appNames={apps}
             filters={filters}
+            workloadInsightTypes={insightTypes.sort()}
+            showWorkloadInsightTypes={true}
+          />
+        </PageConfigItem>
+        <PageConfigItem className={commonStyles("separator")}>
+          <TimeScaleDropdown
+            options={defaultTimeScaleOptions}
+            currentScale={timeScale}
+            setTimeScale={onTimeScaleChange}
           />
         </PageConfigItem>
       </PageConfig>
+      <SelectedFilters
+        filters={filters}
+        onRemoveFilter={onSubmitFilters}
+        onClearFilters={clearFilters}
+        className={cx("margin-adjusted")}
+      />
       <div className={cx("table-area")}>
         <Loading
-          loading={transactions === null}
+          loading={isLoading}
           page="transaction insights"
           error={transactionsError}
-          renderError={() => InsightsError()}
+          renderError={() => InsightsError(transactionsError?.message)}
         >
           <div>
             <section className={sortableTableCx("cl-table-container")}>
@@ -225,17 +283,18 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
                   totalCount={filteredTransactions?.length}
                   arrayItemName="transaction insights"
                   activeFilters={countActiveFilters}
-                  onClearFilters={clearFilters}
                 />
               </div>
               <TransactionInsightsTable
                 data={filteredTransactions}
                 sortSetting={sortSetting}
                 onChangeSortSetting={onChangeSortSetting}
+                setTimeScale={onTimeScaleChange}
                 renderNoResult={
                   <EmptyInsightsTablePlaceholder
                     isEmptySearchResults={
-                      search?.length > 0 && filteredTransactions?.length === 0
+                      (search?.length > 0 || countActiveFilters > 0) &&
+                      filteredTransactions?.length === 0
                     }
                   />
                 }
@@ -248,6 +307,20 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
               total={filteredTransactions?.length}
               onChange={onChangePage}
             />
+            {maxSizeApiReached && (
+              <InlineAlert
+                intent="info"
+                title={
+                  <>
+                    Not all insights are displayed because the maximum number of
+                    insights was reached in the console.&nbsp;
+                    <Anchor href={insights} target="_blank">
+                      Learn more
+                    </Anchor>
+                  </>
+                }
+              />
+            )}
           </div>
         </Loading>
       </div>

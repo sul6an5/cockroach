@@ -14,6 +14,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -21,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -107,18 +109,17 @@ func (p *planner) GrantRoleNode(ctx context.Context, n *tree.GrantRole) (*GrantR
 			for name := range roleoption.ByName {
 				if maybeOption == name {
 					return nil, errors.WithHintf(
-						pgerror.Newf(pgcode.UndefinedObject,
-							"role/user %s does not exist", r),
+						sqlerrors.NewUndefinedUserError(r),
 						"%s is a role option, try using ALTER ROLE to change a role's options.", maybeOption)
 				}
 			}
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %s does not exist", r)
+			return nil, sqlerrors.NewUndefinedUserError(r)
 		}
 	}
 
 	for _, m := range inputMembers {
 		if _, ok := roles[m]; !ok {
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %s does not exist", m)
+			return nil, sqlerrors.NewUndefinedUserError(m)
 		}
 	}
 
@@ -166,10 +167,18 @@ func (p *planner) GrantRoleNode(ctx context.Context, n *tree.GrantRole) (*GrantR
 }
 
 func (n *GrantRoleNode) startExec(params runParams) error {
-	opName := "grant-role"
+	var rowsAffected int
+	roleMembersHasIDs := params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.V23_1RoleMembersTableHasIDColumns)
+
 	// Add memberships. Existing memberships are allowed.
 	// If admin option is false, we do not remove it from existing memberships.
 	memberStmt := `INSERT INTO system.role_members ("role", "member", "isAdmin") VALUES ($1, $2, $3) ON CONFLICT ("role", "member")`
+	if roleMembersHasIDs {
+		memberStmt = `
+INSERT INTO system.role_members ("role", "member", "isAdmin", role_id, member_id)
+VALUES ($1, $2, $3, (SELECT user_id FROM system.users WHERE username = $1), (SELECT user_id FROM system.users WHERE username = $2))
+ON CONFLICT ("role", "member")`
+	}
 	if n.adminOption {
 		// admin option: true, set "isAdmin" even if the membership exists.
 		memberStmt += ` DO UPDATE SET "isAdmin" = true`
@@ -178,22 +187,20 @@ func (n *GrantRoleNode) startExec(params runParams) error {
 		memberStmt += ` DO NOTHING`
 	}
 
-	var rowsAffected int
 	for _, r := range n.roles {
 		for _, m := range n.members {
-			affected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
-				params.ctx,
-				opName,
-				params.p.txn,
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			memberStmtRowsAffected, err := params.p.InternalSQLTxn().ExecEx(
+				params.ctx, "grant-role", params.p.Txn(),
+				sessiondata.RootUserSessionDataOverride,
 				memberStmt,
-				r.Normalized(), m.Normalized(), n.adminOption,
+				r.Normalized(),
+				m.Normalized(),
+				n.adminOption,
 			)
 			if err != nil {
 				return err
 			}
-
-			rowsAffected += affected
+			rowsAffected += memberStmtRowsAffected
 		}
 	}
 

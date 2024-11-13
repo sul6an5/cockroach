@@ -12,6 +12,8 @@ package scpb
 
 import (
 	"sort"
+	"strings"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -21,7 +23,11 @@ import (
 // elements in the target state.
 type CurrentState struct {
 	TargetState
-	Current []Status
+
+	// Current holds the current statuses of the elements in the TargetState.
+	// Initial is like Current, except in the statement transaction, in which
+	// it instead holds the statuses at the beginning of the transaction.
+	Initial, Current []Status
 
 	// InRollback captures whether the job is currently rolling back.
 	// This is important to ensure that the job can be moved to the proper
@@ -40,10 +46,38 @@ type CurrentState struct {
 	Revertible bool
 }
 
+// ByteSize returns an estimated memory allocation for a schema change state `s`.
+// We created this function since the protobuf `s.Size()` method is the size of
+// `s` when it's serialized, and often differs greatly from the actual size in
+// memory.
+//
+// TODO (xiang): gogoproto `oneof` directive, as used today for scpb.ElementProto
+// is quite memory-inefficient and is the biggest contribution to the memory diff.
+// Change it to use protobuf native `oneof`.
+func (s CurrentState) ByteSize() (ret int64) {
+	ret += int64(unsafe.Sizeof(Target{})+2*unsafe.Sizeof(Status(0))) * int64(cap(s.TargetState.Targets))
+	for _, s := range s.TargetState.Statements {
+		ret += int64(s.Size())
+	}
+	ret += int64(s.TargetState.Authorization.Size())
+	ret += int64(cap(s.Initial)+cap(s.Current)) * int64(unsafe.Sizeof(Status(0)))
+	ret += int64(unsafe.Sizeof(false))
+	return ret
+}
+
+// WithCurrentStatuses returns a shallow copy of the current state
+// with a new set of current statuses.
+func (s CurrentState) WithCurrentStatuses(current []Status) CurrentState {
+	ret := s
+	ret.Current = current
+	return ret
+}
+
 // DeepCopy returns a deep copy of the receiver.
 func (s CurrentState) DeepCopy() CurrentState {
 	return CurrentState{
 		TargetState: *protoutil.Clone(&s.TargetState).(*TargetState),
+		Initial:     append(make([]Status, 0, len(s.Initial)), s.Initial...),
 		Current:     append(make([]Status, 0, len(s.Current)), s.Current...),
 		InRollback:  s.InRollback,
 		Revertible:  s.Revertible,
@@ -69,6 +103,18 @@ func (s *CurrentState) Rollback() {
 	s.InRollback = true
 }
 
+// StatementTags returns the concatenated statement tags in the current state.
+func (s CurrentState) StatementTags() string {
+	var sb strings.Builder
+	for i, stmt := range s.Statements {
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		sb.WriteString(stmt.StatementTag)
+	}
+	return sb.String()
+}
+
 // NumStatus is the number of values which Status may take on.
 var NumStatus = len(Status_name)
 
@@ -82,12 +128,16 @@ type Element interface {
 	element()
 }
 
+type ElementGetter interface {
+	Element() Element
+}
+
 //go:generate go run element_generator.go --in elements.proto --out elements_generated.go
 //go:generate go run element_uml_generator.go --out uml/table.puml
 
 // Element returns an Element from its wrapper for serialization.
 func (e *ElementProto) Element() Element {
-	return e.GetValue().(Element)
+	return e.GetElementOneOf().(ElementGetter).Element()
 }
 
 // MakeTarget constructs a new Target. The passed elem must be one of the oneOf
@@ -99,9 +149,7 @@ func MakeTarget(status TargetStatus, elem Element, metadata *TargetMetadata) Tar
 	if metadata != nil {
 		t.Metadata = *protoutil.Clone(metadata).(*TargetMetadata)
 	}
-	if !t.SetValue(elem) {
-		panic(errors.Errorf("unknown element type %T", elem))
-	}
+	t.SetElement(elem)
 	return t
 }
 
@@ -141,6 +189,7 @@ func MakeCurrentStateFromDescriptors(descriptorStates []*DescriptorState) (Curre
 				cs.JobID,
 			)
 		}
+		s.Initial = append(s.Initial, cs.CurrentStatuses...)
 		s.Current = append(s.Current, cs.CurrentStatuses...)
 		s.Targets = append(s.Targets, cs.Targets...)
 		targetRanks = append(targetRanks, cs.TargetRanks...)
@@ -185,6 +234,7 @@ func (s *stateAndRanks) Less(i, j int) bool { return s.ranks[i] < s.ranks[j] }
 func (s *stateAndRanks) Swap(i, j int) {
 	s.ranks[i], s.ranks[j] = s.ranks[j], s.ranks[i]
 	s.Targets[i], s.Targets[j] = s.Targets[j], s.Targets[i]
+	s.Initial[i], s.Initial[j] = s.Initial[j], s.Initial[i]
 	s.Current[i], s.Current[j] = s.Current[j], s.Current[i]
 }
 

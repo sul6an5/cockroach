@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
@@ -31,6 +32,9 @@ type TestingKnobs struct {
 	// It allows the tests to muck with the Sink, and even return altogether different
 	// implementation.
 	WrapSink func(s Sink, jobID jobspb.JobID) Sink
+	// PubsubClientSkipClientCreation, if set, skips creating a google cloud
+	// client as it is expected that the test manually sets a client.
+	PubsubClientSkipClientCreation bool
 	// FilterSpanWithMutation is a filter returning true if the resolved span event should
 	// be skipped. This method takes a pointer in case resolved spans need to be mutated.
 	FilterSpanWithMutation func(resolved *jobspb.ResolvedSpan) bool
@@ -47,6 +51,12 @@ type TestingKnobs struct {
 	ShouldReplan func(ctx context.Context, oldPlan, newPlan *sql.PhysicalPlan) bool
 	// RaiseRetryableError is a knob used to possibly return an error.
 	RaiseRetryableError func() error
+
+	// This is currently used to test negative timestamp in cursor i.e of the form
+	// "-3us". Check TestChangefeedCursor for more info. This function needs to be in the
+	// knobs as current statement time will only be available once the create changefeed statement
+	// starts executing.
+	OverrideCursor func(currentTime *hlc.Timestamp) string
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/errors"
 )
@@ -35,15 +36,17 @@ func TestingGetDatabaseDescriptorWithVersion(
 ) catalog.DatabaseDescriptor {
 	ctx := context.Background()
 	var desc catalog.Descriptor
-	direct := catkv.MakeDirect(codec, version)
+	cr := catkv.NewCatalogReader(
+		codec, version, nil /* systemDatabaseCache */, nil, /* maybeMonitor */
+	)
 	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-		id, err := direct.LookupDescriptorID(ctx, txn, keys.RootNamespaceID, keys.RootNamespaceID, database)
+		id, err := lookupDescriptorID(ctx, cr, txn, keys.RootNamespaceID, keys.RootNamespaceID, database)
 		if err != nil {
 			panic(err)
 		} else if id == descpb.InvalidID {
 			panic(fmt.Sprintf("database %s not found", database))
 		}
-		desc, err = direct.MustGetDescriptorByID(ctx, txn, id, catalog.Database)
+		desc, err = mustGetDescriptorByID(ctx, version, cr, txn, id, catalog.Database)
 		if err != nil {
 			panic(err)
 		}
@@ -73,15 +76,17 @@ func TestingGetSchemaDescriptorWithVersion(
 ) catalog.SchemaDescriptor {
 	ctx := context.Background()
 	var desc catalog.Descriptor
-	direct := catkv.MakeDirect(codec, version)
+	cr := catkv.NewCatalogReader(
+		codec, version, nil /* systemDatabaseCache */, nil, /* maybeMonitor */
+	)
 	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-		schemaID, err := direct.LookupDescriptorID(ctx, txn, dbID, keys.RootNamespaceID, schemaName)
+		schemaID, err := lookupDescriptorID(ctx, cr, txn, dbID, keys.RootNamespaceID, schemaName)
 		if err != nil {
 			panic(err)
 		} else if schemaID == descpb.InvalidID {
 			panic(fmt.Sprintf("schema %s not found", schemaName))
 		}
-		desc, err = direct.MustGetDescriptorByID(ctx, txn, schemaID, catalog.Schema)
+		desc, err = mustGetDescriptorByID(ctx, version, cr, txn, schemaID, catalog.Schema)
 		if err != nil {
 			panic(err)
 		}
@@ -160,6 +165,36 @@ func TestingGetPublicTypeDescriptor(
 	return TestingGetTypeDescriptor(kvDB, codec, database, "public", object)
 }
 
+func TestGetFunctionDescriptor(
+	kvDB *kv.DB, codec keys.SQLCodec, database string, schema string, fName string,
+) catalog.FunctionDescriptor {
+	db := TestingGetDatabaseDescriptor(kvDB, codec, database)
+	sc := TestingGetSchemaDescriptor(kvDB, codec, db.GetID(), schema)
+	f, found := sc.GetFunction(fName)
+	if !found {
+		panic(fmt.Sprintf("function %s.%s.%s does not exist", database, schema, fName))
+	}
+	if len(f.Signatures) != 1 {
+		panic(fmt.Sprintf("expected only 1 function %s.%s.%s, found %d", database, schema, fName, len(f.Signatures)))
+	}
+	fnID := f.Signatures[0].ID
+	ctx := context.Background()
+	var fnDesc catalog.Descriptor
+	cr := catkv.NewCatalogReader(
+		codec, latestBinaryVersion, nil /* systemDatabaseCache */, nil, /* maybeMonitor */
+	)
+	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+		fnDesc, err = mustGetDescriptorByID(ctx, latestBinaryVersion, cr, txn, fnID, catalog.Function)
+		if err != nil {
+			panic(err)
+		}
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+	return fnDesc.(catalog.FunctionDescriptor)
+}
+
 func testingGetObjectDescriptor(
 	kvDB *kv.DB,
 	codec keys.SQLCodec,
@@ -169,33 +204,84 @@ func testingGetObjectDescriptor(
 	object string,
 ) (desc catalog.Descriptor) {
 	ctx := context.Background()
-	direct := catkv.MakeDirect(codec, version)
+	cr := catkv.NewCatalogReader(
+		codec, version, nil /* systemDatabaseCache */, nil, /* maybeMonitor */
+	)
 	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-		dbID, err := direct.LookupDescriptorID(ctx, txn, keys.RootNamespaceID, keys.RootNamespaceID, database)
+		dbID, err := lookupDescriptorID(ctx, cr, txn, keys.RootNamespaceID, keys.RootNamespaceID, database)
 		if err != nil {
 			return err
 		}
 		if dbID == descpb.InvalidID {
 			return errors.Errorf("database %s not found", database)
 		}
-		schemaID, err := direct.LookupDescriptorID(ctx, txn, dbID, keys.RootNamespaceID, schema)
+		schemaID, err := lookupDescriptorID(ctx, cr, txn, dbID, keys.RootNamespaceID, schema)
 		if err != nil {
 			return err
 		}
 		if schemaID == descpb.InvalidID {
 			return errors.Errorf("schema %s not found", schema)
 		}
-		objectID, err := direct.LookupDescriptorID(ctx, txn, dbID, schemaID, object)
+		objectID, err := lookupDescriptorID(ctx, cr, txn, dbID, schemaID, object)
 		if err != nil {
 			return err
 		}
 		if objectID == descpb.InvalidID {
 			return errors.Errorf("object %s not found", object)
 		}
-		desc, err = direct.MustGetDescriptorByID(ctx, txn, objectID, catalog.Any)
+		desc, err = mustGetDescriptorByID(ctx, version, cr, txn, objectID, catalog.Any)
 		return err
 	}); err != nil {
 		panic(err)
 	}
 	return desc
+}
+
+func lookupDescriptorID(
+	ctx context.Context,
+	cr catkv.CatalogReader,
+	txn *kv.Txn,
+	dbID descpb.ID,
+	schemaID descpb.ID,
+	objectName string,
+) (descpb.ID, error) {
+	key := descpb.NameInfo{ParentID: dbID, ParentSchemaID: schemaID, Name: objectName}
+	c, err := cr.GetByNames(ctx, txn, []descpb.NameInfo{key})
+	if err != nil {
+		return descpb.InvalidID, err
+	}
+	if e := c.LookupNamespaceEntry(&key); e != nil {
+		return e.GetID(), nil
+	}
+	return descpb.InvalidID, nil
+}
+
+func mustGetDescriptorByID(
+	ctx context.Context,
+	version clusterversion.ClusterVersion,
+	cr catkv.CatalogReader,
+	txn *kv.Txn,
+	id descpb.ID,
+	expectedType catalog.DescriptorType,
+) (catalog.Descriptor, error) {
+	const isDescriptorRequired = true
+	c, err := cr.GetByIDs(ctx, txn, []descpb.ID{id}, isDescriptorRequired, expectedType)
+	if err != nil {
+		return nil, err
+	}
+	desc := c.LookupDescriptor(id)
+	vd := catkv.NewCatalogReaderBackedValidationDereferencer(cr, txn, nil /* dvmpMaybe */)
+	ve := validate.Validate(
+		ctx, version, vd, catalog.ValidationReadTelemetry, validate.ImmutableRead, desc,
+	)
+	if err := ve.CombinedError(); err != nil {
+		return nil, err
+	}
+	return desc, nil
+}
+
+// TestingValidateSelf is a convenience function for internal descriptor
+// validation.
+func TestingValidateSelf(desc catalog.Descriptor) error {
+	return validate.Self(clusterversion.TestingClusterVersion, desc)
 }

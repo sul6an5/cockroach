@@ -59,6 +59,13 @@ func Initialize(ctx context.Context, ver roachpb.Version, sv *settings.Values) e
 	return version.initialize(ctx, ver, sv)
 }
 
+// AssertInitialized checks whether Initialize() has been called yet. This
+// is used in test code to assert that an initial cluster version has
+// been set when that matters.
+func AssertInitialized(ctx context.Context, sv *settings.Values) {
+	_ = version.activeVersion(ctx, sv)
+}
+
 // Handle is the interface through which callers access the active cluster
 // version and this binary's version details.
 type Handle interface {
@@ -263,19 +270,6 @@ func (cv ClusterVersion) String() string {
 // SafeFormat implements the redact.SafeFormatter interface.
 func (cv ClusterVersion) SafeFormat(p redact.SafePrinter, _ rune) {
 	p.Print(cv.Version)
-}
-
-// PrettyPrint returns the value in a format that makes it apparent whether or
-// not it is a fence version.
-func (cv ClusterVersion) PrettyPrint() string {
-	// If we're a version greater than v20.2 and have an odd internal version,
-	// we're a fence version. See fenceVersionFor in pkg/upgrade to understand
-	// what these are.
-	fenceVersion := !cv.Version.LessEq(roachpb.Version{Major: 20, Minor: 2}) && (cv.Internal%2) == 1
-	if !fenceVersion {
-		return cv.String()
-	}
-	return redact.Sprintf("%s%s", cv.String(), "(fence)").StripMarkers()
 }
 
 // ClusterVersionImpl implements the settings.ClusterVersionImpl interface.

@@ -11,6 +11,7 @@
 package builtins
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
@@ -46,9 +47,9 @@ var pgcryptoBuiltins = map[string]builtinDefinition{
 	"crypt": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryCrypto},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"password", types.String}, {"salt", types.String}},
+			Types:      tree.ParamTypes{{Name: "password", Typ: types.String}, {Name: "salt", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				password := tree.MustBeDString(args[0])
 				salt := tree.MustBeDString(args[1])
 				hash, err := crypt(string(password), string(salt))
@@ -58,16 +59,16 @@ var pgcryptoBuiltins = map[string]builtinDefinition{
 				return tree.NewDString(hash), nil
 			},
 			Info:       "Generates a hash based on a password and salt. The hash algorithm and number of rounds if applicable are encoded in the salt.",
-			Volatility: volatility.Volatile,
+			Volatility: volatility.Immutable,
 		},
 	),
 
 	"digest": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryCrypto},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"data", types.String}, {"type", types.String}},
+			Types:      tree.ParamTypes{{Name: "data", Typ: types.String}, {Name: "type", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				alg := tree.MustBeDString(args[1])
 				hashFunc, err := getHashFunc(string(alg))
 				if err != nil {
@@ -81,12 +82,12 @@ var pgcryptoBuiltins = map[string]builtinDefinition{
 			},
 			Info: "Computes a binary hash of the given `data`. `type` is the algorithm " +
 				"to use (md5, sha1, sha224, sha256, sha384, or sha512).",
-			Volatility: volatility.Leakproof,
+			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"data", types.Bytes}, {"type", types.String}},
+			Types:      tree.ParamTypes{{Name: "data", Typ: types.Bytes}, {Name: "type", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				alg := tree.MustBeDString(args[1])
 				hashFunc, err := getHashFunc(string(alg))
 				if err != nil {
@@ -109,9 +110,9 @@ var pgcryptoBuiltins = map[string]builtinDefinition{
 	"gen_salt": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryCrypto},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"type", types.String}},
+			Types:      tree.ParamTypes{{Name: "type", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				typ := tree.MustBeDString(args[0])
 				salt, err := genSalt(string(typ), 0)
 				if err != nil {
@@ -123,9 +124,9 @@ var pgcryptoBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"type", types.String}, {"iter_count", types.Int}},
+			Types:      tree.ParamTypes{{Name: "type", Typ: types.String}, {Name: "iter_count", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				typ := tree.MustBeDString(args[0])
 				rounds := tree.MustBeDInt(args[1])
 				salt, err := genSalt(string(typ), int(rounds))
@@ -142,9 +143,9 @@ var pgcryptoBuiltins = map[string]builtinDefinition{
 	"hmac": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryCrypto},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"data", types.String}, {"key", types.String}, {"type", types.String}},
+			Types:      tree.ParamTypes{{Name: "data", Typ: types.String}, {Name: "key", Typ: types.String}, {Name: "type", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				key := tree.MustBeDString(args[1])
 				alg := tree.MustBeDString(args[2])
 				hashFunc, err := getHashFunc(string(alg))
@@ -158,12 +159,12 @@ var pgcryptoBuiltins = map[string]builtinDefinition{
 				return tree.NewDBytes(tree.DBytes(h.Sum(nil))), nil
 			},
 			Info:       "Calculates hashed MAC for `data` with key `key`. `type` is the same as in `digest()`.",
-			Volatility: volatility.Leakproof,
+			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"data", types.Bytes}, {"key", types.Bytes}, {"type", types.String}},
+			Types:      tree.ParamTypes{{Name: "data", Typ: types.Bytes}, {Name: "key", Typ: types.Bytes}, {Name: "type", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				key := tree.MustBeDBytes(args[1])
 				alg := tree.MustBeDString(args[2])
 				hashFunc, err := getHashFunc(string(alg))

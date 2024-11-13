@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/errors"
 )
@@ -80,15 +81,15 @@ func registerPsycopg(r registry.Registry) {
 
 		// TODO(rafi): When psycopg 2.9.4 is released and tagged,
 		//    use the tag version instead of the commit.
-		//if err := repeatGitCloneE(
+		// if err := repeatGitCloneE(
 		//	ctx, t, c,
 		//	"https://github.com/psycopg/psycopg2.git",
 		//	"/mnt/data1/psycopg",
 		//	supportedPsycopgTag,
 		//	node,
-		//); err != nil {
+		// ); err != nil {
 		//	t.Fatal(err)
-		//}
+		// }
 		if err = c.RunE(ctx, node, "git clone https://github.com/psycopg/psycopg2.git /mnt/data1/psycopg"); err != nil {
 			t.Fatal(err)
 		}
@@ -103,15 +104,8 @@ func registerPsycopg(r registry.Registry) {
 			t.Fatal(err)
 		}
 
-		blocklistName, expectedFailures, ignoredlistName, ignoredlist := psycopgBlocklists.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No psycopg blocklist defined for cockroach version %s", version)
-		}
-		if ignoredlist == nil {
-			t.Fatalf("No psycopg ignorelist defined for cockroach version %s", version)
-		}
 		t.L().Printf("Running cockroach version %s, using blocklist %s, using ignoredlist %s",
-			version, blocklistName, ignoredlistName)
+			version, "psycopgBlockList", "psycopgIgnoreList")
 
 		t.Status("running psycopg test suite")
 
@@ -124,16 +118,10 @@ func registerPsycopg(r registry.Registry) {
 			make check PYTHON_VERSION=3`,
 		)
 
-		// Expected to fail but we should still scan the error to check if
-		// there's an SSH/roachprod error.
-		if err != nil {
-			// install.NonZeroExitCode includes unrelated to SSH errors ("255")
-			// or roachprod errors, so we call t.Fatal if the error is not an
-			// install.NonZeroExitCode error
-			commandError := (*install.NonZeroExitCode)(nil)
-			if !errors.As(err, &commandError) {
-				t.Fatal(err)
-			}
+		// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+		// Proceed for any other (command) errors
+		if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+			t.Fatal(err)
 		}
 
 		// Result error contains stdout, stderr, and any error content returned by exec package.
@@ -144,16 +132,16 @@ func registerPsycopg(r registry.Registry) {
 
 		// Find all the failed and errored tests.
 		results := newORMTestsResults()
-		results.parsePythonUnitTestOutput(rawResults, expectedFailures, ignoredlist)
+		results.parsePythonUnitTestOutput(rawResults, psycopgBlockList, psycopgIgnoreList)
 		results.summarizeAll(
-			t, "psycopg" /* ormName */, blocklistName, expectedFailures,
+			t, "psycopg" /* ormName */, "psycopgBlockList", psycopgBlockList,
 			version, supportedPsycopgTag,
 		)
 	}
 
 	r.Add(registry.TestSpec{
 		Name:    "psycopg",
-		Owner:   registry.OwnerSQLExperience,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
 		Tags:    []string{`default`, `driver`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {

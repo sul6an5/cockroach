@@ -13,19 +13,19 @@ package scexec
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/scmutationexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 )
 
 // Dependencies contains all the dependencies required by the executor.
@@ -37,9 +37,8 @@ type Dependencies interface {
 	IndexMerger() Merger
 	BackfillProgressTracker() BackfillerTracker
 	PeriodicProgressFlusher() PeriodicProgressFlusher
-	IndexValidator() IndexValidator
+	Validator() Validator
 	IndexSpanSplitter() IndexSpanSplitter
-	EventLogger() EventLogger
 	DescriptorMetadataUpdater(ctx context.Context) DescriptorMetadataUpdater
 	StatsRefresher() StatsRefreshQueue
 	GetTestingKnobs() *TestingKnobs
@@ -48,6 +47,7 @@ type Dependencies interface {
 	// Statements returns the statements behind this schema change.
 	Statements() []string
 	User() username.SQLUsername
+	ClusterSettings() *cluster.Settings
 }
 
 // Catalog encapsulates the catalog-related dependencies for the executor.
@@ -55,45 +55,7 @@ type Dependencies interface {
 // changes.
 type Catalog interface {
 	scmutationexec.NameResolver
-	scmutationexec.SyntheticDescriptorStateUpdater
-
-	// MustReadImmutableDescriptors reads descriptors from the catalog by ID.
-	MustReadImmutableDescriptors(ctx context.Context, ids ...descpb.ID) ([]catalog.Descriptor, error)
-
-	// MustReadMutableDescriptor the mutable equivalent to
-	// MustReadImmutableDescriptors.
-	MustReadMutableDescriptor(ctx context.Context, id descpb.ID) (catalog.MutableDescriptor, error)
-
-	// NewCatalogChangeBatcher is equivalent to creating a new kv.Batch for the
-	// current kv.Txn.
-	NewCatalogChangeBatcher() CatalogChangeBatcher
-}
-
-// EventLogger encapsulates the operations for emitting event log entries.
-type EventLogger interface {
-	// LogEvent writes to the event log.
-	LogEvent(
-		ctx context.Context,
-		details eventpb.CommonSQLEventDetails,
-		event logpb.EventPayload,
-	) error
-
-	// LogEventForSchemaChange write a schema change event entry into the event log.
-	LogEventForSchemaChange(
-		ctx context.Context, event logpb.EventPayload,
-	) error
-}
-
-// Telemetry encapsulates metrics gather for the declarative schema changer.
-type Telemetry interface {
-	// IncrementSchemaChangeErrorType increments the number of errors of a given
-	// type observed by the schema changer.
-	IncrementSchemaChangeErrorType(typ string)
-}
-
-// CatalogChangeBatcher encapsulates batched updates to the catalog: descriptor
-// updates, namespace operations, etc.
-type CatalogChangeBatcher interface {
+	scmutationexec.DescriptorReader
 
 	// CreateOrUpdateDescriptor upserts a descriptor.
 	CreateOrUpdateDescriptor(ctx context.Context, desc catalog.MutableDescriptor) error
@@ -104,11 +66,38 @@ type CatalogChangeBatcher interface {
 	// DeleteDescriptor deletes a descriptor entry.
 	DeleteDescriptor(ctx context.Context, id descpb.ID) error
 
-	// ValidateAndRun executes the updates after validating the catalog changes.
-	ValidateAndRun(ctx context.Context) error
-
 	// DeleteZoneConfig deletes the zone config for a descriptor.
 	DeleteZoneConfig(ctx context.Context, id descpb.ID) error
+
+	// UpdateComment upserts a comment for the (objID, subID, cmtType) key.
+	UpdateComment(
+		ctx context.Context, key catalogkeys.CommentKey, cmt string,
+	) error
+
+	// DeleteComment deletes a comment with (objID, subID, cmtType) key.
+	DeleteComment(
+		ctx context.Context, key catalogkeys.CommentKey,
+	) error
+
+	// Validate validates all the uncommitted catalog changes performed
+	// in this transaction so far.
+	Validate(ctx context.Context) error
+
+	// Run persists all the uncommitted catalog changes performed in this
+	// transaction so far. Reset cannot be called after this method.
+	Run(ctx context.Context) error
+
+	// Reset undoes all the uncommitted catalog changes performed in this
+	// transaction so far, assuming that they haven't been persisted yet
+	// by calling Run.
+	Reset(ctx context.Context) error
+}
+
+// Telemetry encapsulates metrics gather for the declarative schema changer.
+type Telemetry interface {
+	// IncrementSchemaChangeErrorType increments the number of errors of a given
+	// type observed by the schema changer.
+	IncrementSchemaChangeErrorType(typ string)
 }
 
 // TransactionalJobRegistry creates and updates jobs in the current transaction.
@@ -124,6 +113,10 @@ type TransactionalJobRegistry interface {
 	// SchemaChangerJobID returns the schema changer job ID, creating one if it
 	// doesn't yet exist.
 	SchemaChangerJobID() jobspb.JobID
+
+	// CurrentJob returns the schema changer job that is currently, running,
+	// if we are executing within a job.
+	CurrentJob() *jobs.Job
 
 	// CreateJob creates a job in the current transaction and returns the
 	// id which was assigned to that job, or an error otherwise.
@@ -196,10 +189,11 @@ type Merger interface {
 	) error
 }
 
-// IndexValidator provides interfaces that allow indexes to be validated.
-type IndexValidator interface {
+// Validator provides interfaces that allow indexes and check constraints to be validated.
+type Validator interface {
 	ValidateForwardIndexes(
 		ctx context.Context,
+		job *jobs.Job,
 		tbl catalog.TableDescriptor,
 		indexes []catalog.Index,
 		override sessiondata.InternalExecutorOverride,
@@ -207,8 +201,17 @@ type IndexValidator interface {
 
 	ValidateInvertedIndexes(
 		ctx context.Context,
+		job *jobs.Job,
 		tbl catalog.TableDescriptor,
 		indexes []catalog.Index,
+		override sessiondata.InternalExecutorOverride,
+	) error
+
+	ValidateConstraint(
+		ctx context.Context,
+		tbl catalog.TableDescriptor,
+		constraint catalog.Constraint,
+		indexIDForValidation descpb.IndexID,
 		override sessiondata.InternalExecutorOverride,
 	) error
 }
@@ -217,8 +220,13 @@ type IndexValidator interface {
 // prior to backfilling.
 type IndexSpanSplitter interface {
 
-	// MaybeSplitIndexSpans will attempt to split the backfilled index span.
+	// MaybeSplitIndexSpans will attempt to split the backfilled index span, if
+	// the index is in the system tenant or is partitioned.
 	MaybeSplitIndexSpans(ctx context.Context, table catalog.TableDescriptor, indexToBackfill catalog.Index) error
+
+	// MaybeSplitIndexSpansForPartitioning will split backfilled index spans
+	// across hash-sharded index boundaries if applicable.
+	MaybeSplitIndexSpansForPartitioning(ctx context.Context, table catalog.TableDescriptor, indexToBackfill catalog.Index) error
 }
 
 // BackfillProgress tracks the progress for a Backfill.
@@ -333,39 +341,11 @@ type BackfillerProgressFlusher interface {
 // DescriptorMetadataUpdater is used to update metadata associated with schema objects,
 // for example comments associated with a schema.
 type DescriptorMetadataUpdater interface {
-	// UpsertDescriptorComment updates a comment associated with a schema object.
-	UpsertDescriptorComment(id int64, subID int64, commentType keys.CommentType, comment string) error
-
-	// DeleteDescriptorComment deletes a comment for schema object.
-	DeleteDescriptorComment(id int64, subID int64, commentType keys.CommentType) error
-
-	//UpsertConstraintComment upserts a comment associated with a constraint.
-	UpsertConstraintComment(tableID descpb.ID, constraintID descpb.ConstraintID, comment string) error
-
-	//DeleteConstraintComment deletes a comment associated with a constraint.
-	DeleteConstraintComment(tableID descpb.ID, constraintID descpb.ConstraintID) error
-
 	// DeleteDatabaseRoleSettings deletes role settings associated with a database.
 	DeleteDatabaseRoleSettings(ctx context.Context, dbID descpb.ID) error
 
-	// SwapDescriptorSubComment moves a comment from one sub ID to another.
-	SwapDescriptorSubComment(id int64, oldSubID int64, newSubID int64, commentType keys.CommentType) error
-
-	// DeleteAllCommentsForTables deletes all table-bound comments for the tables
-	// with the specified IDs.
-	DeleteAllCommentsForTables(ids catalog.DescriptorIDSet) error
-
 	// DeleteSchedule deletes the given schedule.
 	DeleteSchedule(ctx context.Context, id int64) error
-
-	// UpsertZoneConfig sets the zone config for a given descriptor. If necessary,
-	// the subzone spans will be recomputed as part of this call.
-	UpsertZoneConfig(
-		ctx context.Context, id descpb.ID, zone *zonepb.ZoneConfig,
-	) (numAffected int, err error)
-
-	// DeleteZoneConfig deletes a zone config for a given descriptor.
-	DeleteZoneConfig(ctx context.Context, id descpb.ID) (numAffected int, err error)
 }
 
 // StatsRefreshQueue queues table for stats refreshes.
@@ -379,4 +359,36 @@ type StatsRefresher interface {
 	// NotifyMutation notifies the stats refresher that a table needs its
 	// statistics updated.
 	NotifyMutation(table catalog.TableDescriptor, rowsAffected int)
+}
+
+// ProtectedTimestampManager used to install a protected timestamp before
+// the GC interval is encountered.
+type ProtectedTimestampManager interface {
+	// TryToProtectBeforeGC adds a protected timestamp record for a historical
+	// transaction for a specific table, once a certain percentage of the GC time
+	// has elapsed. This is done on a best effort bases using a timer relative to
+	// the GC TTL, and should be done fairy early in the transaction. Note, the
+	// function assumes the in-memory job is up to date with the persisted job
+	// record.
+	TryToProtectBeforeGC(
+		ctx context.Context, job *jobs.Job, tableDesc catalog.TableDescriptor, readAsOf hlc.Timestamp,
+	) jobsprotectedts.Cleaner
+
+	// Protect adds a protected timestamp record for a historical transaction for
+	// a specific target immediately. If an existing record is found, it will be
+	// updated with a new timestamp. Returns a Cleaner function to remove the
+	// protected timestamp, if one was installed. Note, the function assumes the
+	// in-memory job is up to date with the persisted job record.
+	Protect(
+		ctx context.Context,
+		job *jobs.Job,
+		target *ptpb.Target,
+		readAsOf hlc.Timestamp,
+	) (jobsprotectedts.Cleaner, error)
+
+	// Unprotect unprotects the spans associated with the job, mainly for last
+	// resort cleanup. The function assumes the in-memory job is up to date with
+	// the persisted job record. Note: This should only be used for job cleanup if
+	// its not currently, executing.
+	Unprotect(ctx context.Context, job *jobs.Job) error
 }

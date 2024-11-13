@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/ui"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -134,13 +135,17 @@ func (p *ReverseHTTPProxy) Start(ctx context.Context, stop *stop.Stopper) {
 	// configured in `obsservice` and not hardcoded into `obslib`. This
 	// gives lib users a chance to do whatever they want with the UI.
 	mux.Handle("/", ui.Handler(ui.Config{
-		ExperimentalUseLogin: false,
-		LoginEnabled:         false,
+		Insecure: true,
 		GetUser: func(ctx context.Context) *string {
 			u := "Observability Service"
 			return &u
 		},
 		OIDC: &noOIDCConfigured{},
+		Flags: serverpb.FeatureFlags{
+			IsObservabilityService: true,
+			// TODO(obs-infra): make conditional once obsservice becomes tenant-aware.
+			CanViewKvMetricDashboards: true,
+		},
 	}))
 	for _, path := range CRDBProxyPaths {
 		mux.Handle(path, p.proxy)

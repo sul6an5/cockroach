@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -21,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/raft/v3"
 )
 
 type unreliableRaftHandlerFuncs struct {
@@ -31,8 +32,9 @@ type unreliableRaftHandlerFuncs struct {
 	dropReq  func(*kvserverpb.RaftMessageRequest) bool
 	dropHB   func(*kvserverpb.RaftHeartbeat) bool
 	dropResp func(*kvserverpb.RaftMessageResponse) bool
-	// snapErr defaults to returning nil.
-	snapErr func(*kvserverpb.SnapshotRequest_Header) error
+	// snapErr and delegateErr default to returning nil.
+	snapErr     func(*kvserverpb.SnapshotRequest_Header) error
+	delegateErr func(request *kvserverpb.DelegateSendSnapshotRequest) error
 }
 
 func noopRaftHandlerFuncs() unreliableRaftHandlerFuncs {
@@ -62,7 +64,7 @@ func (h *unreliableRaftHandler) HandleRaftRequest(
 	ctx context.Context,
 	req *kvserverpb.RaftMessageRequest,
 	respStream kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	if len(req.Heartbeats)+len(req.HeartbeatResps) > 0 {
 		reqCpy := *req
 		req = &reqCpy
@@ -134,6 +136,20 @@ func (h *unreliableRaftHandler) HandleSnapshot(
 	return h.RaftMessageHandler.HandleSnapshot(ctx, header, respStream)
 }
 
+func (h *unreliableRaftHandler) HandleDelegatedSnapshot(
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
+	if req.RangeID == h.rangeID && h.delegateErr != nil {
+		if err := h.delegateErr(req); err != nil {
+			return &kvserverpb.DelegateSnapshotResponse{
+				Status:       kvserverpb.DelegateSnapshotResponse_ERROR,
+				EncodedError: errors.EncodeError(context.Background(), err),
+			}
+		}
+	}
+	return h.RaftMessageHandler.HandleDelegatedSnapshot(ctx, req)
+}
+
 // testClusterStoreRaftMessageHandler exists to allows a store to be stopped and
 // restarted while maintaining a partition using an unreliableRaftHandler.
 type testClusterStoreRaftMessageHandler struct {
@@ -150,10 +166,10 @@ func (h *testClusterStoreRaftMessageHandler) HandleRaftRequest(
 	ctx context.Context,
 	req *kvserverpb.RaftMessageRequest,
 	respStream kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	store, err := h.getStore()
 	if err != nil {
-		return roachpb.NewError(err)
+		return kvpb.NewError(err)
 	}
 	return store.HandleRaftRequest(ctx, req, respStream)
 }
@@ -181,15 +197,16 @@ func (h *testClusterStoreRaftMessageHandler) HandleSnapshot(
 }
 
 func (h *testClusterStoreRaftMessageHandler) HandleDelegatedSnapshot(
-	ctx context.Context,
-	req *kvserverpb.DelegateSnapshotRequest,
-	stream kvserver.DelegateSnapshotResponseStream,
-) error {
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
 	store, err := h.getStore()
 	if err != nil {
-		return err
+		return &kvserverpb.DelegateSnapshotResponse{
+			Status:       kvserverpb.DelegateSnapshotResponse_ERROR,
+			EncodedError: errors.EncodeError(context.Background(), err),
+		}
 	}
-	return store.HandleDelegatedSnapshot(ctx, req, stream)
+	return store.HandleDelegatedSnapshot(ctx, req)
 }
 
 // testClusterPartitionedRange is a convenient abstraction to create a range on a node
@@ -198,7 +215,7 @@ type testClusterPartitionedRange struct {
 	rangeID roachpb.RangeID
 	mu      struct {
 		syncutil.RWMutex
-		partitionedNode     int
+		partitionedNodeIdx  int
 		partitioned         bool
 		partitionedReplicas map[roachpb.ReplicaID]bool
 	}
@@ -232,7 +249,7 @@ func setupPartitionedRange(
 	tc *testcluster.TestCluster,
 	rangeID roachpb.RangeID,
 	replicaID roachpb.ReplicaID,
-	partitionedNode int,
+	partitionedNodeIdx int,
 	activated bool,
 	funcs unreliableRaftHandlerFuncs,
 ) (*testClusterPartitionedRange, error) {
@@ -243,14 +260,14 @@ func setupPartitionedRange(
 			storeIdx: i,
 		})
 	}
-	return setupPartitionedRangeWithHandlers(tc, rangeID, replicaID, partitionedNode, activated, handlers, funcs)
+	return setupPartitionedRangeWithHandlers(tc, rangeID, replicaID, partitionedNodeIdx, activated, handlers, funcs)
 }
 
 func setupPartitionedRangeWithHandlers(
 	tc *testcluster.TestCluster,
 	rangeID roachpb.RangeID,
 	replicaID roachpb.ReplicaID,
-	partitionedNode int,
+	partitionedNodeIdx int,
 	activated bool,
 	handlers []kvserver.RaftMessageHandler,
 	funcs unreliableRaftHandlerFuncs,
@@ -260,9 +277,9 @@ func setupPartitionedRangeWithHandlers(
 		handlers: make([]kvserver.RaftMessageHandler, 0, len(handlers)),
 	}
 	pr.mu.partitioned = activated
-	pr.mu.partitionedNode = partitionedNode
+	pr.mu.partitionedNodeIdx = partitionedNodeIdx
 	if replicaID == 0 {
-		ts := tc.Servers[partitionedNode]
+		ts := tc.Servers[partitionedNodeIdx]
 		store, err := ts.Stores().GetStore(ts.GetFirstStoreID())
 		if err != nil {
 			return nil, err
@@ -294,8 +311,8 @@ func setupPartitionedRangeWithHandlers(
 				pr.mu.RLock()
 				defer pr.mu.RUnlock()
 				return pr.mu.partitioned &&
-					(s == pr.mu.partitionedNode ||
-						req.FromReplica.StoreID == roachpb.StoreID(pr.mu.partitionedNode)+1)
+					(s == pr.mu.partitionedNodeIdx ||
+						req.FromReplica.StoreID == roachpb.StoreID(pr.mu.partitionedNodeIdx)+1)
 			}
 		}
 		if h.dropHB == nil {
@@ -305,10 +322,19 @@ func setupPartitionedRangeWithHandlers(
 				if !pr.mu.partitioned {
 					return false
 				}
-				if s == partitionedNode {
+				if s == partitionedNodeIdx {
 					return true
 				}
 				return pr.mu.partitionedReplicas[hb.FromReplicaID]
+			}
+		}
+		if h.dropResp == nil {
+			h.dropResp = func(resp *kvserverpb.RaftMessageResponse) bool {
+				pr.mu.RLock()
+				defer pr.mu.RUnlock()
+				return pr.mu.partitioned &&
+					(s == pr.mu.partitionedNodeIdx ||
+						resp.FromReplica.StoreID == roachpb.StoreID(pr.mu.partitionedNodeIdx)+1)
 			}
 		}
 		if h.snapErr == nil {
@@ -319,6 +345,16 @@ func setupPartitionedRangeWithHandlers(
 					return nil
 				}
 				if pr.mu.partitionedReplicas[header.RaftMessageRequest.ToReplica.ReplicaID] {
+					return errors.New("partitioned")
+				}
+				return nil
+			}
+		}
+		if h.delegateErr == nil {
+			h.delegateErr = func(resp *kvserverpb.DelegateSendSnapshotRequest) error {
+				pr.mu.RLock()
+				defer pr.mu.RUnlock()
+				if pr.mu.partitionedReplicas[resp.DelegatedSender.ReplicaID] {
 					return errors.New("partitioned")
 				}
 				return nil

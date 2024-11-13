@@ -177,10 +177,11 @@ type routerOutputOpArgs struct {
 	unlimitedAllocator *colmem.Allocator
 	// memoryLimit acts as a soft limit to allow the router output to use disk
 	// when it is exceeded.
-	memoryLimit int64
-	diskAcc     *mon.BoundAccount
-	cfg         colcontainer.DiskQueueCfg
-	fdSemaphore semaphore.Semaphore
+	memoryLimit     int64
+	diskAcc         *mon.BoundAccount
+	converterMemAcc *mon.BoundAccount
+	cfg             colcontainer.DiskQueueCfg
+	fdSemaphore     semaphore.Semaphore
 
 	// unblockedEventsChan must be a buffered channel.
 	unblockedEventsChan chan<- struct{}
@@ -209,6 +210,7 @@ func newRouterOutputOp(args routerOutputOpArgs) *routerOutputOp {
 			DiskQueueCfg:       args.cfg,
 			FDSemaphore:        args.fdSemaphore,
 			DiskAcc:            args.diskAcc,
+			ConverterMemAcc:    args.converterMemAcc,
 		},
 	)
 
@@ -285,7 +287,8 @@ func (o *routerOutputOp) DrainMeta() []execinfrapb.ProducerMetadata {
 func (o *routerOutputOp) Close(ctx context.Context) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.mu.data.Close(ctx)
+	o.closeLocked(ctx)
+	return nil
 }
 
 func (o *routerOutputOp) initWithHashRouter(r *HashRouter) {
@@ -463,7 +466,8 @@ type HashRouter struct {
 // Operator must have an independent allocator (this means that each allocator
 // should be linked to an independent mem account) as Operator.Next will usually
 // be called concurrently between different outputs. Similarly, each output
-// needs to have a separate disk account.
+// needs to have a separate disk account and a separate converter memory
+// account.
 func NewHashRouter(
 	unlimitedAllocators []*colmem.Allocator,
 	input colexecargs.OpWithMetaInfo,
@@ -473,6 +477,7 @@ func NewHashRouter(
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	diskAccounts []*mon.BoundAccount,
+	converterMemAccounts []*mon.BoundAccount,
 ) (*HashRouter, []colexecop.DrainableClosableOperator) {
 	outputs := make([]routerOutput, len(unlimitedAllocators))
 	outputsAsOps := make([]colexecop.DrainableClosableOperator, len(unlimitedAllocators))
@@ -498,6 +503,7 @@ func NewHashRouter(
 				unlimitedAllocator:  unlimitedAllocators[i],
 				memoryLimit:         memoryLimitPerOutput,
 				diskAcc:             diskAccounts[i],
+				converterMemAcc:     converterMemAccounts[i],
 				cfg:                 diskQueueCfg,
 				fdSemaphore:         fdSemaphore,
 				unblockedEventsChan: unblockEventsChan,
@@ -645,8 +651,6 @@ func (r *HashRouter) Run(ctx context.Context) {
 	// in DrainMeta.
 	r.waitForMetadata <- bufferedMeta
 	close(r.waitForMetadata)
-
-	r.inputMetaInfo.ToClose.CloseAndLogOnErr(ctx, "hash router")
 }
 
 // processNextBatch reads the next batch from its input, hashes it and adds

@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupinfo"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -53,7 +54,12 @@ func TestFullClusterBackup(t *testing.T) {
 	settings := clustersettings.MakeTestingClusterSettings()
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			Settings: settings,
+			// Disabled only because backupRestoreTestSetupEmpty, another DR test
+			// helper function, that is not yet enabled to set up tenants within
+			// clusters by default. Tracking issue
+			// https://github.com/cockroachdb/cockroach/issues/76378
+			DisableDefaultTestTenant: true,
+			Settings:                 settings,
 			Knobs: base.TestingKnobs{
 				SpanConfig: &spanconfig.TestingKnobs{
 					// We compare job progress before and after a restore. Disable
@@ -140,7 +146,7 @@ CREATE TABLE data2.foo (a int);
 	// Note: this is not the backup under test, this just serves as a job which
 	// should appear in the restore.
 	// This job will eventually fail since it will run from a new cluster.
-	sqlDB.Exec(t, `BACKUP data.bank TO 'nodelocal://0/throwawayjob'`)
+	sqlDB.Exec(t, `BACKUP data.bank TO 'nodelocal://1/throwawayjob'`)
 	// Populate system.settings.
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_io_write.concurrent_addsstable_requests = 5`)
 	sqlDB.Exec(t, `INSERT INTO system.ui (key, value, "lastUpdated") VALUES ($1, $2, now())`, "some_key", "some_val")
@@ -184,8 +190,8 @@ CREATE TABLE data2.foo (a int);
 
 	doneRestore := make(chan struct{})
 	go func() {
+		defer close(doneRestore)
 		sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
-		close(doneRestore)
 	}()
 
 	// Check that zones are restored during pre-restore.
@@ -207,14 +213,14 @@ CREATE TABLE data2.foo (a int);
 		store := tcRestore.GetFirstStoreFromServer(t, 0)
 		startKey := keys.SystemSQLCodec.TablePrefix(uint32(id))
 		endKey := startKey.PrefixEnd()
-		it := store.Engine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+		it := store.TODOEngine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 			UpperBound: endKey,
 		})
 		defer it.Close()
 		it.SeekGE(storage.MVCCKey{Key: startKey})
 		hasKey, err := it.Valid()
 		require.NoError(t, err)
-		require.False(t, hasKey, "did not expect to find a key, found %s", it.Key())
+		require.False(t, hasKey, "did not expect to find a key, found %s", it.UnsafeKey())
 	})
 
 	// Allow the restore to make progress after we've checked the pre-restore
@@ -279,6 +285,9 @@ CREATE TABLE data2.foo (a int);
 				verificationQueries[i] = query
 			case systemschema.CommentsTable.GetName():
 				query := fmt.Sprintf("SELECT comment FROM system.%s", table)
+				verificationQueries[i] = query
+			case systemschema.ScheduledJobsTable.GetName():
+				query := fmt.Sprintf("SELECT schedule_id, schedule_name FROM system.%s", table)
 				verificationQueries[i] = query
 			default:
 				query := fmt.Sprintf("SELECT * FROM system.%s", table)
@@ -351,6 +360,11 @@ func TestSingletonSpanConfigJobPostRestore(t *testing.T) {
 
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			// Disabled only because backupRestoreTestSetupEmpty, another DR test
+			// helper function, is not yet enabled to set up tenants within
+			// clusters by default. Tracking issue
+			// https://github.com/cockroachdb/cockroach/issues/76378
+			DisableDefaultTestTenant: true,
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			},
@@ -384,7 +398,7 @@ func TestIncrementalFullClusterBackup(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 10
-	const incrementalBackupLocation = "nodelocal://0/inc-full-backup"
+	const incrementalBackupLocation = "nodelocal://1/inc-full-backup"
 	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
@@ -599,6 +613,12 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 
+	// This test flakes due to
+	// https://github.com/cockroachdb/cockroach/issues/86806. Instead of skipping
+	// the test all together, setting the cluster setting to false which triggers
+	// the failure.
+	sqlDB.Exec(t, "SET CLUSTER SETTING kv.bulkio.write_metadata_sst.enabled=false")
+
 	// Setup the system systemTablesToVerify to ensure that they are copied to the new cluster.
 	// Populate system.users.
 	for i := 0; i < 1000; i++ {
@@ -613,7 +633,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Name() == backupbase.BackupManifestName || !strings.HasSuffix(path, ".sst") {
+		if info.Name() == backupbase.BackupManifestName || !strings.HasSuffix(path, ".sst") || info.Name() == backupinfo.BackupMetadataDescriptorsListPath || info.Name() == backupinfo.BackupMetadataFilesListPath {
 			return nil
 		}
 		return os.Remove(path)
@@ -626,7 +646,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 	// Note: this is not the backup under test, this just serves as a job which
 	// should appear in the restore.
 	// This job will eventually fail since it will run from a new cluster.
-	sqlDB.Exec(t, `BACKUP data.bank TO 'nodelocal://0/throwawayjob'`)
+	sqlDB.Exec(t, `BACKUP data.bank TO 'nodelocal://1/throwawayjob'`)
 	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
 
 	t.Run("during restoration of data", func(t *testing.T) {
@@ -942,14 +962,19 @@ func TestReintroduceOfflineSpans(t *testing.T) {
 			}},
 	}
 	params.ServerArgs.Knobs = knobs
+	// Disabled only because backupRestoreTestSetupEmpty, another DR test
+	// helper function, is not yet enabled to set up tenants within
+	// clusters by default. Tracking issue
+	// https://github.com/cockroachdb/cockroach/issues/76378
+	params.ServerArgs.DisableDefaultTestTenant = true
 
 	const numAccounts = 1000
 	ctx := context.Background()
 	_, srcDB, tempDir, cleanupSrc := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, params)
 	defer cleanupSrc()
 
-	dbBackupLoc := "nodelocal://0/my_db_backup"
-	clusterBackupLoc := "nodelocal://0/my_cluster_backup"
+	dbBackupLoc := "nodelocal://1/my_db_backup"
+	clusterBackupLoc := "nodelocal://1/my_cluster_backup"
 
 	// the small test-case will get entirely buffered/merged by small-file merging
 	// and not report any progress in the meantime unless it is disabled.
@@ -1098,6 +1123,11 @@ func TestFullClusterRestoreWithUserIDs(t *testing.T) {
 
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			// Disabled only because backupRestoreTestSetupEmpty, another DR test
+			// helper function, that is not yet enabled to set up tenants within
+			// clusters by default. Tracking issue
+			// https://github.com/cockroachdb/cockroach/issues/76378
+			DisableDefaultTestTenant: true,
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			},

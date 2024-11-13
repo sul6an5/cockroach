@@ -25,55 +25,41 @@ import (
 )
 
 const (
-	awsAccessKeyIDKey      = "AWS_ACCESS_KEY_ID"
-	awsSecretAccessKeyKey  = "AWS_SECRET_ACCESS_KEY"
 	teamcityBuildBranchKey = "TC_BUILD_BRANCH"
 )
 
 var provisionalReleasePrefixRE = regexp.MustCompile(`^provisional_[0-9]{12}_`)
 
 func main() {
-	var isReleaseF = flag.Bool("release", false, "build in release mode instead of bleeding-edge mode")
-	var destBucket = flag.String("bucket", "", "override default bucket")
-	var gcsBucket = flag.String("gcs-bucket", "", "override default bucket")
-	var doProvisionalF = flag.Bool("provisional", false, "publish provisional binaries")
-	var doBlessF = flag.Bool("bless", false, "bless provisional binaries")
+	var gcsBucket string
+	var outputDirectory string
+	var buildTagOverride string
+	var doProvisional bool
+	var isRelease bool
+	var doBless bool
+	flag.BoolVar(&isRelease, "release", false, "build in release mode instead of bleeding-edge mode")
+	flag.StringVar(&gcsBucket, "gcs-bucket", "", "GCS bucket")
+	flag.StringVar(&outputDirectory, "output-directory", "",
+		"Save local copies of uploaded release archives in this directory")
+	flag.StringVar(&buildTagOverride, "build-tag-override", "", "override the version from version.txt")
+	flag.BoolVar(&doProvisional, "provisional", false, "publish provisional binaries")
+	flag.BoolVar(&doBless, "bless", false, "bless provisional binaries")
 
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	var bucketName string
-	if len(*destBucket) > 0 {
-		bucketName = *destBucket
-	} else if *isReleaseF {
-		bucketName = "binaries.cockroachdb.com"
-	} else {
-		bucketName = "cockroach"
+	// GCS bucket is required now
+	if gcsBucket == "" {
+		log.Fatal("GCS bucket not specified")
 	}
-	log.Printf("Using S3 bucket: %s", bucketName)
-
-	if _, ok := os.LookupEnv(awsAccessKeyIDKey); !ok {
-		log.Fatalf("AWS access key ID environment variable %s is not set", awsAccessKeyIDKey)
+	if _, ok := os.LookupEnv("GOOGLE_APPLICATION_CREDENTIALS"); !ok {
+		log.Fatal("GOOGLE_APPLICATION_CREDENTIALS environment variable is not set")
 	}
-	if _, ok := os.LookupEnv(awsSecretAccessKeyKey); !ok {
-		log.Fatalf("AWS secret access key environment variable %s is not set", awsSecretAccessKeyKey)
-	}
-	var providers []release.ObjectPutGetter
-	s3, err := release.NewS3("us-east-1", bucketName)
+	gcs, err := release.NewGCS(gcsBucket)
 	if err != nil {
-		log.Fatalf("Creating AWS S3 session: %s", err)
+		log.Fatalf("Creating GCS session: %s", err)
 	}
-	providers = append(providers, s3)
-	if *gcsBucket != "" {
-		if _, ok := os.LookupEnv("GOOGLE_APPLICATION_CREDENTIALS"); !ok {
-			log.Fatal("GOOGLE_APPLICATION_CREDENTIALS environment variable is not set")
-		}
-		gcs, err := release.NewGCS(*gcsBucket)
-		if err != nil {
-			log.Fatalf("Creating GCS session: %s", err)
-		}
-		providers = append(providers, gcs)
-	}
+	providers := []release.ObjectPutGetter{gcs}
 
 	branch, ok := os.LookupEnv(teamcityBuildBranchKey)
 	if !ok {
@@ -98,22 +84,26 @@ func main() {
 	}
 
 	run(providers, runFlags{
-		doProvisional: *doProvisionalF,
-		doBless:       *doBlessF,
-		isRelease:     *isReleaseF,
-		branch:        branch,
-		pkgDir:        pkg,
-		sha:           string(bytes.TrimSpace(shaOut)),
+		doProvisional:    doProvisional,
+		doBless:          doBless,
+		isRelease:        isRelease,
+		buildTagOverride: buildTagOverride,
+		branch:           branch,
+		pkgDir:           pkg,
+		sha:              string(bytes.TrimSpace(shaOut)),
+		outputDirectory:  outputDirectory,
 	}, release.ExecFn{})
 }
 
 type runFlags struct {
-	doProvisional bool
-	doBless       bool
-	isRelease     bool
-	branch        string
-	sha           string
-	pkgDir        string
+	doProvisional    bool
+	doBless          bool
+	isRelease        bool
+	buildTagOverride string
+	branch           string
+	sha              string
+	pkgDir           string
+	outputDirectory  string
 }
 
 func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.ExecFn) {
@@ -154,7 +144,14 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 		updateLatest = true
 	}
 
-	platforms := []release.Platform{release.PlatformLinux, release.PlatformMacOS, release.PlatformWindows, release.PlatformLinuxArm}
+	platforms := []release.Platform{
+		release.PlatformLinux,
+		release.PlatformLinuxFIPS,
+		release.PlatformMacOS,
+		release.PlatformMacOSArm,
+		release.PlatformWindows,
+		release.PlatformLinuxArm,
+	}
 	var cockroachBuildOpts []opts
 	for _, platform := range platforms {
 		var o opts
@@ -164,6 +161,7 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 		o.VersionStr = versionStr
 		o.AbsolutePath = filepath.Join(flags.pkgDir, "cockroach"+release.SuffixFromPlatform(platform))
 		o.CockroachSQLAbsolutePath = filepath.Join(flags.pkgDir, "cockroach-sql"+release.SuffixFromPlatform(platform))
+		o.Channel = release.ChannelFromPlatform(platform)
 		cockroachBuildOpts = append(cockroachBuildOpts, o)
 	}
 
@@ -189,23 +187,34 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 				}
 			} else {
 				for _, provider := range providers {
+					crdbFiles := append(
+						[]release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.AbsolutePath, "cockroach")},
+						release.MakeCRDBLibraryArchiveFiles(o.PkgDir, o.Platform)...,
+					)
+					crdbBody, err := release.CreateArchive(o.Platform, o.VersionStr, "cockroach", crdbFiles)
+					if err != nil {
+						log.Fatalf("cannot create crdb release archive %s", err)
+					}
+
+					sqlFiles := []release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.CockroachSQLAbsolutePath, "cockroach-sql")}
+					sqlBody, err := release.CreateArchive(o.Platform, o.VersionStr, "cockroach-sql", sqlFiles)
+					if err != nil {
+						log.Fatalf("cannot create sql release archive %s", err)
+					}
 					release.PutRelease(provider, release.PutReleaseOptions{
-						NoCache:       false,
-						Platform:      o.Platform,
-						VersionStr:    o.VersionStr,
-						ArchivePrefix: "cockroach",
-						Files: append(
-							[]release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.AbsolutePath, "cockroach")},
-							release.MakeCRDBLibraryArchiveFiles(o.PkgDir, o.Platform)...,
-						),
-					})
+						NoCache:         false,
+						Platform:        o.Platform,
+						VersionStr:      o.VersionStr,
+						ArchivePrefix:   "cockroach",
+						OutputDirectory: flags.outputDirectory,
+					}, crdbBody)
 					release.PutRelease(provider, release.PutReleaseOptions{
-						NoCache:       false,
-						Platform:      o.Platform,
-						VersionStr:    o.VersionStr,
-						ArchivePrefix: "cockroach-sql",
-						Files:         []release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.CockroachSQLAbsolutePath, "cockroach-sql")},
-					})
+						NoCache:         false,
+						Platform:        o.Platform,
+						VersionStr:      o.VersionStr,
+						ArchivePrefix:   "cockroach-sql",
+						OutputDirectory: flags.outputDirectory,
+					}, sqlBody)
 				}
 			}
 		}
@@ -230,11 +239,15 @@ func buildCockroach(flags runFlags, o opts, execFn release.ExecFn) {
 		log.Printf("done building cockroach: %s", pretty.Sprint(o))
 	}()
 
-	var buildOpts release.BuildOptions
-	buildOpts.ExecFn = execFn
+	buildOpts := release.BuildOptions{
+		ExecFn:  execFn,
+		Channel: release.ChannelFromPlatform(o.Platform),
+	}
 	if flags.isRelease {
 		buildOpts.Release = true
-		buildOpts.BuildTag = o.VersionStr
+	}
+	if flags.buildTagOverride != "" {
+		buildOpts.BuildTag = flags.buildTagOverride
 	}
 
 	if err := release.MakeRelease(o.Platform, buildOpts, o.PkgDir); err != nil {
@@ -249,6 +262,7 @@ type opts struct {
 	AbsolutePath             string
 	CockroachSQLAbsolutePath string
 	PkgDir                   string
+	Channel                  string
 }
 
 func markLatestRelease(svc release.ObjectPutGetter, o opts) {

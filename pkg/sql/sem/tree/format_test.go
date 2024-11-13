@@ -159,7 +159,7 @@ func TestFormatExpr(t *testing.T) {
 		{`timestamp 'now'`, tree.FmtShowTypes,
 			`(('now')[string]::TIMESTAMP)[timestamp]`},
 		{`timestamptz '2003-01-01 00:00:00+03:00'`, tree.FmtShowTypes,
-			`('2003-01-01 00:00:00+03:00')[timestamptz]`},
+			`('2003-01-01 00:00:00+03')[timestamptz]`},
 		{`timestamptz '2003-01-01 00:00:00'`, tree.FmtShowTypes,
 			`(('2003-01-01 00:00:00')[string]::TIMESTAMPTZ)[timestamptz]`},
 		{`greatest(unique_rowid(), 12)`, tree.FmtShowTypes,
@@ -253,6 +253,46 @@ func TestFormatExpr(t *testing.T) {
 	}
 }
 
+// TestFormatUntypedExpr is similar to TestFormatExpr, but it does not
+// type-check the test expressions before formatting them. It allows for testing
+// formatting of mis-typed expressions.
+func TestFormatUntypedExpr(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	testData := []struct {
+		expr     string
+		f        tree.FmtFlags
+		expected string
+	}{
+		{"((1, 2) AS foo)", tree.FmtHideConstants, "((_, _) AS foo)"},
+		{"((1, 2, 3) AS foo)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo)"},
+		{"((1, 2, 3) AS foo, bar)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo, bar)"},
+		{"((1, 2, 3) AS foo, bar, baz)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo, bar)"},
+		{"((1, 2) AS foo, bar)", tree.FmtHideConstants, "((_, _) AS foo, bar)"},
+		{"((1, 2) AS foo, bar, baz)", tree.FmtHideConstants, "((_, _) AS foo, bar, baz)"},
+		{"(ROW(1) AS foo)", tree.FmtHideConstants, "((_,) AS foo)"},
+		{"(ROW(1) AS foo, bar)", tree.FmtHideConstants, "((_,) AS foo, bar)"},
+		{"(ROW(1) AS foo, bar, baz)", tree.FmtHideConstants, "((_,) AS foo, bar, baz)"},
+		{"(ROW(1, 2) AS foo, bar, baz)", tree.FmtHideConstants, "((_, _) AS foo, bar, baz)"},
+		{"(ROW(1, 2, 3) AS foo, bar)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo, bar)"},
+		{"(ROW(1, 2, 3) AS foo, bar, baz)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo, bar)"},
+		{"(ROW(1, 2, 3) AS foo)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo)"},
+	}
+
+	for i, test := range testData {
+		t.Run(fmt.Sprintf("%d %s", i, test.expr), func(t *testing.T) {
+			expr, err := parser.ParseExpr(test.expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exprStr := tree.AsStringWithFlags(expr, test.f)
+			if exprStr != test.expected {
+				t.Fatalf("expected %q, got %q", test.expected, exprStr)
+			}
+		})
+	}
+}
+
 func TestFormatExpr2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -330,7 +370,7 @@ func TestFormatExpr2(t *testing.T) {
 		},
 		{tree.NewDTuple(
 			types.MakeTuple([]*types.T{enumType, enumType}),
-			tree.DNull, enumHi),
+			tree.DNull, &enumHi),
 			tree.FmtParsable,
 			`(NULL:::greeting, 'hi':::greeting)`,
 		},
@@ -339,13 +379,13 @@ func TestFormatExpr2(t *testing.T) {
 		// enclosing tuple for serialization purposes.
 		{tree.NewDTuple(
 			types.MakeTuple([]*types.T{enumType, enumType}),
-			enumHi, enumHello),
+			&enumHi, &enumHello),
 			tree.FmtSerializable,
 			`(x'4201':::@100500, x'42':::@100500)`,
 		},
 		{tree.NewDTuple(
 			types.MakeTuple([]*types.T{enumType, enumType}),
-			tree.DNull, enumHi),
+			tree.DNull, &enumHi),
 			tree.FmtSerializable,
 			`(NULL:::@100500, x'4201':::@100500)`,
 		},
@@ -420,7 +460,7 @@ func TestFormatPgwireText(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			typeChecked, err = normalize.Expr(evalCtx, typeChecked)
+			typeChecked, err = normalize.Expr(ctx, evalCtx, typeChecked)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -481,7 +521,7 @@ func TestFormatNodeSummary(t *testing.T) {
 		},
 		{
 			stmt:     `UPDATE system.jobs SET status = $2, payload = $3, last_run = $4, num_runs = $5 WHERE internal_table_id = $1`,
-			expected: `UPDATE system.jobs SET status = $2, pa... WHERE internal_table_...`,
+			expected: `UPDATE system.jobs SET status = $1, pa... WHERE internal_table_...`,
 		},
 		{
 			stmt:     `UPDATE system.extra_extra_long_table_name SET (schedule_state, next_run) = ($1, $2) WHERE schedule_id = 'name'`,

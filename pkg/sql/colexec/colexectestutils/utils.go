@@ -745,7 +745,7 @@ func stringToDatum(val string, typ *types.T, evalCtx *eval.Context) tree.Datum {
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
-	d, err := eval.Expr(evalCtx, typedExpr)
+	d, err := eval.Expr(context.Background(), evalCtx, typedExpr)
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
@@ -1016,6 +1016,15 @@ func (s *opTestInput) Next() coldata.Batch {
 						}
 						col.Index(outputIdx).Set(reflect.ValueOf(d))
 					case types.BytesFamily:
+						if vec.Type().Family() == types.EnumFamily {
+							enumMeta := s.typs[i].TypeMeta.EnumData
+							if enumMeta == nil {
+								colexecerror.InternalError(errors.AssertionFailedf("unexpectedly empty enum metadata in opTestInput"))
+							}
+							reps := enumMeta.PhysicalRepresentations
+							setColVal(vec, outputIdx, reps[rng.Intn(len(reps))], s.evalCtx)
+							break
+						}
 						newBytes := make([]byte, rng.Intn(16)+1)
 						rng.Read(newBytes)
 						setColVal(vec, outputIdx, newBytes, s.evalCtx)

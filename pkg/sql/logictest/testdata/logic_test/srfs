@@ -449,10 +449,10 @@ SELECT information_schema._pg_expandarray()
 query error pq: unknown signature: information_schema._pg_expandarray()
 SELECT * FROM information_schema._pg_expandarray()
 
-query error pq: information_schema\._pg_expandarray\(\): cannot determine type of empty array\. Consider annotating with the desired type, for example ARRAY\[\]:::int\[\]
+query error pq: information_schema\._pg_expandarray\(\): cannot determine type of empty array\. Consider casting to the desired type, for example ARRAY\[\]::int\[\]
 SELECT information_schema._pg_expandarray(ARRAY[])
 
-query error pq: information_schema\._pg_expandarray\(\): cannot determine type of empty array\. Consider annotating with the desired type, for example ARRAY\[\]:::int\[\]
+query error pq: information_schema\._pg_expandarray\(\): cannot determine type of empty array\. Consider casting to the desired type, for example ARRAY\[\]::int\[\]
 SELECT * FROM information_schema._pg_expandarray(ARRAY[])
 
 statement error could not determine polymorphic type
@@ -581,7 +581,7 @@ SELECT ('a').x
 query error pq: type string is not composite
 SELECT (('a')).x
 
-query error pq: unnest\(\): cannot determine type of empty array. Consider annotating with the desired type, for example ARRAY\[\]:::int\[\]
+query error pq: unnest\(\): cannot determine type of empty array. Consider casting to the desired type, for example ARRAY\[\]::int\[\]
 SELECT (unnest(ARRAY[])).*
 
 query error type int is not composite
@@ -862,7 +862,7 @@ CREATE TABLE uu (x INT DEFAULT generate_series(1, 3))
 statement error generator functions are not allowed in CHECK
 CREATE TABLE uu (x INT CHECK (generate_series(1, 3) < 3))
 
-statement error generator functions are not allowed in computed column
+statement error generate_series\(\): generator functions are not allowed in STORED COMPUTED COLUMN
 CREATE TABLE uu (x INT AS (generate_series(1, 3)) STORED)
 
 subtest correlated_srf
@@ -1270,3 +1270,34 @@ SELECT (x).* FROM (SELECT unnest(ARRAY[t58438.*]) FROM t58438) v(x);
 1  2
 3  4
 5  6
+
+subtest redundant_zip_expression
+
+statement ok
+SET testing_optimizer_disable_rule_probability = 1.0;
+
+statement ok
+CREATE TABLE t95615 (c1 INET PRIMARY KEY)
+
+statement ok
+INSERT INTO t95615 VALUES ('192.168.0.1'::INET)
+
+# Test that a redundant function call in a ProjectSet doesn't crash due to
+# being built into more than one zip expression.
+query TTTI
+SELECT * FROM t95615, LATERAL ROWS FROM (hostmask(c1), hostmask(c1)) WITH ORDINALITY
+----
+192.168.0.1  0.0.0.0  0.0.0.0  1
+
+statement ok
+CREATE FUNCTION f95615() RETURNS FLOAT IMMUTABLE LEAKPROOF LANGUAGE SQL AS 'SELECT 1.1'
+
+# A redundant UDF call should be added only once in a zip expression and not
+# error out.
+query TFFI
+SELECT * FROM t95615, LATERAL ROWS FROM (f95615(), f95615()) WITH ORDINALITY
+----
+192.168.0.1  1.1  1.1  1
+
+statement ok
+RESET testing_optimizer_disable_rule_probability

@@ -28,7 +28,8 @@ import (
 )
 
 type recordResolvedWriter struct {
-	resolved []jobspb.ResolvedSpan
+	resolved    []jobspb.ResolvedSpan
+	memAcquired bool
 }
 
 func (r *recordResolvedWriter) Add(ctx context.Context, e kvevent.Event) error {
@@ -44,6 +45,20 @@ func (r *recordResolvedWriter) Drain(ctx context.Context) error {
 
 func (r *recordResolvedWriter) CloseWithReason(ctx context.Context, reason error) error {
 	return nil
+}
+
+func (r *recordResolvedWriter) AcquireMemory(ctx context.Context, n int64) (kvevent.Alloc, error) {
+	// Don't care to actually acquire memory; just testing that we try to do so.
+	r.memAcquired = true
+	return kvevent.Alloc{}, nil
+}
+
+func tenantOrSystemCodec(s serverutils.TestServerInterface) keys.SQLCodec {
+	var codec = s.Codec()
+	if len(s.TestTenants()) > 0 {
+		codec = s.TestTenants()[0].Codec()
+	}
+	return codec
 }
 
 var _ kvevent.Writer = (*recordResolvedWriter)(nil)
@@ -62,8 +77,9 @@ CREATE TABLE t (a INT PRIMARY KEY);
 INSERT INTO t VALUES (1), (2), (3);
 `)
 
-	descr := desctestutils.TestingGetPublicTableDescriptor(kvdb, keys.SystemSQLCodec, "defaultdb", "t")
-	span := tableSpan(uint32(descr.GetID()))
+	codec := tenantOrSystemCodec(s)
+	descr := desctestutils.TestingGetPublicTableDescriptor(kvdb, codec, "defaultdb", "t")
+	span := tableSpan(codec, uint32(descr.GetID()))
 
 	exportTime := kvdb.Clock().Now()
 	cfg := scanConfig{
@@ -85,6 +101,7 @@ INSERT INTO t VALUES (1), (2), (3);
 
 	sink := &recordResolvedWriter{}
 	require.NoError(t, scanner.Scan(ctx, sink, cfg))
+	require.True(t, sink.memAcquired)
 
 	startKey := span.Key
 	require.Equal(t, 3, len(sink.resolved))

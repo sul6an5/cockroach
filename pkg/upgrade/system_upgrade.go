@@ -16,10 +16,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/logtags"
 )
@@ -27,23 +29,29 @@ import (
 // Cluster abstracts a physical KV cluster and can be utilized by a long-running
 // upgrade.
 type Cluster interface {
-	// NumNodes returns the number of nodes in the cluster. This is merely a
-	// convenience method and is not meant to be used to infer cluster stability;
-	// for that, use UntilClusterStable.
-	NumNodes(ctx context.Context) (int, error)
+	// NumNodesOrServers returns the number of nodes in the cluster or the
+	// number of SQL servers active for the given tenant being upgraded.
+	// This is merely a convenience method and is not meant to be used
+	// to infer cluster stability; for that, use UntilClusterStable.
+	NumNodesOrServers(ctx context.Context) (int, error)
 
-	// ForEveryNode is a short hand to execute the given closure (named by the
-	// informational parameter op) against every node in the cluster at a given
-	// point in time. Given it's possible for nodes to join or leave the cluster
-	// during (we don't make any guarantees for the ordering of cluster membership
-	// events), we only expect this to be used in conjunction with
-	// UntilClusterStable (see the comment there for how these two primitives can be
-	// put together).
-	ForEveryNode(
+	// ForEveryNodeOrServer executes the given closure (named by the
+	// informational parameter op) against every node or SQL server active in
+	// the cluster at a given point in time. Given it's possible for
+	// nodes/servers to become active/deactive during the upgrade (we don't make
+	// any guarantees on the ordering of cluster membership events), we only
+	// expect this to be used in conjunction with UntilClusterStable (see the
+	// comment there for how these two primitives can be put together).
+	ForEveryNodeOrServer(
 		ctx context.Context,
 		op string,
 		fn func(context.Context, serverpb.MigrationClient) error,
 	) error
+
+	// ValidateAfterUpdateSystemVersion performs any required validation after
+	// the system version is updated. This is used to perform additional
+	// validation during the tenant upgrade interlock.
+	ValidateAfterUpdateSystemVersion(ctx context.Context) error
 
 	// UntilClusterStable invokes the given closure until the cluster membership
 	// is stable, i.e once the set of nodes in the cluster before and after the
@@ -71,7 +79,7 @@ type Cluster interface {
 	//
 	// To consider an example of how this primitive is used, let's consider our
 	// use of it to bump the cluster version. We use in conjunction with
-	// ForEveryNode, where after we return, we can rely on the guarantee that all
+	// ForEveryNodeOrTenantPod, where after we return, we can rely on the guarantee that all
 	// nodes in the cluster will have their cluster versions bumped. This then
 	// implies that future node additions will observe the latest version (through
 	// the join RPC). That in turn lets us author upgrades that can assume that
@@ -94,30 +102,6 @@ type Cluster interface {
 	// just be the `Migrate` request, with code added within [1] to do the
 	// specific things intended for the specified version.
 	//
-	// It's important to note that the closure is being executed in the context of
-	// a distributed transaction that may be automatically retried. So something
-	// like the following is an anti-pattern:
-	//
-	//     processed := 0
-	//     _ = h.IterateRangeDescriptors(...,
-	//         func(descriptors ...roachpb.RangeDescriptor) error {
-	//             processed += len(descriptors) // we'll over count if retried
-	//             log.Infof(ctx, "processed %d ranges", processed)
-	//         },
-	//     )
-	//
-	// Instead we allow callers to pass in a callback to signal on every attempt
-	// (including the first). This lets us salvage the example above:
-	//
-	//     var processed int
-	//     init := func() { processed = 0 }
-	//     _ = h.IterateRangeDescriptors(..., init,
-	//         func(descriptors ...roachpb.RangeDescriptor) error {
-	//             processed += len(descriptors)
-	//             log.Infof(ctx, "processed %d ranges", processed)
-	//         },
-	//     )
-	//
 	// [1]: pkg/kv/kvserver/batch_eval/cmd_migrate.go
 	IterateRangeDescriptors(
 		ctx context.Context,
@@ -130,10 +114,13 @@ type Cluster interface {
 // SystemDeps are the dependencies of upgrades which perform actions at the
 // KV layer on behalf of the system tenant.
 type SystemDeps struct {
-	Cluster    Cluster
-	DB         *kv.DB
-	DistSender *kvcoord.DistSender
-	Stopper    *stop.Stopper
+	Cluster       Cluster
+	DB            descs.DB
+	Settings      *cluster.Settings
+	JobRegistry   *jobs.Registry
+	Stopper       *stop.Stopper
+	KeyVisKnobs   *keyvisualizer.TestingKnobs
+	SQLStatsKnobs *sqlstats.TestingKnobs
 }
 
 // SystemUpgrade is an implementation of Upgrade for system-level
@@ -146,25 +133,38 @@ type SystemUpgrade struct {
 
 // SystemUpgradeFunc is used to perform kv-level upgrades. It should only be
 // run from the system tenant.
-type SystemUpgradeFunc func(context.Context, clusterversion.ClusterVersion, SystemDeps, *jobs.Job) error
+type SystemUpgradeFunc func(context.Context, clusterversion.ClusterVersion, SystemDeps) error
 
 // NewSystemUpgrade constructs a SystemUpgrade.
-func NewSystemUpgrade(
-	description string, cv clusterversion.ClusterVersion, fn SystemUpgradeFunc,
-) *SystemUpgrade {
+func NewSystemUpgrade(description string, v roachpb.Version, fn SystemUpgradeFunc) *SystemUpgrade {
 	return &SystemUpgrade{
 		upgrade: upgrade{
 			description: description,
-			cv:          cv,
+			v:           v,
+		},
+		fn: fn,
+	}
+}
+
+// NewPermanentSystemUpgrade constructs a SystemUpgrade that is marked as
+// "permanent": an upgrade that will run regardless of the cluster's bootstrap
+// version. Note however that the upgrade will still run at most once.
+func NewPermanentSystemUpgrade(
+	description string, v roachpb.Version, fn SystemUpgradeFunc, v22_2StartupMigrationName string,
+) *SystemUpgrade {
+	return &SystemUpgrade{
+		upgrade: upgrade{
+			description:               description,
+			v:                         v,
+			permanent:                 true,
+			v22_2StartupMigrationName: v22_2StartupMigrationName,
 		},
 		fn: fn,
 	}
 }
 
 // Run kickstarts the actual upgrade process for system-level upgrades.
-func (m *SystemUpgrade) Run(
-	ctx context.Context, cv clusterversion.ClusterVersion, d SystemDeps, job *jobs.Job,
-) error {
-	ctx = logtags.AddTag(ctx, fmt.Sprintf("upgrade=%s", cv), nil)
-	return m.fn(ctx, cv, d, job)
+func (m *SystemUpgrade) Run(ctx context.Context, v roachpb.Version, d SystemDeps) error {
+	ctx = logtags.AddTag(ctx, fmt.Sprintf("upgrade=%s", v), nil)
+	return m.fn(ctx, clusterversion.ClusterVersion{Version: v}, d)
 }

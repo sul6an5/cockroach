@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -29,7 +29,7 @@ import (
 func TestCleanupIntentsDuringBackupPerformanceRegression(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
 	skip.UnderRace(t, "measures backup times not to regress, can't work under race")
 
@@ -43,7 +43,7 @@ func TestCleanupIntentsDuringBackupPerformanceRegression(t *testing.T) {
 
 	// Interceptor catches requests that cleanup transactions of size 1000 which are
 	// test data transactions. All other transaction commits pass though.
-	interceptor := func(ctx context.Context, req roachpb.BatchRequest) *roachpb.Error {
+	interceptor := func(ctx context.Context, req *kvpb.BatchRequest) *kvpb.Error {
 		endTxn := req.Requests[0].GetEndTxn()
 		if endTxn != nil && !endTxn.Commit && len(endTxn.LockSpans) == perTransactionRowCount {
 			// If this is a rollback of one the test's SQL transactions, allow the

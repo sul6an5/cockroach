@@ -35,9 +35,12 @@ type rowContainerHelper struct {
 }
 
 func (c *rowContainerHelper) Init(
-	typs []*types.T, evalContext *extendedEvalContext, opName redact.RedactableString,
+	ctx context.Context,
+	typs []*types.T,
+	evalContext *extendedEvalContext,
+	opName redact.RedactableString,
 ) {
-	c.initMonitors(evalContext, opName)
+	c.initMonitors(ctx, evalContext, opName)
 	distSQLCfg := &evalContext.DistSQLPlanner.distSQLSrv.ServerConfig
 	c.rows = &rowcontainer.DiskBackedRowContainer{}
 	c.rows.Init(
@@ -50,9 +53,12 @@ func (c *rowContainerHelper) Init(
 // InitWithDedup is a variant of init that is used if row deduplication
 // functionality is needed (see addRowWithDedup).
 func (c *rowContainerHelper) InitWithDedup(
-	typs []*types.T, evalContext *extendedEvalContext, opName redact.RedactableString,
+	ctx context.Context,
+	typs []*types.T,
+	evalContext *extendedEvalContext,
+	opName redact.RedactableString,
 ) {
-	c.initMonitors(evalContext, opName)
+	c.initMonitors(ctx, evalContext, opName)
 	distSQLCfg := &evalContext.DistSQLPlanner.distSQLSrv.ServerConfig
 	c.rows = &rowcontainer.DiskBackedRowContainer{}
 	// The DiskBackedRowContainer can be configured to deduplicate along the
@@ -72,15 +78,17 @@ func (c *rowContainerHelper) InitWithDedup(
 }
 
 func (c *rowContainerHelper) initMonitors(
-	evalContext *extendedEvalContext, opName redact.RedactableString,
+	ctx context.Context, evalContext *extendedEvalContext, opName redact.RedactableString,
 ) {
 	distSQLCfg := &evalContext.DistSQLPlanner.distSQLSrv.ServerConfig
+	// TODO(yuzefovich): currently the memory usage of c.memMonitor doesn't
+	// count against sql.mem.distsql.current metric. Fix it.
 	c.memMonitor = execinfra.NewLimitedMonitorNoFlowCtx(
-		evalContext.Ctx(), evalContext.Mon, distSQLCfg, evalContext.SessionData(),
+		ctx, evalContext.Planner.Mon(), distSQLCfg, evalContext.SessionData(),
 		redact.Sprintf("%s-limited", opName),
 	)
 	c.diskMonitor = execinfra.NewMonitor(
-		evalContext.Ctx(), distSQLCfg.ParentDiskMonitor, redact.Sprintf("%s-disk", opName),
+		ctx, distSQLCfg.ParentDiskMonitor, redact.Sprintf("%s-disk", opName),
 	)
 }
 
@@ -135,22 +143,12 @@ func (c *rowContainerHelper) Close(ctx context.Context) {
 // tree.Datums.
 type rowContainerIterator struct {
 	iter rowcontainer.RowIterator
-
-	typs   []*types.T
-	datums tree.Datums
-	da     tree.DatumAlloc
 }
 
 // newRowContainerIterator returns a new rowContainerIterator that must be
 // closed once no longer needed.
-func newRowContainerIterator(
-	ctx context.Context, c rowContainerHelper, typs []*types.T,
-) *rowContainerIterator {
-	i := &rowContainerIterator{
-		iter:   c.rows.NewIterator(ctx),
-		typs:   typs,
-		datums: make(tree.Datums, len(typs)),
-	}
+func newRowContainerIterator(ctx context.Context, c rowContainerHelper) *rowContainerIterator {
+	i := &rowContainerIterator{iter: c.rows.NewIterator(ctx)}
 	i.iter.Rewind()
 	return i
 }
@@ -169,10 +167,7 @@ func (i *rowContainerIterator) Next() (tree.Datums, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = rowenc.EncDatumRowToDatums(i.typs, i.datums, row, &i.da); err != nil {
-		return nil, err
-	}
-	return i.datums, nil
+	return row, nil
 }
 
 func (i *rowContainerIterator) Close() {

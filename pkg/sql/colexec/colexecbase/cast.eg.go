@@ -67,9 +67,10 @@ func isIdentityCast(fromType, toType *types.T) bool {
 		// by float64 physically.
 		return true
 	}
-	if fromType.Family() == types.UuidFamily && toType.Family() == types.BytesFamily {
-		// The cast from UUID to Bytes is an identity because we don't need to
-		// perform any conversion since both are represented in the same way.
+	if toType.Family() == types.BytesFamily && (fromType.Family() == types.UuidFamily || fromType.Family() == types.EnumFamily) {
+		// The casts from UUID or enum to Bytes is an identity because we don't
+		// need to perform any conversion since both are represented in the same
+		// way.
 		return true
 	}
 	return false
@@ -319,6 +320,19 @@ func GetCastOperator(
 					}
 				}
 			}
+		case types.EnumFamily:
+			switch fromType.Width() {
+			case -1:
+			default:
+				switch toType.Family() {
+				case types.StringFamily:
+					switch toType.Width() {
+					case -1:
+					default:
+						return &castEnumStringOp{castOpBase: base}, nil
+					}
+				}
+			}
 		case types.FloatFamily:
 			switch fromType.Width() {
 			case -1:
@@ -517,6 +531,12 @@ func GetCastOperator(
 					default:
 						return &castStringDecimalOp{castOpBase: base}, nil
 					}
+				case types.EnumFamily:
+					switch toType.Width() {
+					case -1:
+					default:
+						return &castStringEnumOp{castOpBase: base}, nil
+					}
 				case types.FloatFamily:
 					switch toType.Width() {
 					case -1:
@@ -612,7 +632,11 @@ func GetCastOperator(
 			}
 		}
 	}
-	return nil, errors.Errorf("unhandled cast %s -> %s", fromType.SQLString(), toType.SQLString())
+	return nil, errors.Errorf(
+		"unhandled cast %s -> %s",
+		fromType.SQLStringForError(),
+		toType.SQLStringForError(),
+	)
 }
 
 func IsCastSupported(fromType, toType *types.T) bool {
@@ -835,6 +859,19 @@ func IsCastSupported(fromType, toType *types.T) bool {
 					}
 				}
 			}
+		case types.EnumFamily:
+			switch fromType.Width() {
+			case -1:
+			default:
+				switch toType.Family() {
+				case types.StringFamily:
+					switch toType.Width() {
+					case -1:
+					default:
+						return true
+					}
+				}
+			}
 		case types.FloatFamily:
 			switch fromType.Width() {
 			case -1:
@@ -1033,6 +1070,12 @@ func IsCastSupported(fromType, toType *types.T) bool {
 					default:
 						return true
 					}
+				case types.EnumFamily:
+					switch toType.Width() {
+					case -1:
+					default:
+						return true
+					}
 				case types.FloatFamily:
 					switch toType.Width() {
 					case -1:
@@ -1203,6 +1246,16 @@ type castIdentityOp struct {
 
 var _ colexecop.ClosableOperator = &castIdentityOp{}
 
+// identityOrder is a slice in which every integer equals its ordinal.
+var identityOrder []int
+
+func init() {
+	identityOrder = make([]int, coldata.MaxBatchSize)
+	for i := range identityOrder {
+		identityOrder[i] = i
+	}
+}
+
 func (c *castIdentityOp) Next() coldata.Batch {
 	batch := c.Input.Next()
 	n := batch.Length()
@@ -1211,17 +1264,19 @@ func (c *castIdentityOp) Next() coldata.Batch {
 	}
 	projVec := batch.ColVec(c.outputIdx)
 	c.allocator.PerformOperation([]coldata.Vec{projVec}, func() {
-		maxIdx := n
+		srcVec := batch.ColVec(c.colIdx)
 		if sel := batch.Selection(); sel != nil {
 			// We don't want to perform the deselection during copying, so we
-			// will copy everything up to (and including) the last selected
-			// element, without the selection vector.
-			maxIdx = sel[n-1] + 1
+			// use a special copy in which we use the identity order but apply
+			// the selection vector.
+			projVec.CopyWithReorderedSource(srcVec, sel[:n], identityOrder)
+		} else {
+			projVec.Copy(coldata.SliceArgs{
+				Src:         srcVec,
+				SrcStartIdx: 0,
+				SrcEndIdx:   n,
+			})
 		}
-		projVec.Copy(coldata.SliceArgs{
-			Src:       batch.ColVec(c.colIdx),
-			SrcEndIdx: maxIdx,
-		})
 	})
 	return batch
 }
@@ -1306,13 +1361,16 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 			if inputVec.Nulls().MaybeHasNulls() {
 				for scratchIdx, outputIdx := range sel[:n] {
 					{
-						var evalCtx *eval.Context = c.evalCtx
+						var (
+							ctx     context.Context = c.Ctx
+							evalCtx *eval.Context   = c.evalCtx
+						)
 						converted := scratch[scratchIdx]
 						if true && converted == tree.DNull {
 							outputNulls.SetNull(outputIdx)
 							continue
 						}
-						res, err := eval.PerformCast(evalCtx, converted, toType)
+						res, err := eval.PerformCast(ctx, evalCtx, converted, toType)
 						if err != nil {
 							colexecerror.ExpectedError(err)
 						}
@@ -1322,13 +1380,16 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 			} else {
 				for scratchIdx, outputIdx := range sel[:n] {
 					{
-						var evalCtx *eval.Context = c.evalCtx
+						var (
+							ctx     context.Context = c.Ctx
+							evalCtx *eval.Context   = c.evalCtx
+						)
 						converted := scratch[scratchIdx]
 						if false && converted == tree.DNull {
 							outputNulls.SetNull(outputIdx)
 							continue
 						}
-						res, err := eval.PerformCast(evalCtx, converted, toType)
+						res, err := eval.PerformCast(ctx, evalCtx, converted, toType)
 						if err != nil {
 							colexecerror.ExpectedError(err)
 						}
@@ -1342,9 +1403,10 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 				for idx := 0; idx < n; idx++ {
 					{
 						var (
-							scratchIdx int           = idx
-							outputIdx  int           = idx
-							evalCtx    *eval.Context = c.evalCtx
+							ctx        context.Context = c.Ctx
+							scratchIdx int             = idx
+							outputIdx  int             = idx
+							evalCtx    *eval.Context   = c.evalCtx
 						)
 						//gcassert:bce
 						converted := scratch[scratchIdx]
@@ -1352,7 +1414,7 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 							outputNulls.SetNull(outputIdx)
 							continue
 						}
-						res, err := eval.PerformCast(evalCtx, converted, toType)
+						res, err := eval.PerformCast(ctx, evalCtx, converted, toType)
 						if err != nil {
 							colexecerror.ExpectedError(err)
 						}
@@ -1363,9 +1425,10 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 				for idx := 0; idx < n; idx++ {
 					{
 						var (
-							scratchIdx int           = idx
-							outputIdx  int           = idx
-							evalCtx    *eval.Context = c.evalCtx
+							ctx        context.Context = c.Ctx
+							scratchIdx int             = idx
+							outputIdx  int             = idx
+							evalCtx    *eval.Context   = c.evalCtx
 						)
 						//gcassert:bce
 						converted := scratch[scratchIdx]
@@ -1373,7 +1436,7 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 							outputNulls.SetNull(outputIdx)
 							continue
 						}
-						res, err := eval.PerformCast(evalCtx, converted, toType)
+						res, err := eval.PerformCast(ctx, evalCtx, converted, toType)
 						if err != nil {
 							colexecerror.ExpectedError(err)
 						}
@@ -4724,6 +4787,239 @@ func (c *castDecimalStringOp) Next() coldata.Batch {
 							var r []byte
 
 							r = []byte(v.String())
+							if toType.Oid() != oid.T_name {
+								// bpchar types truncate trailing whitespace.
+								if toType.Oid() == oid.T_bpchar {
+									r = bytes.TrimRight(r, " ")
+								}
+								// If the string type specifies a limit we truncate to that limit:
+								//   'hello'::CHAR(2) -> 'he'
+								// This is true of all the string type variants.
+								if toType.Width() > 0 {
+									r = []byte(util.TruncateString(string(r), int(toType.Width())))
+								}
+								if toType.Oid() == oid.T_char {
+									// "char" is supposed to truncate long values.
+									r = []byte(util.TruncateString(string(r), 1))
+								}
+							}
+							if toType.Width() > 0 && utf8.RuneCountInString(string(r)) > int(toType.Width()) {
+								_typeString := toType.SQLString()
+								colexecerror.ExpectedError(
+									pgerror.Newf(pgcode.StringDataRightTruncation, "value too long for type "+_typeString))
+							}
+
+							outputCol.Set(tupleIdx, r)
+						}
+					}
+				}
+			}
+		},
+	)
+	return batch
+}
+
+type castEnumStringOp struct {
+	castOpBase
+}
+
+var _ colexecop.ResettableOperator = &castEnumStringOp{}
+var _ colexecop.ClosableOperator = &castEnumStringOp{}
+
+func (c *castEnumStringOp) Next() coldata.Batch {
+	batch := c.Input.Next()
+	n := batch.Length()
+	if n == 0 {
+		return coldata.ZeroBatch
+	}
+	sel := batch.Selection()
+	inputVec := batch.ColVec(c.colIdx)
+	outputVec := batch.ColVec(c.outputIdx)
+	fromType := inputVec.Type()
+	toType := outputVec.Type()
+	// Remove unused warnings.
+	_ = toType
+	c.allocator.PerformOperation(
+		[]coldata.Vec{outputVec}, func() {
+			inputCol := inputVec.Bytes()
+			inputNulls := inputVec.Nulls()
+			outputCol := outputVec.Bytes()
+			outputNulls := outputVec.Nulls()
+			if inputVec.MaybeHasNulls() {
+				outputNulls.Copy(inputNulls)
+				if sel != nil {
+					{
+						var (
+							evalCtx *eval.Context = c.evalCtx
+							buf     *bytes.Buffer = &c.buf
+						)
+						// Silence unused warnings.
+						_ = evalCtx
+						_ = buf
+						var tupleIdx int
+						for i := 0; i < n; i++ {
+							tupleIdx = sel[i]
+							if true && inputNulls.NullAt(tupleIdx) {
+								continue
+							}
+							v := inputCol.Get(tupleIdx)
+							var r []byte
+
+							_, logical, err := tree.GetEnumComponentsFromPhysicalRep(fromType, v)
+							if err != nil {
+								colexecerror.ExpectedError(err)
+							}
+							r = []byte(logical)
+
+							if toType.Oid() != oid.T_name {
+								// bpchar types truncate trailing whitespace.
+								if toType.Oid() == oid.T_bpchar {
+									r = bytes.TrimRight(r, " ")
+								}
+								// If the string type specifies a limit we truncate to that limit:
+								//   'hello'::CHAR(2) -> 'he'
+								// This is true of all the string type variants.
+								if toType.Width() > 0 {
+									r = []byte(util.TruncateString(string(r), int(toType.Width())))
+								}
+								if toType.Oid() == oid.T_char {
+									// "char" is supposed to truncate long values.
+									r = []byte(util.TruncateString(string(r), 1))
+								}
+							}
+							if toType.Width() > 0 && utf8.RuneCountInString(string(r)) > int(toType.Width()) {
+								_typeString := toType.SQLString()
+								colexecerror.ExpectedError(
+									pgerror.Newf(pgcode.StringDataRightTruncation, "value too long for type "+_typeString))
+							}
+
+							outputCol.Set(tupleIdx, r)
+						}
+					}
+				} else {
+					{
+						var (
+							evalCtx *eval.Context = c.evalCtx
+							buf     *bytes.Buffer = &c.buf
+						)
+						// Silence unused warnings.
+						_ = evalCtx
+						_ = buf
+						var tupleIdx int
+						for i := 0; i < n; i++ {
+							tupleIdx = i
+							if true && inputNulls.NullAt(tupleIdx) {
+								continue
+							}
+							v := inputCol.Get(tupleIdx)
+							var r []byte
+
+							_, logical, err := tree.GetEnumComponentsFromPhysicalRep(fromType, v)
+							if err != nil {
+								colexecerror.ExpectedError(err)
+							}
+							r = []byte(logical)
+
+							if toType.Oid() != oid.T_name {
+								// bpchar types truncate trailing whitespace.
+								if toType.Oid() == oid.T_bpchar {
+									r = bytes.TrimRight(r, " ")
+								}
+								// If the string type specifies a limit we truncate to that limit:
+								//   'hello'::CHAR(2) -> 'he'
+								// This is true of all the string type variants.
+								if toType.Width() > 0 {
+									r = []byte(util.TruncateString(string(r), int(toType.Width())))
+								}
+								if toType.Oid() == oid.T_char {
+									// "char" is supposed to truncate long values.
+									r = []byte(util.TruncateString(string(r), 1))
+								}
+							}
+							if toType.Width() > 0 && utf8.RuneCountInString(string(r)) > int(toType.Width()) {
+								_typeString := toType.SQLString()
+								colexecerror.ExpectedError(
+									pgerror.Newf(pgcode.StringDataRightTruncation, "value too long for type "+_typeString))
+							}
+
+							outputCol.Set(tupleIdx, r)
+						}
+					}
+				}
+			} else {
+				if sel != nil {
+					{
+						var (
+							evalCtx *eval.Context = c.evalCtx
+							buf     *bytes.Buffer = &c.buf
+						)
+						// Silence unused warnings.
+						_ = evalCtx
+						_ = buf
+						var tupleIdx int
+						for i := 0; i < n; i++ {
+							tupleIdx = sel[i]
+							if false && inputNulls.NullAt(tupleIdx) {
+								continue
+							}
+							v := inputCol.Get(tupleIdx)
+							var r []byte
+
+							_, logical, err := tree.GetEnumComponentsFromPhysicalRep(fromType, v)
+							if err != nil {
+								colexecerror.ExpectedError(err)
+							}
+							r = []byte(logical)
+
+							if toType.Oid() != oid.T_name {
+								// bpchar types truncate trailing whitespace.
+								if toType.Oid() == oid.T_bpchar {
+									r = bytes.TrimRight(r, " ")
+								}
+								// If the string type specifies a limit we truncate to that limit:
+								//   'hello'::CHAR(2) -> 'he'
+								// This is true of all the string type variants.
+								if toType.Width() > 0 {
+									r = []byte(util.TruncateString(string(r), int(toType.Width())))
+								}
+								if toType.Oid() == oid.T_char {
+									// "char" is supposed to truncate long values.
+									r = []byte(util.TruncateString(string(r), 1))
+								}
+							}
+							if toType.Width() > 0 && utf8.RuneCountInString(string(r)) > int(toType.Width()) {
+								_typeString := toType.SQLString()
+								colexecerror.ExpectedError(
+									pgerror.Newf(pgcode.StringDataRightTruncation, "value too long for type "+_typeString))
+							}
+
+							outputCol.Set(tupleIdx, r)
+						}
+					}
+				} else {
+					{
+						var (
+							evalCtx *eval.Context = c.evalCtx
+							buf     *bytes.Buffer = &c.buf
+						)
+						// Silence unused warnings.
+						_ = evalCtx
+						_ = buf
+						var tupleIdx int
+						for i := 0; i < n; i++ {
+							tupleIdx = i
+							if false && inputNulls.NullAt(tupleIdx) {
+								continue
+							}
+							v := inputCol.Get(tupleIdx)
+							var r []byte
+
+							_, logical, err := tree.GetEnumComponentsFromPhysicalRep(fromType, v)
+							if err != nil {
+								colexecerror.ExpectedError(err)
+							}
+							r = []byte(logical)
+
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
 								if toType.Oid() == oid.T_bpchar {
@@ -9419,7 +9715,8 @@ func (c *castStringDateOp) Next() coldata.Batch {
 
 							_now := evalCtx.GetRelativeParseTime()
 							_dateStyle := evalCtx.GetDateStyle()
-							_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(v))
+							_ph := &evalCtx.ParseHelper
+							_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(v), _ph)
 							if err != nil {
 								colexecerror.ExpectedError(err)
 							}
@@ -9449,7 +9746,8 @@ func (c *castStringDateOp) Next() coldata.Batch {
 
 							_now := evalCtx.GetRelativeParseTime()
 							_dateStyle := evalCtx.GetDateStyle()
-							_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(v))
+							_ph := &evalCtx.ParseHelper
+							_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(v), _ph)
 							if err != nil {
 								colexecerror.ExpectedError(err)
 							}
@@ -9481,7 +9779,8 @@ func (c *castStringDateOp) Next() coldata.Batch {
 
 							_now := evalCtx.GetRelativeParseTime()
 							_dateStyle := evalCtx.GetDateStyle()
-							_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(v))
+							_ph := &evalCtx.ParseHelper
+							_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(v), _ph)
 							if err != nil {
 								colexecerror.ExpectedError(err)
 							}
@@ -9511,7 +9810,8 @@ func (c *castStringDateOp) Next() coldata.Batch {
 
 							_now := evalCtx.GetRelativeParseTime()
 							_dateStyle := evalCtx.GetDateStyle()
-							_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(v))
+							_ph := &evalCtx.ParseHelper
+							_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(v), _ph)
 							if err != nil {
 								colexecerror.ExpectedError(err)
 							}
@@ -9726,6 +10026,154 @@ func (c *castStringDecimalOp) Next() coldata.Batch {
 							}
 
 							//gcassert:bce
+							outputCol.Set(tupleIdx, r)
+						}
+					}
+				}
+			}
+		},
+	)
+	return batch
+}
+
+type castStringEnumOp struct {
+	castOpBase
+}
+
+var _ colexecop.ResettableOperator = &castStringEnumOp{}
+var _ colexecop.ClosableOperator = &castStringEnumOp{}
+
+func (c *castStringEnumOp) Next() coldata.Batch {
+	batch := c.Input.Next()
+	n := batch.Length()
+	if n == 0 {
+		return coldata.ZeroBatch
+	}
+	sel := batch.Selection()
+	inputVec := batch.ColVec(c.colIdx)
+	outputVec := batch.ColVec(c.outputIdx)
+	toType := outputVec.Type()
+	// Remove unused warnings.
+	_ = toType
+	c.allocator.PerformOperation(
+		[]coldata.Vec{outputVec}, func() {
+			inputCol := inputVec.Bytes()
+			inputNulls := inputVec.Nulls()
+			outputCol := outputVec.Bytes()
+			outputNulls := outputVec.Nulls()
+			if inputVec.MaybeHasNulls() {
+				outputNulls.Copy(inputNulls)
+				if sel != nil {
+					{
+						var (
+							evalCtx *eval.Context = c.evalCtx
+							buf     *bytes.Buffer = &c.buf
+						)
+						// Silence unused warnings.
+						_ = evalCtx
+						_ = buf
+						var tupleIdx int
+						for i := 0; i < n; i++ {
+							tupleIdx = sel[i]
+							if true && inputNulls.NullAt(tupleIdx) {
+								continue
+							}
+							v := inputCol.Get(tupleIdx)
+							var r []byte
+
+							_logical := string(v)
+							var err error
+							r, _, err = tree.GetEnumComponentsFromLogicalRep(toType, _logical)
+							if err != nil {
+								colexecerror.ExpectedError(err)
+							}
+
+							outputCol.Set(tupleIdx, r)
+						}
+					}
+				} else {
+					{
+						var (
+							evalCtx *eval.Context = c.evalCtx
+							buf     *bytes.Buffer = &c.buf
+						)
+						// Silence unused warnings.
+						_ = evalCtx
+						_ = buf
+						var tupleIdx int
+						for i := 0; i < n; i++ {
+							tupleIdx = i
+							if true && inputNulls.NullAt(tupleIdx) {
+								continue
+							}
+							v := inputCol.Get(tupleIdx)
+							var r []byte
+
+							_logical := string(v)
+							var err error
+							r, _, err = tree.GetEnumComponentsFromLogicalRep(toType, _logical)
+							if err != nil {
+								colexecerror.ExpectedError(err)
+							}
+
+							outputCol.Set(tupleIdx, r)
+						}
+					}
+				}
+			} else {
+				if sel != nil {
+					{
+						var (
+							evalCtx *eval.Context = c.evalCtx
+							buf     *bytes.Buffer = &c.buf
+						)
+						// Silence unused warnings.
+						_ = evalCtx
+						_ = buf
+						var tupleIdx int
+						for i := 0; i < n; i++ {
+							tupleIdx = sel[i]
+							if false && inputNulls.NullAt(tupleIdx) {
+								continue
+							}
+							v := inputCol.Get(tupleIdx)
+							var r []byte
+
+							_logical := string(v)
+							var err error
+							r, _, err = tree.GetEnumComponentsFromLogicalRep(toType, _logical)
+							if err != nil {
+								colexecerror.ExpectedError(err)
+							}
+
+							outputCol.Set(tupleIdx, r)
+						}
+					}
+				} else {
+					{
+						var (
+							evalCtx *eval.Context = c.evalCtx
+							buf     *bytes.Buffer = &c.buf
+						)
+						// Silence unused warnings.
+						_ = evalCtx
+						_ = buf
+						var tupleIdx int
+						for i := 0; i < n; i++ {
+							tupleIdx = i
+							if false && inputNulls.NullAt(tupleIdx) {
+								continue
+							}
+							v := inputCol.Get(tupleIdx)
+							var r []byte
+
+							_logical := string(v)
+							var err error
+							r, _, err = tree.GetEnumComponentsFromLogicalRep(toType, _logical)
+							if err != nil {
+								colexecerror.ExpectedError(err)
+							}
+
 							outputCol.Set(tupleIdx, r)
 						}
 					}
@@ -11477,7 +11925,7 @@ func (c *castTimestampStringOp) Next() coldata.Batch {
 							v := inputCol.Get(tupleIdx)
 							var r []byte
 
-							r = []byte(tree.FormatTimestamp(v))
+							r = tree.PGWireFormatTimestamp(v, nil, r)
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
 								if toType.Oid() == oid.T_bpchar {
@@ -11523,7 +11971,7 @@ func (c *castTimestampStringOp) Next() coldata.Batch {
 							v := inputCol.Get(tupleIdx)
 							var r []byte
 
-							r = []byte(tree.FormatTimestamp(v))
+							r = tree.PGWireFormatTimestamp(v, nil, r)
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
 								if toType.Oid() == oid.T_bpchar {
@@ -11569,7 +12017,7 @@ func (c *castTimestampStringOp) Next() coldata.Batch {
 							v := inputCol.Get(tupleIdx)
 							var r []byte
 
-							r = []byte(tree.FormatTimestamp(v))
+							r = tree.PGWireFormatTimestamp(v, nil, r)
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
 								if toType.Oid() == oid.T_bpchar {
@@ -11615,7 +12063,7 @@ func (c *castTimestampStringOp) Next() coldata.Batch {
 							v := inputCol.Get(tupleIdx)
 							var r []byte
 
-							r = []byte(tree.FormatTimestamp(v))
+							r = tree.PGWireFormatTimestamp(v, nil, r)
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
 								if toType.Oid() == oid.T_bpchar {
@@ -11694,16 +12142,14 @@ func (c *castTimestamptzStringOp) Next() coldata.Batch {
 							var r []byte
 
 							// Convert to context timezone for correct display.
-							_t := v.In(evalCtx.GetLocation())
+							_t := v
 
 							_t = _t.Round(time.Microsecond)
 							if _t.After(tree.MaxSupportedTime) || _t.Before(tree.MinSupportedTime) {
 								colexecerror.ExpectedError(tree.NewTimestampExceedsBoundsError(_t))
 							}
 
-							buf.Reset()
-							tree.FormatTimestampTZ(_t, buf)
-							r = []byte(buf.String())
+							r = tree.PGWireFormatTimestamp(_t, evalCtx.GetLocation(), r)
 
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
@@ -11751,16 +12197,14 @@ func (c *castTimestamptzStringOp) Next() coldata.Batch {
 							var r []byte
 
 							// Convert to context timezone for correct display.
-							_t := v.In(evalCtx.GetLocation())
+							_t := v
 
 							_t = _t.Round(time.Microsecond)
 							if _t.After(tree.MaxSupportedTime) || _t.Before(tree.MinSupportedTime) {
 								colexecerror.ExpectedError(tree.NewTimestampExceedsBoundsError(_t))
 							}
 
-							buf.Reset()
-							tree.FormatTimestampTZ(_t, buf)
-							r = []byte(buf.String())
+							r = tree.PGWireFormatTimestamp(_t, evalCtx.GetLocation(), r)
 
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
@@ -11808,16 +12252,14 @@ func (c *castTimestamptzStringOp) Next() coldata.Batch {
 							var r []byte
 
 							// Convert to context timezone for correct display.
-							_t := v.In(evalCtx.GetLocation())
+							_t := v
 
 							_t = _t.Round(time.Microsecond)
 							if _t.After(tree.MaxSupportedTime) || _t.Before(tree.MinSupportedTime) {
 								colexecerror.ExpectedError(tree.NewTimestampExceedsBoundsError(_t))
 							}
 
-							buf.Reset()
-							tree.FormatTimestampTZ(_t, buf)
-							r = []byte(buf.String())
+							r = tree.PGWireFormatTimestamp(_t, evalCtx.GetLocation(), r)
 
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
@@ -11865,16 +12307,14 @@ func (c *castTimestamptzStringOp) Next() coldata.Batch {
 							var r []byte
 
 							// Convert to context timezone for correct display.
-							_t := v.In(evalCtx.GetLocation())
+							_t := v
 
 							_t = _t.Round(time.Microsecond)
 							if _t.After(tree.MaxSupportedTime) || _t.Before(tree.MinSupportedTime) {
 								colexecerror.ExpectedError(tree.NewTimestampExceedsBoundsError(_t))
 							}
 
-							buf.Reset()
-							tree.FormatTimestampTZ(_t, buf)
-							r = []byte(buf.String())
+							r = tree.PGWireFormatTimestamp(_t, evalCtx.GetLocation(), r)
 
 							if toType.Oid() != oid.T_name {
 								// bpchar types truncate trailing whitespace.
@@ -12187,7 +12627,7 @@ func (c *castDatumBoolOp) Next() coldata.Batch {
 							var r bool
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12217,7 +12657,7 @@ func (c *castDatumBoolOp) Next() coldata.Batch {
 							var r bool
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12249,7 +12689,7 @@ func (c *castDatumBoolOp) Next() coldata.Batch {
 							var r bool
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12279,7 +12719,7 @@ func (c *castDatumBoolOp) Next() coldata.Batch {
 							var r bool
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12344,7 +12784,7 @@ func (c *castDatumInt2Op) Next() coldata.Batch {
 							var r int16
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12374,7 +12814,7 @@ func (c *castDatumInt2Op) Next() coldata.Batch {
 							var r int16
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12406,7 +12846,7 @@ func (c *castDatumInt2Op) Next() coldata.Batch {
 							var r int16
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12436,7 +12876,7 @@ func (c *castDatumInt2Op) Next() coldata.Batch {
 							var r int16
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12501,7 +12941,7 @@ func (c *castDatumInt4Op) Next() coldata.Batch {
 							var r int32
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12531,7 +12971,7 @@ func (c *castDatumInt4Op) Next() coldata.Batch {
 							var r int32
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12563,7 +13003,7 @@ func (c *castDatumInt4Op) Next() coldata.Batch {
 							var r int32
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12593,7 +13033,7 @@ func (c *castDatumInt4Op) Next() coldata.Batch {
 							var r int32
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12658,7 +13098,7 @@ func (c *castDatumIntOp) Next() coldata.Batch {
 							var r int64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12688,7 +13128,7 @@ func (c *castDatumIntOp) Next() coldata.Batch {
 							var r int64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12720,7 +13160,7 @@ func (c *castDatumIntOp) Next() coldata.Batch {
 							var r int64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12750,7 +13190,7 @@ func (c *castDatumIntOp) Next() coldata.Batch {
 							var r int64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12815,7 +13255,7 @@ func (c *castDatumFloatOp) Next() coldata.Batch {
 							var r float64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12845,7 +13285,7 @@ func (c *castDatumFloatOp) Next() coldata.Batch {
 							var r float64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12877,7 +13317,7 @@ func (c *castDatumFloatOp) Next() coldata.Batch {
 							var r float64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12907,7 +13347,7 @@ func (c *castDatumFloatOp) Next() coldata.Batch {
 							var r float64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -12972,7 +13412,7 @@ func (c *castDatumDecimalOp) Next() coldata.Batch {
 							var r apd.Decimal
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13002,7 +13442,7 @@ func (c *castDatumDecimalOp) Next() coldata.Batch {
 							var r apd.Decimal
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13034,7 +13474,7 @@ func (c *castDatumDecimalOp) Next() coldata.Batch {
 							var r apd.Decimal
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13064,7 +13504,7 @@ func (c *castDatumDecimalOp) Next() coldata.Batch {
 							var r apd.Decimal
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13129,7 +13569,7 @@ func (c *castDatumDateOp) Next() coldata.Batch {
 							var r int64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13159,7 +13599,7 @@ func (c *castDatumDateOp) Next() coldata.Batch {
 							var r int64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13191,7 +13631,7 @@ func (c *castDatumDateOp) Next() coldata.Batch {
 							var r int64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13221,7 +13661,7 @@ func (c *castDatumDateOp) Next() coldata.Batch {
 							var r int64
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13286,7 +13726,7 @@ func (c *castDatumTimestampOp) Next() coldata.Batch {
 							var r time.Time
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13316,7 +13756,7 @@ func (c *castDatumTimestampOp) Next() coldata.Batch {
 							var r time.Time
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13348,7 +13788,7 @@ func (c *castDatumTimestampOp) Next() coldata.Batch {
 							var r time.Time
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13378,7 +13818,7 @@ func (c *castDatumTimestampOp) Next() coldata.Batch {
 							var r time.Time
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13443,7 +13883,7 @@ func (c *castDatumIntervalOp) Next() coldata.Batch {
 							var r duration.Duration
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13473,7 +13913,7 @@ func (c *castDatumIntervalOp) Next() coldata.Batch {
 							var r duration.Duration
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13505,7 +13945,7 @@ func (c *castDatumIntervalOp) Next() coldata.Batch {
 							var r duration.Duration
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13535,7 +13975,7 @@ func (c *castDatumIntervalOp) Next() coldata.Batch {
 							var r duration.Duration
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13600,7 +14040,7 @@ func (c *castDatumStringOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13629,7 +14069,7 @@ func (c *castDatumStringOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13660,7 +14100,7 @@ func (c *castDatumStringOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13689,7 +14129,7 @@ func (c *castDatumStringOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13753,7 +14193,7 @@ func (c *castDatumBytesOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13782,7 +14222,7 @@ func (c *castDatumBytesOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13813,7 +14253,7 @@ func (c *castDatumBytesOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13842,7 +14282,7 @@ func (c *castDatumBytesOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13906,7 +14346,7 @@ func (c *castDatumTimestamptzOp) Next() coldata.Batch {
 							var r time.Time
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13936,7 +14376,7 @@ func (c *castDatumTimestamptzOp) Next() coldata.Batch {
 							var r time.Time
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13968,7 +14408,7 @@ func (c *castDatumTimestamptzOp) Next() coldata.Batch {
 							var r time.Time
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -13998,7 +14438,7 @@ func (c *castDatumTimestamptzOp) Next() coldata.Batch {
 							var r time.Time
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14063,7 +14503,7 @@ func (c *castDatumUuidOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14092,7 +14532,7 @@ func (c *castDatumUuidOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14123,7 +14563,7 @@ func (c *castDatumUuidOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14152,7 +14592,7 @@ func (c *castDatumUuidOp) Next() coldata.Batch {
 							var r []byte
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14216,7 +14656,7 @@ func (c *castDatumJsonbOp) Next() coldata.Batch {
 							var r json.JSON
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14245,7 +14685,7 @@ func (c *castDatumJsonbOp) Next() coldata.Batch {
 							var r json.JSON
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14276,7 +14716,7 @@ func (c *castDatumJsonbOp) Next() coldata.Batch {
 							var r json.JSON
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14305,7 +14745,7 @@ func (c *castDatumJsonbOp) Next() coldata.Batch {
 							var r json.JSON
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14368,7 +14808,7 @@ func (c *castDatumDatumOp) Next() coldata.Batch {
 							var r interface{}
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14403,7 +14843,7 @@ func (c *castDatumDatumOp) Next() coldata.Batch {
 							var r interface{}
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14440,7 +14880,7 @@ func (c *castDatumDatumOp) Next() coldata.Batch {
 							var r interface{}
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}
@@ -14475,7 +14915,7 @@ func (c *castDatumDatumOp) Next() coldata.Batch {
 							var r interface{}
 
 							{
-								_castedDatum, err := eval.PerformCast(evalCtx, v.(tree.Datum), toType)
+								_castedDatum, err := eval.PerformCast(c.Ctx, evalCtx, v.(tree.Datum), toType)
 								if err != nil {
 									colexecerror.ExpectedError(err)
 								}

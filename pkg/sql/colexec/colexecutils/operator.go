@@ -76,9 +76,7 @@ func (s *fixedNumTuplesNoInputOp) Next() coldata.Batch {
 	if s.numTuplesLeft == 0 {
 		return coldata.ZeroBatch
 	}
-	// The internal batch has no columns, so no memory is ever released on the
-	// ResetInternalBatch() call.
-	_ = s.batch.ResetInternalBatch()
+	s.batch.ResetInternalBatch()
 	length := s.numTuplesLeft
 	if length > coldata.BatchSize() {
 		length = coldata.BatchSize()
@@ -86,6 +84,28 @@ func (s *fixedNumTuplesNoInputOp) Next() coldata.Batch {
 	s.numTuplesLeft -= length
 	s.batch.SetLength(length)
 	return s.batch
+}
+
+type rawBatchOp struct {
+	colexecop.ZeroInputNode
+	batch coldata.Batch
+}
+
+var _ colexecop.Operator = &rawBatchOp{}
+
+func (s *rawBatchOp) Init(ctx context.Context) {
+}
+
+func (s *rawBatchOp) Next() coldata.Batch {
+	b := s.batch
+	s.batch = coldata.ZeroBatch
+	return b
+}
+
+// NewRawColDataBatchOp allocates a rawBatchOp. This is used by COPY to perform
+// vectorized inserts.
+func NewRawColDataBatchOp(b coldata.Batch) colexecop.Operator {
+	return &rawBatchOp{batch: b}
 }
 
 // vectorTypeEnforcer is a utility Operator that on every call to Next

@@ -843,10 +843,10 @@ WHERE views.chat_id = 1 and views.user_id = 1;
 # have to sort its output).
 
 statement ok
-CREATE TABLE xyz (x INT, y INT, z INT, PRIMARY KEY(x, y, z));
+CREATE TABLE xyz (x INT, y INT, z INT, PRIMARY KEY(x, y DESC, z));
 
 statement ok
-CREATE TABLE uvw (u INT, v INT, w INT, PRIMARY KEY(u, v, w));
+CREATE TABLE uvw (u INT, v INT, w INT, PRIMARY KEY(u, v, w DESC));
 
 statement ok
 INSERT INTO xyz VALUES (1, 1, 1), (1, 1, 2), (1, 2, 3), (2, 1, 4), (2, 1, 5), (2, 1, 6), (3, 1, 7);
@@ -855,86 +855,86 @@ statement ok
 INSERT INTO uvw VALUES (1, 1, 1), (1, 2, 2), (1, 2, 3), (2, 1, 4), (2, 1, 5), (2, 2, 6), (2, 2, 7);
 
 query IIIIII colnames
-SELECT * FROM xyz INNER LOOKUP JOIN uvw ON x = u ORDER BY x, y, z, u, v, w
+SELECT * FROM xyz INNER LOOKUP JOIN uvw ON x = u ORDER BY x, y DESC, z, u, v, w DESC
 ----
 x  y  z  u  v  w
-1  1  1  1  1  1
-1  1  1  1  2  2
-1  1  1  1  2  3
-1  1  2  1  1  1
-1  1  2  1  2  2
-1  1  2  1  2  3
 1  2  3  1  1  1
-1  2  3  1  2  2
 1  2  3  1  2  3
-2  1  4  2  1  4
-2  1  4  2  1  5
-2  1  4  2  2  6
-2  1  4  2  2  7
-2  1  5  2  1  4
-2  1  5  2  1  5
-2  1  5  2  2  6
-2  1  5  2  2  7
-2  1  6  2  1  4
-2  1  6  2  1  5
-2  1  6  2  2  6
-2  1  6  2  2  7
-
-query IIIIII colnames
-SELECT * FROM xyz INNER HASH JOIN uvw ON x = u ORDER BY x, y, z, u, v, w
-----
-x  y  z  u  v  w
+1  2  3  1  2  2
 1  1  1  1  1  1
-1  1  1  1  2  2
 1  1  1  1  2  3
+1  1  1  1  2  2
 1  1  2  1  1  1
-1  1  2  1  2  2
 1  1  2  1  2  3
-1  2  3  1  1  1
-1  2  3  1  2  2
-1  2  3  1  2  3
-2  1  4  2  1  4
+1  1  2  1  2  2
 2  1  4  2  1  5
-2  1  4  2  2  6
+2  1  4  2  1  4
 2  1  4  2  2  7
-2  1  5  2  1  4
+2  1  4  2  2  6
 2  1  5  2  1  5
-2  1  5  2  2  6
+2  1  5  2  1  4
 2  1  5  2  2  7
-2  1  6  2  1  4
+2  1  5  2  2  6
 2  1  6  2  1  5
-2  1  6  2  2  6
+2  1  6  2  1  4
 2  1  6  2  2  7
+2  1  6  2  2  6
 
 query IIIIII colnames
-SELECT * FROM xyz INNER LOOKUP JOIN uvw ON x = u AND y = v ORDER BY u, x, v, y, z, w
+SELECT * FROM xyz INNER HASH JOIN uvw ON x = u ORDER BY x, y DESC, z, u, v, w DESC
+----
+x  y  z  u  v  w
+1  2  3  1  1  1
+1  2  3  1  2  3
+1  2  3  1  2  2
+1  1  1  1  1  1
+1  1  1  1  2  3
+1  1  1  1  2  2
+1  1  2  1  1  1
+1  1  2  1  2  3
+1  1  2  1  2  2
+2  1  4  2  1  5
+2  1  4  2  1  4
+2  1  4  2  2  7
+2  1  4  2  2  6
+2  1  5  2  1  5
+2  1  5  2  1  4
+2  1  5  2  2  7
+2  1  5  2  2  6
+2  1  6  2  1  5
+2  1  6  2  1  4
+2  1  6  2  2  7
+2  1  6  2  2  6
+
+query IIIIII colnames
+SELECT * FROM xyz INNER LOOKUP JOIN uvw ON x = u AND y = v ORDER BY u, x, v, y DESC, z, w DESC
 ----
 x  y  z  u  v  w
 1  1  1  1  1  1
 1  1  2  1  1  1
-1  2  3  1  2  2
 1  2  3  1  2  3
-2  1  4  2  1  4
+1  2  3  1  2  2
 2  1  4  2  1  5
-2  1  5  2  1  4
+2  1  4  2  1  4
 2  1  5  2  1  5
-2  1  6  2  1  4
+2  1  5  2  1  4
 2  1  6  2  1  5
+2  1  6  2  1  4
 
 query IIIIII colnames
-SELECT * FROM xyz INNER HASH JOIN uvw ON x = u AND y = v ORDER BY u, x, v, y, z, w
+SELECT * FROM xyz INNER HASH JOIN uvw ON x = u AND y = v ORDER BY u, x, v, y DESC, z, w DESC
 ----
 x  y  z  u  v  w
 1  1  1  1  1  1
 1  1  2  1  1  1
-1  2  3  1  2  2
 1  2  3  1  2  3
-2  1  4  2  1  4
+1  2  3  1  2  2
 2  1  4  2  1  5
-2  1  5  2  1  4
+2  1  4  2  1  4
 2  1  5  2  1  5
-2  1  6  2  1  4
+2  1  5  2  1  4
 2  1  6  2  1  5
+2  1  6  2  1  4
 
 # Test inequality lookup joins.
 # Case with idxCol <= inputCol.
@@ -1466,3 +1466,53 @@ NULL                                  294276-12-31 23:59:59.999999 +0000 +0000  
 0000-01-01 23:59:59.999999 +0000 UTC  1970-01-01 00:00:00 +0000 +0000           0000-01-02 00:00:00 +0000 UTC         2042-01-01 00:00:00 +0000 +0000
 0000-01-02 00:00:00 +0000 UTC         2042-01-01 00:00:00 +0000 +0000           NULL                                  294276-12-31 23:59:59.999999 +0000 +0000
 0000-01-02 00:00:00 +0000 UTC         2042-01-01 00:00:00 +0000 +0000           0000-01-02 00:00:00 +0000 UTC         2042-01-01 00:00:00 +0000 +0000
+
+statement ok
+SET variable_inequality_lookup_join_enabled=false
+
+statement error pq: could not produce a query plan conforming to the LOOKUP JOIN hint
+SELECT a, b, c, d, e, f FROM abc INNER LOOKUP JOIN def ON f <= a ORDER BY a, b, c, d, e, f
+
+statement error pq: could not produce a query plan conforming to the LOOKUP JOIN hint
+SELECT a, b, c, d, e, f FROM def INNER LOOKUP JOIN abc ON a >= f ORDER BY a, b, c, d, e, f
+
+statement error pq: could not produce a query plan conforming to the LOOKUP JOIN hint
+SELECT a, b, c, d, e, f FROM abc INNER LOOKUP JOIN def ON f < a AND f >= b ORDER BY a, b, c, d, e, f
+
+statement ok
+RESET variable_inequality_lookup_join_enabled
+
+
+subtest regression_89576
+
+# Regression test for #89576. Lookup joins should not try to produce virtual
+# computed columns directly from primary indexes.
+statement ok
+CREATE TABLE t89576 (
+  k INT PRIMARY KEY,
+  s STRING,
+  v STRING AS (lower(s)) VIRTUAL NOT NULL,
+  INDEX (v)
+);
+INSERT INTO t89576 VALUES (1, 'foo')
+
+query T
+SELECT t2.v
+FROM t89576 AS t1
+LEFT JOIN t89576 AS t2
+ON (t2.v) = (t1.v)
+AND (t2.s) = (t1.s)
+----
+foo
+
+# TODO(#90771): We no longer explore lookup joins for this query, but it
+# should be possible by projecting virtual computed column expressions after the
+# upper join in the paired joiner. When this is supported, this query should
+# succeed and we should turn this test directive into "query T" and verify the
+# result matches the one in the query above.
+statement error pgcode XXUUU could not produce a query plan conforming to the LOOKUP JOIN hint
+SELECT t2.v
+FROM t89576 AS t1
+LEFT LOOKUP JOIN t89576 AS t2
+ON (t2.v) = (t1.v)
+AND (t2.s) = (t1.s)

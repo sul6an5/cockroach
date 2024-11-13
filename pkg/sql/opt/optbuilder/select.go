@@ -11,22 +11,27 @@
 package optbuilder
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/partition"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -45,20 +50,40 @@ import (
 func (b *Builder) buildDataSource(
 	texpr tree.TableExpr, indexFlags *tree.IndexFlags, locking lockingSpec, inScope *scope,
 ) (outScope *scope) {
-	defer func(prevAtRoot bool) {
+	defer func(prevAtRoot bool, prevInsideDataSource bool) {
 		inScope.atRoot = prevAtRoot
-	}(inScope.atRoot)
+		b.insideDataSource = prevInsideDataSource
+	}(inScope.atRoot, b.insideDataSource)
 	inScope.atRoot = false
+	b.insideDataSource = true
 	// NB: The case statements are sorted lexicographically.
-	switch source := texpr.(type) {
+	switch source := (texpr).(type) {
 	case *tree.AliasedTableExpr:
 		if source.IndexFlags != nil {
 			telemetry.Inc(sqltelemetry.IndexHintUseCounter)
 			telemetry.Inc(sqltelemetry.IndexHintSelectUseCounter)
 			indexFlags = source.IndexFlags
 		}
+
+		if source.As.Alias == "" {
+			// The alias is an empty string. If we are in a view or UDF
+			// definition, we are also expanding stars and for this we need
+			// to ensure all unnamed subqueries have a name. (unnamed
+			// subqueries are a CRDB extension, so the behavior in that case
+			// can be CRDB-specific.)
+			//
+			// We do not perform this name assignment in the common case
+			// (everything else besides CREATE VIEW/FUNCTION) so as to save
+			// the cost of the string alloc / name propagation.
+			if _, ok := source.Expr.(*tree.Subquery); ok && (b.insideFuncDef || b.insideViewDef) {
+				b.subqueryNameIdx++
+				// The structure of this name is analogous to the auto-generated
+				// names for anonymous scalar expressions.
+				source.As.Alias = tree.Name(fmt.Sprintf("?subquery%d?", b.subqueryNameIdx))
+			}
+		}
+
 		if source.As.Alias != "" {
-			inScope = inScope.push()
 			inScope.alias = &source.As
 			locking = locking.filter(source.As.Alias)
 		}
@@ -102,13 +127,13 @@ func (b *Builder) buildDataSource(
 				InCols:  inCols,
 				OutCols: outCols,
 				ID:      b.factory.Metadata().NextUniqueID(),
+				Mtr:     cte.mtr,
 			})
 
 			return outScope
 		}
 
 		ds, depName, resName := b.resolveDataSource(tn, privilege.SELECT)
-
 		locking = locking.filter(tn.ObjectName)
 		if locking.isSet() {
 			// SELECT ... FOR [KEY] UPDATE/SHARE also requires UPDATE privileges.
@@ -166,6 +191,11 @@ func (b *Builder) buildDataSource(
 		// This is the special '[ ... ]' syntax. We treat this as syntactic sugar
 		// for a top-level CTE, so it cannot refer to anything in the input scope.
 		// See #41078.
+		if b.insideFuncDef {
+			panic(unimplemented.NewWithIssue(
+				92961, "statement source (square bracket syntax) within user-defined function",
+			))
+		}
 		emptyScope := b.allocScope()
 		innerScope := b.buildStmt(source.Statement, nil /* desiredTypes */, emptyScope)
 		if len(innerScope.cols) == 0 {
@@ -208,6 +238,7 @@ func (b *Builder) buildDataSource(
 			InCols:  inCols,
 			OutCols: outCols,
 			ID:      b.factory.Metadata().NextUniqueID(),
+			Mtr:     cte.mtr,
 		})
 
 		return outScope
@@ -251,6 +282,17 @@ func (b *Builder) buildDataSource(
 func (b *Builder) buildView(
 	view cat.View, viewName *tree.TableName, locking lockingSpec, inScope *scope,
 ) (outScope *scope) {
+	if b.sourceViews == nil {
+		b.sourceViews = make(map[string]struct{})
+	}
+	// Check whether there is a circular dependency between views.
+	if _, ok := b.sourceViews[viewName.FQString()]; ok {
+		panic(pgerror.Newf(pgcode.InvalidObjectDefinition, "cyclic view dependency for relation %s", viewName))
+	}
+	b.sourceViews[viewName.FQString()] = struct{}{}
+	defer func() {
+		delete(b.sourceViews, viewName.FQString())
+	}()
 	// Cache the AST so that multiple references won't need to reparse.
 	if b.views == nil {
 		b.views = make(map[cat.View]*tree.Select)
@@ -429,16 +471,20 @@ func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta 
 // errorOnInvalidMultiregionDB panics if the table described by tabMeta is owned
 // by a non-multiregion database or a multiregion database with SURVIVE REGION
 // FAILURE goal.
-func errorOnInvalidMultiregionDB(evalCtx *eval.Context, tabMeta *opt.TableMeta) {
-	survivalGoal, ok := tabMeta.GetDatabaseSurvivalGoal(evalCtx.Planner)
+func errorOnInvalidMultiregionDB(
+	ctx context.Context, evalCtx *eval.Context, tabMeta *opt.TableMeta,
+) {
+	survivalGoal, ok := tabMeta.GetDatabaseSurvivalGoal(ctx, evalCtx.Planner)
 	// non-multiregional database or SURVIVE REGION FAILURE option
 	if !ok {
-		err := pgerror.New(pgcode.QueryHasNoHomeRegion,
-			"Query has no home region. Try accessing only tables in multi-region databases with ZONE survivability.")
+		err := pgerror.Newf(pgcode.QueryHasNoHomeRegion,
+			"Query has no home region. Try accessing only tables in multi-region databases with ZONE survivability. %s",
+			sqlerrors.EnforceHomeRegionFurtherInfo)
 		panic(err)
 	} else if survivalGoal == descpb.SurvivalGoal_REGION_FAILURE {
-		err := pgerror.New(pgcode.QueryHasNoHomeRegion,
-			"The enforce_home_region setting cannot be combined with REGION survivability. Try accessing only tables in multi-region databases with ZONE survivability.")
+		err := pgerror.Newf(pgcode.QueryHasNoHomeRegion,
+			"The enforce_home_region setting cannot be combined with REGION survivability. Try accessing only tables in multi-region databases with ZONE survivability. %s",
+			sqlerrors.EnforceHomeRegionFurtherInfo)
 		panic(err)
 	}
 }
@@ -535,14 +581,36 @@ func (b *Builder) buildScan(
 		private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}
 		outScope.expr = b.factory.ConstructScan(&private)
 
+		// Add the partial indexes after constructing the scan so we can use the
+		// logical properties of the scan to fully normalize the index predicates.
+		b.addPartialIndexPredicatesForTable(tabMeta, outScope.expr)
+
 		// Note: virtual tables should not be collected as view dependencies.
 		return outScope
 	}
 
 	// Scanning tables in databases that don't use the SURVIVE ZONE FAILURE option
 	// is disallowed when EnforceHomeRegion is true.
-	if b.evalCtx.SessionData().EnforceHomeRegion {
-		errorOnInvalidMultiregionDB(b.evalCtx, tabMeta)
+	if b.evalCtx.SessionData().EnforceHomeRegion && statements.IsANSIDML(b.stmt) {
+		errorOnInvalidMultiregionDB(b.ctx, b.evalCtx, tabMeta)
+		// Populate the remote regions touched by the multiregion database used in
+		// this query. If a query dynamically errors out as having no home region,
+		// the query will be replanned with each of the remote regions,
+		// one-at-a-time, with AOST follower_read_timestamp(). If one of these
+		// retries doesn't error out, that region will be reported to the user as
+		// the query's home region.
+		if len(b.evalCtx.RemoteRegions) == 0 {
+			if regionsNames, ok := tabMeta.GetRegionsInDatabase(b.ctx, b.evalCtx.Planner); ok {
+				if gatewayRegion, ok := b.evalCtx.Locality.Find("region"); ok {
+					b.evalCtx.RemoteRegions = make(catpb.RegionNames, 0, len(regionsNames))
+					for _, regionName := range regionsNames {
+						if string(regionName) != gatewayRegion {
+							b.evalCtx.RemoteRegions = append(b.evalCtx.RemoteRegions, regionName)
+						}
+					}
+				}
+			}
+		}
 	}
 
 	private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}
@@ -637,7 +705,7 @@ func (b *Builder) buildScan(
 
 	b.addCheckConstraintsForTable(tabMeta)
 	b.addComputedColsForTable(tabMeta)
-	b.addIndexPartitionLocalitiesForTable(tabMeta)
+	tabMeta.CacheIndexPartitionLocalities(b.evalCtx)
 
 	outScope.expr = b.factory.ConstructScan(&private)
 
@@ -808,21 +876,8 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 			var sharedProps props.Shared
 			memo.BuildSharedProps(scalar, &sharedProps, b.evalCtx)
 			if !sharedProps.VolatilitySet.HasStable() && !sharedProps.VolatilitySet.HasVolatile() {
-				tabMeta.AddComputedCol(colID, scalar)
+				tabMeta.AddComputedCol(colID, scalar, sharedProps.OuterCols)
 			}
-		}
-	}
-}
-
-// addIndexPartitionLocalitiesForTable caches locality prefix sorters in the
-// table metadata for indexes that have a mix of local and remote partitions.
-func (b *Builder) addIndexPartitionLocalitiesForTable(tabMeta *opt.TableMeta) {
-	tab := tabMeta.Table
-	for indexOrd, n := 0, tab.IndexCount(); indexOrd < n; indexOrd++ {
-		index := tab.Index(indexOrd)
-		if localPartitions, ok := partition.HasMixOfLocalAndRemotePartitions(b.evalCtx, index); ok {
-			ps := partition.GetSortedPrefixes(index, localPartitions, b.evalCtx)
-			tabMeta.AddIndexPartitionLocality(indexOrd, ps)
 		}
 	}
 }
@@ -890,6 +945,12 @@ func (b *Builder) buildWithOrdinality(inScope *scope) (outScope *scope) {
 func (b *Builder) buildSelectStmt(
 	stmt tree.SelectStatement, locking lockingSpec, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
+	// The top level in a select statement is not considered a data source.
+	oldInsideDataSource := b.insideDataSource
+	defer func() {
+		b.insideDataSource = oldInsideDataSource
+	}()
+	b.insideDataSource = false
 	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
 	case *tree.LiteralValuesClause:
@@ -1056,7 +1117,7 @@ func (b *Builder) buildSelectClause(
 	// function that refers to variables in fromScope or an ancestor scope,
 	// buildAggregateFunction is called which adds columns to the appropriate
 	// aggInScope and aggOutScope.
-	b.analyzeProjectionList(sel.Exprs, desiredTypes, fromScope, projectionsScope)
+	b.analyzeProjectionList(&sel.Exprs, desiredTypes, fromScope, projectionsScope)
 
 	// Any aggregates in the HAVING, ORDER BY and DISTINCT ON clauses (if they
 	// exist) will be added here.

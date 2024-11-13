@@ -128,8 +128,14 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.AlterTableOwner(ctx, n)
 	case *tree.AlterTableSetSchema:
 		return p.AlterTableSetSchema(ctx, n)
+	case *tree.AlterTenantCapability:
+		return p.AlterTenantCapability(ctx, n)
 	case *tree.AlterTenantSetClusterSetting:
 		return p.AlterTenantSetClusterSetting(ctx, n)
+	case *tree.AlterTenantRename:
+		return p.alterRenameTenant(ctx, n)
+	case *tree.AlterTenantService:
+		return p.alterTenantService(ctx, n)
 	case *tree.AlterType:
 		return p.AlterType(ctx, n)
 	case *tree.AlterRole:
@@ -152,6 +158,11 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.CommentOnIndex(ctx, n)
 	case *tree.CommentOnTable:
 		return p.CommentOnTable(ctx, n)
+	case *tree.CopyTo:
+		// COPY TO does not actually get prepared in any meaningful way. This means
+		// it can't have placeholder arguments, and the execution can use the same
+		// logic as if it were a simple query. This matches the Postgres behavior.
+		return &zeroNode{}, nil
 	case *tree.CreateDatabase:
 		return p.CreateDatabase(ctx, n)
 	case *tree.CreateIndex:
@@ -168,6 +179,8 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.CreateExtension(ctx, n)
 	case *tree.CreateExternalConnection:
 		return p.CreateExternalConnection(ctx, n)
+	case *tree.CreateTenant:
+		return p.CreateTenantNode(ctx, n)
 	case *tree.DropExternalConnection:
 		return p.DropExternalConnection(ctx, n)
 	case *tree.Deallocate:
@@ -192,6 +205,8 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.DropSequence(ctx, n)
 	case *tree.DropTable:
 		return p.DropTable(ctx, n)
+	case *tree.DropTenant:
+		return p.DropTenant(ctx, n)
 	case *tree.DropType:
 		return p.DropType(ctx, n)
 	case *tree.DropView:
@@ -237,7 +252,7 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 	case *tree.SetSessionAuthorizationDefault:
 		return p.SetSessionAuthorizationDefault()
 	case *tree.SetSessionCharacteristics:
-		return p.SetSessionCharacteristics(n)
+		return p.SetSessionCharacteristics(ctx, n)
 	case *tree.ShowClusterSetting:
 		return p.ShowClusterSetting(ctx, n)
 	case *tree.ShowTenantClusterSetting:
@@ -250,6 +265,8 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.ShowHistogram(ctx, n)
 	case *tree.ShowTableStats:
 		return p.ShowTableStats(ctx, n)
+	case *tree.ShowTenant:
+		return p.ShowTenant(ctx, n)
 	case *tree.ShowTraceForSession:
 		return p.ShowTrace(ctx, n)
 	case *tree.ShowVar:
@@ -304,7 +321,10 @@ func init() {
 		&tree.AlterTableLocality{},
 		&tree.AlterTableOwner{},
 		&tree.AlterTableSetSchema{},
+		&tree.AlterTenantCapability{},
+		&tree.AlterTenantRename{},
 		&tree.AlterTenantSetClusterSetting{},
+		&tree.AlterTenantService{},
 		&tree.AlterType{},
 		&tree.AlterSequence{},
 		&tree.AlterRole{},
@@ -316,9 +336,11 @@ func init() {
 		&tree.CommentOnIndex{},
 		&tree.CommentOnConstraint{},
 		&tree.CommentOnTable{},
+		&tree.CopyTo{},
 		&tree.CreateDatabase{},
 		&tree.CreateExtension{},
 		&tree.CreateExternalConnection{},
+		&tree.CreateTenant{},
 		&tree.CreateIndex{},
 		&tree.CreateSchema{},
 		&tree.CreateSequence{},
@@ -336,6 +358,7 @@ func init() {
 		&tree.DropSchema{},
 		&tree.DropSequence{},
 		&tree.DropTable{},
+		&tree.DropTenant{},
 		&tree.DropType{},
 		&tree.DropView{},
 		&tree.FetchCursor{},
@@ -365,6 +388,7 @@ func init() {
 		&tree.ShowCreateExternalConnections{},
 		&tree.ShowHistogram{},
 		&tree.ShowTableStats{},
+		&tree.ShowTenant{},
 		&tree.ShowTraceForSession{},
 		&tree.ShowZoneConfig{},
 		&tree.ShowFingerprints{},
@@ -376,13 +400,15 @@ func init() {
 		// CCL statements (without Export which has an optimizer operator).
 		&tree.AlterBackup{},
 		&tree.AlterBackupSchedule{},
+		&tree.AlterTenantReplication{},
 		&tree.Backup{},
 		&tree.ShowBackup{},
 		&tree.Restore{},
 		&tree.CreateChangefeed{},
+		&tree.ScheduledChangefeed{},
 		&tree.Import{},
 		&tree.ScheduledBackup{},
-		&tree.StreamIngestion{},
+		&tree.CreateTenantFromReplication{},
 	} {
 		typ := optbuilder.OpaqueReadOnly
 		if tree.CanModifySchema(stmt) {

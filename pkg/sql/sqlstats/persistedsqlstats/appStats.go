@@ -13,7 +13,7 @@ package persistedsqlstats
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/ssmemstorage"
 	"github.com/cockroachdb/errors"
@@ -34,9 +34,9 @@ var _ sqlstats.ApplicationStats = &ApplicationStats{}
 
 // RecordStatement implements sqlstats.ApplicationStats interface.
 func (s *ApplicationStats) RecordStatement(
-	ctx context.Context, key roachpb.StatementStatisticsKey, value sqlstats.RecordedStmtStats,
-) (roachpb.StmtFingerprintID, error) {
-	var fingerprintID roachpb.StmtFingerprintID
+	ctx context.Context, key appstatspb.StatementStatisticsKey, value sqlstats.RecordedStmtStats,
+) (appstatspb.StmtFingerprintID, error) {
+	var fingerprintID appstatspb.StmtFingerprintID
 	err := s.recordStatsOrSendMemoryPressureSignal(func() (err error) {
 		fingerprintID, err = s.ApplicationStats.RecordStatement(ctx, key, value)
 		return err
@@ -44,17 +44,17 @@ func (s *ApplicationStats) RecordStatement(
 	return fingerprintID, err
 }
 
-// ShouldSaveLogicalPlanDesc implements sqlstats.ApplicationStats interface.
-func (s *ApplicationStats) ShouldSaveLogicalPlanDesc(
+// ShouldSample implements sqlstats.ApplicationStats interface.
+func (s *ApplicationStats) ShouldSample(
 	fingerprint string, implicitTxn bool, database string,
-) bool {
-	return s.ApplicationStats.ShouldSaveLogicalPlanDesc(fingerprint, implicitTxn, database)
+) (bool, bool) {
+	return s.ApplicationStats.ShouldSample(fingerprint, implicitTxn, database)
 }
 
 // RecordTransaction implements sqlstats.ApplicationStats interface and saves
 // per-transaction statistics.
 func (s *ApplicationStats) RecordTransaction(
-	ctx context.Context, key roachpb.TransactionFingerprintID, value sqlstats.RecordedTxnStats,
+	ctx context.Context, key appstatspb.TransactionFingerprintID, value sqlstats.RecordedTxnStats,
 ) error {
 	return s.recordStatsOrSendMemoryPressureSignal(func() error {
 		return s.ApplicationStats.RecordTransaction(ctx, key, value)

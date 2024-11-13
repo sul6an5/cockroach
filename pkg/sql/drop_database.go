@@ -13,17 +13,18 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -60,14 +61,14 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 	}
 
 	// Check that the database exists.
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
-		tree.DatabaseLookupFlags{Required: !n.IfExists})
+	if db, err := p.Descriptors().ByName(p.txn).MaybeGet().Database(ctx, string(n.Name)); err != nil {
+		return nil, err
+	} else if db == nil && n.IfExists {
+		return newZeroNode(nil /* columns */), nil
+	}
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.Name))
 	if err != nil {
 		return nil, err
-	}
-	if dbDesc == nil {
-		// IfExists was specified and database was not found.
-		return newZeroNode(nil /* columns */), nil
 	}
 
 	if err := p.CheckPrivilege(ctx, dbDesc, privilege.DROP); err != nil {
@@ -82,12 +83,7 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 	d := newDropCascadeState()
 
 	for _, schema := range schemas {
-		res, err := p.Descriptors().GetSchemaByName(
-			ctx, p.txn, dbDesc, schema, tree.SchemaLookupFlags{
-				Required:       true,
-				RequireMutable: true,
-			},
-		)
+		res, err := p.Descriptors().ByName(p.txn).Get().Schema(ctx, dbDesc, schema)
 		if err != nil {
 			return nil, err
 		}
@@ -129,6 +125,12 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	ctx := params.ctx
 	p := params.p
 
+	// Exit early with an error if the schema is undergoing a declarative schema
+	// change.
+	if catalog.HasConcurrentDeclarativeSchemaChange(n.dbDesc) {
+		return scerrors.ConcurrentSchemaChangeError(n.dbDesc)
+	}
+
 	// Drop all of the collected objects.
 	if err := n.d.dropAllCollectedObjects(ctx, p); err != nil {
 		return err
@@ -138,18 +140,31 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	for _, schemaWithDbDesc := range n.d.schemasToDelete {
 		schemaToDelete := schemaWithDbDesc.schema
 		switch schemaToDelete.SchemaKind() {
-		case catalog.SchemaTemporary, catalog.SchemaPublic:
-			// The public schema and temporary schemas are cleaned up by just removing
-			// the existing namespace entries.
-			key := catalogkeys.MakeSchemaNameKey(p.ExecCfg().Codec, n.dbDesc.GetID(), schemaToDelete.GetName())
-			if _, err := p.txn.Del(ctx, key); err != nil {
+		case catalog.SchemaPublic:
+			b := &kv.Batch{}
+			if err := p.Descriptors().DeleteDescriptorlessPublicSchemaToBatch(
+				ctx, p.ExtendedEvalContext().Tracing.KVTracingEnabled(), n.dbDesc, b,
+			); err != nil {
+				return err
+			}
+			if err := p.txn.Run(ctx, b); err != nil {
+				return err
+			}
+		case catalog.SchemaTemporary:
+			b := &kv.Batch{}
+			if err := p.Descriptors().DeleteTempSchemaToBatch(
+				ctx, p.ExtendedEvalContext().Tracing.KVTracingEnabled(), n.dbDesc, schemaToDelete.GetName(), b,
+			); err != nil {
+				return err
+			}
+			if err := p.txn.Run(ctx, b); err != nil {
 				return err
 			}
 		case catalog.SchemaUserDefined:
 			// For user defined schemas, we have to do a bit more work.
-			mutDesc, ok := schemaToDelete.(*schemadesc.Mutable)
-			if !ok {
-				return errors.AssertionFailedf("expected Mutable, found %T", schemaToDelete)
+			mutDesc, err := p.Descriptors().MutableByID(p.txn).Schema(ctx, schemaToDelete.GetID())
+			if err != nil {
+				return err
 			}
 			if err := params.p.dropSchemaImpl(ctx, n.dbDesc, mutDesc); err != nil {
 				return err
@@ -158,20 +173,21 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		}
 	}
 
-	if err := p.createDropDatabaseJob(
+	p.createDropDatabaseJob(
 		ctx,
 		n.dbDesc.GetID(),
 		schemasIDsToDelete,
 		n.d.getDroppedTableDetails(),
 		n.d.typesToDelete,
+		n.d.functionsToDelete,
 		tree.AsStringWithFQNames(n.n, params.Ann()),
-	); err != nil {
-		return err
-	}
+	)
 
 	n.dbDesc.SetDropped()
 	b := p.txn.NewBatch()
-	p.dropNamespaceEntry(ctx, b, n.dbDesc)
+	if err := p.dropNamespaceEntry(ctx, b, n.dbDesc); err != nil {
+		return err
+	}
 
 	// Note that a job was already queued above.
 	if err := p.writeDatabaseChangeToBatch(ctx, n.dbDesc, b); err != nil {
@@ -183,15 +199,20 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 
 	metadataUpdater := descmetadata.NewMetadataUpdater(
 		ctx,
-		p.ExecCfg().InternalExecutorFactory,
+		p.InternalSQLTxn(),
 		p.Descriptors(),
 		&p.ExecCfg().Settings.SV,
-		p.txn,
 		p.SessionData(),
 	)
 
 	err := metadataUpdater.DeleteDatabaseRoleSettings(ctx, n.dbDesc.GetID())
 	if err != nil {
+		return err
+	}
+
+	if err := p.deleteComment(
+		ctx, n.dbDesc.GetID(), 0 /* subID */, catalogkeys.DatabaseCommentType,
+	); err != nil {
 		return err
 	}
 
@@ -232,8 +253,9 @@ func (p *planner) accumulateAllObjectsToDelete(
 	ctx context.Context, objects []toDelete,
 ) ([]*tabledesc.Mutable, map[descpb.ID]*tabledesc.Mutable, error) {
 	implicitDeleteObjects := make(map[descpb.ID]*tabledesc.Mutable)
+	visited := make(map[descpb.ID]struct{})
 	for _, toDel := range objects {
-		err := p.accumulateCascadingViews(ctx, implicitDeleteObjects, toDel.desc)
+		err := p.accumulateCascadingViews(ctx, implicitDeleteObjects, visited, toDel.desc)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -266,7 +288,7 @@ func (p *planner) accumulateOwnedSequences(
 ) error {
 	for colID := range desc.GetColumns() {
 		for _, seqID := range desc.GetColumns()[colID].OwnsSequenceIds {
-			ownedSeqDesc, err := p.Descriptors().GetMutableTableVersionByID(ctx, seqID, p.txn)
+			ownedSeqDesc, err := p.Descriptors().MutableByID(p.txn).Table(ctx, seqID)
 			if err != nil {
 				// Special case error swallowing for #50711 and #50781, which can
 				// cause columns to own sequences that have been dropped/do not
@@ -290,10 +312,14 @@ func (p *planner) accumulateOwnedSequences(
 // references, which means this list can't be constructed by simply scanning
 // the namespace table.
 func (p *planner) accumulateCascadingViews(
-	ctx context.Context, dependentObjects map[descpb.ID]*tabledesc.Mutable, desc *tabledesc.Mutable,
+	ctx context.Context,
+	dependentObjects map[descpb.ID]*tabledesc.Mutable,
+	visited map[descpb.ID]struct{},
+	desc *tabledesc.Mutable,
 ) error {
+	visited[desc.ID] = struct{}{}
 	for _, ref := range desc.DependedOnBy {
-		desc, err := p.Descriptors().GetMutableDescriptorByID(ctx, p.txn, ref.ID)
+		desc, err := p.Descriptors().MutableByID(p.txn).Desc(ctx, ref.ID)
 		if err != nil {
 			return err
 		}
@@ -306,8 +332,15 @@ func (p *planner) accumulateCascadingViews(
 		if !dependentDesc.IsView() {
 			continue
 		}
+
+		_, seen := visited[ref.ID]
+		if dependentObjects[ref.ID] == dependentDesc || seen {
+			// This view's dependencies are already added.
+			continue
+		}
 		dependentObjects[ref.ID] = dependentDesc
-		if err := p.accumulateCascadingViews(ctx, dependentObjects, dependentDesc); err != nil {
+
+		if err := p.accumulateCascadingViews(ctx, dependentObjects, visited, dependentDesc); err != nil {
 			return err
 		}
 	}

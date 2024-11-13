@@ -72,7 +72,7 @@ func InjectDescriptors(
 		// Pick out the databases and inject them.
 		databases, others := findDatabases(descriptors)
 		for _, db := range databases {
-			id, _, name, _, _, err := descpb.GetDescriptorMetadata(db)
+			id, _, name, _, err := descpb.GetDescriptorMetadata(db)
 			if err != nil {
 				return err
 			}
@@ -91,7 +91,7 @@ func InjectDescriptors(
 		// Inject the other descriptors - this won't do much in the way of
 		// validation.
 		for _, d := range others {
-			id, _, _, _, _, err := descpb.GetDescriptorMetadata(d)
+			id, _, _, _, err := descpb.GetDescriptorMetadata(d)
 			if err != nil {
 				return err
 			}
@@ -101,7 +101,11 @@ func InjectDescriptors(
 		}
 		// Inject the namespace entries.
 		for _, d := range others {
-			id, _, name, _, _, err := descpb.GetDescriptorMetadata(d)
+			if d.GetFunction() != nil {
+				// Functions doesn't have namespace entry.
+				continue
+			}
+			id, _, name, _, err := descpb.GetDescriptorMetadata(d)
 			if err != nil {
 				return err
 			}
@@ -145,5 +149,7 @@ func resetVersionAndModificationTime(d *descpb.Descriptor) {
 		d.Type.Version = 1
 	case *descpb.Descriptor_Table:
 		d.Table.Version = 1
+	case *descpb.Descriptor_Function:
+		d.Function.Version = 1
 	}
 }

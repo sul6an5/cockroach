@@ -19,8 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
@@ -636,6 +638,7 @@ func TestInvertedJoiner(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -665,11 +668,11 @@ func TestInvertedJoiner(t *testing.T) {
 				for _, c := range td.IndexFullColumns(index) {
 					fetchColIDs = append(fetchColIDs, c.GetID())
 				}
-				invCol, err := td.FindColumnWithID(index.InvertedColumnID())
+				invCol, err := catalog.MustFindColumnByID(td, index.InvertedColumnID())
 				if err != nil {
 					t.Fatal(err)
 				}
-				var fetchSpec descpb.IndexFetchSpec
+				var fetchSpec fetchpb.IndexFetchSpec
 				if err := rowenc.InitIndexFetchSpec(
 					&fetchSpec,
 					keys.SystemSQLCodec,
@@ -688,6 +691,7 @@ func TestInvertedJoiner(t *testing.T) {
 				}
 
 				ij, err := newInvertedJoiner(
+					ctx,
 					&flowCtx,
 					0, /* processorID */
 					&execinfrapb.InvertedJoinerSpec{
@@ -704,12 +708,11 @@ func TestInvertedJoiner(t *testing.T) {
 					c.datumsToExpr,
 					in,
 					&post,
-					out,
 				)
 				require.NoError(t, err)
 				// Small batch size to exercise multiple batches.
 				ij.(*invertedJoiner).SetBatchSize(2)
-				ij.Run(ctx)
+				ij.Run(ctx, out)
 				require.True(t, in.Done)
 				require.True(t, out.ProducerClosed())
 
@@ -776,6 +779,7 @@ func TestInvertedJoinerDrain(t *testing.T) {
 	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -784,8 +788,8 @@ func TestInvertedJoinerDrain(t *testing.T) {
 		DiskMonitor: diskMonitor,
 	}
 
-	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
-		var fetchSpec descpb.IndexFetchSpec
+	testReaderProcessorDrain(ctx, t, func() (execinfra.Processor, error) {
+		var fetchSpec fetchpb.IndexFetchSpec
 		if err := rowenc.InitIndexFetchSpec(
 			&fetchSpec,
 			keys.SystemSQLCodec,
@@ -795,6 +799,7 @@ func TestInvertedJoinerDrain(t *testing.T) {
 			t.Fatal(err)
 		}
 		return newInvertedJoiner(
+			ctx,
 			&flowCtx,
 			0, /* processorID */
 			&execinfrapb.InvertedJoinerSpec{
@@ -805,7 +810,6 @@ func TestInvertedJoinerDrain(t *testing.T) {
 			arrayIntersectionExpr{t: t},
 			distsqlutils.NewRowBuffer(types.TwoIntCols, nil /* rows */, distsqlutils.RowBufferArgs{}),
 			&execinfrapb.PostProcessSpec{},
-			out,
 		)
 	})
 }

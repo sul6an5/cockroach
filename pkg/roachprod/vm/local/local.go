@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
@@ -82,12 +82,13 @@ func DeleteCluster(l *logger.Logger, name string) error {
 	l.Printf("Deleting local cluster %s\n", name)
 
 	for i := range c.VMs {
-		if err := os.RemoveAll(VMDir(c.Name, i+1)); err != nil {
+		path := VMDir(c.Name, i+1)
+		if err := os.RemoveAll(path); err != nil {
 			return err
 		}
 	}
 
-	if err := p.storage.DeleteCluster(name); err != nil {
+	if err := p.storage.DeleteCluster(l, name); err != nil {
 		return err
 	}
 
@@ -106,10 +107,10 @@ type VMStorage interface {
 	// SaveCluster saves the metadata for a local cluster. It is expected that
 	// when the program runs again, this same metadata will be reported via
 	// AddCluster.
-	SaveCluster(cluster *cloud.Cluster) error
+	SaveCluster(l *logger.Logger, cluster *cloud.Cluster) error
 
 	// DeleteCluster deletes the metadata for a local cluster.
-	DeleteCluster(name string) error
+	DeleteCluster(l *logger.Logger, name string) error
 }
 
 // A Provider is used to create stub VM objects.
@@ -117,6 +118,20 @@ type Provider struct {
 	clusters cloud.Clusters
 
 	storage VMStorage
+}
+
+func (p *Provider) SnapshotVolume(
+	l *logger.Logger, volume vm.Volume, name, description string, labels map[string]string,
+) (string, error) {
+	return "", nil
+}
+
+func (p *Provider) CreateVolume(*logger.Logger, vm.VolumeCreateOpts) (vm.Volume, error) {
+	return vm.Volume{}, nil
+}
+
+func (p *Provider) AttachVolumeToVM(*logger.Logger, vm.Volume, *vm.VM) (string, error) {
+	return "", nil
 }
 
 // No-op implementation of vm.ProviderOpts
@@ -131,12 +146,12 @@ func (o *providerOpts) ConfigureClusterFlags(*pflag.FlagSet, vm.MultipleProjects
 }
 
 // CleanSSH is part of the vm.Provider interface.  This implementation is a no-op.
-func (p *Provider) CleanSSH() error {
+func (p *Provider) CleanSSH(l *logger.Logger) error {
 	return nil
 }
 
 // ConfigSSH is part of the vm.Provider interface.  This implementation is a no-op.
-func (p *Provider) ConfigSSH(zones []string) error {
+func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
 	return nil
 }
 
@@ -158,7 +173,7 @@ func (p *Provider) Create(
 
 	// We will need to assign ports to the nodes, and they must not conflict with
 	// any other local clusters.
-	var portsTaken util.FastIntSet
+	var portsTaken intsets.Fast
 	for _, c := range p.clusters {
 		for i := range c.VMs {
 			portsTaken.Add(c.VMs[i].SQLPort)
@@ -197,13 +212,13 @@ func (p *Provider) Create(
 			AdminUIPort:      getPort(&adminUIPort),
 			LocalClusterName: c.Name,
 		}
-
-		err := os.MkdirAll(VMDir(c.Name, i+1), 0755)
+		path := VMDir(c.Name, i+1)
+		err := os.MkdirAll(path, 0755)
 		if err != nil {
 			return err
 		}
 	}
-	if err := p.storage.SaveCluster(c); err != nil {
+	if err := p.storage.SaveCluster(l, c); err != nil {
 		return err
 	}
 	p.clusters[c.Name] = c
@@ -211,22 +226,22 @@ func (p *Provider) Create(
 }
 
 // Delete is part of the vm.Provider interface.
-func (p *Provider) Delete(vms vm.List) error {
+func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 	panic("DeleteCluster should be used")
 }
 
 // Reset is part of the vm.Provider interface. This implementation is a no-op.
-func (p *Provider) Reset(vms vm.List) error {
+func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 	return nil
 }
 
 // Extend is part of the vm.Provider interface.  This implementation returns an error.
-func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
+func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
 	return errors.New("local clusters have unlimited lifetime")
 }
 
 // FindActiveAccount is part of the vm.Provider interface. This implementation is a no-op.
-func (p *Provider) FindActiveAccount() (string, error) {
+func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 	return "", nil
 }
 
@@ -236,7 +251,7 @@ func (p *Provider) CreateProviderOpts() vm.ProviderOpts {
 }
 
 // List reports all the local cluster "VM" instances.
-func (p *Provider) List(l *logger.Logger) (vm.List, error) {
+func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) {
 	var result vm.List
 	for _, clusterName := range p.clusters.Names() {
 		c := p.clusters[clusterName]

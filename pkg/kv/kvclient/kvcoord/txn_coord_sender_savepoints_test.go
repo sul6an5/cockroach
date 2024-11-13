@@ -20,11 +20,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -42,7 +43,7 @@ func TestSavepoints(t *testing.T) {
 	abortKey := roachpb.Key("abort")
 	errKey := roachpb.Key("injectErr")
 
-	datadriven.Walk(t, testutils.TestDataPath(t, "savepoints"), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "savepoints"), func(t *testing.T, path string) {
 		// We want to inject txn abort errors in some cases.
 		//
 		// We do this by injecting the error from "underneath" the
@@ -51,14 +52,14 @@ func TestSavepoints(t *testing.T) {
 		var doAbort int64
 		params.Knobs.Store = &kvserver.StoreTestingKnobs{
 			EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-				TestingEvalFilter: func(args kvserverbase.FilterArgs) *roachpb.Error {
+				TestingEvalFilter: func(args kvserverbase.FilterArgs) *kvpb.Error {
 					key := args.Req.Header().Key
 					if atomic.LoadInt64(&doAbort) != 0 && key.Equal(abortKey) {
-						return roachpb.NewErrorWithTxn(
-							roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_UNKNOWN), args.Hdr.Txn)
+						return kvpb.NewErrorWithTxn(
+							kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_UNKNOWN), args.Hdr.Txn)
 					}
 					if key.Equal(errKey) {
-						return roachpb.NewErrorf("injected error")
+						return kvpb.NewErrorf("injected error")
 					}
 					return nil
 				},
@@ -94,7 +95,7 @@ func TestSavepoints(t *testing.T) {
 				ptxn()
 
 			case "commit":
-				if err := txn.CommitOrCleanup(ctx); err != nil {
+				if err := txn.Commit(ctx); err != nil {
 					fmt.Fprintf(&buf, "(%T) %v\n", err, err)
 				}
 
@@ -160,7 +161,7 @@ func TestSavepoints(t *testing.T) {
 					[]byte(td.CmdArgs[1].Key),
 					expVal,
 				); err != nil {
-					if errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
+					if errors.HasType(err, (*kvpb.ConditionFailedError)(nil)) {
 						// Print an easier to match message.
 						fmt.Fprintf(&buf, "(%T) unexpected value\n", err)
 					} else {

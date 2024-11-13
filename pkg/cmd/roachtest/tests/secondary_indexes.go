@@ -12,10 +12,13 @@ package tests
 
 import (
 	"context"
+	"runtime"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,9 +43,6 @@ func runIndexUpgrade(
 	}
 
 	roachNodes := c.All()
-	// An empty string means that the cockroach binary specified by flag
-	// `cockroach` will be used.
-	const mainVersion = ""
 	u := newVersionUpgradeTest(c,
 		uploadAndStart(roachNodes, predecessorVersion),
 		waitForUpgradeStep(roachNodes),
@@ -51,7 +51,7 @@ func runIndexUpgrade(
 		createDataStep(),
 
 		// Upgrade one of the nodes.
-		binaryUpgradeStep(c.Node(1), mainVersion),
+		binaryUpgradeStep(c.Node(1), clusterupgrade.MainVersion),
 
 		// Modify index data from that node.
 		modifyData(1,
@@ -65,8 +65,8 @@ func runIndexUpgrade(
 		verifyTableData(3, firstExpected),
 
 		// Upgrade the rest of the cluster.
-		binaryUpgradeStep(c.Node(2), mainVersion),
-		binaryUpgradeStep(c.Node(3), mainVersion),
+		binaryUpgradeStep(c.Node(2), clusterupgrade.MainVersion),
+		binaryUpgradeStep(c.Node(3), clusterupgrade.MainVersion),
 
 		// Finalize the upgrade.
 		allowAutoUpgradeStep(1),
@@ -137,10 +137,13 @@ func verifyTableData(node int, expected [][]int) versionStep {
 func registerSecondaryIndexesMultiVersionCluster(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    "schemachange/secondary-index-multi-version",
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(3),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			predV, err := PredecessorVersion(*t.BuildVersion())
+			if c.IsLocal() && runtime.GOARCH == "arm64" {
+				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+			}
+			predV, err := version.PredecessorVersion(*t.BuildVersion())
 			if err != nil {
 				t.Fatal(err)
 			}

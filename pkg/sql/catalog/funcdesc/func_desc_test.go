@@ -51,49 +51,99 @@ func TestValidateFuncDesc(t *testing.T) {
 		tableWithFuncBackRefID    = dbID + 5
 		tableWithFuncForwardRefID = dbID + 6
 		typeWithFuncRefID         = dbID + 7
+		viewID                    = dbID + 8
+		tableWithBadConstraint    = dbID + 9
+		tableWithGoodConstraint   = dbID + 10
+		tableWithBadColumn        = dbID + 11
+		tableWIthGoodColumn       = dbID + 12
 	)
 	funcDescID := descpb.ID(bootstrap.TestingUserDescID(0))
 
 	var cb nstree.MutableCatalog
-	cb.UpsertDescriptorEntry(dbdesc.NewBuilder(&descpb.DatabaseDescriptor{
+	cb.UpsertDescriptor(dbdesc.NewBuilder(&descpb.DatabaseDescriptor{
 		Name: "db",
 		ID:   dbID,
 	}).BuildImmutable())
-	cb.UpsertDescriptorEntry(schemadesc.NewBuilder(&descpb.SchemaDescriptor{
+	cb.UpsertDescriptor(schemadesc.NewBuilder(&descpb.SchemaDescriptor{
 		ID:       schemaID,
 		ParentID: dbID,
 		Name:     "schema",
 	}).BuildImmutable())
-	cb.UpsertDescriptorEntry(typedesc.NewBuilder(&descpb.TypeDescriptor{
+	cb.UpsertDescriptor(typedesc.NewBuilder(&descpb.TypeDescriptor{
 		ID:   typeID,
 		Name: "type",
 	}).BuildImmutable())
-	cb.UpsertDescriptorEntry(tabledesc.NewBuilder(&descpb.TableDescriptor{
+	cb.UpsertDescriptor(tabledesc.NewBuilder(&descpb.TableDescriptor{
 		ID:   tableID,
 		Name: "tbl",
 	}).BuildImmutable())
-	cb.UpsertDescriptorEntry(schemadesc.NewBuilder(&descpb.SchemaDescriptor{
+	cb.UpsertDescriptor(schemadesc.NewBuilder(&descpb.SchemaDescriptor{
 		ID:       schemaWithFuncRefID,
 		ParentID: dbID,
 		Name:     "schema",
 		Functions: map[string]descpb.SchemaDescriptor_Function{
-			"f": {Overloads: []descpb.SchemaDescriptor_FunctionOverload{{ID: funcDescID}}},
+			"f": {Signatures: []descpb.SchemaDescriptor_FunctionSignature{{ID: funcDescID}}},
 		},
 	}).BuildImmutable())
-	cb.UpsertDescriptorEntry(typedesc.NewBuilder(&descpb.TypeDescriptor{
+	cb.UpsertDescriptor(typedesc.NewBuilder(&descpb.TypeDescriptor{
 		ID:                       typeWithFuncRefID,
 		Name:                     "type",
 		ReferencingDescriptorIDs: []descpb.ID{funcDescID},
 	}).BuildImmutable())
-	cb.UpsertDescriptorEntry(tabledesc.NewBuilder(&descpb.TableDescriptor{
+	cb.UpsertDescriptor(tabledesc.NewBuilder(&descpb.TableDescriptor{
 		ID:           tableWithFuncBackRefID,
 		Name:         "tbl",
 		DependedOnBy: []descpb.TableDescriptor_Reference{{ID: funcDescID}},
 	}).BuildImmutable())
-	cb.UpsertDescriptorEntry(tabledesc.NewBuilder(&descpb.TableDescriptor{
+	cb.UpsertDescriptor(tabledesc.NewBuilder(&descpb.TableDescriptor{
 		ID:        tableWithFuncForwardRefID,
 		Name:      "tbl",
 		DependsOn: []descpb.ID{funcDescID},
+	}).BuildImmutable())
+	cb.UpsertDescriptor(tabledesc.NewBuilder(&descpb.TableDescriptor{
+		ID:        viewID,
+		Name:      "v",
+		ViewQuery: "some query",
+	}).BuildImmutable())
+	cb.UpsertDescriptor(tabledesc.NewBuilder(&descpb.TableDescriptor{
+		ID:   tableWithBadConstraint,
+		Name: "tbl_bad_constraint",
+		Checks: []*descpb.TableDescriptor_CheckConstraint{
+			{
+				Expr:         "[FUNCTION 100101] ()",
+				ConstraintID: 1,
+			},
+		},
+	}).BuildImmutable())
+	cb.UpsertDescriptor(tabledesc.NewBuilder(&descpb.TableDescriptor{
+		ID:   tableWithGoodConstraint,
+		Name: "tbl_good_constraint",
+		Checks: []*descpb.TableDescriptor_CheckConstraint{
+			{
+				Expr:         "[FUNCTION 100100] ()",
+				ConstraintID: 1,
+			},
+		},
+	}).BuildImmutable())
+	cb.UpsertDescriptor(tabledesc.NewBuilder(&descpb.TableDescriptor{
+		ID:   tableWithBadColumn,
+		Name: "tbl_bad_col",
+		Columns: []descpb.ColumnDescriptor{
+			{
+				ID:              1,
+				UsesFunctionIds: []descpb.ID{101},
+			},
+		},
+	}).BuildImmutable())
+	cb.UpsertDescriptor(tabledesc.NewBuilder(&descpb.TableDescriptor{
+		ID:   tableWIthGoodColumn,
+		Name: "tbl_good_col",
+		Columns: []descpb.ColumnDescriptor{
+			{
+				ID:              1,
+				UsesFunctionIds: []descpb.ID{100},
+			},
+		},
 	}).BuildImmutable())
 
 	defaultPrivileges := catpb.NewBasePrivilegeDescriptor(username.RootUserName())
@@ -140,7 +190,7 @@ func TestValidateFuncDesc(t *testing.T) {
 			},
 		},
 		{
-			"user testuser must not have SELECT privileges on function \"f\"",
+			"user testuser must not have [SELECT] privileges on function \"f\"",
 			descpb.FunctionDescriptor{
 				Name:           "f",
 				ID:             funcDescID,
@@ -170,7 +220,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 					},
@@ -178,7 +228,7 @@ func TestValidateFuncDesc(t *testing.T) {
 			},
 		},
 		{
-			"cannot set leakproof on function with non-immutable volatility: VOLATILE",
+			"leak proof function must be immutable, but got volatility: VOLATILE",
 			descpb.FunctionDescriptor{
 				Name:           "f",
 				ID:             funcDescID,
@@ -188,7 +238,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -209,7 +259,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -233,7 +283,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -258,7 +308,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -284,7 +334,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -310,7 +360,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -336,7 +386,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -352,6 +402,30 @@ func TestValidateFuncDesc(t *testing.T) {
 			},
 		},
 		{
+			"depended-on-by view \"v\" (1008) has no corresponding depends-on forward reference",
+			descpb.FunctionDescriptor{
+				Name:           "f",
+				ID:             funcDescID,
+				ParentID:       dbID,
+				ParentSchemaID: schemaWithFuncRefID,
+				Privileges:     defaultPrivileges,
+				ReturnType: descpb.FunctionDescriptor_ReturnType{
+					Type: types.Int,
+				},
+				Params: []descpb.FunctionDescriptor_Parameter{
+					{
+						Name: "arg1",
+						Type: types.Int,
+					},
+				},
+				LeakProof:  true,
+				Volatility: catpb.Function_IMMUTABLE,
+				DependedOnBy: []descpb.FunctionDescriptor_Reference{
+					{ID: viewID},
+				},
+			},
+		},
+		{
 			"depended-on-by table \"tbl\" (1003) has no corresponding depends-on forward reference",
 			descpb.FunctionDescriptor{
 				Name:           "f",
@@ -362,7 +436,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -388,7 +462,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -414,7 +488,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -440,7 +514,7 @@ func TestValidateFuncDesc(t *testing.T) {
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type: types.Int,
 				},
-				Args: []descpb.FunctionDescriptor_Argument{
+				Params: []descpb.FunctionDescriptor_Parameter{
 					{
 						Name: "arg1",
 						Type: types.Int,
@@ -455,16 +529,116 @@ func TestValidateFuncDesc(t *testing.T) {
 				DependsOnTypes: []descpb.ID{typeWithFuncRefID},
 			},
 		},
+		{
+			`constraint 1 in depended-on-by relation "tbl_bad_constraint" (1009) does not have reference to function "f" (100)`,
+			descpb.FunctionDescriptor{
+				Name:           "f",
+				ID:             funcDescID,
+				ParentID:       dbID,
+				ParentSchemaID: schemaWithFuncRefID,
+				Privileges:     defaultPrivileges,
+				ReturnType: descpb.FunctionDescriptor_ReturnType{
+					Type: types.Int,
+				},
+				Params: []descpb.FunctionDescriptor_Parameter{
+					{
+						Name: "arg1",
+						Type: types.Int,
+					},
+				},
+				LeakProof:  true,
+				Volatility: catpb.Function_IMMUTABLE,
+				DependedOnBy: []descpb.FunctionDescriptor_Reference{
+					{ID: tableWithBadConstraint, ConstraintIDs: []descpb.ConstraintID{1}},
+				},
+				DependsOn:      []descpb.ID{tableWithFuncBackRefID},
+				DependsOnTypes: []descpb.ID{typeWithFuncRefID},
+			},
+		},
+		{
+			``,
+			descpb.FunctionDescriptor{
+				Name:           "f",
+				ID:             funcDescID,
+				ParentID:       dbID,
+				ParentSchemaID: schemaWithFuncRefID,
+				Privileges:     defaultPrivileges,
+				ReturnType: descpb.FunctionDescriptor_ReturnType{
+					Type: types.Int,
+				},
+				Params: []descpb.FunctionDescriptor_Parameter{
+					{
+						Name: "arg1",
+						Type: types.Int,
+					},
+				},
+				LeakProof:  true,
+				Volatility: catpb.Function_IMMUTABLE,
+				DependedOnBy: []descpb.FunctionDescriptor_Reference{
+					{ID: tableWithGoodConstraint, ConstraintIDs: []descpb.ConstraintID{1}},
+				},
+				DependsOn:      []descpb.ID{tableWithFuncBackRefID},
+				DependsOnTypes: []descpb.ID{typeWithFuncRefID},
+			},
+		},
+		{
+			`column 1 in depended-on-by relation "tbl_bad_col" (1011) does not have reference to function "f" (100)`,
+			descpb.FunctionDescriptor{
+				Name:           "f",
+				ID:             funcDescID,
+				ParentID:       dbID,
+				ParentSchemaID: schemaWithFuncRefID,
+				Privileges:     defaultPrivileges,
+				ReturnType: descpb.FunctionDescriptor_ReturnType{
+					Type: types.Int,
+				},
+				Volatility: catpb.Function_IMMUTABLE,
+				DependedOnBy: []descpb.FunctionDescriptor_Reference{
+					{ID: tableWithBadColumn, ColumnIDs: []descpb.ColumnID{1}},
+				},
+				DependsOn:      []descpb.ID{tableWithFuncBackRefID},
+				DependsOnTypes: []descpb.ID{typeWithFuncRefID},
+			},
+		},
+		{
+			``,
+			descpb.FunctionDescriptor{
+				Name:           "f",
+				ID:             funcDescID,
+				ParentID:       dbID,
+				ParentSchemaID: schemaWithFuncRefID,
+				Privileges:     defaultPrivileges,
+				ReturnType: descpb.FunctionDescriptor_ReturnType{
+					Type: types.Int,
+				},
+				Volatility: catpb.Function_IMMUTABLE,
+				DependedOnBy: []descpb.FunctionDescriptor_Reference{
+					{ID: tableWIthGoodColumn, ColumnIDs: []descpb.ColumnID{1}},
+				},
+				DependsOn:      []descpb.ID{tableWithFuncBackRefID},
+				DependsOnTypes: []descpb.ID{typeWithFuncRefID},
+			},
+		},
 	}
 
 	for i, test := range testData {
 		desc := funcdesc.NewBuilder(&test.desc).BuildImmutable()
-		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
+		var expectedErr string
+		if test.err != "" {
+			expectedErr = fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
+		}
 		ve := cb.Validate(ctx, clusterversion.TestingClusterVersion, catalog.NoValidationTelemetry, validate.Write, desc)
-		if err := ve.CombinedError(); err == nil {
-			t.Errorf("#%d expected err: %s, but found nil: %v", i, expectedErr, test.desc)
-		} else if expectedErr != err.Error() {
-			t.Errorf("#%d expected err: %s, but found %s", i, expectedErr, err)
+		err := ve.CombinedError()
+		if expectedErr == "" {
+			if err != nil {
+				t.Errorf("#%d expected no err, but found %s", i, err)
+			}
+		} else {
+			if err == nil {
+				t.Errorf("#%d expected err: %s, but found nil: %v", i, expectedErr, test.desc)
+			} else if expectedErr != err.Error() {
+				t.Errorf("#%d expected err: %s, but found %s", i, expectedErr, err)
+			}
 		}
 	}
 }
@@ -479,7 +653,7 @@ func TestToOverload(t *testing.T) {
 			// Test all fields are properly valued.
 			desc: descpb.FunctionDescriptor{
 				ID:                1,
-				Args:              []descpb.FunctionDescriptor_Argument{{Name: "arg1", Type: types.Int}},
+				Params:            []descpb.FunctionDescriptor_Parameter{{Name: "arg1", Type: types.Int}},
 				ReturnType:        descpb.FunctionDescriptor_ReturnType{Type: types.Int, ReturnSet: true},
 				LeakProof:         true,
 				Volatility:        catpb.Function_IMMUTABLE,
@@ -488,11 +662,12 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ArgTypes{
+				Types: tree.ParamTypes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType: tree.FixedReturnType(types.Int),
 				ReturnSet:  true,
+				Class:      tree.GeneratorClass,
 				Volatility: volatility.Leakproof,
 				Body:       "ANY QUERIES",
 				IsUDF:      true,
@@ -502,7 +677,7 @@ func TestToOverload(t *testing.T) {
 			// Test ReturnSet matters.
 			desc: descpb.FunctionDescriptor{
 				ID:                1,
-				Args:              []descpb.FunctionDescriptor_Argument{{Name: "arg1", Type: types.Int}},
+				Params:            []descpb.FunctionDescriptor_Parameter{{Name: "arg1", Type: types.Int}},
 				ReturnType:        descpb.FunctionDescriptor_ReturnType{Type: types.Int, ReturnSet: false},
 				LeakProof:         true,
 				Volatility:        catpb.Function_IMMUTABLE,
@@ -511,7 +686,7 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ArgTypes{
+				Types: tree.ParamTypes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType: tree.FixedReturnType(types.Int),
@@ -525,7 +700,7 @@ func TestToOverload(t *testing.T) {
 			// Test Volatility matters.
 			desc: descpb.FunctionDescriptor{
 				ID:                1,
-				Args:              []descpb.FunctionDescriptor_Argument{{Name: "arg1", Type: types.Int}},
+				Params:            []descpb.FunctionDescriptor_Parameter{{Name: "arg1", Type: types.Int}},
 				ReturnType:        descpb.FunctionDescriptor_ReturnType{Type: types.Int, ReturnSet: true},
 				LeakProof:         false,
 				Volatility:        catpb.Function_STABLE,
@@ -534,10 +709,11 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ArgTypes{
+				Types: tree.ParamTypes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType: tree.FixedReturnType(types.Int),
+				Class:      tree.GeneratorClass,
 				ReturnSet:  true,
 				Volatility: volatility.Stable,
 				Body:       "ANY QUERIES",
@@ -548,7 +724,7 @@ func TestToOverload(t *testing.T) {
 			// Test CalledOnNullInput matters.
 			desc: descpb.FunctionDescriptor{
 				ID:                1,
-				Args:              []descpb.FunctionDescriptor_Argument{{Name: "arg1", Type: types.Int}},
+				Params:            []descpb.FunctionDescriptor_Parameter{{Name: "arg1", Type: types.Int}},
 				ReturnType:        descpb.FunctionDescriptor_ReturnType{Type: types.Int, ReturnSet: true},
 				LeakProof:         true,
 				Volatility:        catpb.Function_IMMUTABLE,
@@ -557,10 +733,11 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ArgTypes{
+				Types: tree.ParamTypes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType:        tree.FixedReturnType(types.Int),
+				Class:             tree.GeneratorClass,
 				ReturnSet:         true,
 				Volatility:        volatility.Leakproof,
 				Body:              "ANY QUERIES",
@@ -572,7 +749,7 @@ func TestToOverload(t *testing.T) {
 			// Test failure on non-immutable but leakproof function.
 			desc: descpb.FunctionDescriptor{
 				ID:                1,
-				Args:              []descpb.FunctionDescriptor_Argument{{Name: "arg1", Type: types.Int}},
+				Params:            []descpb.FunctionDescriptor_Parameter{{Name: "arg1", Type: types.Int}},
 				ReturnType:        descpb.FunctionDescriptor_ReturnType{Type: types.Int, ReturnSet: true},
 				LeakProof:         true,
 				Volatility:        catpb.Function_STABLE,
@@ -581,7 +758,7 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ArgTypes{
+				Types: tree.ParamTypes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType: tree.FixedReturnType(types.Int),

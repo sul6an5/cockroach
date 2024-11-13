@@ -8,8 +8,8 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React, { useMemo } from "react";
-import moment from "moment";
+import React, { useContext, useMemo } from "react";
+import moment from "moment-timezone";
 import classNames from "classnames/bind";
 import {
   ArrowDirection,
@@ -25,6 +25,8 @@ import RangeSelect, {
 import { defaultTimeScaleOptions, findClosestTimeScale } from "./utils";
 
 import styles from "./timeScale.module.scss";
+import { TimezoneContext } from "../contexts";
+import { FormatWithTimezone } from "../util";
 
 const cx = classNames.bind(styles);
 
@@ -40,6 +42,7 @@ export interface TimeScaleDropdownProps {
     timeWindow: TimeWindow,
   ) => TimeScale;
   hasCustomOption?: boolean;
+  className?: string;
 }
 
 export const getTimeLabel = (
@@ -73,6 +76,7 @@ export const getTimeLabel = (
 export const formatRangeSelectSelected = (
   currentWindow: TimeWindow,
   currentScale: TimeScale,
+  timezone: string,
 ): RangeSelectSelected => {
   const selected = {
     timeLabel: getTimeLabel(currentWindow),
@@ -91,8 +95,8 @@ export const formatRangeSelectSelected = (
       ...selected,
       dateStart: omitDayFormat ? "" : start.format(dateFormat),
       dateEnd: omitDayFormat || startEndOnSameDay ? "" : end.format(dateFormat),
-      timeStart: moment.utc(start).format(timeFormat),
-      timeEnd: moment.utc(end).format(timeFormat),
+      timeStart: FormatWithTimezone(start, timeFormat, timezone),
+      timeEnd: FormatWithTimezone(end, timeFormat, timezone),
     };
   } else {
     return selected;
@@ -129,6 +133,7 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
   setTimeScale,
   adjustTimeScaleOnChange,
   hasCustomOption = true,
+  className,
 }): React.ReactElement => {
   const end = currentScale.fixedWindowEnd
     ? moment.utc(currentScale.fixedWindowEnd)
@@ -137,6 +142,7 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
     start: moment.utc(end).subtract(currentScale.windowSize),
     end,
   };
+  const timezone = useContext(TimezoneContext);
 
   const onPresetOptionSelect = (rangeOption: RangeOption) => {
     let timeScale: TimeScale = {
@@ -253,9 +259,13 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
   };
 
   return (
-    <div className={cx("timescale")}>
+    <div className={`${cx("timescale")} ${className}`}>
       <RangeSelect
-        selected={formatRangeSelectSelected(currentWindow, currentScale)}
+        selected={formatRangeSelectSelected(
+          currentWindow,
+          currentScale,
+          timezone,
+        )}
         onPresetOptionSelect={onPresetOptionSelect}
         onCustomSelect={setDateRange}
         options={timeScaleOptions}

@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -38,7 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 const channelServerBrokenRangeMessage = "channelServer broken range"
@@ -60,7 +61,7 @@ func newChannelServer(bufSize int, maxSleep time.Duration) channelServer {
 
 func (s channelServer) HandleRaftRequest(
 	ctx context.Context, req *kvserverpb.RaftMessageRequest, _ kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	if s.maxSleep != 0 {
 		// maxSleep simulates goroutine scheduling delays that could
 		// result in messages being processed out of order (in previous
@@ -68,7 +69,7 @@ func (s channelServer) HandleRaftRequest(
 		time.Sleep(time.Duration(rand.Int63n(int64(s.maxSleep))))
 	}
 	if s.brokenRange != 0 && s.brokenRange == req.RangeID {
-		return roachpb.NewErrorf(channelServerBrokenRangeMessage)
+		return kvpb.NewErrorf(channelServerBrokenRangeMessage)
 	}
 	s.ch <- req
 	return nil
@@ -79,8 +80,8 @@ func (s channelServer) HandleRaftResponse(
 ) error {
 	// Mimic the logic in (*Store).HandleRaftResponse without requiring an
 	// entire Store object to be pulled into these tests.
-	if val, ok := resp.Union.GetValue().(*roachpb.Error); ok {
-		if err, ok := val.GetDetail().(*roachpb.StoreNotFoundError); ok {
+	if val, ok := resp.Union.GetValue().(*kvpb.Error); ok {
+		if err, ok := val.GetDetail().(*kvpb.StoreNotFoundError); ok {
 			return err
 		}
 	}
@@ -97,11 +98,9 @@ func (s channelServer) HandleSnapshot(
 }
 
 func (s channelServer) HandleDelegatedSnapshot(
-	ctx context.Context,
-	req *kvserverpb.DelegateSnapshotRequest,
-	stream kvserver.DelegateSnapshotResponseStream,
-) error {
-	panic("unimplemented")
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
+	panic("unexpected HandleDelegatedSnapshot")
 }
 
 // raftTransportTestContext contains objects needed to test RaftTransport.
@@ -124,12 +123,12 @@ func newRaftTransportTestContext(t testing.TB) *raftTransportTestContext {
 		transports: map[roachpb.NodeID]*kvserver.RaftTransport{},
 	}
 	rttc.nodeRPCContext = rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:  roachpb.SystemTenantID,
-		Config:    testutils.NewNodeTestBaseContext(),
-		Clock:     &timeutil.DefaultTimeSource{},
-		MaxOffset: time.Nanosecond,
-		Stopper:   rttc.stopper,
-		Settings:  cluster.MakeTestingClusterSettings(),
+		TenantID:        roachpb.SystemTenantID,
+		Config:          testutils.NewNodeTestBaseContext(),
+		Clock:           &timeutil.DefaultTimeSource{},
+		ToleratedOffset: time.Nanosecond,
+		Stopper:         rttc.stopper,
+		Settings:        cluster.MakeTestingClusterSettings(),
 	})
 	// Ensure that tests using this test context and restart/shut down
 	// their servers do not inadvertently start talking to servers from
@@ -140,10 +139,7 @@ func newRaftTransportTestContext(t testing.TB) *raftTransportTestContext {
 	// we can't enforce some of the RPC check validation.
 	rttc.nodeRPCContext.TestingAllowNamedRPCToAnonymousServer = true
 
-	server := rpc.NewServer(rttc.nodeRPCContext) // never started
-	rttc.gossip = gossip.NewTest(
-		1, rttc.nodeRPCContext, server, rttc.stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef(),
-	)
+	rttc.gossip = gossip.NewTest(1, rttc.stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
 	return rttc
 }
@@ -168,7 +164,8 @@ func (rttc *raftTransportTestContext) AddNode(nodeID roachpb.NodeID) *kvserver.R
 func (rttc *raftTransportTestContext) AddNodeWithoutGossip(
 	nodeID roachpb.NodeID, addr net.Addr, stopper *stop.Stopper,
 ) (*kvserver.RaftTransport, net.Addr) {
-	grpcServer := rpc.NewServer(rttc.nodeRPCContext)
+	grpcServer, err := rpc.NewServer(rttc.nodeRPCContext)
+	require.NoError(rttc.t, err)
 	ctwWithTracer := log.MakeTestingAmbientCtxWithNewTracer()
 	transport := kvserver.NewRaftTransport(
 		ctwWithTracer,
@@ -180,9 +177,7 @@ func (rttc *raftTransportTestContext) AddNodeWithoutGossip(
 	)
 	rttc.transports[nodeID] = transport
 	ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, addr)
-	if err != nil {
-		rttc.t.Fatal(err)
-	}
+	require.NoError(rttc.t, err)
 	return transport, ln.Addr()
 }
 

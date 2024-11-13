@@ -17,9 +17,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -38,7 +39,244 @@ import (
 //
 // The function is free to modify contents of JobMetadata in place (but the
 // changes will be ignored unless JobUpdater is used).
-type UpdateFn func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error
+type UpdateFn func(txn isql.Txn, md JobMetadata, ju *JobUpdater) error
+
+type Updater struct {
+	j   *Job
+	txn isql.Txn
+}
+
+func (j *Job) NoTxn() Updater {
+	return Updater{j: j}
+}
+
+func (j *Job) WithTxn(txn isql.Txn) Updater {
+	return Updater{j: j, txn: txn}
+}
+
+func (j *Job) maybeWithTxn(txn isql.Txn) Updater {
+	if txn != nil {
+		return j.WithTxn(txn)
+	}
+	return j.NoTxn()
+}
+
+func (u Updater) update(ctx context.Context, useReadLock bool, updateFn UpdateFn) (retErr error) {
+	if u.txn == nil {
+		return u.j.registry.db.Txn(ctx, func(
+			ctx context.Context, txn isql.Txn,
+		) error {
+			u.txn = txn
+			return u.update(ctx, useReadLock, updateFn)
+		})
+	}
+	ctx, sp := tracing.ChildSpan(ctx, "update-job")
+	defer sp.Finish()
+
+	var payload *jobspb.Payload
+	var progress *jobspb.Progress
+	var status Status
+	var runStats *RunStats
+	j := u.j
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Wrapf(retErr, "job %d", j.id)
+			return
+		}
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		if payload != nil {
+			j.mu.payload = *payload
+		}
+		if progress != nil {
+			j.mu.progress = *progress
+		}
+		if runStats != nil {
+			j.mu.runStats = runStats
+		}
+		if status != "" {
+			j.mu.status = status
+		}
+	}()
+
+	row, err := u.txn.QueryRowEx(
+		ctx, "select-job", u.txn.KV(),
+		sessiondata.RootUserSessionDataOverride,
+		getSelectStmtForJobUpdate(ctx, j.session != nil, useReadLock, u.j.registry.settings.Version), j.ID(),
+	)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return errors.Errorf("not found in system.jobs table")
+	}
+
+	if status, err = unmarshalStatus(row[0]); err != nil {
+		return err
+	}
+	if payload, err = UnmarshalPayload(row[1]); err != nil {
+		return err
+	}
+	if progress, err = UnmarshalProgress(row[2]); err != nil {
+		return err
+	}
+	if j.session != nil {
+		if row[3] == tree.DNull {
+			return errors.Errorf(
+				"with status %q: expected session %q but found NULL",
+				status, j.session.ID())
+		}
+		storedSession := []byte(*row[3].(*tree.DBytes))
+		if !bytes.Equal(storedSession, j.session.ID().UnsafeBytes()) {
+			return errors.Errorf(
+				"with status %q: expected session %q but found %q",
+				status, j.session.ID(), sqlliveness.SessionID(storedSession))
+		}
+	} else {
+		log.VInfof(ctx, 1, "job %d: update called with no session ID", j.ID())
+	}
+
+	md := JobMetadata{
+		ID:       j.ID(),
+		Status:   status,
+		Payload:  payload,
+		Progress: progress,
+	}
+
+	offset := 0
+	if j.session != nil {
+		offset = 1
+	}
+	var lastRun *tree.DTimestamp
+	var ok bool
+	lastRun, ok = row[3+offset].(*tree.DTimestamp)
+	if !ok {
+		return errors.AssertionFailedf("expected timestamp last_run, but got %T", lastRun)
+	}
+	var numRuns *tree.DInt
+	numRuns, ok = row[4+offset].(*tree.DInt)
+	if !ok {
+		return errors.AssertionFailedf("expected int num_runs, but got %T", numRuns)
+	}
+	md.RunStats = &RunStats{
+		NumRuns: int(*numRuns),
+		LastRun: lastRun.Time,
+	}
+
+	var ju JobUpdater
+	if err := updateFn(u.txn, md, &ju); err != nil {
+		return err
+	}
+	if j.registry.knobs.BeforeUpdate != nil {
+		if err := j.registry.knobs.BeforeUpdate(md, ju.md); err != nil {
+			return err
+		}
+	}
+
+	if !ju.hasUpdates() {
+		return nil
+	}
+
+	// Build a statement of the following form, depending on which properties
+	// need updating:
+	//
+	//   UPDATE system.jobs
+	//   SET
+	//     [status = $2,]
+	//     [payload = $y,]
+	//     [progress = $z]
+	//   WHERE
+	//     id = $1
+
+	var setters []string
+	params := []interface{}{j.ID()} // $1 is always the job ID.
+	addSetter := func(column string, value interface{}) {
+		params = append(params, value)
+		setters = append(setters, fmt.Sprintf("%s = $%d", column, len(params)))
+	}
+
+	if ju.md.Status != "" {
+		addSetter("status", ju.md.Status)
+	}
+
+	var payloadBytes []byte
+	if ju.md.Payload != nil {
+		payload = ju.md.Payload
+		var err error
+		payloadBytes, err = protoutil.Marshal(payload)
+		if err != nil {
+			return err
+		}
+	}
+
+	var progressBytes []byte
+	if ju.md.Progress != nil {
+		progress = ju.md.Progress
+		progress.ModifiedMicros = timeutil.ToUnixMicros(u.now())
+		var err error
+		progressBytes, err = protoutil.Marshal(progress)
+		if err != nil {
+			return err
+		}
+	}
+
+	if !u.j.registry.settings.Version.IsActive(ctx, clusterversion.V23_1StopWritingPayloadAndProgressToSystemJobs) {
+		if payloadBytes != nil {
+			addSetter("payload", payloadBytes)
+		}
+
+		if progressBytes != nil {
+			addSetter("progress", progressBytes)
+		}
+	}
+
+	if ju.md.RunStats != nil {
+		runStats = ju.md.RunStats
+		addSetter("last_run", ju.md.RunStats.LastRun)
+		addSetter("num_runs", ju.md.RunStats.NumRuns)
+	}
+
+	if len(setters) != 0 {
+		updateStmt := fmt.Sprintf(
+			"UPDATE system.jobs SET %s WHERE id = $1",
+			strings.Join(setters, ", "),
+		)
+		n, err := u.txn.ExecEx(
+			ctx, "job-update", u.txn.KV(),
+			sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+			updateStmt, params...,
+		)
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return errors.Errorf(
+				"expected exactly one row affected, but %d rows affected by job update", n,
+			)
+		}
+	}
+
+	// Insert the job payload and details into the system.jobs_info table if the
+	// associated cluster version is active.
+	//
+	// TODO(adityamaru): Stop writing the payload and details to the system.jobs
+	// table once we are outside the compatability window for 22.2.
+	if u.j.registry.settings.Version.IsActive(ctx, clusterversion.V23_1CreateSystemJobInfoTable) {
+		infoStorage := j.InfoStorage(u.txn)
+		if payloadBytes != nil {
+			if err := infoStorage.WriteLegacyPayload(ctx, payloadBytes); err != nil {
+				return err
+			}
+		}
+		if progressBytes != nil {
+			if err := infoStorage.WriteLegacyProgress(ctx, progressBytes); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
 
 // RunStats consists of job-run statistics: num of runs and last-run timestamp.
 type RunStats struct {
@@ -128,208 +366,73 @@ func UpdateHighwaterProgressed(highWater hlc.Timestamp, md JobMetadata, ju *JobU
 //	  if md.Status != StatusRunning {
 //	    return errors.New("job no longer running")
 //	  }
-//	  md.UpdateStatus(StatusPaused)
+//	  ju.UpdateStatus(StatusPaused)
 //	  // <modify md.Payload>
-//	  md.UpdatePayload(md.Payload)
+//	  ju.UpdatePayload(md.Payload)
 //	}
 //
 // Note that there are various convenience wrappers (like FractionProgressed)
 // defined in jobs.go.
-func (j *Job) Update(ctx context.Context, txn *kv.Txn, updateFn UpdateFn) error {
+func (u Updater) Update(ctx context.Context, updateFn UpdateFn) error {
 	const useReadLock = false
-	return j.update(ctx, txn, useReadLock, updateFn)
+	return u.update(ctx, useReadLock, updateFn)
 }
 
-func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateFn UpdateFn) error {
-	ctx, sp := tracing.ChildSpan(ctx, "update-job")
-	defer sp.Finish()
-
-	var payload *jobspb.Payload
-	var progress *jobspb.Progress
-	var status Status
-	var runStats *RunStats
-
-	if err := j.runInTxn(ctx, txn, func(ctx context.Context, txn *kv.Txn) error {
-		payload, progress, runStats = nil, nil, nil
-		var err error
-		var row tree.Datums
-		row, err = j.registry.ex.QueryRowEx(
-			ctx, "select-job", txn,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-			getSelectStmtForJobUpdate(j.session != nil, useReadLock), j.ID(),
-		)
-		if err != nil {
-			return err
-		}
-		if row == nil {
-			return errors.Errorf("not found in system.jobs table")
-		}
-
-		if status, err = unmarshalStatus(row[0]); err != nil {
-			return err
-		}
-		if payload, err = UnmarshalPayload(row[1]); err != nil {
-			return err
-		}
-		if progress, err = UnmarshalProgress(row[2]); err != nil {
-			return err
-		}
-		if j.session != nil {
-			if row[3] == tree.DNull {
-				return errors.Errorf(
-					"with status %q: expected session %q but found NULL",
-					status, j.session.ID())
-			}
-			storedSession := []byte(*row[3].(*tree.DBytes))
-			if !bytes.Equal(storedSession, j.session.ID().UnsafeBytes()) {
-				return errors.Errorf(
-					"with status %q: expected session %q but found %q",
-					status, j.session.ID(), sqlliveness.SessionID(storedSession))
-			}
-		} else {
-			log.VInfof(ctx, 1, "job %d: update called with no session ID", j.ID())
-		}
-
-		md := JobMetadata{
-			ID:       j.ID(),
-			Status:   status,
-			Payload:  payload,
-			Progress: progress,
-		}
-
-		offset := 0
-		if j.session != nil {
-			offset = 1
-		}
-		var lastRun *tree.DTimestamp
-		var ok bool
-		lastRun, ok = row[3+offset].(*tree.DTimestamp)
-		if !ok {
-			return errors.AssertionFailedf("expected timestamp last_run, but got %T", lastRun)
-		}
-		var numRuns *tree.DInt
-		numRuns, ok = row[4+offset].(*tree.DInt)
-		if !ok {
-			return errors.AssertionFailedf("expected int num_runs, but got %T", numRuns)
-		}
-		md.RunStats = &RunStats{
-			NumRuns: int(*numRuns),
-			LastRun: lastRun.Time,
-		}
-
-		var ju JobUpdater
-		if err := updateFn(txn, md, &ju); err != nil {
-			return err
-		}
-		if j.registry.knobs.BeforeUpdate != nil {
-			if err := j.registry.knobs.BeforeUpdate(md, ju.md); err != nil {
-				return err
-			}
-		}
-
-		if !ju.hasUpdates() {
-			return nil
-		}
-
-		// Build a statement of the following form, depending on which properties
-		// need updating:
-		//
-		//   UPDATE system.jobs
-		//   SET
-		//     [status = $2,]
-		//     [payload = $y,]
-		//     [progress = $z]
-		//   WHERE
-		//     id = $1
-
-		var setters []string
-		params := []interface{}{j.ID()} // $1 is always the job ID.
-		addSetter := func(column string, value interface{}) {
-			params = append(params, value)
-			setters = append(setters, fmt.Sprintf("%s = $%d", column, len(params)))
-		}
-
-		if ju.md.Status != "" {
-			addSetter("status", ju.md.Status)
-		}
-
-		if ju.md.Payload != nil {
-			payload = ju.md.Payload
-			payloadBytes, err := protoutil.Marshal(payload)
-			if err != nil {
-				return err
-			}
-			addSetter("payload", payloadBytes)
-		}
-
-		if ju.md.Progress != nil {
-			progress = ju.md.Progress
-			progress.ModifiedMicros = timeutil.ToUnixMicros(txn.ReadTimestamp().GoTime())
-			progressBytes, err := protoutil.Marshal(progress)
-			if err != nil {
-				return err
-			}
-			addSetter("progress", progressBytes)
-		}
-
-		if ju.md.RunStats != nil {
-			runStats = ju.md.RunStats
-			addSetter("last_run", ju.md.RunStats.LastRun)
-			addSetter("num_runs", ju.md.RunStats.NumRuns)
-		}
-
-		updateStmt := fmt.Sprintf(
-			"UPDATE system.jobs SET %s WHERE id = $1",
-			strings.Join(setters, ", "),
-		)
-		n, err := j.registry.ex.Exec(ctx, "job-update", txn, updateStmt, params...)
-		if err != nil {
-			return err
-		}
-		if n != 1 {
-			return errors.Errorf(
-				"expected exactly one row affected, but %d rows affected by job update", n,
-			)
-		}
-		return nil
-	}); err != nil {
-		return errors.Wrapf(err, "job %d", j.id)
-	}
-	func() {
-		j.mu.Lock()
-		defer j.mu.Unlock()
-		if payload != nil {
-			j.mu.payload = *payload
-		}
-		if progress != nil {
-			j.mu.progress = *progress
-		}
-		if runStats != nil {
-			j.mu.runStats = runStats
-		}
-		if status != "" {
-			j.mu.status = status
-		}
-	}()
-	return nil
+func (u Updater) now() time.Time {
+	return u.j.registry.clock.Now().GoTime()
 }
 
 // getSelectStmtForJobUpdate constructs the select statement used in Job.update.
-func getSelectStmtForJobUpdate(hasSession, useReadLock bool) string {
+func getSelectStmtForJobUpdate(
+	ctx context.Context, hasSession, useReadLock bool, version clusterversion.Handle,
+) string {
 	const (
-		selectWithoutSession = `SELECT status, payload, progress`
-		selectWithSession    = selectWithoutSession + `, claim_session_id`
-		from                 = ` FROM system.jobs WHERE id = $1`
-		fromForUpdate        = from + ` FOR UPDATE`
-		backoffColumns       = ", COALESCE(last_run, created), COALESCE(num_runs, 0)"
+		selectWithoutSession = `
+WITH
+	latestpayload AS (SELECT job_id, value FROM system.job_info AS payload WHERE info_key = 'legacy_payload' AND job_id = $1 ORDER BY written DESC LIMIT 1),
+	latestprogress AS (SELECT job_id, value FROM system.job_info AS progress WHERE info_key = 'legacy_progress' AND job_id = $1 ORDER BY written DESC LIMIT 1)
+	SELECT
+		status, payload.value AS payload, progress.value AS progress`
+		selectWithSession = selectWithoutSession + `, claim_session_id`
+		from              = `
+	FROM system.jobs AS j
+	INNER JOIN latestpayload AS payload ON j.id = payload.job_id
+	LEFT JOIN latestprogress AS progress ON j.id = progress.job_id
+	WHERE id = $1
+`
+		fromForUpdate = from + `FOR UPDATE`
+
+		// TODO(adityamaru): Delete deprecated queries once we are outside the 22.2
+		// compatibility window.
+		deprecatedSelectWithoutSession = `SELECT status, payload, progress`
+		deprecatedSelectWithSession    = deprecatedSelectWithoutSession + `, claim_session_id`
+		deprecatedFrom                 = ` FROM system.jobs WHERE id = $1`
+		deprecatedFromForUpdate        = deprecatedFrom + ` FOR UPDATE`
+		backoffColumns                 = ", COALESCE(last_run, created), COALESCE(num_runs, 0)"
 	)
-	stmt := selectWithoutSession
-	if hasSession {
-		stmt = selectWithSession
+
+	var stmt string
+	if version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled) {
+		stmt = selectWithoutSession
+		if hasSession {
+			stmt = selectWithSession
+		}
+		stmt = stmt + backoffColumns
+		if useReadLock {
+			return stmt + fromForUpdate
+		}
+		stmt = stmt + from
+	} else {
+		stmt = deprecatedSelectWithoutSession
+		if hasSession {
+			stmt = deprecatedSelectWithSession
+		}
+		stmt = stmt + backoffColumns
+		if useReadLock {
+			return stmt + deprecatedFromForUpdate
+		}
+		stmt = stmt + deprecatedFrom
 	}
-	stmt = stmt + backoffColumns
-	if useReadLock {
-		return stmt + fromForUpdate
-	}
-	return stmt + from
+
+	return stmt
 }

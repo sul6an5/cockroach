@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/cockroachdb/cockroach/pkg/util/tsearch"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -276,9 +277,13 @@ func RandDatumWithNullChance(
 		if err != nil {
 			panic(err)
 		}
-		return d
+		return tree.NewDEnum(d)
 	case types.VoidFamily:
 		return tree.DVoidDatum
+	case types.TSVectorFamily:
+		return tree.NewDTSVector(tsearch.RandomTSVector(rng))
+	case types.TSQueryFamily:
+		return tree.NewDTSQuery(tsearch.RandomTSQuery(rng))
 	default:
 		panic(errors.AssertionFailedf("invalid type %v", typ.DebugString()))
 	}
@@ -367,6 +372,12 @@ func adjustDatum(datum tree.Datum, typ *types.T) tree.Datum {
 			return datum
 		}
 		return &tree.DBitArray{BitArray: datum.(*tree.DBitArray).ToWidth(uint(typ.Width()))}
+
+	case types.StringFamily:
+		if typ.Oid() == oid.T_name {
+			datum = tree.NewDName(string(*datum.(*tree.DString)))
+		}
+		return datum
 
 	default:
 		return datum
@@ -470,6 +481,15 @@ func randStringSimple(rng *rand.Rand) string {
 }
 
 func randJSONSimple(rng *rand.Rand) json.JSON {
+	return randJSONSimpleDepth(rng, 0)
+}
+
+func randJSONSimpleDepth(rng *rand.Rand, depth int) json.JSON {
+	depth++
+	// Prevents timeouts during stress runs.
+	if depth > 100 {
+		return json.NullJSONValue
+	}
 	switch rng.Intn(10) {
 	case 0:
 		return json.NullJSONValue
@@ -484,13 +504,13 @@ func randJSONSimple(rng *rand.Rand) json.JSON {
 	case 5:
 		a := json.NewArrayBuilder(0)
 		for i := rng.Intn(3); i >= 0; i-- {
-			a.Add(randJSONSimple(rng))
+			a.Add(randJSONSimpleDepth(rng, depth))
 		}
 		return a.Build()
 	default:
 		a := json.NewObjectBuilder(0)
 		for i := rng.Intn(3); i >= 0; i-- {
-			a.Add(randStringSimple(rng), randJSONSimple(rng))
+			a.Add(randStringSimple(rng), randJSONSimpleDepth(rng, depth))
 		}
 		return a.Build()
 	}

@@ -19,7 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -43,18 +47,35 @@ type jobStarter func(c cluster.Cluster, t test.Test) (string, error)
 func jobSurvivesNodeShutdown(
 	ctx context.Context, t test.Test, c cluster.Cluster, nodeToShutdown int, startJob jobStarter,
 ) {
-	watcherNode := 1 + (nodeToShutdown)%c.Spec().NodeCount
-	target := c.Node(nodeToShutdown)
+	cfg := nodeShutdownConfig{
+		shutdownNode: nodeToShutdown,
+		watcherNode:  1 + (nodeToShutdown)%c.Spec().NodeCount,
+		crdbNodes:    c.All(),
+	}
+	executeNodeShutdown(ctx, t, c, cfg, startJob)
+}
+
+type nodeShutdownConfig struct {
+	shutdownNode    int
+	watcherNode     int
+	crdbNodes       option.NodeListOption
+	restartSettings []install.ClusterSettingOption
+}
+
+func executeNodeShutdown(
+	ctx context.Context, t test.Test, c cluster.Cluster, cfg nodeShutdownConfig, startJob jobStarter,
+) {
+	target := c.Node(cfg.shutdownNode)
 	t.L().Printf("test has chosen shutdown target node %d, and watcher node %d",
-		nodeToShutdown, watcherNode)
+		cfg.shutdownNode, cfg.watcherNode)
 
 	jobIDCh := make(chan string, 1)
 
-	m := c.NewMonitor(ctx)
+	m := c.NewMonitor(ctx, cfg.crdbNodes)
 	m.Go(func(ctx context.Context) error {
 		defer close(jobIDCh)
 
-		watcherDB := c.Conn(ctx, t.L(), watcherNode)
+		watcherDB := c.Conn(ctx, t.L(), cfg.watcherNode)
 		defer watcherDB.Close()
 
 		// Wait for 3x replication to ensure that the cluster
@@ -75,6 +96,8 @@ func jobSurvivesNodeShutdown(
 
 		pollInterval := 5 * time.Second
 		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+
 		var status string
 		for {
 			select {
@@ -107,7 +130,7 @@ func jobSurvivesNodeShutdown(
 		}
 
 		// Check once a second to see if the job has started running.
-		watcherDB := c.Conn(ctx, t.L(), watcherNode)
+		watcherDB := c.Conn(ctx, t.L(), cfg.watcherNode)
 		defer watcherDB.Close()
 		timeToWait := time.Second
 		timer := timeutil.Timer{}
@@ -141,9 +164,18 @@ func jobSurvivesNodeShutdown(
 			}
 		}
 
-		t.L().Printf(`stopping node %s`, target)
-		if err := c.StopE(ctx, t.L(), option.DefaultStopOpts(), target); err != nil {
-			return errors.Wrapf(err, "could not stop node %s", target)
+		rng, _ := randutil.NewTestRand()
+		shouldUseSigKill := rng.Float64() > 0.5
+		if shouldUseSigKill {
+			t.L().Printf(`stopping node (using SIGKILL) %s`, target)
+			if err := c.StopE(ctx, t.L(), option.DefaultStopOpts(), target); err != nil {
+				return errors.Wrapf(err, "could not stop node %s", target)
+			}
+		} else {
+			t.L().Printf(`stopping node gracefully %s`, target)
+			if err := c.StopCockroachGracefullyOnNode(ctx, t.L(), cfg.shutdownNode); err != nil {
+				return errors.Wrapf(err, "could not stop node %s", target)
+			}
 		}
 		t.L().Printf("stopped node %s", target)
 
@@ -156,7 +188,20 @@ func jobSurvivesNodeShutdown(
 	// NB: the roachtest harness checks that at the end of the test, all nodes
 	// that have data also have a running process.
 	t.Status(fmt.Sprintf("restarting %s (node restart test is done)\n", target))
-	if err := c.StartE(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), target); err != nil {
+	// Don't begin another backup schedule, as the parent test driver has already
+	// set or disallowed the automatic backup schedule.
+	if err := c.StartE(ctx, t.L(), option.DefaultStartOptsNoBackups(),
+		install.MakeClusterSettings(cfg.restartSettings...), target); err != nil {
 		t.Fatal(errors.Wrapf(err, "could not restart node %s", target))
 	}
+}
+
+func getJobProgress(t test.Test, db *sqlutils.SQLRunner, jobID jobspb.JobID) *jobspb.Progress {
+	ret := &jobspb.Progress{}
+	var buf []byte
+	db.QueryRow(t, `SELECT progress FROM crdb_internal.system_jobs WHERE id = $1`, jobID).Scan(&buf)
+	if err := protoutil.Unmarshal(buf, ret); err != nil {
+		t.Fatal(err)
+	}
+	return ret
 }

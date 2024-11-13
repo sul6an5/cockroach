@@ -11,7 +11,6 @@
 package spanconfigtestutils
 
 import (
-	"context"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -20,18 +19,23 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigbounds"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
 )
 
 // spanRe matches strings of the form "[start, end)", capturing both the "start"
 // and "end" keys.
-var spanRe = regexp.MustCompile(`^\[(\w+),\s??(\w+)\)$`)
+var spanRe = regexp.MustCompile(`^\[((/Tenant/\d*/)?\w+),\s??((/Tenant/\d*/)?\w+)\)$`)
 
 // systemTargetRe matches strings of the form
 // "{entire-keyspace|source=<id>,(target=<id>|all-tenant-keyspace-targets-set)}".
@@ -39,9 +43,113 @@ var systemTargetRe = regexp.MustCompile(
 	`^{(entire-keyspace)|(source=(\d*),\s??((target=(\d*))|all-tenant-keyspace-targets-set))}$`,
 )
 
-// configRe matches either FALLBACK (for readability) or a single letter. It's a
-// shorthand for declaring a unique tagged config.
-var configRe = regexp.MustCompile(`^(FALLBACK)|(^\w)$`)
+// configRe matches either FALLBACK (for readability), a single letter, or a
+// specified GC TTL value. It's a shorthand for declaring a unique tagged config.
+var configRe = regexp.MustCompile(`^(FALLBACK)|(^GC\.ttl=(\d*))|(^\w)$`)
+
+// boundsRe matches a string of the form "{GC.ttl_start=<int>,GC.ttl_end=<int>}".
+// It translates to an upper/lower bound expressed through SpanConfigBounds.
+var boundsRe = regexp.MustCompile(`{GC\.ttl_start=(\d*),\s??GC.ttl_end=(\d*)}`)
+
+// tenantRe matches a string of the form "/Tenant/<id>".
+var tenantRe = regexp.MustCompile(`/Tenant/(\d*)`)
+
+// keyRe matches a string of the form "a", "Tenant/10/a". An optional tenant
+// prefix may be used to specify a key inside a secondary tenant's keyspace;
+// otherwise, the key is within the system tenant's keyspace.
+var keyRe = regexp.MustCompile(`(Tenant/\d*/)?(\w+)`)
+
+// ParseRangeID is helper function that constructs a roachpb.RangeID from a
+// string of the form "r<int>".
+func ParseRangeID(t testing.TB, s string) roachpb.RangeID {
+	rangeID, err := strconv.Atoi(strings.TrimPrefix(s, "r"))
+	require.NoError(t, err)
+	return roachpb.RangeID(rangeID)
+}
+
+// ParseNodeID is helper function that constructs a roachpb.NodeID from a string
+// of the form "n<int>".
+func ParseNodeID(t testing.TB, s string) roachpb.NodeID {
+	nodeID, err := strconv.Atoi(strings.TrimPrefix(s, "n"))
+	require.NoError(t, err)
+	return roachpb.NodeID(nodeID)
+}
+
+// ParseReplicaSet is helper function that constructs a roachpb.ReplicaSet from
+// a string of the form "voters=[n1,n2,...] non-voters=[n3,...]". The
+// {store,replica} IDs for each replica is set to be equal to the corresponding
+// node ID.
+func ParseReplicaSet(t testing.TB, s string) roachpb.ReplicaSet {
+	replSet := roachpb.ReplicaSet{}
+	rtypes := map[string]roachpb.ReplicaType{
+		"voters":                     roachpb.VOTER_FULL,
+		"voters-incoming":            roachpb.VOTER_INCOMING,
+		"voters-outgoing":            roachpb.VOTER_OUTGOING,
+		"voters-demoting-learners":   roachpb.VOTER_DEMOTING_LEARNER,
+		"voters-demoting-non-voters": roachpb.VOTER_DEMOTING_NON_VOTER,
+		"learners":                   roachpb.LEARNER,
+		"non-voters":                 roachpb.NON_VOTER,
+	}
+	for _, part := range strings.Split(s, " ") {
+		inner := strings.Split(part, "=")
+		require.Len(t, inner, 2)
+		rtype, found := rtypes[inner[0]]
+		require.Truef(t, found, "unexpected replica type: %s", inner[0])
+		nodes := strings.TrimSuffix(strings.TrimPrefix(inner[1], "["), "]")
+
+		for _, n := range strings.Split(nodes, ",") {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			nodeID := ParseNodeID(t, n)
+			replSet.AddReplica(roachpb.ReplicaDescriptor{
+				NodeID:    nodeID,
+				StoreID:   roachpb.StoreID(nodeID),
+				ReplicaID: roachpb.ReplicaID(nodeID),
+				Type:      rtype,
+			})
+		}
+	}
+	return replSet
+}
+
+// ParseZoneConfig is helper function that constructs a zonepb.ZoneConfig from a
+// string of the form "num_replicas=<int> num_voters=<int> constraints='..'
+// voter_constraints='..'".
+func ParseZoneConfig(t testing.TB, s string) zonepb.ZoneConfig {
+	config := zonepb.DefaultZoneConfig()
+	parts := strings.Split(s, " ")
+	for _, part := range parts {
+		switch {
+		case strings.HasPrefix(part, "num_replicas="):
+			part = strings.TrimPrefix(part, "num_replicas=")
+			n, err := strconv.Atoi(part)
+			require.NoError(t, err)
+			n32 := int32(n)
+			config.NumReplicas = &n32
+		case strings.HasPrefix(part, "num_voters="):
+			part = strings.TrimPrefix(part, "num_voters=")
+			n, err := strconv.Atoi(part)
+			require.NoError(t, err)
+			n32 := int32(n)
+			config.NumVoters = &n32
+		case strings.HasPrefix(part, "constraints="):
+			cl := zonepb.ConstraintsList{}
+			part = strings.TrimPrefix(part, "constraints=")
+			require.NoError(t, yaml.UnmarshalStrict([]byte(part), &cl))
+			config.Constraints = cl.Constraints
+		case strings.HasPrefix(part, "voter_constraints="):
+			cl := zonepb.ConstraintsList{}
+			part = strings.TrimPrefix(part, "voter_constraints=")
+			require.NoError(t, yaml.UnmarshalStrict([]byte(part), &cl))
+			config.VoterConstraints = cl.Constraints
+		default:
+			t.Fatalf("unrecognized suffix for %s, expected 'num_replicas=', 'num_voters=', 'constraints=', or 'voter_constraints='", part)
+		}
+	}
+	return config
+}
 
 // ParseSpan is helper function that constructs a roachpb.Span from a string of
 // the form "[start, end)".
@@ -51,11 +159,48 @@ func ParseSpan(t testing.TB, sp string) roachpb.Span {
 	}
 
 	matches := spanRe.FindStringSubmatch(sp)
-	start, end := matches[1], matches[2]
+	startStr, endStr := matches[1], matches[3]
+	start, tenStart := ParseKey(t, startStr)
+	end, tenEnd := ParseKey(t, endStr)
+
+	// Sanity check keys don't straddle tenant boundaries.
+	require.Equal(t, tenStart, tenEnd)
+
 	return roachpb.Span{
-		Key:    roachpb.Key(start),
-		EndKey: roachpb.Key(end),
+		Key:    start,
+		EndKey: end,
 	}
+}
+
+// ParseKey constructs a roachpb.Key from the supplied input. The key may be
+// optionally prefixed with a "/Tenant/ID/" prefix; doing so ensures the key
+// belongs to the specified tenant's keyspace. Otherwise, the key lies in the
+// system tenant's keyspace.
+//
+// In addition to the key, the tenant ID is also returned.
+func ParseKey(t testing.TB, key string) (roachpb.Key, roachpb.TenantID) {
+	require.True(t, keyRe.MatchString(key))
+
+	matches := keyRe.FindStringSubmatch(key)
+	tenantID := roachpb.SystemTenantID
+	if matches[1] != "" {
+		tenantID = parseTenant(t, key)
+	}
+
+	codec := keys.MakeSQLCodec(tenantID)
+	return append(codec.TenantPrefix(), roachpb.Key(matches[2])...), tenantID
+}
+
+// parseTenant expects a string of the form "ten-<tenantID>" and returns the
+// tenant ID.
+func parseTenant(t testing.TB, input string) roachpb.TenantID {
+	require.True(t, tenantRe.MatchString(input), input)
+
+	matches := tenantRe.FindStringSubmatch(input)
+	tenID := matches[1]
+	tenIDRaw, err := strconv.Atoi(tenID)
+	require.NoError(t, err)
+	return roachpb.MustMakeTenantID(uint64(tenIDRaw))
 }
 
 // parseSystemTarget is a helepr function that constructs a
@@ -73,12 +218,12 @@ func parseSystemTarget(t testing.TB, systemTarget string) spanconfig.SystemTarge
 	sourceID, err := strconv.Atoi(matches[3])
 	require.NoError(t, err)
 	if matches[4] == "all-tenant-keyspace-targets-set" {
-		return spanconfig.MakeAllTenantKeyspaceTargetsSet(roachpb.MakeTenantID(uint64(sourceID)))
+		return spanconfig.MakeAllTenantKeyspaceTargetsSet(roachpb.MustMakeTenantID(uint64(sourceID)))
 	}
 	targetID, err := strconv.Atoi(matches[6])
 	require.NoError(t, err)
 	target, err := spanconfig.MakeTenantKeyspaceTarget(
-		roachpb.MakeTenantID(uint64(sourceID)), roachpb.MakeTenantID(uint64(targetID)),
+		roachpb.MustMakeTenantID(uint64(sourceID)), roachpb.MustMakeTenantID(uint64(targetID)),
 	)
 	require.NoError(t, err)
 	return target
@@ -99,8 +244,7 @@ func ParseTarget(t testing.TB, target string) spanconfig.Target {
 }
 
 // ParseConfig is helper function that constructs a roachpb.SpanConfig that's
-// "tagged" with the given string (i.e. a constraint with the given string a
-// required key).
+// "tagged" with the given string. See configRe for specifics.
 func ParseConfig(t testing.TB, conf string) roachpb.SpanConfig {
 	if !configRe.MatchString(conf) {
 		t.Fatalf("expected %s to match config regex", conf)
@@ -108,22 +252,104 @@ func ParseConfig(t testing.TB, conf string) roachpb.SpanConfig {
 	matches := configRe.FindStringSubmatch(conf)
 
 	var ts int64
+	var gcTTL int
 	if matches[1] == "FALLBACK" {
 		ts = -1
+	} else if matches[4] != "" {
+		ts = int64(matches[4][0])
 	} else {
-		ts = int64(matches[2][0])
+		var err error
+		gcTTL, err = strconv.Atoi(matches[3])
+		require.NoError(t, err)
+	}
+
+	var protectionPolicies []roachpb.ProtectionPolicy
+	if ts != 0 {
+		protectionPolicies = []roachpb.ProtectionPolicy{
+			{
+				ProtectedTimestamp: hlc.Timestamp{
+					WallTime: ts,
+				},
+			},
+		}
 	}
 	return roachpb.SpanConfig{
 		GCPolicy: roachpb.GCPolicy{
-			ProtectionPolicies: []roachpb.ProtectionPolicy{
-				{
-					ProtectedTimestamp: hlc.Timestamp{
-						WallTime: ts,
-					},
-				},
-			},
+			ProtectionPolicies: protectionPolicies,
+			TTLSeconds:         int32(gcTTL),
 		},
 	}
+}
+
+// BoundsUpdate ..
+type BoundsUpdate struct {
+	TenantID roachpb.TenantID
+	Bounds   *spanconfigbounds.Bounds
+	Deleted  bool
+}
+
+// ParseDeclareBoundsArguments parses datadriven test input to a list of
+// tenantcapabilities.Updates that can be applied to a
+// tenantcapabilities.Reader. The input is of the following form:
+//
+// delete ten-10
+// set ten-10:{GC.ttl_start=5, GC.ttl_end=30}
+func ParseDeclareBoundsArguments(t *testing.T, input string) (updates []BoundsUpdate) {
+	for _, line := range strings.Split(input, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		const setPrefix, deletePrefix = "set ", "delete "
+
+		switch {
+		case strings.HasPrefix(line, setPrefix):
+			line = strings.TrimPrefix(line, line[:len(setPrefix)])
+			parts := strings.Split(line, ":")
+			require.Len(t, parts, 2)
+			tenantID := parseTenant(t, parts[0])
+			bounds := parseBounds(t, parts[1])
+			updates = append(updates, BoundsUpdate{
+				TenantID: tenantID,
+				Bounds:   bounds,
+			})
+
+		case strings.HasPrefix(line, deletePrefix):
+			line = strings.TrimPrefix(line, line[:len(deletePrefix)])
+			tenantID := parseTenant(t, line)
+			updates = append(updates,
+				BoundsUpdate{
+					TenantID: tenantID,
+					Bounds:   nil,
+					Deleted:  true,
+				},
+			)
+		default:
+			t.Fatalf("malformed line %q, expected to find prefix %q or %q",
+				line, setPrefix, deletePrefix)
+		}
+	}
+	return updates
+}
+
+// parseBounds parses a string that looks like {GC.ttl_start=5, GC.ttl_end=40}
+// into a spanconfigbounds.Bounds struct.
+func parseBounds(t *testing.T, input string) *spanconfigbounds.Bounds {
+	require.True(t, boundsRe.MatchString(input))
+
+	matches := boundsRe.FindStringSubmatch(input)
+	gcTTLStart, err := strconv.Atoi(matches[1])
+	require.NoError(t, err)
+	gcTTLEnd, err := strconv.Atoi(matches[2])
+	require.NoError(t, err)
+
+	return spanconfigbounds.New(&tenantcapabilitiespb.SpanConfigBounds{
+		GCTTLSeconds: &tenantcapabilitiespb.SpanConfigBounds_Int32Range{
+			Start: int32(gcTTLStart),
+			End:   int32(gcTTLEnd),
+		},
+	})
 }
 
 // ParseSpanConfigRecord is helper function that constructs a
@@ -253,21 +479,44 @@ func ParseStoreApplyArguments(t testing.TB, input string) (updates []spanconfig.
 // roundtrip; spans containing special keys that translate to pretty-printed
 // keys are printed as such.
 func PrintSpan(sp roachpb.Span) string {
-	s := []string{
-		sp.Key.String(),
-		sp.EndKey.String(),
-	}
-	for i := range s {
+	var res []string
+	for _, key := range []roachpb.Key{sp.Key, sp.EndKey} {
+		var tenantPrefixStr string
+		rest, tenID, err := keys.DecodeTenantPrefix(key)
+		if err != nil {
+			panic(err)
+		}
+
+		if !tenID.IsSystem() {
+			tenantPrefixStr = fmt.Sprintf("%s", keys.MakeSQLCodec(tenID).TenantPrefix())
+		}
+
 		// Raw keys are quoted, so we unquote them.
-		if strings.Contains(s[i], "\"") {
+		restStr := roachpb.Key(rest).String()
+		if strings.Contains(restStr, "\"") {
 			var err error
-			s[i], err = strconv.Unquote(s[i])
+			restStr, err = strconv.Unquote(restStr)
 			if err != nil {
 				panic(err)
 			}
 		}
+
+		// For keys inside a secondary tenant, we don't print the "/Min" suffix if
+		// the key is at the start of their keyspace. Also, we add a "/" delimiter
+		// after the tenant prefix.
+		if !tenID.IsSystem() {
+			if roachpb.Key(rest).Compare(keys.MinKey) == 0 {
+				restStr = ""
+			}
+
+			if restStr != "" {
+				restStr = fmt.Sprintf("/%s", restStr)
+			}
+		}
+
+		res = append(res, fmt.Sprintf("%s%s", tenantPrefixStr, restStr))
 	}
-	return fmt.Sprintf("[%s,%s)", s[0], s[1])
+	return fmt.Sprintf("[%s,%s)", res[0], res[1])
 }
 
 // PrintTarget is a helper function that prints a spanconfig.Target.
@@ -288,6 +537,12 @@ func PrintTarget(t testing.TB, target spanconfig.Target) string {
 // ParseSpanConfig helper above.
 func PrintSpanConfig(config roachpb.SpanConfig) string {
 	// See ParseConfig for what a "tagged" roachpb.SpanConfig translates to.
+	if config.GCPolicy.TTLSeconds != 0 && len(config.GCPolicy.ProtectionPolicies) != 0 {
+		panic("cannot have both TTL and protection policies set for tagged configs") // sanity check
+	}
+	if config.GCPolicy.TTLSeconds != 0 {
+		return fmt.Sprintf("GC.ttl=%d", config.GCPolicy.TTLSeconds)
+	}
 	conf := make([]string, 0, len(config.GCPolicy.ProtectionPolicies)*2)
 	for i, policy := range config.GCPolicy.ProtectionPolicies {
 		if i > 0 {
@@ -451,51 +706,6 @@ func MaybeLimitAndOffset(
 	return strings.TrimSpace(output.String())
 }
 
-// SplitPoint is a unit of what's retrievable from a spanconfig.StoreReader. It
-// captures a single split point, and the config to be applied over the
-// following key span (or at least until the next such SplitPoint).
-//
-// TODO(irfansharif): Find a better name?
-type SplitPoint struct {
-	RKey   roachpb.RKey
-	Config roachpb.SpanConfig
-}
-
-// SplitPoints is a collection of split points.
-type SplitPoints []SplitPoint
-
-func (rs SplitPoints) String() string {
-	var output strings.Builder
-	for _, c := range rs {
-		output.WriteString(fmt.Sprintf("%-42s %s\n", c.RKey.String(),
-			PrintSpanConfigDiffedAgainstDefaults(c.Config)))
-	}
-	return output.String()
-}
-
-// GetSplitPoints returns a list of range split points as suggested by the given
-// StoreReader.
-func GetSplitPoints(ctx context.Context, t testing.TB, reader spanconfig.StoreReader) SplitPoints {
-	var splitPoints []SplitPoint
-	splitKey := roachpb.RKeyMin
-	for {
-		splitKeyConf, err := reader.GetSpanConfigForKey(ctx, splitKey)
-		require.NoError(t, err)
-
-		splitPoints = append(splitPoints, SplitPoint{
-			RKey:   splitKey,
-			Config: splitKeyConf,
-		})
-
-		if !reader.NeedsSplit(ctx, splitKey, roachpb.RKeyMax) {
-			break
-		}
-		splitKey = reader.ComputeSplitKey(ctx, splitKey, roachpb.RKeyMax)
-	}
-
-	return splitPoints
-}
-
 // ParseProtectionTarget returns a ptpb.Target based on the input. This target
 // could either refer to a Cluster, list of Tenants or SchemaObjects.
 func ParseProtectionTarget(t testing.TB, input string) *ptpb.Target {
@@ -516,7 +726,7 @@ func ParseProtectionTarget(t testing.TB, input string) *ptpb.Target {
 		for _, tenID := range tenantIDs {
 			id, err := strconv.Atoi(tenID)
 			require.NoError(t, err)
-			ids = append(ids, roachpb.MakeTenantID(uint64(id)))
+			ids = append(ids, roachpb.MustMakeTenantID(uint64(id)))
 		}
 		return ptpb.MakeTenantsTarget(ids)
 	case strings.HasPrefix(target, schemaObjectPrefix):

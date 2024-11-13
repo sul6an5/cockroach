@@ -267,6 +267,47 @@ func (s *nodeDecommissionWaitType) Set(value string) error {
 	return nil
 }
 
+type nodeDecommissionCheckMode int
+
+const (
+	nodeDecommissionChecksSkip nodeDecommissionCheckMode = iota
+	nodeDecommissionChecksEnabled
+	nodeDecommissionChecksStrict
+)
+
+// Type implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) Type() string { return "string" }
+
+// String implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) String() string {
+	switch *s {
+	case nodeDecommissionChecksSkip:
+		return "skip"
+	case nodeDecommissionChecksEnabled:
+		return "enabled"
+	case nodeDecommissionChecksStrict:
+		return "strict"
+	default:
+		panic("unexpected node decommission check mode (possible values: enabled, strict, skip)")
+	}
+}
+
+// Set implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) Set(value string) error {
+	switch value {
+	case "skip":
+		*s = nodeDecommissionChecksSkip
+	case "enabled":
+		*s = nodeDecommissionChecksEnabled
+	case "strict":
+		*s = nodeDecommissionChecksStrict
+	default:
+		return fmt.Errorf("invalid node decommission parameter: %s "+
+			"(possible values: enabled, strict, skip)", value)
+	}
+	return nil
+}
+
 // bytesOrPercentageValue is a flag that accepts an integer value, an integer
 // plus a unit (e.g. 32GB or 32GiB) or a percentage (e.g. 32%). In all these
 // cases, it transforms the string flag input into an int64 value.
@@ -330,15 +371,20 @@ func diskPercentResolverFactory(dir string) (percentResolverFunc, error) {
 	}, nil
 }
 
-// newBytesOrPercentageValue creates a bytesOrPercentageValue.
+// makeBytesOrPercentageValue creates a bytesOrPercentageValue.
 //
 // v and percentResolver can be nil (either they're both specified or they're
 // both nil). If they're nil, then Resolve() has to be called later to get the
 // passed-in value.
-func newBytesOrPercentageValue(
+//
+// When using this function, be sure to define the flag Value in a
+// context struct (in context.go) and place the call to
+// makeBytesOrPercentageValue() in one of the context init
+// functions. Do not use global-scope variables.
+func makeBytesOrPercentageValue(
 	v *int64, percentResolver func(percent int) (int64, error),
-) *bytesOrPercentageValue {
-	return &bytesOrPercentageValue{
+) bytesOrPercentageValue {
+	return bytesOrPercentageValue{
 		bval:            humanizeutil.NewBytesValue(v),
 		percentResolver: percentResolver,
 	}

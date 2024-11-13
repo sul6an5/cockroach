@@ -14,6 +14,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -127,6 +128,10 @@ func TestIsEmpty(t *testing.T) {
 	assert.False(t, a.IsEmpty())
 	a = makeSynTS(0, 0)
 	assert.False(t, a.IsEmpty())
+
+	nonZero := makeTS(1, 1)
+	nonZero.Synthetic = true
+	require.NoError(t, zerofields.NoZeroField(nonZero), "please update IsEmpty as well")
 }
 
 func TestTimestampNext(t *testing.T) {
@@ -404,4 +409,24 @@ func BenchmarkTimestampStringSynthetic(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = ts.String()
 	}
+}
+
+func BenchmarkTimestampIsEmpty(b *testing.B) {
+	cases := map[string]Timestamp{
+		"empty":    {},
+		"walltime": {WallTime: 1664364012528805328},
+		"all":      {WallTime: 1664364012528805328, Logical: 65535, Synthetic: true},
+	}
+
+	var result bool
+
+	for name, ts := range cases {
+		b.Run(name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				result = ts.IsEmpty()
+			}
+		})
+	}
+
+	_ = result // make sure compiler doesn't optimize away the call
 }

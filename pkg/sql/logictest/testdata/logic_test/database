@@ -41,6 +41,19 @@ postgres       root   NULL            NULL              {}       NULL           
 system         node   NULL            NULL              {}       NULL           NULL
 test           root   NULL            NULL              {}       NULL           NULL
 
+statement ok
+COMMENT ON DATABASE a IS 'AAA'
+
+query TTTTTTT colnames
+SHOW DATABASES WITH COMMENT
+----
+database_name  owner  primary_region  secondary_region  regions  survival_goal  comment
+a              root   NULL            NULL              {}       NULL           AAA
+defaultdb      root   NULL            NULL              {}       NULL           NULL
+postgres       root   NULL            NULL              {}       NULL           NULL
+system         node   NULL            NULL              {}       NULL           NULL
+test           root   NULL            NULL              {}       NULL           NULL
+
 # Verify that SHOW SCHEMAS FROM a includes user-defined schemas.
 statement ok
 CREATE SCHEMA a.s
@@ -323,3 +336,28 @@ user testuser
 
 statement error permission denied to create database
 CREATE DATABASE d WITH OWNER testuser2
+
+user root
+
+# Fix for https://github.com/cockroachdb/cockroach/issues/97938.
+subtest if_not_exists_with_owner
+
+statement ok
+CREATE DATABASE IF NOT EXISTS ifnotexistsownerdb WITH OWNER testuser
+
+query TTTTTT colnames
+SELECT * FROM [SHOW DATABASES] WHERE database_name = 'ifnotexistsownerdb'
+----
+database_name       owner     primary_region  secondary_region  regions  survival_goal
+ifnotexistsownerdb  testuser  NULL            NULL              {}       NULL
+
+statement ok
+CREATE DATABASE IF NOT EXISTS ifnotexistsownerdb WITH OWNER testuser
+
+query TTTTTT colnames
+SELECT * FROM [SHOW DATABASES] WHERE database_name = 'ifnotexistsownerdb'
+----
+database_name       owner     primary_region  secondary_region  regions  survival_goal
+ifnotexistsownerdb  testuser  NULL            NULL              {}       NULL
+
+subtest end

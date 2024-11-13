@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -27,7 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/lib/pq/oid"
 )
 
@@ -54,11 +56,6 @@ const (
 // and is to be used from Context.
 type DatabaseCatalog interface {
 
-	// ParseQualifiedTableName parses a SQL string of the form
-	// `[ database_name . ] [ schema_name . ] table_name`.
-	// NB: this is deprecated! Use parser.ParseQualifiedTableName when possible.
-	ParseQualifiedTableName(sql string) (*tree.TableName, error)
-
 	// ResolveTableName expands the given table name and
 	// makes it point to a valid object.
 	// If the database name is not given, it uses the search path to find it, and
@@ -70,21 +67,9 @@ type DatabaseCatalog interface {
 	// whether it exists.
 	SchemaExists(ctx context.Context, dbName, scName string) (found bool, err error)
 
-	// IsTableVisible checks if the table with the given ID belongs to a schema
-	// on the given sessiondata.SearchPath.
-	IsTableVisible(
-		ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID oid.Oid,
-	) (isVisible bool, exists bool, err error)
-
-	// IsTypeVisible checks if the type with the given ID belongs to a schema
-	// on the given sessiondata.SearchPath.
-	IsTypeVisible(
-		ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
-	) (isVisible bool, exists bool, err error)
-
-	// HasAnyPrivilege returns whether the current user has privilege to access
-	// the given object.
-	HasAnyPrivilege(ctx context.Context, specifier HasPrivilegeSpecifier, user username.SQLUsername, privs []privilege.Privilege) (HasAnyPrivilegeResult, error)
+	// HasAnyPrivilegeForSpecifier returns whether the current user has privilege
+	// to access the given object.
+	HasAnyPrivilegeForSpecifier(ctx context.Context, specifier HasPrivilegeSpecifier, user username.SQLUsername, privs []privilege.Privilege) (HasAnyPrivilegeResult, error)
 }
 
 // CastFunc is a function which cases a datum to a given type.
@@ -131,6 +116,17 @@ type CatalogBuiltins interface {
 
 	// PGRelationIsUpdatable returns the update events the relation supports.
 	PGRelationIsUpdatable(ctx context.Context, oid *tree.DOid) (*tree.DInt, error)
+
+	// RedactDescriptor expects an encoded protobuf descriptor, decodes it,
+	// redacts its expressions, and re-encodes it.
+	RedactDescriptor(ctx context.Context, encodedDescriptor []byte) ([]byte, error)
+
+	// DescriptorWithPostDeserializationChanges expects an encoded protobuf
+	// descriptor, decodes it, puts it into a catalog.DescriptorBuilder,
+	// calls RunPostDeserializationChanges, and re-encodes it.
+	DescriptorWithPostDeserializationChanges(
+		ctx context.Context, encodedDescriptor []byte,
+	) ([]byte, error)
 }
 
 // HasPrivilegeSpecifier specifies an object to lookup privilege for.
@@ -161,6 +157,11 @@ type HasPrivilegeSpecifier struct {
 	// Only one of ColumnName, ColumnAttNum is filled.
 	ColumnName   *tree.Name
 	ColumnAttNum *uint32
+
+	// Function privilege
+	// This needs to be a user-defined function OID. Builtin function OIDs won't
+	// work since they're not descriptors based.
+	FunctionOID *oid.Oid
 }
 
 // TypeResolver is an interface for resolving types and type OIDs.
@@ -194,6 +195,13 @@ type Planner interface {
 	TypeResolver
 	tree.FunctionReferenceResolver
 
+	// Mon returns the Planner's monitor.
+	//
+	// TODO(yuzefovich): memory usage against this monitor doesn't count against
+	// sql.mem.distsql.current metric, audit the callers to see whether this is
+	// undesirable in some places.
+	Mon() *mon.BytesMonitor
+
 	// ExecutorConfig returns *ExecutorConfig
 	ExecutorConfig() interface{}
 
@@ -205,11 +213,23 @@ type Planner interface {
 	// EvalSubquery returns the Datum for the given subquery node.
 	EvalSubquery(expr *tree.Subquery) (tree.Datum, error)
 
-	// EvalRoutineExpr evaluates a routine with the given input datums and
+	// EvalRoutineExpr evaluates a routine with the given argument datums and
 	// returns the resulting datum.
 	EvalRoutineExpr(
-		ctx context.Context, expr *tree.RoutineExpr, input tree.Datums,
+		ctx context.Context, expr *tree.RoutineExpr, args tree.Datums,
 	) (tree.Datum, error)
+
+	// RoutineExprGenerator returns a ValueGenerator that produces the results
+	// of the routine.
+	RoutineExprGenerator(
+		ctx context.Context, expr *tree.RoutineExpr, args tree.Datums,
+	) ValueGenerator
+
+	// GenerateTestObjects is used to generate a large number of
+	// objets quickly.
+	// Note: we pass parameters as a string to avoid a package
+	// dependency to randgen from users of this interface;
+	GenerateTestObjects(ctx context.Context, parameters string) (string, error)
 
 	// UnsafeUpsertDescriptor is used to repair descriptors in dire
 	// circumstances. See the comment on the planner implementation.
@@ -224,6 +244,10 @@ type Planner interface {
 	// ForceDeleteTableData cleans up underlying data for a table
 	// descriptor ID. See the comment on the planner implementation.
 	ForceDeleteTableData(ctx context.Context, descID int64) error
+
+	// UpsertDroppedRelationGCTTL is used to upsert the GC TTL in the zone
+	// configuration of a dropped table, sequence or materialized view.
+	UpsertDroppedRelationGCTTL(ctx context.Context, id int64, ttl duration.Duration) error
 
 	// UnsafeUpsertNamespaceEntry is used to repair namespace entries in dire
 	// circumstances. See the comment on the planner implementation.
@@ -275,7 +299,7 @@ type Planner interface {
 
 	// DeserializeSessionState deserializes the state as serialized variables
 	// into the current session.
-	DeserializeSessionState(state *tree.DBytes) (*tree.DBool, error)
+	DeserializeSessionState(ctx context.Context, state *tree.DBytes) (*tree.DBool, error)
 
 	// CreateSessionRevivalToken creates a token that can be used to log in
 	// as the current user, in bytes form.
@@ -339,28 +363,43 @@ type Planner interface {
 	// IsActive returns if the version specified by key is active.
 	IsActive(ctx context.Context, key clusterversion.Key) bool
 
-	// SynthesizePrivilegeDescriptor synthesizes a
-	// PrivilegeDescriptor given a SyntheticPrivilegeObject's path
-	// from system.privileges.
-	SynthesizePrivilegeDescriptor(
-		ctx context.Context,
-		privilegeObjectName string,
-		privilegeObjectPath string,
-		privilegeObjectType privilege.ObjectType,
-	) (*catpb.PrivilegeDescriptor, error)
-
 	// GetMultiregionConfig synthesizes a new multiregion.RegionConfig describing
 	// the multiregion properties of the database identified via databaseID. The
 	// second return value is false if the database doesn't exist or is not
 	// multiregion.
-	GetMultiregionConfig(databaseID descpb.ID) (interface{}, bool)
+	GetMultiregionConfig(ctx context.Context, databaseID descpb.ID) (interface{}, bool)
+
+	// IsANSIDML returns true if the statement being planned is one of the 4 DML
+	// statements, SELECT, UPDATE, INSERT, DELETE, or an EXPLAIN of one of these
+	// statements.
+	IsANSIDML() bool
+
+	// EnforceHomeRegion returns true if the statement being planned is an ANSI
+	// DML statement and the enforce_home_region session setting is true.
+	EnforceHomeRegion() bool
+
+	// GetRangeDescIterator gets a rangedesc.Iterator for the specified span.
+	GetRangeDescIterator(context.Context, roachpb.Span) (rangedesc.Iterator, error)
+
+	// GetRangeDescByID gets the RangeDescriptor by the specified RangeID.
+	GetRangeDescByID(context.Context, roachpb.RangeID) (roachpb.RangeDescriptor, error)
+
+	SpanStats(context.Context, roachpb.Spans) (*roachpb.SpanStatsResponse, error)
+
+	GetDetailsForSpanStats(ctx context.Context, dbId int, tableId int) (InternalRows, error)
+
+	// MaybeReallocateAnnotations makes a new annotations slice of size
+	// numAnnotations if one is maintained by this Planner and the current one has
+	// less than numAnnotations entries. If updated, the annotations in the eval
+	// context held in the planner is also updated.
+	MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx)
 }
 
 // InternalRows is an iterator interface that's exposed by the internal
 // executor. It provides access to the rows from a query.
 // InternalRows is a copy of the one in sql/internal.go excluding the
 // Types function - we don't need the Types function for use cases where
-// QueryIteratorEx is used from the InternalExecutor on the Planner.
+// QueryIteratorEx is used from the Executor on the Planner.
 // Furthermore, we cannot include the Types function due to a cyclic
 // dependency on colinfo.ResultColumns - we cannot import colinfo in tree.
 type InternalRows interface {
@@ -416,6 +455,13 @@ type SessionAccessor interface {
 	// HasRoleOption returns nil iff the current session user has the specified
 	// role option.
 	HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error)
+
+	// CheckPrivilege verifies that the current user has `privilege` on `descriptor`.
+	CheckPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind) error
+
+	// HasViewActivityOrViewActivityRedactedRole returns true iff the current session user has the
+	// VIEWACTIVITY or VIEWACTIVITYREDACTED permission.
+	HasViewActivityOrViewActivityRedactedRole(ctx context.Context) (bool, error)
 }
 
 // PreparedStatementState is a limited interface that exposes metadata about
@@ -525,20 +571,21 @@ type ChangefeedState interface {
 // builtin functions to create, configure, and destroy tenants. The methods will
 // return errors when run by any tenant other than the system tenant.
 type TenantOperator interface {
-	// CreateTenant attempts to install a new tenant in the system. It returns
-	// an error if the tenant already exists. The new tenant is created at the
-	// current active version of the cluster performing the create.
-	CreateTenant(ctx context.Context, tenantID uint64) error
+	// CreateTenant attempts to create a new secondary tenant.
+	CreateTenant(ctx context.Context, parameters string) (roachpb.TenantID, error)
 
-	// DestroyTenant attempts to uninstall an existing tenant from the system.
+	// DropTenantByID attempts to uninstall an existing tenant from the system.
 	// It returns an error if the tenant does not exist. If synchronous is true
 	// the gc job will not wait for a GC ttl.
-	DestroyTenant(ctx context.Context, tenantID uint64, synchronous bool) error
+	DropTenantByID(ctx context.Context, tenantID uint64, synchronous, ignoreServiceMode bool) error
 
 	// GCTenant attempts to garbage collect a DROP tenant from the system. Upon
 	// success it also removes the tenant record.
 	// It returns an error if the tenant does not exist.
 	GCTenant(ctx context.Context, tenantID uint64) error
+
+	// LookupTenantID returns the ID for the given tenant name.o
+	LookupTenantID(ctx context.Context, tenantName roachpb.TenantName) (roachpb.TenantID, error)
 
 	// UpdateTenantResourceLimits reconfigures the tenant resource limits.
 	// See multitenant.TenantUsageServer for more details on the arguments.

@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
 
@@ -222,29 +221,25 @@ FROM
 				members = append(members, string(tree.MustBeDString(d)))
 			}
 		}
-		// Try to construct type information from the resulting row.
-		switch {
-		case len(members) > 0:
-			typ := types.MakeEnum(catid.TypeIDToOID(descpb.ID(id)), 0 /* arrayTypeID */)
-			typ.TypeMeta = types.UserDefinedTypeMetadata{
-				Name: &types.UserDefinedTypeName{
-					Schema: scName,
-					Name:   name,
-				},
-				EnumData: &types.EnumMetadata{
-					LogicalRepresentations: members,
-					// The physical representations don't matter in this case, but the
-					// enum related code in tree expects that the length of
-					// PhysicalRepresentations is equal to the length of LogicalRepresentations.
-					PhysicalRepresentations: make([][]byte, len(members)),
-					IsMemberReadOnly:        make([]bool, len(members)),
-				},
-			}
-			key := tree.MakeSchemaQualifiedTypeName(scName, name)
-			udtMapping[key] = typ
-		default:
-			return nil, errors.New("unsupported SQLSmith type kind")
+		// Construct type information from the resulting row. Note that the UDT
+		// may have no members (e.g., `CREATE TYPE t AS ENUM ()`).
+		typ := types.MakeEnum(catid.TypeIDToOID(descpb.ID(id)), 0 /* arrayTypeID */)
+		typ.TypeMeta = types.UserDefinedTypeMetadata{
+			Name: &types.UserDefinedTypeName{
+				Schema: scName,
+				Name:   name,
+			},
+			EnumData: &types.EnumMetadata{
+				LogicalRepresentations: members,
+				// The physical representations don't matter in this case, but the
+				// enum related code in tree expects that the length of
+				// PhysicalRepresentations is equal to the length of LogicalRepresentations.
+				PhysicalRepresentations: make([][]byte, len(members)),
+				IsMemberReadOnly:        make([]bool, len(members)),
+			},
 		}
+		key := tree.MakeSchemaQualifiedTypeName(scName, name)
+		udtMapping[key] = typ
 	}
 	var udts []*types.T
 	for _, t := range udtMapping {
@@ -472,13 +467,13 @@ type operator struct {
 var operators = func() map[oid.Oid][]operator {
 	m := map[oid.Oid][]operator{}
 	for BinaryOperator, overload := range tree.BinOps {
-		for _, ov := range overload {
-			bo := ov.(*tree.BinOp)
+		_ = overload.ForEachBinOp(func(bo *tree.BinOp) error {
 			m[bo.ReturnType.Oid()] = append(m[bo.ReturnType.Oid()], operator{
 				BinOp:    bo,
 				Operator: treebin.MakeBinaryOperator(BinaryOperator),
 			})
-		}
+			return nil
+		})
 	}
 	return m
 }()
@@ -500,6 +495,14 @@ var functions = func() map[tree.FunctionClass]map[oid.Oid][]function {
 			// See #69213.
 			continue
 		}
+
+		if n := tree.Name(def.Name); n.String() != def.Name {
+			// sqlsmith doesn't know how to quote function names, e.g. for
+			// the numeric cast, we need to use `"numeric"(val)`, but sqlsmith
+			// makes it `numeric(val)` which is incorrect.
+			continue
+		}
+
 		skip := false
 		for _, substr := range []string{
 			// crdb_internal.complete_stream_ingestion_job is a stateful
@@ -518,14 +521,14 @@ var functions = func() map[tree.FunctionClass]map[oid.Oid][]function {
 			"crdb_internal.revalidate_unique_constraint",
 			"crdb_internal.request_statement_bundle",
 			"crdb_internal.set_compaction_concurrency",
+			// TODO(#97097): Temporarily disable crdb_internal.fingerprint
+			// which produces internal errors for some valid inputs.
+			"crdb_internal.fingerprint",
 		} {
 			skip = skip || strings.Contains(def.Name, substr)
 		}
 		if skip {
 			continue
-		}
-		if _, ok := m[def.Class]; !ok {
-			m[def.Class] = map[oid.Oid][]function{}
 		}
 		// Ignore pg compat functions since many are unimplemented.
 		if def.Category == "Compatibility" {
@@ -535,6 +538,9 @@ var functions = func() map[tree.FunctionClass]map[oid.Oid][]function {
 			continue
 		}
 		for _, ov := range def.Definition {
+			if m[ov.Class] == nil {
+				m[ov.Class] = map[oid.Oid][]function{}
+			}
 			// Ignore documented unusable functions.
 			if strings.Contains(ov.Info, "Not usable") {
 				continue
@@ -549,7 +555,7 @@ var functions = func() map[tree.FunctionClass]map[oid.Oid][]function {
 			if !found {
 				continue
 			}
-			m[def.Class][typ.Oid()] = append(m[def.Class][typ.Oid()], function{
+			m[ov.Class][typ.Oid()] = append(m[ov.Class][typ.Oid()], function{
 				def:      def,
 				overload: ov,
 			})

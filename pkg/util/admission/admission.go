@@ -110,7 +110,7 @@
 //   registry.AddMetricStruct(metrics[i])
 // }
 // kvQueue := coord.GetWorkQueue(admission.KVWork)
-// // Pass kvQueue to server.Node that implements roachpb.InternalServer.
+// // Pass kvQueue to server.Node that implements kvpb.InternalServer.
 // ...
 // // Do similar things with the other WorkQueues.
 //
@@ -131,9 +131,9 @@ package admission
 import (
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/redact"
 )
 
 // requester is an interface implemented by an object that orders admission
@@ -165,7 +165,7 @@ type granter interface {
 	// avoids queueing in the requester.
 	//
 	// REQUIRES: count > 0. count == 1 for slots.
-	tryGet(count int64) bool
+	tryGet(count int64) (granted bool)
 	// returnGrant is called for:
 	// - returning slots after use.
 	// - returning either slots or tokens when the grant raced with the work
@@ -258,23 +258,22 @@ type granterWithLockedCalls interface {
 // The interface is used by the entity that periodically looks at load and
 // computes the tokens to grant (ioLoadListener).
 type granterWithIOTokens interface {
-	// setAvailableIOTokensLocked bounds the available tokens that can be
-	// granted to the value provided in the tokens parameter. This is not a
-	// tight bound when the callee has negative available tokens, due to the use
-	// of granter.tookWithoutPermission, since in that the case the callee
+	// setAvailableTokens bounds the available {io,elastic disk bandwidth}
+	// tokens that can be granted to the value provided in the
+	// {io,elasticDiskBandwidth}Tokens parameter. elasticDiskBandwidthTokens
+	// bounds what can be granted to elastic work, and is based on disk
+	// bandwidth being a bottleneck resource. These are not tight bounds when
+	// the callee has negative available tokens, due to the use of
+	// granter.tookWithoutPermission, since in that the case the callee
 	// increments that negative value with the value provided by tokens. This
 	// method needs to be called periodically. The return value is the number of
 	// used tokens in the interval since the prior call to this method. Note
 	// that tokensUsed can be negative, though that will be rare, since it is
 	// possible for tokens to be returned.
-	setAvailableIOTokensLocked(tokens int64) (tokensUsed int64)
-	// setAvailableElasticDiskBandwidthTokensLocked bounds the available tokens
-	// that can be granted to elastic work. These tokens are based on disk
-	// bandwidth being a bottleneck resource.
-	setAvailableElasticDiskBandwidthTokensLocked(tokens int64)
-	// getDiskTokensUsedAndResetLocked returns the disk bandwidth tokens used
+	setAvailableTokens(ioTokens int64, elasticDiskBandwidthTokens int64) (tokensUsed int64)
+	// getDiskTokensUsedAndReset returns the disk bandwidth tokens used
 	// since the last such call.
-	getDiskTokensUsedAndResetLocked() [numWorkClasses]int64
+	getDiskTokensUsedAndReset() [admissionpb.NumWorkClasses]int64
 	// setAdmittedDoneModelsLocked supplies the models to use when
 	// storeWriteDone is called, to adjust token consumption. Note that these
 	// models are not used for token adjustment at admission time -- that is
@@ -282,7 +281,7 @@ type granterWithIOTokens interface {
 	// asymmetry is due to the need to use all the functionality of WorkQueue at
 	// admission time. See the long explanatory comment at the beginning of
 	// store_token_estimation.go, regarding token estimation.
-	setAdmittedDoneModelsLocked(l0WriteLM tokensLinearModel, l0IngestLM tokensLinearModel,
+	setAdmittedDoneModels(l0WriteLM tokensLinearModel, l0IngestLM tokensLinearModel,
 		ingestLM tokensLinearModel)
 }
 
@@ -321,9 +320,24 @@ type CPULoadListener interface {
 // storeRequester is used to abstract *StoreWorkQueue for testing.
 type storeRequester interface {
 	requesterClose
-	getRequesters() [numWorkClasses]requester
+	getRequesters() [admissionpb.NumWorkClasses]requester
 	getStoreAdmissionStats() storeAdmissionStats
 	setStoreRequestEstimates(estimates storeRequestEstimates)
+}
+
+// elasticCPULimiter is used to set the CPU utilization limit for elastic work
+// (defined as a % of available system CPU).
+type elasticCPULimiter interface {
+	getUtilizationLimit() float64
+	setUtilizationLimit(limit float64)
+	hasWaitingRequests() bool
+	computeUtilizationMetric()
+}
+
+// SchedulerLatencyListener listens to the latest scheduler latency data. We
+// expect this to be called every scheduler_latency.sample_period.
+type SchedulerLatencyListener interface {
+	SchedulerLatency(p99, period time.Duration)
 }
 
 // grantKind represents the two kind of ways we grant admission: using a slot
@@ -486,7 +500,7 @@ const (
 	numWorkKinds
 )
 
-func workKindString(workKind WorkKind) redact.RedactableString {
+func workKindString(workKind WorkKind) string {
 	switch workKind {
 	case KVWork:
 		return "kv"
@@ -508,8 +522,9 @@ func workKindString(workKind WorkKind) redact.RedactableString {
 // all of these when StoreWorkQueue.AdmittedWorkDone is called, so that these
 // cumulative values are mutually consistent.
 type storeAdmissionStats struct {
-	// Total requests that called AdmittedWorkDone or BypassedWorkDone.
-	admittedCount uint64
+	// Total requests that called {Admitted,Bypassed}WorkDone, or in the case of
+	// replicated writes, the requests that called Admit.
+	workCount uint64
 	// Sum of StoreWorkDoneInfo.WriteBytes.
 	//
 	// TODO(sumeer): writeAccountedBytes and ingestedAccountedBytes are not
@@ -534,7 +549,7 @@ type storeAdmissionStats struct {
 	// (e.g. for logging).
 	aux struct {
 		// These bypassed numbers are already included in the corresponding
-		// {admittedCount, writeAccountedBytes, ingestedAccountedBytes}.
+		// {workCount, writeAccountedBytes, ingestedAccountedBytes}.
 		bypassedCount                  uint64
 		writeBypassedAccountedBytes    uint64
 		ingestedBypassedAccountedBytes uint64
@@ -547,3 +562,10 @@ type storeRequestEstimates struct {
 	// writeTokens is the tokens to request at admission time. Must be > 0.
 	writeTokens int64
 }
+
+// PacerFactory is used to construct a new admission.Pacer.
+type PacerFactory interface {
+	NewPacer(unit time.Duration, wi WorkInfo) *Pacer
+}
+
+var _ PacerFactory = &ElasticCPUGrantCoordinator{}

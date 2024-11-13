@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -51,11 +51,6 @@ func ValidateRowLevelTTL(ttl *catpb.RowLevelTTL) error {
 			return err
 		}
 	}
-	if ttl.RangeConcurrency != 0 {
-		if err := ValidateTTLRangeConcurrency("ttl_range_concurrency", ttl.RangeConcurrency); err != nil {
-			return err
-		}
-	}
 	if ttl.DeleteRateLimit != 0 {
 		if err := ValidateTTLRateLimit("ttl_delete_rate_limit", ttl.DeleteRateLimit); err != nil {
 			return err
@@ -79,13 +74,18 @@ func ValidateTTLExpirationExpr(desc catalog.TableDescriptor) error {
 	if expirationExpr == "" {
 		return nil
 	}
-	expr, err := parser.ParseExpr(string(expirationExpr))
+	exprs, err := parser.ParseExprs([]string{string(expirationExpr)})
 	if err != nil {
 		return errors.Wrapf(err, "ttl_expiration_expression %q must be a valid expression", expirationExpr)
+	} else if len(exprs) != 1 {
+		return errors.Newf(
+			`ttl_expiration_expression %q must be a single expression`,
+			expirationExpr,
+		)
 	}
 	// Ideally, we would also call schemaexpr.ValidateTTLExpirationExpression
 	// here, but that requires a SemaCtx which we don't have here.
-	valid, err := schemaexpr.HasValidColumnReferences(desc, expr)
+	valid, err := schemaexpr.HasValidColumnReferences(desc, exprs[0])
 	if err != nil {
 		return err
 	}
@@ -106,16 +106,16 @@ func ValidateTTLExpirationColumn(desc catalog.TableDescriptor) error {
 		return nil
 	}
 	intervalExpr := desc.GetRowLevelTTL().DurationExpr
-	col, err := desc.FindColumnWithName(colinfo.TTLDefaultExpirationColumnName)
+	col, err := catalog.MustFindColumnByTreeName(desc, catpb.TTLDefaultExpirationColumnName)
 	if err != nil {
-		return errors.Wrapf(err, "expected column %s", colinfo.TTLDefaultExpirationColumnName)
+		return errors.Wrapf(err, "expected column %s", catpb.TTLDefaultExpirationColumnName)
 	}
 	expectedStr := `current_timestamp():::TIMESTAMPTZ + ` + string(intervalExpr)
 	if col.GetDefaultExpr() != expectedStr {
 		return pgerror.Newf(
 			pgcode.InvalidTableDefinition,
 			"expected DEFAULT expression of %s to be %s",
-			colinfo.TTLDefaultExpirationColumnName,
+			catpb.TTLDefaultExpirationColumnName,
 			expectedStr,
 		)
 	}
@@ -123,7 +123,7 @@ func ValidateTTLExpirationColumn(desc catalog.TableDescriptor) error {
 		return pgerror.Newf(
 			pgcode.InvalidTableDefinition,
 			"expected ON UPDATE expression of %s to be %s",
-			colinfo.TTLDefaultExpirationColumnName,
+			catpb.TTLDefaultExpirationColumnName,
 			expectedStr,
 		)
 	}
@@ -132,7 +132,7 @@ func ValidateTTLExpirationColumn(desc catalog.TableDescriptor) error {
 	pk := desc.GetPrimaryIndex()
 	for i := 0; i < pk.NumKeyColumns(); i++ {
 		dir := pk.GetKeyColumnDirection(i)
-		if dir != catpb.IndexColumn_ASC {
+		if dir != catenumpb.IndexColumn_ASC {
 			return unimplemented.NewWithIssuef(
 				76912,
 				`non-ascending ordering on PRIMARY KEYs are not supported with row-level TTL`,
@@ -145,18 +145,6 @@ func ValidateTTLExpirationColumn(desc catalog.TableDescriptor) error {
 
 // ValidateTTLBatchSize validates the batch size of a TTL.
 func ValidateTTLBatchSize(key string, val int64) error {
-	if val <= 0 {
-		return pgerror.Newf(
-			pgcode.InvalidParameterValue,
-			`"%s" must be at least 1`,
-			key,
-		)
-	}
-	return nil
-}
-
-// ValidateTTLRangeConcurrency validates the batch size of a TTL.
-func ValidateTTLRangeConcurrency(key string, val int64) error {
 	if val <= 0 {
 		return pgerror.Newf(
 			pgcode.InvalidParameterValue,

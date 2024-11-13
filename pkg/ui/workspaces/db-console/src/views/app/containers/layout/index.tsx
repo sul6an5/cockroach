@@ -25,7 +25,6 @@ import {
 } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import LoginIndicator from "src/views/app/components/loginIndicator";
-import FeedbackSurveyLink from "src/views/app/components/feedbackSurveyLink/feedbackSurveyLink";
 import {
   GlobalNavigation,
   CockroachLabsLockupIcon,
@@ -39,6 +38,8 @@ import { Badge } from "@cockroachlabs/cluster-ui";
 
 import "./layout.styl";
 import "./layoutPanel.styl";
+import { getDataFromServer } from "src/util/dataFromServer";
+import TenantDropdown from "../../components/tenantDropdown/tenantDropdown";
 
 export interface LayoutProps {
   clusterName: string;
@@ -84,7 +85,6 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
                 <CockroachLabsLockupIcon height={26} />
               </Left>
               <Right>
-                <FeedbackSurveyLink />
                 <LoginIndicator />
               </Right>
             </GlobalNavigation>
@@ -92,9 +92,13 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
           <div className="layout-panel__navigation-bar">
             <PageHeader>
               <Text textType={TextTypes.Heading2} noWrap>
+                {getDataFromServer().FeatureFlags.is_observability_service
+                  ? "(Obs Service) "
+                  : ""}
                 {clusterName || `Cluster id: ${clusterId || ""}`}
               </Text>
               <Badge text={clusterVersion} />
+              <TenantDropdown />
             </PageHeader>
           </div>
           <div className="layout-panel__body">
@@ -102,7 +106,9 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
               <NavigationBar />
             </div>
             <div ref={this.contentRef} className="layout-panel__content">
-              <ErrorBoundary>{this.props.children}</ErrorBoundary>
+              <ErrorBoundary key={this.props.location.pathname}>
+                {this.props.children}
+              </ErrorBoundary>
             </div>
           </div>
         </div>

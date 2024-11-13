@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -33,7 +34,7 @@ func TestStoreKeyEncodeDecode(t *testing.T) {
 	}{
 		{key: StoreIdentKey(), expSuffix: localStoreIdentSuffix, expDetail: nil},
 		{key: StoreGossipKey(), expSuffix: localStoreGossipSuffix, expDetail: nil},
-		{key: StoreClusterVersionKey(), expSuffix: localStoreClusterVersionSuffix, expDetail: nil},
+		{key: DeprecatedStoreClusterVersionKey(), expSuffix: localStoreClusterVersionSuffix, expDetail: nil},
 		{key: StoreLastUpKey(), expSuffix: localStoreLastUpSuffix, expDetail: nil},
 		{key: StoreHLCUpperBoundKey(), expSuffix: localStoreHLCUpperBoundSuffix, expDetail: nil},
 	}
@@ -541,9 +542,9 @@ func TestBatchRange(t *testing.T) {
 	}
 
 	for i, c := range testCases {
-		var ba roachpb.BatchRequest
+		var ba kvpb.BatchRequest
 		for _, pair := range c.req {
-			ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+			ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{
 				Key: roachpb.Key(pair[0]), EndKey: roachpb.Key(pair[1]),
 			}})
 		}
@@ -572,8 +573,8 @@ func TestBatchError(t *testing.T) {
 	}
 
 	for i, c := range testCases {
-		var ba roachpb.BatchRequest
-		ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+		var ba kvpb.BatchRequest
+		ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{
 			Key: roachpb.Key(c.req[0]), EndKey: roachpb.Key(c.req[1]),
 		}})
 		if _, err := Range(ba.Requests); !testutils.IsError(err, c.errMsg) {
@@ -582,8 +583,8 @@ func TestBatchError(t *testing.T) {
 	}
 
 	// Test a case where a non-range request has an end key.
-	var ba roachpb.BatchRequest
-	ba.Add(&roachpb.GetRequest{RequestHeader: roachpb.RequestHeader{
+	var ba kvpb.BatchRequest
+	ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{
 		Key: roachpb.Key("a"), EndKey: roachpb.Key("b"),
 	}})
 	if _, err := Range(ba.Requests); !testutils.IsError(err, "end key specified for non-range operation") {
@@ -601,7 +602,7 @@ func TestMakeFamilyKey(t *testing.T) {
 
 func TestEnsureSafeSplitKey(t *testing.T) {
 	tenSysCodec := SystemSQLCodec
-	ten5Codec := MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	encInt := encoding.EncodeUvarintAscending
 	encInts := func(c SQLCodec, vals ...uint64) roachpb.Key {
 		k := c.TenantPrefix()
@@ -703,12 +704,12 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 	}
 }
 
-func TestTenantPrefix(t *testing.T) {
+func testDecodeTenantPrefixShared(t *testing.T) {
 	tIDs := []roachpb.TenantID{
 		roachpb.SystemTenantID,
-		roachpb.MakeTenantID(2),
-		roachpb.MakeTenantID(999),
-		roachpb.MakeTenantID(math.MaxUint64),
+		roachpb.MustMakeTenantID(2),
+		roachpb.MustMakeTenantID(999),
+		roachpb.MustMakeTenantID(math.MaxUint64),
 	}
 	for _, tID := range tIDs {
 		t.Run(fmt.Sprintf("%v", tID), func(t *testing.T) {
@@ -738,6 +739,17 @@ func TestTenantPrefix(t *testing.T) {
 	}
 }
 
+func TestDecodeTenantPrefix(t *testing.T) {
+	testDecodeTenantPrefixShared(t)
+}
+
+func TestDecodeTenantPrefixE(t *testing.T) {
+	testDecodeTenantPrefixShared(t)
+
+	_, _, err := DecodeTenantPrefixE([]byte("\xfe\x88\x28\xa0\x9b"))
+	require.Error(t, err, roachpb.ErrInvalidTenantID)
+}
+
 func TestLockTableKeyEncodeDecode(t *testing.T) {
 	expectedPrefix := append([]byte(nil), LocalRangeLockTablePrefix...)
 	expectedPrefix = append(expectedPrefix, LockTableSingleKeyInfix...)
@@ -757,6 +769,31 @@ func TestLockTableKeyEncodeDecode(t *testing.T) {
 			k, err := DecodeLockTableSingleKey(ltKey)
 			require.NoError(t, err)
 			require.Equal(t, test.key, k)
+		})
+	}
+}
+
+func TestLockTableSingleKeyNext_Equivalent(t *testing.T) {
+	testCases := []struct {
+		key roachpb.Key
+	}{
+		{key: roachpb.Key("foo")},
+		{key: roachpb.Key("a")},
+		{key: roachpb.Key("")},
+		// Causes a doubly-local range local key.
+		{key: RangeDescriptorKey(roachpb.RKey("baz"))},
+	}
+	for _, test := range testCases {
+		t.Run("", func(t *testing.T) {
+			next := test.key.Next()
+			want, _ := LockTableSingleKey(next, nil)
+
+			got, _ := LockTableSingleNextKey(test.key, nil)
+			require.Equal(t, want, got)
+
+			k, err := DecodeLockTableSingleKey(got)
+			require.NoError(t, err)
+			require.Equal(t, next, k)
 		})
 	}
 }

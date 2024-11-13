@@ -17,8 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -31,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 9
+const configIdx = 8
 
 var sqliteLogicTestDir string
 
@@ -55,7 +54,7 @@ func TestMain(m *testing.M) {
 			}
 		}
 	}
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
@@ -69,9 +68,15 @@ func runSqliteLogicTest(t *testing.T, file string) {
 		skip.IgnoreLint(t, "-bigtest flag must be specified to run this test")
 	}
 	// SQLLite logic tests can be very memory intensive, so we give them larger
-	// limit than other logic tests get.
+	// limit than other logic tests get. Also some of the 'delete' files become
+	// extremely slow when MVCC range tombstones are enabled for point deletes,
+	// so we disable that.
 	serverArgs := logictest.TestServerArgs{
 		MaxSQLMemoryLimit: 512 << 20, // 512 MiB
+		DisableUseMVCCRangeTombstonesForPointDeletes: true,
+		// Some sqlite tests with very low bytes limit value are too slow, so
+		// ensure 3 KiB lower bound.
+		BatchBytesLimitLowerBound: 3 << 10, // 3 KiB
 	}
 	logictest.RunLogicTest(t, serverArgs, configIdx, filepath.Join(sqliteLogicTestDir, file))
 }

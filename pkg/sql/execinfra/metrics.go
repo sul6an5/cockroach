@@ -24,14 +24,11 @@ type DistSQLMetrics struct {
 	ContendedQueriesCount *metric.Counter
 	FlowsActive           *metric.Gauge
 	FlowsTotal            *metric.Counter
-	FlowsQueued           *metric.Gauge
-	FlowsScheduled        *metric.Counter
-	QueueWaitHist         *metric.Histogram
-	MaxBytesHist          *metric.Histogram
+	MaxBytesHist          metric.IHistogram
 	CurBytesCount         *metric.Gauge
 	VecOpenFDs            *metric.Gauge
 	CurDiskBytesCount     *metric.Gauge
-	MaxDiskBytesHist      *metric.Histogram
+	MaxDiskBytesHist      metric.IHistogram
 	QueriesSpilled        *metric.Counter
 	SpilledBytesWritten   *metric.Counter
 	SpilledBytesRead      *metric.Counter
@@ -72,24 +69,6 @@ var (
 		Help:        "Number of distributed SQL flows executed",
 		Measurement: "Flows",
 		Unit:        metric.Unit_COUNT,
-	}
-	metaFlowsQueued = metric.Metadata{
-		Name:        "sql.distsql.flows.queued",
-		Help:        "Number of distributed SQL flows currently queued",
-		Measurement: "Flows",
-		Unit:        metric.Unit_COUNT,
-	}
-	metaFlowsScheduled = metric.Metadata{
-		Name:        "sql.distsql.flows.scheduled",
-		Help:        "Number of distributed SQL flows scheduled",
-		Measurement: "Flows",
-		Unit:        metric.Unit_COUNT,
-	}
-	metaQueueWaitHist = metric.Metadata{
-		Name:        "sql.distsql.flows.queue_wait",
-		Help:        "Duration of time flows spend waiting in the queue",
-		Measurement: "Nanoseconds",
-		Unit:        metric.Unit_NANOSECONDS,
 	}
 	metaMemMaxBytes = metric.Metadata{
 		Name:        "sql.mem.distsql.max",
@@ -141,6 +120,10 @@ var (
 	}
 )
 
+// See pkg/sql/mem_metrics.go
+// log10int64times1000 = log10(math.MaxInt64) * 1000, rounded up somewhat
+const log10int64times1000 = 19 * 1000
+
 // MakeDistSQLMetrics instantiates the metrics holder for DistSQL monitoring.
 func MakeDistSQLMetrics(histogramWindow time.Duration) DistSQLMetrics {
 	return DistSQLMetrics{
@@ -149,17 +132,25 @@ func MakeDistSQLMetrics(histogramWindow time.Duration) DistSQLMetrics {
 		ContendedQueriesCount: metric.NewCounter(metaContendedQueriesCount),
 		FlowsActive:           metric.NewGauge(metaFlowsActive),
 		FlowsTotal:            metric.NewCounter(metaFlowsTotal),
-		FlowsQueued:           metric.NewGauge(metaFlowsQueued),
-		FlowsScheduled:        metric.NewCounter(metaFlowsScheduled),
-		QueueWaitHist:         metric.NewHistogram(metaQueueWaitHist, histogramWindow, metric.IOLatencyBuckets),
-		MaxBytesHist:          metric.NewHistogram(metaMemMaxBytes, histogramWindow, metric.MemoryUsage64MBBuckets),
-		CurBytesCount:         metric.NewGauge(metaMemCurBytes),
-		VecOpenFDs:            metric.NewGauge(metaVecOpenFDs),
-		CurDiskBytesCount:     metric.NewGauge(metaDiskCurBytes),
-		MaxDiskBytesHist:      metric.NewHistogram(metaDiskMaxBytes, histogramWindow, metric.MemoryUsage64MBBuckets),
-		QueriesSpilled:        metric.NewCounter(metaQueriesSpilled),
-		SpilledBytesWritten:   metric.NewCounter(metaSpilledBytesWritten),
-		SpilledBytesRead:      metric.NewCounter(metaSpilledBytesRead),
+		MaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+			Metadata: metaMemMaxBytes,
+			Duration: histogramWindow,
+			MaxVal:   log10int64times1000,
+			SigFigs:  3,
+			Buckets:  metric.MemoryUsage64MBBuckets,
+		}),
+		CurBytesCount:     metric.NewGauge(metaMemCurBytes),
+		VecOpenFDs:        metric.NewGauge(metaVecOpenFDs),
+		CurDiskBytesCount: metric.NewGauge(metaDiskCurBytes),
+		MaxDiskBytesHist: metric.NewHistogram(metric.HistogramOptions{
+			Metadata: metaDiskMaxBytes,
+			Duration: histogramWindow,
+			MaxVal:   log10int64times1000,
+			SigFigs:  3,
+			Buckets:  metric.MemoryUsage64MBBuckets}),
+		QueriesSpilled:      metric.NewCounter(metaQueriesSpilled),
+		SpilledBytesWritten: metric.NewCounter(metaSpilledBytesWritten),
+		SpilledBytesRead:    metric.NewCounter(metaSpilledBytesRead),
 	}
 }
 
@@ -167,9 +158,6 @@ func MakeDistSQLMetrics(histogramWindow time.Duration) DistSQLMetrics {
 func (m *DistSQLMetrics) QueryStart() {
 	m.QueriesActive.Inc(1)
 	m.QueriesTotal.Inc(1)
-}
-func (m *DistSQLMetrics) QueryStartPrint() int64{
-	return m.QueriesTotal.Count()
 }
 
 // QueryStop registers the end of a DistSQL query.

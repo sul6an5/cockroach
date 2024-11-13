@@ -14,7 +14,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -23,24 +23,21 @@ import (
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.RequestLease, declareKeysRequestLease, RequestLease)
+	RegisterReadWriteCommand(kvpb.RequestLease, declareKeysRequestLease, RequestLease)
 }
 
 func declareKeysRequestLease(
 	rs ImmutableRangeState,
-	_ *roachpb.Header,
-	_ roachpb.Request,
+	_ *kvpb.Header,
+	_ kvpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
 	// NOTE: RequestLease is run on replicas that do not hold the lease, so
 	// acquiring latches would not help synchronize with other requests. As
-	// such, the request does not actually acquire latches over these spans
-	// (see concurrency.shouldAcquireLatches). However, we continue to
-	// declare the keys in order to appease SpanSet assertions under race.
-	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeLeaseKey(rs.GetRangeID())})
-	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangePriorReadSummaryKey(rs.GetRangeID())})
-	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
+	// such, the request does not declare latches. See also
+	// concurrency.shouldIgnoreLatches().
+	latchSpans.DisableUndeclaredAccessAssertions()
 }
 
 // RequestLease sets the range lease for this range. The command fails
@@ -51,29 +48,20 @@ func declareKeysRequestLease(
 // lease, all duties required of the range lease holder are commenced, including
 // releasing all latches and clearing the timestamp cache.
 func RequestLease(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
 	// When returning an error from this method, must always return a
 	// newFailedLeaseTrigger() to satisfy stats.
-	args := cArgs.Args.(*roachpb.RequestLeaseRequest)
+	args := cArgs.Args.(*kvpb.RequestLeaseRequest)
 
 	// NOTE: we use the range's current lease as prevLease instead of
 	// args.PrevLease so that we can detect lease requests that will
 	// inevitably fail early and reject them with a detailed
 	// LeaseRejectedError before going through Raft.
 	prevLease, _ := cArgs.EvalCtx.GetLease()
-	rErr := &roachpb.LeaseRejectedError{
+	rErr := &kvpb.LeaseRejectedError{
 		Existing:  prevLease,
 		Requested: args.Lease,
-	}
-
-	// If this check is removed at some point, the filtering of learners on the
-	// sending side would have to be removed as well.
-	if err := roachpb.CheckCanReceiveLease(args.Lease.Replica, cArgs.EvalCtx.Desc().Replicas(),
-		true, /* lhRemovalAllowed */
-	); err != nil {
-		rErr.Message = err.Error()
-		return newFailedLeaseTrigger(false /* isTransfer */), rErr
 	}
 
 	// MIGRATION(tschottdorf): needed to apply Raft commands which got proposed
@@ -85,6 +73,16 @@ func RequestLease(
 
 	isExtension := prevLease.Replica.StoreID == newLease.Replica.StoreID
 	effectiveStart := newLease.Start
+
+	// If this check is removed at some point, the filtering of learners on the
+	// sending side would have to be removed as well.
+	wasLastLeaseholder := isExtension
+	if err := roachpb.CheckCanReceiveLease(
+		args.Lease.Replica, cArgs.EvalCtx.Desc().Replicas(), wasLastLeaseholder,
+	); err != nil {
+		rErr.Message = err.Error()
+		return newFailedLeaseTrigger(false /* isTransfer */), rErr
+	}
 
 	// Wind the start timestamp back as far towards the previous lease as we
 	// can. That'll make sure that when multiple leases are requested out of

@@ -10,7 +10,10 @@
 
 package kvcoord
 
-import "github.com/cockroachdb/cockroach/pkg/base"
+import (
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+)
 
 // ClientTestingKnobs contains testing options that dictate the behavior
 // of the key-value client.
@@ -52,6 +55,12 @@ type ClientTestingKnobs struct {
 	// CommitWaitFilter allows tests to instrument the beginning of a transaction
 	// commit wait sleep.
 	CommitWaitFilter func()
+
+	// OnRangeSpanningNonTxnalBatch is invoked whenever DistSender attempts to split
+	// a non-transactional batch across a range boundary. The method may inject an
+	// error which, if non-nil, becomes the result of the batch. Otherwise, execution
+	// continues.
+	OnRangeSpanningNonTxnalBatch func(ba *kvpb.BatchRequest) *kvpb.Error
 }
 
 var _ base.ModuleTestingKnobs = &ClientTestingKnobs{}

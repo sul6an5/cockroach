@@ -10,6 +10,7 @@ package backupccl
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"sort"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuputils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudcheck"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudprivilege"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -32,18 +34,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/doctor"
+	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -104,7 +108,10 @@ func (m manifestInfoReader) showBackup(
 	// FKs for which we can't resolve the cross-table references. We can't
 	// display them anyway, because we don't have the referenced table names,
 	// etc.
-	err := maybeUpgradeDescriptorsInBackupManifests(info.manifests,
+	err := maybeUpgradeDescriptorsInBackupManifests(ctx,
+		kmsEnv.ClusterSettings().Version.ActiveVersion(ctx),
+		info.manifests,
+		info.layerToIterFactory,
 		true /* skipFKsWithNoMatchingTable */)
 	if err != nil {
 		return err
@@ -173,73 +180,119 @@ func (m metadataSSTInfoReader) showBackup(
 	return nil
 }
 
+func showBackupTypeCheck(
+	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
+) (matched bool, header colinfo.ResultColumns, _ error) {
+	backup, ok := stmt.(*tree.ShowBackup)
+	if !ok {
+		return false, nil, nil
+	}
+	if backup.Path == nil && backup.InCollection != nil {
+		return showBackupsInCollectionTypeCheck(ctx, backup, p)
+	}
+	if err := exprutil.TypeCheck(
+		ctx, "SHOW BACKUP", p.SemaCtx(),
+		exprutil.Ints{
+			backup.Options.CheckConnectionConcurrency,
+		},
+		exprutil.Strings{
+			backup.Path,
+			backup.Options.EncryptionPassphrase,
+			backup.Options.EncryptionInfoDir,
+			backup.Options.CheckConnectionTransferSize,
+			backup.Options.CheckConnectionDuration,
+		},
+		exprutil.StringArrays{
+			tree.Exprs(backup.InCollection),
+			tree.Exprs(backup.Options.IncrementalStorage),
+			tree.Exprs(backup.Options.DecryptionKMSURI),
+		},
+	); err != nil {
+		return false, nil, err
+	}
+	if backup.Details == tree.BackupConnectionTest {
+		return true, cloudcheck.Header, nil
+	}
+	infoReader := getBackupInfoReader(p, backup)
+	return true, infoReader.header(), nil
+}
+
 // showBackupPlanHook implements PlanHookFn.
 func showBackupPlanHook(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
 ) (sql.PlanHookRowFn, colinfo.ResultColumns, []sql.PlanNode, bool, error) {
-	backup, ok := stmt.(*tree.ShowBackup)
+	showStmt, ok := stmt.(*tree.ShowBackup)
 	if !ok {
 		return nil, nil, nil, false, nil
 	}
+	exprEval := p.ExprEvaluator("SHOW BACKUP")
 
-	if backup.Path == nil && backup.InCollection != nil {
-		return showBackupsInCollectionPlanHook(ctx, backup, p)
+	// TODO(dt): find move this to its own hook.
+	if showStmt.Details == tree.BackupConnectionTest {
+		loc, err := exprEval.String(ctx, showStmt.Path)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		var params cloudcheck.Params
+		if showStmt.Options.CheckConnectionTransferSize != nil {
+			transferSizeStr, err := exprEval.String(ctx, showStmt.Options.CheckConnectionTransferSize)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			parsed, err := humanizeutil.ParseBytes(transferSizeStr)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			params.TransferSize = parsed
+		}
+		if showStmt.Options.CheckConnectionDuration != nil {
+			durationStr, err := exprEval.String(ctx, showStmt.Options.CheckConnectionDuration)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			parsed, err := time.ParseDuration(durationStr)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			params.MinDuration = parsed
+		}
+		if showStmt.Options.CheckConnectionConcurrency != nil {
+			concurrency, err := exprEval.Int(ctx, showStmt.Options.CheckConnectionConcurrency)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			params.Concurrency = concurrency
+		}
+		return cloudcheck.ShowCloudStorageTestPlanHook(ctx, p, loc, params)
 	}
 
-	toFn, err := p.TypeAsString(ctx, backup.Path, "SHOW BACKUP")
+	if showStmt.Path == nil && showStmt.InCollection != nil {
+		collection, err := exprEval.StringArray(
+			ctx, tree.Exprs(showStmt.InCollection),
+		)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		return showBackupsInCollectionPlanHook(ctx, collection, showStmt, p)
+	}
+
+	to, err := exprEval.String(ctx, showStmt.Path)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
 
-	var inColFn func() ([]string, error)
-	if backup.InCollection != nil {
-		inColFn, err = p.TypeAsStringArray(ctx, tree.Exprs(backup.InCollection), "SHOW BACKUP")
+	var inCol []string
+	if showStmt.InCollection != nil {
+		inCol, err = exprEval.StringArray(ctx, tree.Exprs(showStmt.InCollection))
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 	}
 
-	expected := map[string]sql.KVStringOptValidate{
-		backupencryption.BackupOptEncPassphrase: sql.KVStringOptRequireValue,
-		backupencryption.BackupOptEncKMS:        sql.KVStringOptRequireValue,
-		backupOptWithPrivileges:                 sql.KVStringOptRequireNoValue,
-		backupOptAsJSON:                         sql.KVStringOptRequireNoValue,
-		backupOptWithDebugIDs:                   sql.KVStringOptRequireNoValue,
-		backupOptIncStorage:                     sql.KVStringOptRequireValue,
-		backupOptDebugMetadataSST:               sql.KVStringOptRequireNoValue,
-		backupOptEncDir:                         sql.KVStringOptRequireValue,
-		backupOptCheckFiles:                     sql.KVStringOptRequireNoValue,
-	}
-	optsFn, err := p.TypeAsStringOpts(ctx, backup.Options, expected)
+	infoReader := getBackupInfoReader(p, showStmt)
+
 	if err != nil {
 		return nil, nil, nil, false, err
-	}
-	opts, err := optsFn()
-	if err != nil {
-		return nil, nil, nil, false, err
-	}
-
-	var infoReader backupInfoReader
-	if _, dumpSST := opts[backupOptDebugMetadataSST]; dumpSST {
-		infoReader = metadataSSTInfoReader{}
-	} else if _, asJSON := opts[backupOptAsJSON]; asJSON {
-		infoReader = manifestInfoReader{shower: jsonShower}
-	} else {
-		var shower backupShower
-		switch backup.Details {
-		case tree.BackupRangeDetails:
-			shower = backupShowerRanges
-		case tree.BackupFileDetails:
-			shower = backupShowerFileSetup(backup.InCollection)
-		case tree.BackupSchemaDetails:
-			shower = backupShowerDefault(p, true, opts)
-		case tree.BackupValidateDetails:
-			shower = backupShowerDoctor
-
-		default:
-			shower = backupShowerDefault(p, false, opts)
-		}
-		infoReader = manifestInfoReader{shower: shower}
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -252,17 +305,9 @@ func showBackupPlanHook(
 		)
 		// For old style show backup, 'to' is the resolved path to the full backup;
 		// for new SHOW BACKUP, 'to' is the subdirectory.
-		to, err := toFn()
-		if err != nil {
-			return err
-		}
-
-		if inColFn != nil {
+		if inCol != nil {
 			subdir = to
-			dest, err = inColFn()
-			if err != nil {
-				return err
-			}
+			dest = inCol
 		} else {
 			dest = append(dest, to)
 			// Deprecation notice for old `SHOW BACKUP` syntax. Remove this once the syntax is
@@ -305,12 +350,13 @@ func showBackupPlanHook(
 		}
 
 		// TODO(msbutler): put encryption resolution in helper function, hopefully shared with RESTORE
-		// A user that calls SHOW BACKUP <incremental_dir> on an encrypted incremental
-		// backup will need to pass their full backup's directory to the
-		// encryption_info_dir parameter because the `ENCRYPTION-INFO` file
-		// necessary to decode the incremental backup lives in the full backup dir.
+
 		encStore := baseStores[0]
-		if encDir, ok := opts[backupOptEncDir]; ok {
+		if showStmt.Options.EncryptionInfoDir != nil {
+			encDir, err := exprEval.String(ctx, showStmt.Options.EncryptionInfoDir)
+			if err != nil {
+				return err
+			}
 			encStore, err = p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, encDir, p.User())
 			if err != nil {
 				return errors.Wrap(err, "make storage")
@@ -318,11 +364,19 @@ func showBackupPlanHook(
 			defer encStore.Close()
 		}
 		var encryption *jobspb.BackupEncryptionOptions
-		kmsEnv := backupencryption.MakeBackupKMSEnv(p.ExecCfg().Settings,
-			&p.ExecCfg().ExternalIODirConfig, p.ExecCfg().DB, p.User(), p.ExecCfg().InternalExecutor)
+		kmsEnv := backupencryption.MakeBackupKMSEnv(
+			p.ExecCfg().Settings,
+			&p.ExecCfg().ExternalIODirConfig,
+			p.ExecCfg().InternalDB,
+			p.User(),
+		)
 		showEncErr := `If you are running SHOW BACKUP exclusively on an incremental backup, 
 you must pass the 'encryption_info_dir' parameter that points to the directory of your full backup`
-		if passphrase, ok := opts[backupencryption.BackupOptEncPassphrase]; ok {
+		if showStmt.Options.EncryptionPassphrase != nil {
+			passphrase, err := exprEval.String(ctx, showStmt.Options.EncryptionPassphrase)
+			if err != nil {
+				return err
+			}
 			opts, err := backupencryption.ReadEncryptionOptions(ctx, encStore)
 			if errors.Is(err, backupencryption.ErrEncryptionInfoRead) {
 				return errors.WithHint(err, showEncErr)
@@ -335,7 +389,11 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 				Mode: jobspb.EncryptionMode_Passphrase,
 				Key:  encryptionKey,
 			}
-		} else if kms, ok := opts[backupencryption.BackupOptEncKMS]; ok {
+		} else if showStmt.Options.DecryptionKMSURI != nil {
+			kms, err := exprEval.StringArray(ctx, tree.Exprs(showStmt.Options.DecryptionKMSURI))
+			if err != nil {
+				return err
+			}
 			opts, err := backupencryption.ReadEncryptionOptions(ctx, encStore)
 			if errors.Is(err, backupencryption.ErrEncryptionInfoRead) {
 				return errors.WithHint(err, showEncErr)
@@ -343,12 +401,11 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 			if err != nil {
 				return err
 			}
-
 			var defaultKMSInfo *jobspb.BackupEncryptionOptions_KMSInfo
 			for _, encFile := range opts {
 				defaultKMSInfo, err = backupencryption.ValidateKMSURIsAgainstFullBackup(
 					ctx,
-					[]string{kms},
+					kms,
 					backupencryption.NewEncryptedDataKeyMapFromProtoMap(encFile.EncryptedDataKeyByKMSMasterKeyID),
 					&kmsEnv,
 				)
@@ -364,16 +421,13 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 				KMSInfo: defaultKMSInfo,
 			}
 		}
-		explicitIncPaths := make([]string, 0)
-		explicitIncPath := opts[backupOptIncStorage]
-		if len(explicitIncPath) > 0 {
-			explicitIncPaths = append(explicitIncPaths, explicitIncPath)
-			if len(dest) > 1 {
-				return errors.New("SHOW BACKUP on locality aware backups using incremental_location is" +
-					" not supported yet")
+		var explicitIncPaths []string
+		if showStmt.Options.IncrementalStorage != nil {
+			explicitIncPaths, err = exprEval.StringArray(ctx, tree.Exprs(showStmt.Options.IncrementalStorage))
+			if err != nil {
+				return err
 			}
 		}
-
 		collection, computedSubdir := backupdest.CollectionAndSubdir(dest[0], subdir)
 		fullyResolvedIncrementalsDirectory, err := backupdest.ResolveIncrementalsBackupLocation(
 			ctx,
@@ -402,6 +456,8 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 		)
 		info.collectionURI = dest[0]
 		info.subdir = computedSubdir
+		info.kmsEnv = &kmsEnv
+		info.enc = encryption
 
 		mkStore := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI
 		incStores, cleanupFn, err := backupdest.MakeBackupDestinationStores(ctx, p.User(), mkStore,
@@ -444,6 +500,12 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 				return err
 			}
 		}
+
+		info.layerToIterFactory, err = backupinfo.GetBackupManifestIterFactories(ctx, p.ExecCfg().DistSQLSrv.ExternalStorage, info.manifests, info.enc, info.kmsEnv)
+		if err != nil {
+			return err
+		}
+
 		// If backup is locality aware, check that user passed at least some localities.
 
 		// TODO (msbutler): this is an extremely crude check that the user is
@@ -459,10 +521,8 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 						len(dest)))
 			}
 		}
-		if _, ok := opts[backupOptCheckFiles]; ok {
-			fileSizes, err := checkBackupFiles(ctx, info,
-				p.ExecCfg().DistSQLSrv.ExternalStorageFromURI,
-				p.User())
+		if showStmt.Options.CheckFiles {
+			fileSizes, err := checkBackupFiles(ctx, info, p.ExecCfg(), p.User(), encryption, &kmsEnv)
 			if err != nil {
 				return err
 			}
@@ -471,7 +531,7 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 		if err := infoReader.showBackup(ctx, &mem, mkStore, info, p.User(), &kmsEnv, resultsCh); err != nil {
 			return err
 		}
-		if backup.InCollection == nil {
+		if showStmt.InCollection == nil {
 			telemetry.Count("show-backup.deprecated-subdir-syntax")
 		} else {
 			telemetry.Count("show-backup.collection")
@@ -482,12 +542,40 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 	return fn, infoReader.header(), nil, false, nil
 }
 
+func getBackupInfoReader(p sql.PlanHookState, showStmt *tree.ShowBackup) backupInfoReader {
+	var infoReader backupInfoReader
+	if showStmt.Options.DebugMetadataSST {
+		infoReader = metadataSSTInfoReader{}
+	} else if showStmt.Options.AsJson {
+		infoReader = manifestInfoReader{shower: jsonShower}
+	} else {
+		var shower backupShower
+		switch showStmt.Details {
+		case tree.BackupRangeDetails:
+			shower = backupShowerRanges
+		case tree.BackupFileDetails:
+			shower = backupShowerFileSetup(p, showStmt.InCollection)
+		case tree.BackupSchemaDetails:
+			shower = backupShowerDefault(p, true, showStmt.Options)
+		case tree.BackupValidateDetails:
+			shower = backupShowerDoctor
+
+		default:
+			shower = backupShowerDefault(p, false, showStmt.Options)
+		}
+		infoReader = manifestInfoReader{shower: shower}
+	}
+	return infoReader
+}
+
 // checkBackupFiles validates that each SST is in its expected storage location
 func checkBackupFiles(
 	ctx context.Context,
 	info backupInfo,
-	storeFactory cloud.ExternalStorageFromURIFactory,
+	execCfg *sql.ExecutorConfig,
 	user username.SQLUsername,
+	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
 ) ([][]int64, error) {
 	const maxMissingFiles = 10
 	missingFiles := make(map[string]struct{}, maxMissingFiles)
@@ -496,7 +584,7 @@ func checkBackupFiles(
 		// TODO (msbutler): Right now, checkLayer opens stores for each backup layer. In 22.2,
 		// once a backup chain cannot have mixed localities, only create stores for full backup
 		// and first incremental backup.
-		defaultStore, err := storeFactory(ctx, info.defaultURIs[layer], user)
+		defaultStore, err := execCfg.DistSQLSrv.ExternalStorageFromURI(ctx, info.defaultURIs[layer], user)
 		if err != nil {
 			return nil, err
 		}
@@ -537,7 +625,7 @@ func checkBackupFiles(
 		}
 
 		for locality, uri := range info.localityInfo[layer].URIsByOriginalLocalityKV {
-			store, err := storeFactory(ctx, uri, user)
+			store, err := execCfg.DistSQLSrv.ExternalStorageFromURI(ctx, uri, user)
 			if err != nil {
 				return nil, err
 			}
@@ -545,8 +633,20 @@ func checkBackupFiles(
 		}
 
 		// Check all backup SSTs.
-		fileSizes := make([]int64, len(info.manifests[layer].Files))
-		for i, f := range info.manifests[layer].Files {
+		fileSizes := make([]int64, 0)
+		it, err := info.layerToIterFactory[layer].NewFileIter(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer it.Close()
+		for ; ; it.Next() {
+			if ok, err := it.Valid(); err != nil {
+				return nil, err
+			} else if !ok {
+				break
+			}
+
+			f := it.Value()
 			store := defaultStore
 			uri := info.defaultURIs[layer]
 			if _, ok := localityStores[f.LocalityKV]; ok {
@@ -565,7 +665,7 @@ func checkBackupFiles(
 				}
 				continue
 			}
-			fileSizes[i] = sz
+			fileSizes = append(fileSizes, sz)
 		}
 
 		return fileSizes, nil
@@ -601,10 +701,14 @@ type backupInfo struct {
 	collectionURI string
 	defaultURIs   []string
 	manifests     []backuppb.BackupManifest
-	subdir        string
-	localityInfo  []jobspb.RestoreDetails_BackupLocalityInfo
-	enc           *jobspb.BackupEncryptionOptions
-	fileSizes     [][]int64
+	// layerToIterFactory is a mapping from the index of the backup layer in
+	// manifests to its IterFactory.
+	layerToIterFactory backupinfo.LayerToBackupManifestFileIterFactory
+	subdir             string
+	localityInfo       []jobspb.RestoreDetails_BackupLocalityInfo
+	enc                *jobspb.BackupEncryptionOptions
+	kmsEnv             cloud.KMSEnv
+	fileSizes          [][]int64
 }
 
 type backupShower struct {
@@ -617,7 +721,7 @@ type backupShower struct {
 }
 
 // backupShowerHeaders defines the schema for the table presented to the user.
-func backupShowerHeaders(showSchemas bool, opts map[string]string) colinfo.ResultColumns {
+func backupShowerHeaders(showSchemas bool, opts tree.ShowBackupOptions) colinfo.ResultColumns {
 	baseHeaders := colinfo.ResultColumns{
 		{Name: "database_name", Typ: types.String},
 		{Name: "parent_schema_name", Typ: types.String},
@@ -629,18 +733,19 @@ func backupShowerHeaders(showSchemas bool, opts map[string]string) colinfo.Resul
 		{Name: "size_bytes", Typ: types.Int},
 		{Name: "rows", Typ: types.Int},
 		{Name: "is_full_cluster", Typ: types.Bool},
+		{Name: "regions", Typ: types.String},
 	}
 	if showSchemas {
 		baseHeaders = append(baseHeaders, colinfo.ResultColumn{Name: "create_statement", Typ: types.String})
 	}
-	if _, shouldShowPrivleges := opts[backupOptWithPrivileges]; shouldShowPrivleges {
+	if opts.Privileges {
 		baseHeaders = append(baseHeaders, colinfo.ResultColumn{Name: "privileges", Typ: types.String})
 		baseHeaders = append(baseHeaders, colinfo.ResultColumn{Name: "owner", Typ: types.String})
 	}
-	if _, checkFiles := opts[backupOptCheckFiles]; checkFiles {
+	if opts.CheckFiles {
 		baseHeaders = append(baseHeaders, colinfo.ResultColumn{Name: "file_bytes", Typ: types.Int})
 	}
-	if _, shouldShowIDs := opts[backupOptWithDebugIDs]; shouldShowIDs {
+	if opts.DebugIDs {
 		baseHeaders = append(
 			colinfo.ResultColumns{
 				baseHeaders[0],
@@ -657,7 +762,7 @@ func backupShowerHeaders(showSchemas bool, opts map[string]string) colinfo.Resul
 }
 
 func backupShowerDefault(
-	p sql.PlanHookState, showSchemas bool, opts map[string]string,
+	p sql.PlanHookState, showSchemas bool, opts tree.ShowBackupOptions,
 ) backupShower {
 	return backupShower{
 		header: backupShowerHeaders(showSchemas, opts),
@@ -667,27 +772,62 @@ func backupShowerDefault(
 
 			var rows []tree.Datums
 			for layer, manifest := range info.manifests {
+				descriptors, err := backupinfo.BackupManifestDescriptors(ctx, info.layerToIterFactory[layer], manifest.EndTime)
+				if err != nil {
+					return nil, err
+				}
+				var hydratedDescriptors []catalog.Descriptor
+				showCreate := func(dbName string, tbl catalog.TableDescriptor) (string, error) {
+					if len(hydratedDescriptors) == 0 {
+						var c nstree.MutableCatalog
+						for _, desc := range descriptors {
+							c.UpsertDescriptor(desc)
+						}
+						if err := descs.HydrateCatalog(ctx, c); err != nil {
+							return "", err
+						}
+						hydratedDescriptors = c.OrderedDescriptors()
+					}
+					return p.ShowCreate(
+						ctx,
+						dbName,
+						hydratedDescriptors,
+						tbl,
+						sql.ShowCreateDisplayOptions{
+							FKDisplayMode:  sql.OmitMissingFKClausesFromCreate,
+							IgnoreComments: true,
+						},
+					)
+				}
+
 				// Map database ID to descriptor name.
 				dbIDToName := make(map[descpb.ID]string)
 				schemaIDToName := make(map[descpb.ID]string)
+				typeIDToTypeDescriptor := make(map[descpb.ID]catalog.TypeDescriptor)
 				schemaIDToName[keys.PublicSchemaIDForBackup] = catconstants.PublicSchemaName
-				for i := range manifest.Descriptors {
-					_, db, _, schema, _ := descpb.FromDescriptor(&manifest.Descriptors[i])
-					if db != nil {
-						if _, ok := dbIDToName[db.ID]; !ok {
-							dbIDToName[db.ID] = db.Name
+				for _, desc := range descriptors {
+					switch d := desc.(type) {
+					case catalog.DatabaseDescriptor:
+						if _, ok := dbIDToName[d.GetID()]; !ok {
+							dbIDToName[d.GetID()] = d.GetName()
 						}
-					} else if schema != nil {
-						if _, ok := schemaIDToName[schema.ID]; !ok {
-							schemaIDToName[schema.ID] = schema.Name
+					case catalog.TypeDescriptor:
+						if _, ok := typeIDToTypeDescriptor[d.GetID()]; !ok {
+							typeIDToTypeDescriptor[d.GetID()] = d
+						}
+					case catalog.SchemaDescriptor:
+						if _, ok := schemaIDToName[d.GetID()]; !ok {
+							schemaIDToName[d.GetID()] = d.GetName()
 						}
 					}
 				}
+
 				var fileSizes []int64
 				if len(info.fileSizes) > 0 {
 					fileSizes = info.fileSizes[layer]
 				}
-				tableSizes, err := getTableSizes(manifest.Files, fileSizes)
+
+				tableSizes, err := getTableSizes(ctx, info.layerToIterFactory[layer], fileSizes)
 				if err != nil {
 					return nil, err
 				}
@@ -707,9 +847,8 @@ func backupShowerDefault(
 					}
 				}
 				var row tree.Datums
-				for i := range manifest.Descriptors {
-					descriptor := &manifest.Descriptors[i]
 
+				for _, desc := range descriptors {
 					var dbName string
 					var parentSchemaName string
 					var descriptorType string
@@ -721,19 +860,31 @@ func backupShowerDefault(
 					dataSizeDatum := tree.DNull
 					rowCountDatum := tree.DNull
 					fileSizeDatum := tree.DNull
-
-					desc := descbuilder.NewBuilder(descriptor).BuildExistingMutable()
+					regionsDatum := tree.DNull
 
 					descriptorName := desc.GetName()
 					switch desc := desc.(type) {
 					case catalog.DatabaseDescriptor:
 						descriptorType = "database"
+						if desc.IsMultiRegion() {
+							regions, err := showRegions(typeIDToTypeDescriptor[desc.GetRegionConfig().RegionEnumID], desc.GetName())
+							if err != nil {
+								return nil, errors.Wrapf(err, "cannot generate regions column")
+							}
+							regionsDatum = nullIfEmpty(regions)
+						}
 					case catalog.SchemaDescriptor:
 						descriptorType = "schema"
 						dbName = dbIDToName[desc.GetParentID()]
 						dbID = desc.GetParentID()
 					case catalog.TypeDescriptor:
 						descriptorType = "type"
+						dbName = dbIDToName[desc.GetParentID()]
+						dbID = desc.GetParentID()
+						parentSchemaName = schemaIDToName[desc.GetParentSchemaID()]
+						parentSchemaID = desc.GetParentSchemaID()
+					case catalog.FunctionDescriptor:
+						descriptorType = "function"
 						dbName = dbIDToName[desc.GetParentID()]
 						dbID = desc.GetParentID()
 						parentSchemaName = schemaIDToName[desc.GetParentSchemaID()]
@@ -749,18 +900,18 @@ func backupShowerDefault(
 						rowCountDatum = tree.NewDInt(tree.DInt(tableSize.rowCount.Rows))
 						fileSizeDatum = tree.NewDInt(tree.DInt(tableSize.fileSize))
 
-						displayOptions := sql.ShowCreateDisplayOptions{
-							FKDisplayMode:  sql.OmitMissingFKClausesFromCreate,
-							IgnoreComments: true,
+						// Only resolve the table schemas if running `SHOW BACKUP SCHEMAS`.
+						// In all other cases we discard these results and so it is wasteful
+						// to construct the SQL representation of the table's schema.
+						if showSchemas {
+							createStmt, err := showCreate(dbName, desc)
+							if err != nil {
+								// We expect that we might get an error here due to X-DB
+								// references, which were possible on 20.2 betas and rcs.
+								log.Errorf(ctx, "error while generating create statement: %+v", err)
+							}
+							createStmtDatum = nullIfEmpty(createStmt)
 						}
-						createStmt, err := p.ShowCreate(ctx, dbName, manifest.Descriptors,
-							tabledesc.NewBuilder(desc.TableDesc()).BuildImmutableTable(), displayOptions)
-						if err != nil {
-							// We expect that we might get an error here due to X-DB
-							// references, which were possible on 20.2 betas and rcs.
-							log.Errorf(ctx, "error while generating create statement: %+v", err)
-						}
-						createStmtDatum = nullIfEmpty(createStmt)
 					default:
 						descriptorType = "unknown"
 					}
@@ -776,19 +927,24 @@ func backupShowerDefault(
 						dataSizeDatum,
 						rowCountDatum,
 						tree.MakeDBool(manifest.DescriptorCoverage == tree.AllDescriptors),
+						regionsDatum,
 					}
 					if showSchemas {
 						row = append(row, createStmtDatum)
 					}
-					if _, shouldShowPrivileges := opts[backupOptWithPrivileges]; shouldShowPrivileges {
-						row = append(row, tree.NewDString(showPrivileges(descriptor)))
+					if opts.Privileges {
+						showPrivs, err := showPrivileges(ctx, desc)
+						if err != nil {
+							return nil, err
+						}
+						row = append(row, tree.NewDString(showPrivs))
 						owner := desc.GetPrivileges().Owner().SQLIdentifier()
 						row = append(row, tree.NewDString(owner))
 					}
-					if _, checkFiles := opts[backupOptCheckFiles]; checkFiles {
+					if opts.CheckFiles {
 						row = append(row, fileSizeDatum)
 					}
-					if _, shouldShowIDs := opts[backupOptWithDebugIDs]; shouldShowIDs {
+					if opts.DebugIDs {
 						// If showing debug IDs, interleave the IDs with the corresponding object names.
 						row = append(
 							tree.Datums{
@@ -808,25 +964,26 @@ func backupShowerDefault(
 					row := tree.Datums{
 						tree.DNull, // Database
 						tree.DNull, // Schema
-						tree.NewDString(roachpb.MakeTenantID(t.ID).String()), // Object Name
-						tree.NewDString("TENANT"),                            // Object Type
+						tree.NewDString(roachpb.MustMakeTenantID(t.ID).String()), // Object Name
+						tree.NewDString("TENANT"),                                // Object Type
 						backupType,
 						start,
 						end,
 						tree.DNull, // DataSize
 						tree.DNull, // RowCount
 						tree.DNull, // Descriptor Coverage
+						tree.DNull, // Regions
 					}
 					if showSchemas {
 						row = append(row, tree.DNull)
 					}
-					if _, shouldShowPrivileges := opts[backupOptWithPrivileges]; shouldShowPrivileges {
+					if opts.Privileges {
 						row = append(row, tree.DNull)
 					}
-					if _, checkFiles := opts[backupOptCheckFiles]; checkFiles {
+					if opts.CheckFiles {
 						row = append(row, tree.DNull)
 					}
-					if _, shouldShowIDs := opts[backupOptWithDebugIDs]; shouldShowIDs {
+					if opts.DebugIDs {
 						// If showing debug IDs, interleave the IDs with the corresponding object names.
 						row = append(
 							tree.Datums{
@@ -856,12 +1013,29 @@ type descriptorSize struct {
 // getLogicalSSTSize gets the total logical bytes stored in each SST. Note that a
 // BackupManifest_File identifies a span in an SST and there can be multiple
 // spans stored in an SST.
-func getLogicalSSTSize(files []backuppb.BackupManifest_File) map[string]int64 {
+func getLogicalSSTSize(
+	ctx context.Context, iterFactory *backupinfo.IterFactory,
+) (map[string]int64, error) {
+	ctx, span := tracing.ChildSpan(ctx, "backupccl.getLogicalSSTSize")
+	defer span.Finish()
+
 	sstDataSize := make(map[string]int64)
-	for _, file := range files {
-		sstDataSize[file.Path] += file.EntryCounts.DataSize
+	it, err := iterFactory.NewFileIter(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return sstDataSize
+	defer it.Close()
+	for ; ; it.Next() {
+		if ok, err := it.Valid(); err != nil {
+			return nil, err
+		} else if !ok {
+			break
+		}
+
+		f := it.Value()
+		sstDataSize[f.Path] += f.EntryCounts.DataSize
+	}
+	return sstDataSize, nil
 }
 
 // approximateSpanPhysicalSize approximates the number of bytes written to disk for the span.
@@ -873,21 +1047,42 @@ func approximateSpanPhysicalSize(
 
 // getTableSizes gathers row and size count for each table in the manifest
 func getTableSizes(
-	files []backuppb.BackupManifest_File, fileSizes []int64,
+	ctx context.Context, iterFactory *backupinfo.IterFactory, fileSizes []int64,
 ) (map[descpb.ID]descriptorSize, error) {
-	tableSizes := make(map[descpb.ID]descriptorSize)
-	if len(files) == 0 {
-		return tableSizes, nil
-	}
-	_, tenantID, err := keys.DecodeTenantPrefix(files[0].Span.Key)
+	ctx, span := tracing.ChildSpan(ctx, "backupccl.getTableSizes")
+	defer span.Finish()
+
+	logicalSSTSize, err := getLogicalSSTSize(ctx, iterFactory)
 	if err != nil {
 		return nil, err
 	}
-	showCodec := keys.MakeSQLCodec(tenantID)
 
-	logicalSSTSize := getLogicalSSTSize(files)
+	it, err := iterFactory.NewFileIter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	tableSizes := make(map[descpb.ID]descriptorSize)
+	var tenantID roachpb.TenantID
+	var showCodec keys.SQLCodec
+	var idx int
+	for ; ; it.Next() {
+		if ok, err := it.Valid(); err != nil {
+			return nil, err
+		} else if !ok {
+			break
+		}
 
-	for i, file := range files {
+		f := it.Value()
+		if !tenantID.IsSet() {
+			var err error
+			_, tenantID, err = keys.DecodeTenantPrefix(f.Span.Key)
+			if err != nil {
+				return nil, err
+			}
+			showCodec = keys.MakeSQLCodec(tenantID)
+		}
+
 		// TODO(dan): This assumes each file in the backup only
 		// contains data from a single table, which is usually but
 		// not always correct. It does not account for a BACKUP that
@@ -897,18 +1092,20 @@ func getTableSizes(
 		// TODO(msbutler): after handling the todo above, understand whether
 		// we should return an error if a key does not have tableId. The lack
 		// of error handling let #77705 sneak by our unit tests.
-		_, tableID, err := showCodec.DecodeTablePrefix(file.Span.Key)
+		_, tableID, err := showCodec.DecodeTablePrefix(f.Span.Key)
 		if err != nil {
 			continue
 		}
 		s := tableSizes[descpb.ID(tableID)]
-		s.rowCount.Add(file.EntryCounts)
+		s.rowCount.Add(f.EntryCounts)
 		if len(fileSizes) > 0 {
-			s.fileSize += approximateSpanPhysicalSize(file.EntryCounts.DataSize, logicalSSTSize[file.Path],
-				fileSizes[i])
+			s.fileSize += approximateSpanPhysicalSize(f.EntryCounts.DataSize, logicalSSTSize[f.Path],
+				fileSizes[idx])
 		}
 		tableSizes[descpb.ID(tableID)] = s
+		idx++
 	}
+
 	return tableSizes, nil
 }
 
@@ -926,31 +1123,57 @@ func nullIfZero(i descpb.ID) tree.Datum {
 	return tree.NewDInt(tree.DInt(i))
 }
 
-func showPrivileges(descriptor *descpb.Descriptor) string {
+// showRegions constructs a string containing the ALTER DATABASE
+// commands that create the multi region specifications for a backed up database.
+func showRegions(typeDesc catalog.TypeDescriptor, dbname string) (string, error) {
+	var regionsStringBuilder strings.Builder
+	if typeDesc == nil {
+		return "", fmt.Errorf("type descriptor for %s is nil", dbname)
+	}
+	r := typeDesc.AsRegionEnumTypeDescriptor()
+	if r == nil {
+		return "", fmt.Errorf("type descriptor for %s is of kind %s", dbname, typeDesc.GetKind())
+	}
+
+	regionsStringBuilder.WriteString("ALTER DATABASE ")
+	regionsStringBuilder.WriteString(dbname)
+	regionsStringBuilder.WriteString(" SET PRIMARY REGION ")
+	regionsStringBuilder.WriteString("\"" + r.PrimaryRegion().String() + "\"")
+	regionsStringBuilder.WriteString(";")
+
+	_ = r.ForEachPublicRegion(func(regionName catpb.RegionName) error {
+		if regionName != r.PrimaryRegion() {
+			regionsStringBuilder.WriteString(" ALTER DATABASE ")
+			regionsStringBuilder.WriteString(dbname)
+			regionsStringBuilder.WriteString(" ADD REGION ")
+			regionsStringBuilder.WriteString("\"" + regionName.String() + "\"")
+			regionsStringBuilder.WriteString(";")
+		}
+		return nil
+	})
+	return regionsStringBuilder.String(), nil
+}
+
+func showPrivileges(ctx context.Context, desc catalog.Descriptor) (string, error) {
+	ctx, span := tracing.ChildSpan(ctx, "backupccl.showPrivileges")
+	defer span.Finish()
+	_ = ctx // ctx is currently unused, but this new ctx should be used below in the future.
+
 	var privStringBuilder strings.Builder
 
-	b := descbuilder.NewBuilder(descriptor)
-	if b == nil {
-		return ""
+	if desc == nil {
+		return "", nil
 	}
-	var objectType privilege.ObjectType
-	switch b.DescriptorType() {
-	case catalog.Database:
-		objectType = privilege.Database
-	case catalog.Table:
-		objectType = privilege.Table
-	case catalog.Type:
-		objectType = privilege.Type
-	case catalog.Schema:
-		objectType = privilege.Schema
-	default:
-		return ""
-	}
-	privDesc := b.BuildImmutable().GetPrivileges()
+	privDesc := desc.GetPrivileges()
+	objectType := desc.GetObjectType()
 	if privDesc == nil {
-		return ""
+		return "", nil
 	}
-	for _, userPriv := range privDesc.Show(objectType, false /* showImplicitOwnerPrivs */) {
+	showList, err := privDesc.Show(objectType, false /* showImplicitOwnerPrivs */)
+	if err != nil {
+		return "", err
+	}
+	for _, userPriv := range showList {
 		privs := userPriv.Privileges
 		if len(privs) == 0 {
 			continue
@@ -961,12 +1184,13 @@ func showPrivileges(descriptor *descpb.Descriptor) string {
 				privsWithGrantOption = append(privsWithGrantOption, priv.Kind.String())
 			}
 		}
+
 		if len(privsWithGrantOption) > 0 {
 			privStringBuilder.WriteString("GRANT ")
 			privStringBuilder.WriteString(strings.Join(privsWithGrantOption, ", "))
 			privStringBuilder.WriteString(" ON ")
 			privStringBuilder.WriteString(strings.ToUpper(string(objectType)) + " ")
-			privStringBuilder.WriteString(descpb.GetDescriptorName(descriptor))
+			privStringBuilder.WriteString(desc.GetName())
 			privStringBuilder.WriteString(" TO ")
 			privStringBuilder.WriteString(userPriv.User.SQLIdentifier())
 			privStringBuilder.WriteString(" WITH GRANT OPTION; ")
@@ -984,14 +1208,14 @@ func showPrivileges(descriptor *descpb.Descriptor) string {
 			privStringBuilder.WriteString(strings.Join(privsWithoutGrantOption, ", "))
 			privStringBuilder.WriteString(" ON ")
 			privStringBuilder.WriteString(strings.ToUpper(string(objectType)) + " ")
-			privStringBuilder.WriteString(descpb.GetDescriptorName(descriptor))
+			privStringBuilder.WriteString(desc.GetName())
 			privStringBuilder.WriteString(" TO ")
 			privStringBuilder.WriteString(userPriv.User.SQLIdentifier())
 			privStringBuilder.WriteString("; ")
 		}
 	}
 
-	return privStringBuilder.String()
+	return privStringBuilder.String(), nil
 }
 
 var backupShowerRanges = backupShower{
@@ -1027,11 +1251,12 @@ var backupShowerDoctor = backupShower{
 		var namespaceTable doctor.NamespaceTable
 		// Extract all the descriptors from the given manifest and generate the
 		// namespace and descriptor tables needed by doctor.
-		descriptors, _ := backupinfo.LoadSQLDescsFromBackupsAtTime(info.manifests, hlc.Timestamp{})
+		descriptors, _, err := backupinfo.LoadSQLDescsFromBackupsAtTime(ctx, info.manifests, info.layerToIterFactory, hlc.Timestamp{})
+		if err != nil {
+			return nil, err
+		}
 		for _, desc := range descriptors {
-			builder := desc.NewBuilder()
-			mutDesc := builder.BuildCreatedMutable()
-			bytes, err := protoutil.Marshal(mutDesc.DescriptorProto())
+			bytes, err := protoutil.Marshal(desc.DescriptorProto())
 			if err != nil {
 				return nil, err
 			}
@@ -1080,7 +1305,9 @@ var backupShowerDoctor = backupShower{
 	},
 }
 
-func backupShowerFileSetup(inCol tree.StringOrPlaceholderOptList) backupShower {
+func backupShowerFileSetup(
+	p sql.PlanHookState, inCol tree.StringOrPlaceholderOptList,
+) backupShower {
 	return backupShower{header: colinfo.ResultColumns{
 		{Name: "path", Typ: types.String},
 		{Name: "backup_type", Typ: types.String},
@@ -1114,8 +1341,24 @@ func backupShowerFileSetup(inCol tree.StringOrPlaceholderOptList) backupShower {
 					backupType = "incremental"
 				}
 
-				logicalSSTSize := getLogicalSSTSize(manifest.Files)
-				for j, file := range manifest.Files {
+				logicalSSTSize, err := getLogicalSSTSize(ctx, info.layerToIterFactory[i])
+				if err != nil {
+					return nil, err
+				}
+
+				it, err := info.layerToIterFactory[i].NewFileIter(ctx)
+				if err != nil {
+					return nil, err
+				}
+				defer it.Close()
+				var idx int
+				for ; ; it.Next() {
+					if ok, err := it.Valid(); err != nil {
+						return nil, err
+					} else if !ok {
+						break
+					}
+					file := it.Value()
 					filePath := file.Path
 					if inCol != nil {
 						filePath = path.Join(manifestDirs[i], filePath)
@@ -1130,7 +1373,7 @@ func backupShowerFileSetup(inCol tree.StringOrPlaceholderOptList) backupShower {
 					sz := int64(-1)
 					if len(info.fileSizes) > 0 {
 						sz = approximateSpanPhysicalSize(file.EntryCounts.DataSize,
-							logicalSSTSize[file.Path], info.fileSizes[i][j])
+							logicalSSTSize[file.Path], info.fileSizes[i][idx])
 					}
 					rows = append(rows, tree.Datums{
 						tree.NewDString(filePath),
@@ -1144,6 +1387,7 @@ func backupShowerFileSetup(inCol tree.StringOrPlaceholderOptList) backupShower {
 						tree.NewDString(locality),
 						tree.NewDInt(tree.DInt(sz)),
 					})
+					idx++
 				}
 			}
 			return rows, nil
@@ -1242,28 +1486,33 @@ var jsonShower = backupShower{
 	},
 }
 
+func showBackupsInCollectionTypeCheck(
+	ctx context.Context, backup *tree.ShowBackup, p sql.PlanHookState,
+) (matched bool, header colinfo.ResultColumns, _ error) {
+	if err := exprutil.TypeCheck(ctx, "SHOW BACKUPS", p.SemaCtx(),
+		exprutil.StringArrays{tree.Exprs(backup.InCollection)},
+	); err != nil {
+		return false, nil, err
+	}
+	return true, showBackupsInCollectionHeader, nil
+}
+
+var showBackupsInCollectionHeader = colinfo.ResultColumns{
+	{Name: "path", Typ: types.String},
+}
+
 // showBackupPlanHook implements PlanHookFn.
 func showBackupsInCollectionPlanHook(
-	ctx context.Context, backup *tree.ShowBackup, p sql.PlanHookState,
+	ctx context.Context, collection []string, showStmt *tree.ShowBackup, p sql.PlanHookState,
 ) (sql.PlanHookRowFn, colinfo.ResultColumns, []sql.PlanNode, bool, error) {
 
-	collectionFn, err := p.TypeAsStringArray(ctx, tree.Exprs(backup.InCollection), "SHOW BACKUPS")
-	if err != nil {
+	if err := cloudprivilege.CheckDestinationPrivileges(ctx, p, collection); err != nil {
 		return nil, nil, nil, false, err
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
-		ctx, span := tracing.ChildSpan(ctx, backup.StatementTag())
+		ctx, span := tracing.ChildSpan(ctx, showStmt.StatementTag())
 		defer span.Finish()
-
-		collection, err := collectionFn()
-		if err != nil {
-			return err
-		}
-
-		if err := cloudprivilege.CheckDestinationPrivileges(ctx, p, collection); err != nil {
-			return err
-		}
 
 		store, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, collection[0], p.User())
 		if err != nil {
@@ -1279,9 +1528,9 @@ func showBackupsInCollectionPlanHook(
 		}
 		return nil
 	}
-	return fn, colinfo.ResultColumns{{Name: "path", Typ: types.String}}, nil, false, nil
+	return fn, showBackupsInCollectionHeader, nil, false, nil
 }
 
 func init() {
-	sql.AddPlanHook("backupccl.showBackupPlanHook", showBackupPlanHook)
+	sql.AddPlanHook("backupccl.showBackupPlanHook", showBackupPlanHook, showBackupTypeCheck)
 }

@@ -15,8 +15,19 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/gogo/protobuf/proto"
 )
+
+var ignoreAllUpdates = envutil.EnvOrDefaultBool("COCKROACH_IGNORE_CLUSTER_SETTINGS", false)
+
+// IsIgnoringAllUpdates returns true if Updaters returned by NewUpdater will
+// discard all updates due to the COCKROACH_IGNORE_CLUSTER_SETTINGS var.
+func IsIgnoringAllUpdates() bool {
+	return ignoreAllUpdates
+}
 
 // EncodeDuration encodes a duration in the format of EncodedValue.Value.
 func EncodeDuration(d time.Duration) string {
@@ -36,6 +47,15 @@ func EncodeInt(i int64) string {
 // EncodeFloat encodes a float in the format of EncodedValue.Value.
 func EncodeFloat(f float64) string {
 	return strconv.FormatFloat(f, 'G', -1, 64)
+}
+
+// EncodeProtobuf encodes a protobuf in the format of EncodedValue.Value.
+func EncodeProtobuf(p protoutil.Message) string {
+	data := make([]byte, p.Size())
+	if _, err := p.MarshalTo(data); err != nil {
+		panic(errors.Wrapf(err, "encoding %s: %+v", proto.MessageName(p), p))
+	}
+	return string(data)
 }
 
 type updater struct {
@@ -65,6 +85,9 @@ func (u NoopUpdater) ResetRemaining(context.Context) {}
 
 // NewUpdater makes an Updater.
 func NewUpdater(sv *Values) Updater {
+	if ignoreAllUpdates {
+		return NoopUpdater{}
+	}
 	return updater{
 		m:  make(map[string]struct{}, len(registry)),
 		sv: sv,
@@ -91,6 +114,12 @@ func (u updater) Set(ctx context.Context, key string, value EncodedValue) error 
 	switch setting := d.(type) {
 	case *StringSetting:
 		return setting.set(ctx, u.sv, value.Value)
+	case *ProtobufSetting:
+		p, err := setting.DecodeValue(value.Value)
+		if err != nil {
+			return err
+		}
+		return setting.set(ctx, u.sv, p)
 	case *BoolSetting:
 		b, err := setting.DecodeValue(value.Value)
 		if err != nil {

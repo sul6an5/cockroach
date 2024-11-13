@@ -21,6 +21,7 @@ import {
   transactionsBytesReadBarChart,
   transactionsLatencyBarChart,
   transactionsContentionBarChart,
+  transactionsCPUBarChart,
   transactionsMaxMemUsageBarChart,
   transactionsNetworkBytesBarChart,
   transactionsRetryBarChart,
@@ -28,7 +29,15 @@ import {
 import { statisticsTableTitles } from "../statsTableUtil/statsTableUtil";
 import { tableClasses } from "./transactionsTableClasses";
 import { transactionLink } from "./transactionsCells";
-import { Count, FixLong, longToInt, TimestampToString } from "src/util";
+import {
+  FixFingerprintHexValue,
+  Count,
+  FixLong,
+  longToInt,
+  unset,
+  appNamesAttr,
+  propsToQueryString,
+} from "src/util";
 import { SortSetting } from "../sortedtable";
 import {
   getStatementsByFingerprintId,
@@ -38,6 +47,7 @@ import {
 } from "../transactionsPage/utils";
 import classNames from "classnames/bind";
 import statsTablePageStyles from "src/statementsTable/statementsTableContent.module.scss";
+import { BarChartOptions } from "../barCharts/barChartFactory";
 
 export type Transaction =
   protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
@@ -54,6 +64,7 @@ interface TransactionsTable {
 }
 
 export interface TransactionInfo extends Transaction {
+  regions: string[];
   regionNodes: string[];
 }
 
@@ -62,8 +73,8 @@ const { latencyClasses } = tableClasses;
 const cx = classNames.bind(statsTablePageStyles);
 
 interface TransactionLinkTargetProps {
-  aggregatedTs: string;
   transactionFingerprintId: string;
+  application?: string;
 }
 
 // TransactionLinkTarget returns the link to the relevant transaction page, given
@@ -71,7 +82,11 @@ interface TransactionLinkTargetProps {
 export const TransactionLinkTarget = (
   props: TransactionLinkTargetProps,
 ): string => {
-  return `/transaction/${props.transactionFingerprintId}`;
+  const searchParams = propsToQueryString({
+    [appNamesAttr]: [props.application],
+  });
+
+  return `/transaction/${props.transactionFingerprintId}?${searchParams}`;
 };
 
 export function makeTransactionsColumns(
@@ -86,7 +101,7 @@ export function makeTransactionsColumns(
       label: cx("statements-table__col--bar-chart__label"),
     },
   };
-  const sampledExecStatsBarChartOptions = {
+  const sampledExecStatsBarChartOptions: BarChartOptions<TransactionInfo> = {
     classes: defaultBarChartOptions.classes,
     displayNoSamples: (d: TransactionInfo) => {
       return longToInt(d.stats_data.stats.exec_stats?.count) == 0;
@@ -103,6 +118,10 @@ export function makeTransactionsColumns(
     latencyClasses.barChart,
   );
   const contentionBar = transactionsContentionBarChart(
+    transactions,
+    sampledExecStatsBarChartOptions,
+  );
+  const cpuBar = transactionsCPUBarChart(
     transactions,
     sampledExecStatsBarChartOptions,
   );
@@ -123,15 +142,17 @@ export function makeTransactionsColumns(
       title: statisticsTableTitles.transactions(statType),
       cell: (item: TransactionInfo) =>
         transactionLink({
-          transactionText: statementFingerprintIdsToText(
-            item.stats_data.statement_fingerprint_ids,
-            statements,
-          ),
-          transactionSummary: statementFingerprintIdsToSummarizedText(
-            item.stats_data.statement_fingerprint_ids,
-            statements,
-          ),
-          aggregatedTs: TimestampToString(item.stats_data.aggregated_ts),
+          transactionText:
+            statementFingerprintIdsToText(
+              item.stats_data.statement_fingerprint_ids,
+              statements,
+            ) || "Transaction query unavailable.",
+          transactionSummary:
+            statementFingerprintIdsToSummarizedText(
+              item.stats_data.statement_fingerprint_ids,
+              statements,
+            ) || "Transaction query unavailable.",
+          appName: item.stats_data.app,
           transactionFingerprintId:
             item.stats_data.transaction_fingerprint_id.toString(),
           search,
@@ -151,6 +172,14 @@ export function makeTransactionsColumns(
       cell: countBar,
       sort: (item: TransactionInfo) =>
         FixLong(Number(item.stats_data.stats.count)),
+    },
+    {
+      name: "applicationName",
+      title: statisticsTableTitles.applicationName(statType),
+      className: cx("statements-table__col-app-name"),
+      cell: (item: TransactionInfo) =>
+        item.stats_data?.app?.length ? item.stats_data.app : unset,
+      sort: (item: TransactionInfo) => item.stats_data?.app,
     },
     {
       name: "rowsProcessed",
@@ -190,6 +219,14 @@ export function makeTransactionsColumns(
         FixLong(Number(item.stats_data.stats.exec_stats.contention_time?.mean)),
     },
     {
+      name: "cpu",
+      title: statisticsTableTitles.cpu(statType),
+      cell: cpuBar,
+      className: cx("statements-table__col-cpu"),
+      sort: (item: TransactionInfo) =>
+        FixLong(Number(item.stats_data.stats.exec_stats.cpu_sql_nanos?.mean)),
+    },
+    {
       name: "maxMemUsage",
       title: statisticsTableTitles.maxMemUsage(statType),
       cell: maxMemUsageBar,
@@ -212,16 +249,7 @@ export function makeTransactionsColumns(
       sort: (item: TransactionInfo) =>
         longToInt(Number(item.stats_data.stats.max_retries)),
     },
-    {
-      name: "regionNodes",
-      title: statisticsTableTitles.regionNodes(statType),
-      className: cx("statements-table__col-regions"),
-      cell: (item: TransactionInfo) => {
-        return longListWithTooltip(item.regionNodes.sort().join(", "), 50);
-      },
-      sort: (item: TransactionInfo) => item.regionNodes.sort().join(", "),
-      hideIfTenant: true,
-    },
+    makeRegionsColumn(isTenant),
     {
       name: "statementsCount",
       title: statisticsTableTitles.statementsCount(statType),
@@ -234,12 +262,40 @@ export function makeTransactionsColumns(
       name: "transactionFingerprintId",
       title: statisticsTableTitles.transactionFingerprintId(statType),
       cell: (item: TransactionInfo) =>
-        item.stats_data?.transaction_fingerprint_id.toString(16),
+        FixFingerprintHexValue(
+          item.stats_data?.transaction_fingerprint_id.toString(16),
+        ),
       sort: (item: TransactionInfo) =>
         item.stats_data?.transaction_fingerprint_id.toString(16),
       showByDefault: false,
     },
-  ].filter(c => !(isTenant && c.hideIfTenant));
+  ];
+}
+
+function makeRegionsColumn(
+  isTenant: boolean,
+): ColumnDescriptor<TransactionInfo> {
+  if (isTenant) {
+    return {
+      name: "regions",
+      title: statisticsTableTitles.regions("transaction"),
+      className: cx("statements-table__col-regions"),
+      cell: (item: TransactionInfo) => {
+        return longListWithTooltip(item.regions.sort().join(", "), 50);
+      },
+      sort: (item: TransactionInfo) => item.regions.sort().join(", "),
+    };
+  } else {
+    return {
+      name: "regionNodes",
+      title: statisticsTableTitles.regionNodes("transaction"),
+      className: cx("statements-table__col-regions"),
+      cell: (item: TransactionInfo) => {
+        return longListWithTooltip(item.regionNodes.sort().join(", "), 50);
+      },
+      sort: (item: TransactionInfo) => item.regionNodes.sort().join(", "),
+    };
+  }
 }
 
 export const TransactionsTable: React.FC<TransactionsTable> = props => {

@@ -18,19 +18,59 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	pgx "github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
 )
+
+// TestUserLoginAfterGC sets an artificially low gc.ttl on system.role_members,
+// then verifies that the role membership cache still works. This is valuable to
+// test since we change the read timestamp of the transaction that populates the
+// role membership cache.
+func TestUserLoginAfterGC(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	// Create a user.
+	_, err := db.Exec(`CREATE USER newuser WITH password '123'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`GRANT admin TO newuser`)
+	require.NoError(t, err)
+
+	// Sleep so that the system.role_members modification time is 2s in the past.
+	time.Sleep(2 * time.Second)
+
+	// Force a table GC with a threshold of 500ms in the past.
+	err = s.ForceTableGC(ctx, "system", "role_members", s.Clock().Now().Add(-int64(500*time.Millisecond), 0))
+	require.NoError(t, err)
+
+	// Verify that newuser can still log in.
+	newUserURL, cleanup := sqlutils.PGUrlWithOptionalClientCerts(
+		t, s.ServingSQLAddr(), t.Name(), url.UserPassword("newuser", "123"), false, /* withClientCerts */
+	)
+	defer cleanup()
+
+	newUserConn, err := sqltestutils.PGXConn(t, newUserURL)
+	require.NoError(t, err)
+	defer func() { _ = newUserConn.Close(ctx) }()
+
+	_, err = newUserConn.Exec(ctx, `SHOW GRANTS FOR newuser`)
+	require.NoError(t, err)
+}
 
 // TestGetUserTimeout verifies that user login attempts
 // fail with a suitable timeout when some system range(s) are
@@ -43,11 +83,6 @@ func TestGetUserTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// We want to use a low timeout below to prevent
-	// this test from taking forever, however
-	// race builds are so slow as to trigger this timeout spuriously.
-	skip.UnderRace(t)
-
 	testutils.RunTrueAndFalse(t, "TestGetUserTimeout/single_scan", func(t *testing.T, singleScanEnabled bool) {
 
 		ctx := context.Background()
@@ -59,7 +94,7 @@ func TestGetUserTimeout(t *testing.T) {
 		close(closedCh)
 		unavailableCh.Store(closedCh)
 		knobs := &kvserver.StoreTestingKnobs{
-			TestingRequestFilter: func(ctx context.Context, _ roachpb.BatchRequest) *roachpb.Error {
+			TestingRequestFilter: func(ctx context.Context, _ *kvpb.BatchRequest) *kvpb.Error {
 				select {
 				case <-unavailableCh.Load().(chan struct{}):
 				case <-ctx.Done():
@@ -112,7 +147,7 @@ GRANT admin TO foo`); err != nil {
 			// would report false positives.
 			unauthURL := fooURL
 			unauthURL.User = url.User("foo")
-			dbSQL, err := pgxConn(t, unauthURL)
+			dbSQL, err := sqltestutils.PGXConn(t, unauthURL)
 			if err == nil {
 				defer func() { _ = dbSQL.Close(ctx) }()
 			}
@@ -123,7 +158,7 @@ GRANT admin TO foo`); err != nil {
 
 		func() {
 			// Sanity check: verify that the new user is able to log in with password.
-			dbSQL, err := pgxConn(t, fooURL)
+			dbSQL, err := sqltestutils.PGXConn(t, fooURL)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -145,7 +180,7 @@ GRANT admin TO foo`); err != nil {
 
 		// Cache our privilege check for `SHOW is_superuser` and the
 		// underlying query to a virtual table.
-		dbSQL, err := pgxConn(t, fooURL)
+		dbSQL, err := sqltestutils.PGXConn(t, fooURL)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,7 +204,7 @@ GRANT admin TO foo`); err != nil {
 				// Now attempt to connect again. Since a previous authentication attempt
 				// for this user occurred, the auth-related info should be cached, so
 				// authentication should work.
-				dbSQL, err := pgxConn(t, fooURL)
+				dbSQL, err := sqltestutils.PGXConn(t, fooURL)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -189,7 +224,7 @@ GRANT admin TO foo`); err != nil {
 				// Now attempt to connect with a different user. We're expecting a timeout
 				// within 5 seconds.
 				start := timeutil.Now()
-				dbSQL, err := pgxConn(t, barURL)
+				dbSQL, err := sqltestutils.PGXConn(t, barURL)
 				if err == nil {
 					defer func() { _ = dbSQL.Close(ctx) }()
 				}
@@ -205,7 +240,7 @@ GRANT admin TO foo`); err != nil {
 			t.Log("-- no timeout for root --")
 
 			func() {
-				dbSQL, err := pgxConn(t, rootURL)
+				dbSQL, err := sqltestutils.PGXConn(t, rootURL)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -237,7 +272,7 @@ GRANT admin TO foo`); err != nil {
 				// Now attempt to connect with foo. We're expecting a timeout within 5
 				// seconds as the membership cache is invalid.
 				start := timeutil.Now()
-				dbSQL, err := pgxConn(t, fooURL)
+				dbSQL, err := sqltestutils.PGXConn(t, fooURL)
 				if err == nil {
 					defer func() { _ = dbSQL.Close(ctx) }()
 				}
@@ -251,14 +286,4 @@ GRANT admin TO foo`); err != nil {
 			}()
 		}()
 	})
-}
-
-func pgxConn(t *testing.T, connURL url.URL) (*pgx.Conn, error) {
-	t.Helper()
-	pgxConfig, err := pgx.ParseConfig(connURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return pgx.ConnectConfig(context.Background(), pgxConfig)
 }

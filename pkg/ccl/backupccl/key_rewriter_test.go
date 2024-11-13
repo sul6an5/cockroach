@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -182,8 +183,8 @@ func TestKeyRewriter(t *testing.T) {
 		}
 	})
 	systemTenant := roachpb.SystemTenantID
-	tenant3 := roachpb.MakeTenantID(3)
-	tenant4 := roachpb.MakeTenantID(4)
+	tenant3 := roachpb.MustMakeTenantID(3)
+	tenant4 := roachpb.MustMakeTenantID(4)
 
 	// Restoring a tenant's data from a backup as another tenant.
 	testTableRekeyAsDiffTenant := func(srcTenant, destTenant roachpb.TenantID) {
@@ -271,10 +272,13 @@ func TestKeyRewriter(t *testing.T) {
 
 // mustMarshalDesc marshals the provided TableDescriptor.
 func mustMarshalDesc(t *testing.T, tableDesc *descpb.TableDescriptor) []byte {
-	desc := tabledesc.NewBuilder(tableDesc).BuildImmutable().DescriptorProto()
+	pb := tabledesc.NewBuilder(tableDesc).BuildCreatedMutable().DescriptorProto()
 	// Set the timestamp to a non-zero value.
-	descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(desc, hlc.Timestamp{WallTime: 1})
-	bytes, err := protoutil.Marshal(desc)
+	mut, err := descbuilder.BuildMutable(nil /* original */, pb, hlc.Timestamp{WallTime: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bytes, err := protoutil.Marshal(mut.DescriptorProto())
 	if err != nil {
 		t.Fatal(err)
 	}

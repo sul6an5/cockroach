@@ -13,15 +13,16 @@ package main
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
 func TestMakeTestRegistry(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "preferSSD", func(t *testing.T, preferSSD bool) {
-		r, err := makeTestRegistry(spec.AWS, "foo", "zone123", preferSSD)
-		require.NoError(t, err)
+		r := makeTestRegistry(spec.AWS, "foo", "zone123", preferSSD)
 		require.Equal(t, preferSSD, r.preferSSD)
 		require.Equal(t, "zone123", r.zones)
 		require.Equal(t, "foo", r.instanceType)
@@ -41,5 +42,16 @@ func TestMakeTestRegistry(t *testing.T) {
 		require.EqualValues(t, 4, s.CPUs)
 		require.True(t, s.TerminateOnMigration)
 	})
+}
 
+// TestPrometheusMetricParser tests that the registry.PromSub()
+// helper properly converts a string into a metric name that Prometheus can read.
+func TestPrometheusMetricParser(t *testing.T) {
+	r := makeTestRegistry(spec.AWS, "foo", "zone123", true)
+	f := r.PromFactory()
+
+	rawName := "restore/nodes=4/duration"
+	promName := registry.PromSub(rawName)
+	require.Equal(t, "restore_nodes_4_duration", promName)
+	f.NewGauge(prometheus.GaugeOpts{Namespace: prometheusNameSpace, Name: promName})
 }

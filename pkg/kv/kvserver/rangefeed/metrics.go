@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 )
 
 var (
@@ -37,16 +36,21 @@ var (
 		Measurement: "Events",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaRangeFeedRegistrations = metric.Metadata{
+		Name:        "kv.rangefeed.registrations",
+		Help:        "Number of active rangefeed registrations",
+		Measurement: "Registrations",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // Metrics are for production monitoring of RangeFeeds.
 type Metrics struct {
-	RangeFeedCatchUpScanNanos *metric.Counter
-	RangeFeedBudgetExhausted  *metric.Counter
-	RangeFeedBudgetBlocked    *metric.Counter
-
-	RangeFeedSlowClosedTimestampLogN  log.EveryN
-	RangeFeedSlowClosedTimestampNudge singleflight.Group
+	RangeFeedCatchUpScanNanos        *metric.Counter
+	RangeFeedBudgetExhausted         *metric.Counter
+	RangeFeedBudgetBlocked           *metric.Counter
+	RangeFeedRegistrations           *metric.Gauge
+	RangeFeedSlowClosedTimestampLogN log.EveryN
 	// RangeFeedSlowClosedTimestampNudgeSem bounds the amount of work that can be
 	// spun up on behalf of the RangeFeed nudger. We don't expect to hit this
 	// limit, but it's here to limit the effect on stability in case something
@@ -63,6 +67,7 @@ func NewMetrics() *Metrics {
 		RangeFeedCatchUpScanNanos:            metric.NewCounter(metaRangeFeedCatchUpScanNanos),
 		RangeFeedBudgetExhausted:             metric.NewCounter(metaRangeFeedExhausted),
 		RangeFeedBudgetBlocked:               metric.NewCounter(metaRangeFeedBudgetBlocked),
+		RangeFeedRegistrations:               metric.NewGauge(metaRangeFeedRegistrations),
 		RangeFeedSlowClosedTimestampLogN:     log.Every(5 * time.Second),
 		RangeFeedSlowClosedTimestampNudgeSem: make(chan struct{}, 1024),
 	}

@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -41,11 +42,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -247,11 +248,11 @@ func createPostgresSchemas(
 	sessionData *sessiondata.SessionData,
 ) ([]*schemadesc.Mutable, error) {
 	createSchema := func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ctx context.Context, txn descs.Txn,
 		dbDesc catalog.DatabaseDescriptor, schema *tree.CreateSchema,
 	) (*schemadesc.Mutable, error) {
 		desc, _, err := sql.CreateUserDefinedSchemaDescriptor(
-			ctx, sessionData, schema, txn, descriptors, execCfg.InternalExecutor,
+			ctx, sessionData, schema, txn,
 			execCfg.DescIDGenerator, dbDesc, false, /* allocateID */
 		)
 		if err != nil {
@@ -275,18 +276,15 @@ func createPostgresSchemas(
 	}
 	var schemaDescs []*schemadesc.Mutable
 	createSchemaDescs := func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ctx context.Context, txn descs.Txn,
 	) error {
 		schemaDescs = nil // reset for retries
-		_, dbDesc, err := descriptors.GetImmutableDatabaseByID(ctx, txn, parentID, tree.DatabaseLookupFlags{
-			Required:    true,
-			AvoidLeased: true,
-		})
+		dbDesc, err := txn.Descriptors().ByID(txn.KV()).WithoutNonPublic().Get().Database(ctx, parentID)
 		if err != nil {
 			return err
 		}
 		for _, schema := range schemasToCreate {
-			scDesc, err := createSchema(ctx, txn, descriptors, dbDesc, schema)
+			scDesc, err := createSchema(ctx, txn, dbDesc, schema)
 			if err != nil {
 				return err
 			}
@@ -296,7 +294,7 @@ func createPostgresSchemas(
 		}
 		return nil
 	}
-	if err := sql.DescsTxn(ctx, execCfg, createSchemaDescs); err != nil {
+	if err := execCfg.InternalDB.DescsTxn(ctx, createSchemaDescs); err != nil {
 		return nil, err
 	}
 	return schemaDescs, nil
@@ -363,6 +361,7 @@ func getSchemaByNameFromMap(
 }
 
 func createPostgresTables(
+	ctx context.Context,
 	evalCtx *eval.Context,
 	p sql.JobExecContext,
 	createTbl map[schemaAndTableName]*tree.CreateTable,
@@ -377,7 +376,7 @@ func createPostgresTables(
 		if create == nil {
 			continue
 		}
-		schema, err := getSchemaByNameFromMap(evalCtx.Ctx(), schemaAndTableName, schemaNameToDesc, evalCtx.Settings.Version)
+		schema, err := getSchemaByNameFromMap(ctx, schemaAndTableName, schemaNameToDesc, evalCtx.Settings.Version)
 		if err != nil {
 			return nil, err
 		}
@@ -385,11 +384,11 @@ func createPostgresTables(
 		// Bundle imports do not support user defined types, and so we nil out the
 		// type resolver to protect against unexpected behavior on UDT resolution.
 		semaCtxPtr := makeSemaCtxWithoutTypeResolver(p.SemaCtx())
-		id, err := getNextPlaceholderDescID(evalCtx.Ctx(), p.ExecCfg())
+		id, err := getNextPlaceholderDescID(ctx, p.ExecCfg())
 		if err != nil {
 			return nil, err
 		}
-		desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), semaCtxPtr, p.ExecCfg().Settings,
+		desc, err := MakeSimpleTableDescriptor(ctx, semaCtxPtr, p.ExecCfg().Settings,
 			create, parentDB, schema, id, fks, walltime)
 		if err != nil {
 			return nil, err
@@ -403,6 +402,7 @@ func createPostgresTables(
 }
 
 func resolvePostgresFKs(
+	ctx context.Context,
 	evalCtx *eval.Context,
 	parentDB catalog.DatabaseDescriptor,
 	tableFKs map[schemaAndTableName][]*tree.ForeignKeyConstraintTableDef,
@@ -415,7 +415,7 @@ func resolvePostgresFKs(
 		if desc == nil {
 			continue
 		}
-		schema, err := getSchemaByNameFromMap(evalCtx.Ctx(), schemaAndTableName, schemaNameToDesc, evalCtx.Settings.Version)
+		schema, err := getSchemaByNameFromMap(ctx, schemaAndTableName, schemaNameToDesc, evalCtx.Settings.Version)
 		if err != nil {
 			return err
 		}
@@ -431,7 +431,7 @@ func resolvePostgresFKs(
 				constraint.Table.CatalogName = "defaultdb"
 			}
 			if err := sql.ResolveFK(
-				evalCtx.Ctx(), nil /* txn */, &fks.resolver,
+				ctx, nil /* txn */, &fks.resolver,
 				parentDB, schema, desc,
 				constraint, backrefs, sql.NewTable,
 				tree.ValidationDefault, evalCtx,
@@ -460,7 +460,8 @@ func getNextPlaceholderDescID(
 	ctx context.Context, execCfg *sql.ExecutorConfig,
 ) (_ descpb.ID, err error) {
 	if placeholderID == 0 {
-		placeholderID, err = descidgen.PeekNextUniqueDescID(ctx, execCfg.DB, execCfg.Codec)
+		idgen := descidgen.NewGenerator(execCfg.Settings, execCfg.Codec, execCfg.DB)
+		placeholderID, err = idgen.PeekNextUniqueDescID(ctx)
 		if err != nil {
 			return descpb.InvalidID, err
 		}
@@ -553,8 +554,9 @@ func readPostgresCreateTable(
 
 	// Construct table descriptors.
 	backrefs := make(map[descpb.ID]*tabledesc.Mutable)
-	tableDescs, err := createPostgresTables(evalCtx, p, schemaObjects.createTbl, fks, backrefs,
-		parentDB, walltime, schemaNameToDesc)
+	tableDescs, err := createPostgresTables(
+		ctx, evalCtx, p, schemaObjects.createTbl, fks, backrefs, parentDB, walltime, schemaNameToDesc,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -562,7 +564,7 @@ func readPostgresCreateTable(
 
 	// Resolve FKs.
 	err = resolvePostgresFKs(
-		evalCtx, parentDB, schemaObjects.tableFKs, fks, backrefs, schemaNameToDesc,
+		ctx, evalCtx, parentDB, schemaObjects.tableFKs, fks, backrefs, schemaNameToDesc,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -819,7 +821,7 @@ func readPostgresStmt(
 						datums[i] = d
 					}
 					// Now that we have all of the datums, we can execute the overload.
-					fnSQL, err := fn(evalCtx, datums)
+					fnSQL, err := fn(ctx, evalCtx, datums)
 					if err != nil {
 						return err
 					}
@@ -872,14 +874,15 @@ func readPostgresStmt(
 		// Otherwise, we silently ignore the drop statement and continue with the import.
 		for _, name := range names {
 			tableName := name.ToUnresolvedObjectName().String()
-			if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-				dbDesc, err := col.Direct().MustGetDatabaseDescByID(ctx, txn, parentID)
+			if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+				dbDesc, err := col.ByID(txn.KV()).Get().Database(ctx, parentID)
 				if err != nil {
 					return err
 				}
-				err = col.Direct().CheckObjectCollision(
+				err = descs.CheckObjectNameCollision(
 					ctx,
-					txn,
+					col,
+					txn.KV(),
 					parentID,
 					dbDesc.GetSchemaID(tree.PublicSchema),
 					tree.NewUnqualifiedTableName(tree.Name(tableName)),
@@ -894,8 +897,6 @@ func readPostgresStmt(
 		}
 	case *tree.BeginTransaction, *tree.CommitTransaction:
 		// Ignore transaction statements as they have no meaning during an IMPORT.
-		// TODO(during review): Should we guard these statements under the
-		// ignore_unsupported flag as well?
 	case *tree.Insert, *tree.CopyFrom, *tree.Delete, copyData:
 		// handled during the data ingestion pass.
 	case *tree.CreateExtension, *tree.CommentOnDatabase, *tree.CommentOnTable,
@@ -1120,7 +1121,7 @@ func (m *pgDumpReader) readFile(
 			var targetColMapIdx []int
 			if len(i.Columns) != 0 {
 				targetColMapIdx = make([]int, len(i.Columns))
-				conv.TargetColOrds = util.FastIntSet{}
+				conv.TargetColOrds = intsets.Fast{}
 				for j := range i.Columns {
 					colName := string(i.Columns[j])
 					idx, ok := m.colMap[conv][colName]
@@ -1161,7 +1162,7 @@ func (m *pgDumpReader) readFile(
 						return errors.Wrapf(err, "reading row %d (%d in insert statement %d)",
 							count, count-startingCount, inserts)
 					}
-					converted, err := eval.Expr(conv.EvalCtx, typed)
+					converted, err := eval.Expr(ctx, conv.EvalCtx, typed)
 					if err != nil {
 						return errors.Wrapf(err, "reading row %d (%d in insert statement %d)",
 							count, count-startingCount, inserts)
@@ -1187,7 +1188,7 @@ func (m *pgDumpReader) readFile(
 			var targetColMapIdx []int
 			if conv != nil {
 				targetColMapIdx = make([]int, len(i.Columns))
-				conv.TargetColOrds = util.FastIntSet{}
+				conv.TargetColOrds = intsets.Fast{}
 				for j := range i.Columns {
 					colName := string(i.Columns[j])
 					idx, ok := m.colMap[conv][colName]

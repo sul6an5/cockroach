@@ -12,7 +12,9 @@ package tests
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -45,16 +49,32 @@ var (
 	targetTable = "bank"
 
 	timeout = 30 * time.Minute
+
+	// teamcityAgentZone is the zone used in this test. Since this test
+	// runs a lot of queries from the TeamCity agent to CRDB nodes, we
+	// make sure to create roachprod nodes that are in the same region
+	// as the TeamCity agents. Note that a change in the TeamCity agent
+	// region could lead to this test timing out (see #92649 for an
+	// occurrence of this).
+	teamcityAgentZone = "us-east4-b"
 )
 
 func registerCDCMixedVersions(r registry.Registry) {
+	var zones string
+	if r.MakeClusterSpec(1).Cloud == spec.GCE {
+		// see rationale in definition of `teamcityAgentZone`
+		zones = teamcityAgentZone
+	}
 	r.Add(registry.TestSpec{
 		Name:            "cdc/mixed-versions",
 		Owner:           registry.OwnerTestEng,
-		Cluster:         r.MakeClusterSpec(5),
+		Cluster:         r.MakeClusterSpec(5, spec.Zones(zones)),
 		Timeout:         timeout,
 		RequiresLicense: true,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			if c.IsLocal() && runtime.GOARCH == "arm64" {
+				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+			}
 			runCDCMixedVersions(ctx, t, c, *t.BuildVersion())
 		},
 	})
@@ -74,9 +94,12 @@ type cdcMixedVersionTester struct {
 		syncutil.Mutex
 		C chan struct{}
 	}
-	kafka     kafkaManager
-	validator *cdctest.CountValidator
-	cleanup   func()
+	crdbUpgrading     syncutil.Mutex
+	kafka             kafkaManager
+	validator         *cdctest.CountValidator
+	testFinished      bool
+	validatorFinished chan struct{}
+	cleanup           func()
 }
 
 func newCDCMixedVersionTester(
@@ -89,11 +112,12 @@ func newCDCMixedVersionTester(
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", lastNode)
 
 	return cdcMixedVersionTester{
-		ctx:           ctx,
-		crdbNodes:     crdbNodes,
-		workloadNodes: lastNode,
-		kafkaNodes:    lastNode,
-		monitor:       c.NewMonitor(ctx, crdbNodes),
+		ctx:               ctx,
+		crdbNodes:         crdbNodes,
+		workloadNodes:     lastNode,
+		kafkaNodes:        lastNode,
+		monitor:           c.NewMonitor(ctx, crdbNodes),
+		validatorFinished: make(chan struct{}),
 	}
 }
 
@@ -124,7 +148,8 @@ func (cmvt *cdcMixedVersionTester) installAndStartWorkload() versionStep {
 			return u.c.RunE(
 				ctx,
 				cmvt.workloadNodes,
-				fmt.Sprintf("./workload run bank {pgurl%s} --max-rate=10 --tolerate-errors", cmvt.crdbNodes),
+				fmt.Sprintf("./workload run bank {pgurl%s} --max-rate=10 --tolerate-errors",
+					cmvt.crdbNodes),
 			)
 		})
 	}
@@ -165,6 +190,19 @@ func (cmvt *cdcMixedVersionTester) waitForResolvedTimestamps() versionStep {
 	}
 }
 
+// finishTest marks the test as finished which will then prompt the
+// changefeed validator loop to return. This step will block until the
+// validator has finished; this is done to avoid the possibility of
+// the test closing the database connection while the validator is
+// running a query.
+func (cmvt *cdcMixedVersionTester) finishTest() versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		t.L().Printf("waiting for background tasks to finish")
+		cmvt.testFinished = true
+		<-cmvt.validatorFinished
+	}
+}
+
 // setupVerifier creates a CDC validator to validate that a changefeed
 // created on the `target` table is able to re-create the table
 // somewhere else. It also verifies CDC's ordering guarantees. This
@@ -179,6 +217,7 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 		// error. However, calling t.Fatal directly lets us stop the test
 		// earlier
 		cmvt.monitor.Go(func(ctx context.Context) error {
+			defer close(cmvt.validatorFinished)
 			consumer, err := cmvt.kafka.consumer(ctx, targetTable)
 			if err != nil {
 				t.Fatal(err)
@@ -192,19 +231,26 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 				t.Fatal(err)
 			}
 
-			fprintV, err := cdctest.NewFingerprintValidator(db, tableName, `fprint`, consumer.partitions, 0, true)
+			getConn := func(node int) *gosql.DB { return u.conn(ctx, t, node) }
+			fprintV, err := cdctest.NewFingerprintValidator(db, tableName, `fprint`, consumer.partitions, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
+			fprintV.DBFunc(cmvt.cdcDBConn(getConn))
 			validators := cdctest.Validators{
 				cdctest.NewOrderValidator(tableName),
 				fprintV,
 			}
 			cmvt.validator = cdctest.MakeCountValidator(validators)
 
-			for {
+			for !cmvt.testFinished {
 				m := consumer.Next(ctx)
 				if m == nil {
+					// this is expected to happen once the test has finished and
+					// Kafka is being shut down. If it happens in the middle of
+					// the test, it will eventually time out, and this message
+					// should allow us to see that the validator finished
+					// earlier than it should have
 					t.L().Printf("end of changefeed")
 					return nil
 				}
@@ -229,6 +275,8 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 					cmvt.timestampResolved()
 				}
 			}
+
+			return nil
 		})
 	}
 }
@@ -241,6 +289,35 @@ func (cmvt *cdcMixedVersionTester) timestampResolved() {
 
 	if cmvt.timestampsResolved.C != nil {
 		cmvt.timestampsResolved.C <- struct{}{}
+	}
+}
+
+// cdcDBConn is the wrapper passed to the FingerprintValidator. The
+// goal is to ensure that database checks by the validator do not
+// happen while we are running an upgrade. We used to retry database
+// calls in the validator, but that logic adds complexity and does not
+// help in testing the changefeed's correctness
+func (cmvt *cdcMixedVersionTester) cdcDBConn(
+	getConn func(int) *gosql.DB,
+) func(func(*gosql.DB) error) error {
+	return func(f func(*gosql.DB) error) error {
+		cmvt.crdbUpgrading.Lock()
+		defer cmvt.crdbUpgrading.Unlock()
+
+		node := cmvt.crdbNodes.RandNode()[0]
+		return f(getConn(node))
+	}
+}
+
+// crdbUpgradeStep is a wrapper to steps that upgrade the cockroach
+// binary running in the cluster. It makes sure we hold exclusive
+// access to the `crdbUpgrading` lock while the upgrade is in process
+func (cmvt *cdcMixedVersionTester) crdbUpgradeStep(step versionStep) versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		cmvt.crdbUpgrading.Lock()
+		defer cmvt.crdbUpgrading.Unlock()
+
+		step(ctx, t, u)
 	}
 }
 
@@ -261,12 +338,12 @@ func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
 		t.Status("creating changefeed")
 		db := u.conn(ctx, t, node)
 
-		options := []cdcOption{
-			{"updated", ""},
-			{"resolved", fmt.Sprintf("'%s'", resolvedInterval)},
+		options := map[string]string{
+			"updated":  "",
+			"resolved": fmt.Sprintf("'%s'", resolvedInterval),
 		}
 		_, err := newChangefeedCreator(db, fmt.Sprintf("%s.%s", targetDB, targetTable), cmvt.kafka.sinkURL(ctx)).
-			With(options...).
+			With(options).
 			Create()
 		if err != nil {
 			t.Fatal(err)
@@ -277,7 +354,7 @@ func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
 func runCDCMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
-	predecessorVersion, err := PredecessorVersion(buildVersion)
+	predecessorVersion, err := version.PredecessorVersion(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,9 +373,6 @@ func runCDCMixedVersions(
 		return tester.crdbNodes[rng.Intn(len(tester.crdbNodes))]
 	}
 
-	// An empty string will lead to the cockroach binary specified by flag
-	// `cockroach` to be used.
-	const mainVersion = ""
 	newVersionUpgradeTest(c,
 		uploadAndStartFromCheckpointFixture(tester.crdbNodes, predecessorVersion),
 		tester.setupVerifier(sqlNode()),
@@ -312,7 +386,7 @@ func runCDCMixedVersions(
 
 		tester.waitForResolvedTimestamps(),
 		// Roll the nodes into the new version one by one in random order
-		binaryUpgradeStep(tester.crdbNodes, mainVersion),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, clusterupgrade.MainVersion)),
 		// let the workload run in the new version for a while
 		tester.waitForResolvedTimestamps(),
 
@@ -320,19 +394,20 @@ func runCDCMixedVersions(
 
 		// Roll back again, which ought to be fine because the cluster upgrade was
 		// not finalized.
-		binaryUpgradeStep(tester.crdbNodes, predecessorVersion),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, predecessorVersion)),
 		tester.waitForResolvedTimestamps(),
 
 		tester.assertValid(),
 
 		// Roll nodes forward and finalize upgrade.
-		binaryUpgradeStep(tester.crdbNodes, mainVersion),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, clusterupgrade.MainVersion)),
 
 		// allow cluster version to update
 		allowAutoUpgradeStep(sqlNode()),
 		waitForUpgradeStep(tester.crdbNodes),
 
 		tester.waitForResolvedTimestamps(),
+		tester.finishTest(),
 		tester.assertValid(),
 	).run(ctx, t)
 }

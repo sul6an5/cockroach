@@ -12,7 +12,9 @@ package storage
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/errors"
 )
 
 // ReadAsOfIterator wraps a SimpleMVCCIterator and only surfaces the latest
@@ -69,6 +71,11 @@ func (f *ReadAsOfIterator) SeekGE(originalKey MVCCKey) {
 
 // Valid implements the simpleMVCCIterator.
 func (f *ReadAsOfIterator) Valid() (bool, error) {
+	if util.RaceEnabled && f.valid {
+		if err := f.assertInvariants(); err != nil {
+			return false, err
+		}
+	}
 	return f.valid, f.err
 }
 
@@ -98,8 +105,18 @@ func (f *ReadAsOfIterator) UnsafeKey() MVCCKey {
 
 // UnsafeValue returns the current value as a byte slice, but the memory is
 // invalidated on the next call to {NextKey,Seek}.
-func (f *ReadAsOfIterator) UnsafeValue() []byte {
+func (f *ReadAsOfIterator) UnsafeValue() ([]byte, error) {
 	return f.iter.UnsafeValue()
+}
+
+// MVCCValueLenAndIsTombstone implements the SimpleMVCCIterator interface.
+func (f *ReadAsOfIterator) MVCCValueLenAndIsTombstone() (int, bool, error) {
+	return f.iter.MVCCValueLenAndIsTombstone()
+}
+
+// ValueLen implements the SimpleMVCCIterator interface.
+func (f *ReadAsOfIterator) ValueLen() int {
+	return f.iter.ValueLen()
 }
 
 // HasPointAndRange implements SimpleMVCCIterator.
@@ -160,19 +177,26 @@ func (f *ReadAsOfIterator) advance(seeked bool) {
 		if key := f.iter.UnsafeKey(); f.asOf.Less(key.Timestamp) {
 			// Skip keys above the asOf timestamp.
 			f.iter.Next()
-		} else if value, err := DecodeMVCCValue(f.iter.UnsafeValue()); err != nil {
-			f.valid, f.err = false, err
-			return
-		} else if value.IsTombstone() {
-			// Skip to the next MVCC key if we find a point tombstone.
-			f.iter.NextKey()
-		} else if key.Timestamp.LessEq(f.newestRangeTombstone) {
-			// The latest range key, as of system time, shadows the latest point key.
-			// This key is therefore deleted as of system time.
-			f.iter.NextKey()
 		} else {
-			// On a valid key that potentially shadows range key(s).
-			return
+			v, err := f.iter.UnsafeValue()
+			if err != nil {
+				f.valid, f.err = false, err
+				return
+			}
+			if isTombstone, err := EncodedMVCCValueIsTombstone(v); err != nil {
+				f.valid, f.err = false, err
+				return
+			} else if isTombstone {
+				// Skip to the next MVCC key if we find a point tombstone.
+				f.iter.NextKey()
+			} else if key.Timestamp.LessEq(f.newestRangeTombstone) {
+				// The latest range key, as of system time, shadows the latest point key.
+				// This key is therefore deleted as of system time.
+				f.iter.NextKey()
+			} else {
+				// On a valid key that potentially shadows range key(s).
+				return
+			}
 		}
 	}
 }
@@ -184,4 +208,42 @@ func NewReadAsOfIterator(iter SimpleMVCCIterator, asOf hlc.Timestamp) *ReadAsOfI
 		asOf = hlc.MaxTimestamp
 	}
 	return &ReadAsOfIterator{iter: iter, asOf: asOf}
+}
+
+// assertInvariants asserts iterator invariants. The iterator must be valid.
+func (f *ReadAsOfIterator) assertInvariants() error {
+	// Check general SimpleMVCCIterator API invariants.
+	if err := assertSimpleMVCCIteratorInvariants(f); err != nil {
+		return err
+	}
+
+	// asOf must be set.
+	if f.asOf.IsEmpty() {
+		return errors.AssertionFailedf("f.asOf is empty")
+	}
+
+	// The underlying iterator must be valid.
+	if ok, err := f.iter.Valid(); !ok || err != nil {
+		errMsg := err.Error()
+		return errors.AssertionFailedf("invalid underlying iter with err=%s", errMsg)
+	}
+
+	// Keys can't be intents or inline values, and must have timestamps at or
+	// below the readAsOf timestamp.
+	key := f.UnsafeKey()
+	if key.Timestamp.IsEmpty() {
+		return errors.AssertionFailedf("emitted key %s has no timestamp", key)
+	}
+	if f.asOf.Less(key.Timestamp) {
+		return errors.AssertionFailedf("emitted key %s above asOf timestamp %s", key, f.asOf)
+	}
+
+	// Tombstones should not be emitted.
+	if _, isTombstone, err := f.MVCCValueLenAndIsTombstone(); err != nil {
+		return errors.NewAssertionErrorWithWrappedErrf(err, "invalid value")
+	} else if isTombstone {
+		return errors.AssertionFailedf("emitted tombstone for key %s", key)
+	}
+
+	return nil
 }

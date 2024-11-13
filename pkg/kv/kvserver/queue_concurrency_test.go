@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -70,7 +71,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 	// replicaInQueue, but this isn't an ideal world. Deal with it.
 	store := &Store{
 		cfg: StoreConfig{
-			Clock:             hlc.NewClockWithSystemTimeSource(time.Second /* maxOffset */),
+			Clock:             hlc.NewClockForTesting(nil),
 			AmbientCtx:        log.MakeTestingAmbientContext(tr),
 			DefaultSpanConfig: roachpb.TestingDefaultSpanConfig(),
 		},
@@ -131,6 +132,8 @@ type fakeQueueImpl struct {
 	pr func(context.Context, *Replica, spanconfig.StoreReader) (processed bool, err error)
 }
 
+var _ queueImpl = &fakeQueueImpl{}
+
 func (fakeQueueImpl) shouldQueue(
 	context.Context, hlc.ClockTimestamp, *Replica, spanconfig.StoreReader,
 ) (shouldQueue bool, priority float64) {
@@ -141,6 +144,11 @@ func (fq fakeQueueImpl) process(
 	ctx context.Context, repl *Replica, confReader spanconfig.StoreReader,
 ) (bool, error) {
 	return fq.pr(ctx, repl, confReader)
+}
+
+func (fakeQueueImpl) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 func (fakeQueueImpl) timer(time.Duration) time.Duration {
@@ -174,7 +182,7 @@ func (fr *fakeReplica) Desc() *roachpb.RangeDescriptor {
 func (fr *fakeReplica) maybeInitializeRaftGroup(context.Context) {}
 func (fr *fakeReplica) redirectOnOrAcquireLease(
 	context.Context,
-) (kvserverpb.LeaseStatus, *roachpb.Error) {
+) (kvserverpb.LeaseStatus, *kvpb.Error) {
 	// baseQueue only checks that the returned error is nil.
 	return kvserverpb.LeaseStatus{}, nil
 }

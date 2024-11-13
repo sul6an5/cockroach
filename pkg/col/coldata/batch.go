@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
@@ -47,6 +46,8 @@ type Batch interface {
 	// Selection, if not nil, returns the selection vector on this batch: a
 	// densely-packed list of the *increasing* indices in each column that have
 	// not been filtered out by a previous step.
+	// TODO(yuzefovich): consider ensuring that the length of the returned slice
+	// equals the length of the batch.
 	Selection() []int
 	// SetSelection sets whether this batch is using its selection vector or not.
 	SetSelection(bool)
@@ -70,17 +71,15 @@ type Batch interface {
 	// batches that they reuse as not doing this could result in correctness
 	// or memory blowup issues. It unsets the selection and sets the length to
 	// 0.
-	//
-	// Notably, it deeply resets the datum-backed vectors and returns the number
-	// of bytes released as a result of the reset. Callers should update the
-	// allocator (which the batch was instantiated from) accordingly unless they
-	// guarantee that the batch doesn't have any datum-backed vectors.
-	ResetInternalBatch() int64
+	ResetInternalBatch()
 	// String returns a pretty representation of this batch.
 	String() string
 }
 
 var _ Batch = &MemBatch{}
+
+// DefaultColdataBatchSize is the default value of coldata-batch-size.
+const DefaultColdataBatchSize = 1024
 
 // defaultBatchSize is the size of batches that is used in the non-test setting.
 // Initially, 1024 was picked based on MonetDB/X100 paper and was later
@@ -89,7 +88,7 @@ var _ Batch = &MemBatch{}
 // better, so we decided to keep 1024 as it is a power of 2).
 var defaultBatchSize = int64(util.ConstantWithMetamorphicTestRange(
 	"coldata-batch-size",
-	1024, /* defaultValue */
+	DefaultColdataBatchSize, /* defaultValue */
 	// min is set to 3 to match colexec's minBatchSize setting.
 	3, /* min */
 	MaxBatchSize,
@@ -130,9 +129,6 @@ func NewMemBatchWithCapacity(typs []*types.T, capacity int, factory ColumnFactor
 		col := &cols[i]
 		col.init(t, capacity, factory)
 		b.b[i] = col
-		if col.CanonicalTypeFamily() == typeconv.DatumVecCanonicalTypeFamily {
-			b.datumVecIdxs.Add(i)
-		}
 	}
 	return b
 }
@@ -202,10 +198,8 @@ type MemBatch struct {
 	// MemBatch.
 	capacity int
 	// b is the slice of columns in this batch.
-	b []Vec
-	// datumVecIdxs stores the indices of all datum-backed vectors in b.
-	datumVecIdxs util.FastIntSet
-	useSel       bool
+	b      []Vec
+	useSel bool
 	// sel is - if useSel is true - a selection vector from upstream. A
 	// selection vector is a list of selected tuple indices in this memBatch's
 	// columns (tuples for which indices are not in sel are considered to be
@@ -258,9 +252,6 @@ func (m *MemBatch) SetLength(length int) {
 
 // AppendCol implements the Batch interface.
 func (m *MemBatch) AppendCol(col Vec) {
-	if col.CanonicalTypeFamily() == typeconv.DatumVecCanonicalTypeFamily {
-		m.datumVecIdxs.Add(len(m.b))
-	}
 	m.b = append(m.b, col)
 }
 
@@ -299,17 +290,12 @@ func (m *MemBatch) Reset(typs []*types.T, length int, factory ColumnFactory) {
 	// since those will get reset in ResetInternalBatch anyway.
 	m.b = m.b[:len(typs)]
 	m.sel = m.sel[:length]
-	for i, ok := m.datumVecIdxs.Next(0); ok; i, ok = m.datumVecIdxs.Next(i + 1) {
-		if i >= len(typs) {
-			m.datumVecIdxs.Remove(i)
-		}
-	}
 	m.ResetInternalBatch()
 	m.SetLength(length)
 }
 
 // ResetInternalBatch implements the Batch interface.
-func (m *MemBatch) ResetInternalBatch() int64 {
+func (m *MemBatch) ResetInternalBatch() {
 	m.SetLength(0 /* length */)
 	m.SetSelection(false)
 	for _, v := range m.b {
@@ -318,11 +304,6 @@ func (m *MemBatch) ResetInternalBatch() int64 {
 			ResetIfBytesLike(v)
 		}
 	}
-	var released int64
-	for i, ok := m.datumVecIdxs.Next(0); ok; i, ok = m.datumVecIdxs.Next(i + 1) {
-		released += m.b[i].Datum().Reset()
-	}
-	return released
 }
 
 // String returns a pretty representation of this batch.
@@ -344,3 +325,9 @@ func (m *MemBatch) String() string {
 // The implementation lives in colconv package and is injected during the
 // initialization.
 var VecsToStringWithRowPrefix func(vecs []Vec, length int, sel []int, prefix string) []string
+
+// GetBatchMemSize returns the total memory footprint of the batch.
+//
+// The implementation lives in the sql/colmem package since it depends on
+// sem/tree, and we don't want to make coldata depend on that.
+var GetBatchMemSize func(Batch) int64

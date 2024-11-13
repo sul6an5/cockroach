@@ -51,9 +51,9 @@ export class Sidebar extends React.Component<SidebarProps> {
     },
     {
       path: "/reports/network",
-      text: "Network Latency",
+      text: "Network",
       activeFor: ["/reports/network"],
-      // Do not show Network Latency for single node cluster.
+      // Do not show Network for single node cluster.
       isHidden: () => this.props.isSingleNodeCluster,
     },
     {
@@ -66,7 +66,7 @@ export class Sidebar extends React.Component<SidebarProps> {
     {
       path: "/debug",
       text: "Advanced Debug",
-      activeFor: ["/reports", "/data-distribution", "/raft"],
+      activeFor: ["/reports", "/data-distribution", "/raft", "/keyvisualizer"],
       ignoreFor: ["/reports/network"],
     },
   ];

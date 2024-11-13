@@ -11,6 +11,7 @@
 import { assert } from "chai";
 import {
   filterTransactions,
+  generateRegion,
   getStatementsByFingerprintId,
   statementFingerprintIdsToText,
 } from "./utils";
@@ -19,6 +20,8 @@ import { data, nodeRegions } from "./transactions.fixture";
 import Long from "long";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 
+type Statement =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 type Transaction =
   protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
 
@@ -285,6 +288,31 @@ describe("statementFingerprintIdsToText", () => {
 SELECT _, _
 SELECT _
 SELECT _`,
+    );
+  });
+});
+
+describe("generateRegion", () => {
+  function transaction(...ids: number[]): Transaction {
+    return {
+      stats_data: {
+        statement_fingerprint_ids: ids.map(id => Long.fromInt(id)),
+      },
+    };
+  }
+
+  function statement(id: number, ...regions: string[]): Statement {
+    return { id: Long.fromInt(id), stats: { regions } };
+  }
+
+  it("gathers up the list of regions for the transaction, sorted", () => {
+    assert.deepEqual(
+      generateRegion(transaction(42, 43, 44), [
+        statement(42, "gcp-us-west1", "gcp-us-east1"),
+        statement(43, "gcp-us-west1"),
+        statement(44, "gcp-us-central1"),
+      ]),
+      ["gcp-us-central1", "gcp-us-east1", "gcp-us-west1"],
     );
   });
 });

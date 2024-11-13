@@ -22,10 +22,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -426,6 +428,102 @@ func TestInMemoryStatsDiscard(t *testing.T) {
 	})
 }
 
+func TestSQLStatsGatewayNodeSetting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, conn, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+	sqlConn := sqlutils.MakeSQLRunner(conn)
+
+	// Gateway Node ID enabled, so should persist the value.
+	sqlConn.Exec(t, "SET CLUSTER SETTING sql.metrics.statement_details.gateway_node.enabled = true")
+	sqlConn.Exec(t, "SET application_name = 'gateway_enabled'")
+	sqlConn.Exec(t, "SELECT 1")
+	s.SQLServer().(*sql.Server).
+		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+	verifyNodeID(t, sqlConn, "SELECT _", true, "gateway_enabled")
+
+	// Gateway Node ID disabled, so shouldn't persist the value on the node_id column, but it should
+	// still store the value on the statistics column.
+	sqlConn.Exec(t, "SET CLUSTER SETTING sql.metrics.statement_details.gateway_node.enabled = false")
+	sqlConn.Exec(t, "SET application_name = 'gateway_disabled'")
+	sqlConn.Exec(t, "SELECT 1")
+	s.SQLServer().(*sql.Server).
+		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+	verifyNodeID(t, sqlConn, "SELECT _", false, "gateway_disabled")
+}
+
+func TestSQLStatsPersistedLimitReached(t *testing.T) {
+	skip.WithIssue(t, 97488)
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, conn, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+	sqlConn := sqlutils.MakeSQLRunner(conn)
+
+	sqlConn.Exec(t, "set cluster setting sql.stats.persisted_rows.max=8")
+	sqlConn.Exec(t, "set cluster setting sql.metrics.max_mem_stmt_fingerprints=3")
+	sqlConn.Exec(t, "set cluster setting sql.metrics.max_mem_txn_fingerprints=3")
+
+	// Cleanup data generated during the test creation.
+	sqlConn.Exec(t, "SELECT crdb_internal.reset_sql_stats()")
+
+	testCases := []struct {
+		query string
+	}{
+		{query: "SELECT 1"},
+		{query: "SELECT 1, 2"},
+		{query: "SELECT 1, 2, 3"},
+		{query: "SELECT 1, 2, 3, 4"},
+		{query: "SELECT 1, 2, 3, 4, 5"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 10"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"},
+		{query: "SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"},
+	}
+
+	var count int64
+	for _, tc := range testCases {
+		sqlConn.Exec(t, tc.query)
+		s.SQLServer().(*sql.Server).
+			GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+		// We can flush data if the size of the table is less than 1.5 the value
+		// sql.stats.persisted_rows.max.
+		// If we flush, we add up to the value of sql.metrics.max_mem_stmt_fingerprints,
+		// so the max value that can exist on the system table will be
+		// sql.stats.persisted_rows.max * 1.5 + sql.metrics.max_mem_stmt_fingerprints:
+		// 8 * 1.5 + 3 = 15.
+		rows := sqlConn.QueryRow(t, `
+		SELECT count(*)
+		FROM system.statement_statistics`)
+		rows.Scan(&count)
+		require.LessOrEqual(t, count, int64(15))
+
+		rows = sqlConn.QueryRow(t, `
+		SELECT count(*)
+		FROM system.transaction_statistics`)
+		rows.Scan(&count)
+		require.LessOrEqual(t, count, int64(15))
+	}
+}
+
 type stubTime struct {
 	syncutil.RWMutex
 	t           time.Time
@@ -550,7 +648,7 @@ func verifyInMemoryStatsCorrectness(
 	t *testing.T, tcs []testCase, statsProvider *persistedsqlstats.PersistedSQLStats,
 ) {
 	for _, tc := range tcs {
-		err := statsProvider.SQLStats.IterateStatementStats(context.Background(), &sqlstats.IteratorOptions{}, func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+		err := statsProvider.SQLStats.IterateStatementStats(context.Background(), &sqlstats.IteratorOptions{}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 			if tc.fingerprint == statistics.Key.Query {
 				require.Equal(t, tc.count, statistics.Stats.Count, "fingerprint: %s", tc.fingerprint)
 			}
@@ -565,7 +663,7 @@ func verifyInMemoryStatsEmpty(
 	t *testing.T, tcs []testCase, statsProvider *persistedsqlstats.PersistedSQLStats,
 ) {
 	for _, tc := range tcs {
-		err := statsProvider.SQLStats.IterateStatementStats(context.Background(), &sqlstats.IteratorOptions{}, func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+		err := statsProvider.SQLStats.IterateStatementStats(context.Background(), &sqlstats.IteratorOptions{}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 			if tc.fingerprint == statistics.Key.Query {
 				require.Equal(t, 0 /* expected */, statistics.Stats.Count, "fingerprint: %s", tc.fingerprint)
 			}
@@ -574,4 +672,36 @@ func verifyInMemoryStatsEmpty(
 
 		require.NoError(t, err)
 	}
+}
+
+func verifyNodeID(
+	t *testing.T,
+	sqlConn *sqlutils.SQLRunner,
+	fingerprint string,
+	gatewayEnabled bool,
+	appName string,
+) {
+	row := sqlConn.DB.QueryRowContext(context.Background(),
+		`
+SELECT
+  node_id,
+  statistics -> 'statistics' ->> 'nodes' as nodes
+FROM
+	system.statement_statistics
+WHERE
+	metadata ->> 'query' = $1 AND
+  app_name = $2
+`, fingerprint, appName)
+
+	var gatewayNodeID int64
+	var allNodesIds string
+
+	e := row.Scan(&gatewayNodeID, &allNodesIds)
+	require.NoError(t, e)
+	nodeID := int64(1)
+	if !gatewayEnabled {
+		nodeID = int64(0)
+	}
+	require.Equal(t, nodeID, gatewayNodeID, "Gateway NodeID")
+	require.Equal(t, "[1]", allNodesIds, "All NodeIDs from statistics")
 }

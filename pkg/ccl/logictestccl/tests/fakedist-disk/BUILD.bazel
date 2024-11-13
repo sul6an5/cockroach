@@ -10,12 +10,11 @@ go_test(
         "//c-deps:libgeos",  # keep
         "//pkg/ccl/logictestccl:testdata",  # keep
     ],
-    shard_count = 3,
+    shard_count = 5,
     tags = ["cpu:2"],
     deps = [
         "//pkg/build/bazel",
         "//pkg/ccl",
-        "//pkg/ccl/utilccl",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",

@@ -11,19 +11,20 @@ package cdcevent
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -31,6 +32,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
+
+const virtualColOrd = 1<<31 - 1
 
 // Metadata describes event metadata.
 type Metadata struct {
@@ -40,18 +43,20 @@ type Metadata struct {
 	FamilyID         descpb.FamilyID          // Column family ID.
 	FamilyName       string                   // Column family name.
 	HasOtherFamilies bool                     // True if the table multiple families.
+	HasVirtual       bool                     // True if table has virtual columns.
 	SchemaTS         hlc.Timestamp            // Schema timestamp for table descriptor.
 }
 
 // Decoder is an interface for decoding KVs into cdc event row.
 type Decoder interface {
 	// DecodeKV decodes specified key value to Row.
-	DecodeKV(ctx context.Context, kv roachpb.KeyValue, schemaTS hlc.Timestamp) (Row, error)
+	DecodeKV(ctx context.Context, kv roachpb.KeyValue, rt RowType, schemaTS hlc.Timestamp, keyOnly bool) (Row, error)
 }
 
 // Row holds a row corresponding to an event.
 type Row struct {
 	*EventDescriptor
+	MvccTimestamp hlc.Timestamp // Mvcc timestamp of this row.
 
 	// datums is the new value of a changed table row.
 	datums rowenc.EncDatumRow
@@ -80,6 +85,11 @@ type Iterator interface {
 	Col(fn ColumnFn) error
 }
 
+// EncDatums returns EncDatumRow.
+func (r Row) EncDatums() rowenc.EncDatumRow {
+	return r.datums
+}
+
 // ForEachKeyColumn returns Iterator for each key column
 func (r Row) ForEachKeyColumn() Iterator {
 	return iter{r: r, cols: r.keyCols}
@@ -90,9 +100,23 @@ func (r Row) ForEachColumn() Iterator {
 	return iter{r: r, cols: r.valueCols}
 }
 
+// ForAllColumns returns Iterator for all columns.
+func (r Row) ForAllColumns() Iterator {
+	return iter{r: r, cols: r.allCols}
+}
+
 // ForEachUDTColumn returns Datum iterator for each column containing user defined types.
 func (r Row) ForEachUDTColumn() Iterator {
 	return iter{r: r, cols: r.udtCols}
+}
+
+// DatumNamed returns the datum with the specified column name, in the form of an Iterator.
+func (r Row) DatumNamed(n string) (Iterator, error) {
+	idx, ok := r.EventDescriptor.colsByName[n]
+	if !ok {
+		return nil, errors.Errorf("No column with name %s in this row", n)
+	}
+	return iter{r: r, cols: []int{idx}}, nil
 }
 
 // DatumAt returns Datum at specified position.
@@ -126,20 +150,56 @@ func (r Row) HasValues() bool {
 	return r.datums != nil
 }
 
+// DebugString returns debug string describing event source.
+func (m Metadata) DebugString() string {
+	return fmt.Sprintf("{table: %d family: %d}", m.TableID, m.FamilyID)
+}
+
+// DebugString returns row string.
+func (r Row) DebugString() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Row%s{", r.Metadata.DebugString()))
+	first := true
+	err := r.ForAllColumns().Datum(func(d tree.Datum, col ResultColumn) error {
+		if !first {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(fmt.Sprintf("%s: %s", col.Name, d.String()))
+		first = false
+		return nil
+	})
+	if err != nil {
+		sb.WriteString(fmt.Sprintf("err: %s", err))
+	}
+	sb.WriteByte('}')
+	return sb.String()
+}
+
 // forEachColumn is a helper which invokes fn for reach column in the ordColumn list.
 func (r Row) forEachDatum(fn DatumFn, colIndexes []int) error {
+	numVirtualCols := 0
 	for _, colIdx := range colIndexes {
 		col := r.cols[colIdx]
-		if col.ord >= len(r.datums) {
-			return errors.AssertionFailedf("index [%d] out of range for column %q", col.ord, col.Name)
-		}
-		encDatum := r.datums[col.ord]
-		if err := encDatum.EnsureDecoded(col.Typ, r.alloc); err != nil {
-			return errors.Wrapf(err, "error decoding column %q as type %s", col.Name, col.Typ.String())
-		}
+		// A datum row will never contain virtual columns. If we encounter a column that is virtual,
+		// then we need to offset each subsequent col.ord by 1. This offset is tracked by numVirtualCols.
+		physicalOrd := col.ord - numVirtualCols
+		if physicalOrd < len(r.datums) {
+			encDatum := r.datums[physicalOrd]
+			if err := encDatum.EnsureDecoded(col.Typ, r.alloc); err != nil {
+				return errors.Wrapf(err, "error decoding column %q as type %s", col.Name, col.Typ.String())
+			}
 
-		if err := fn(encDatum.Datum, col); err != nil {
-			return iterutil.Map(err)
+			if err := fn(encDatum.Datum, col); err != nil {
+				return iterutil.Map(err)
+			}
+		} else if col.ord == virtualColOrd {
+			// Insert null values as placeholders for virtual columns.
+			if err := fn(tree.DNull, col); err != nil {
+				return iterutil.Map(err)
+			}
+			numVirtualCols++
+		} else {
+			return errors.AssertionFailedf("index [%d] out of range for column %q", physicalOrd, col.Name)
 		}
 	}
 	return nil
@@ -185,9 +245,11 @@ type EventDescriptor struct {
 	cols []ResultColumn
 
 	// Precomputed index lists into cols.
-	keyCols   []int // Primary key columns.
-	valueCols []int // All column family columns.
-	udtCols   []int // Columns containing UDTs.
+	keyCols    []int          // Primary key columns.
+	valueCols  []int          // All column family columns.
+	udtCols    []int          // Columns containing UDTs.
+	allCols    []int          // Contains all the columns
+	colsByName map[string]int // All columns, map[col.GetName()]idx in cols
 }
 
 // NewEventDescriptor returns EventDescriptor for specified table and family descriptors.
@@ -195,6 +257,7 @@ func NewEventDescriptor(
 	desc catalog.TableDescriptor,
 	family *descpb.ColumnFamilyDescriptor,
 	includeVirtualColumns bool,
+	keyOnly bool,
 	schemaTS hlc.Timestamp,
 ) (*EventDescriptor, error) {
 	sd := EventDescriptor{
@@ -207,7 +270,8 @@ func NewEventDescriptor(
 			HasOtherFamilies: desc.NumFamilies() > 1,
 			SchemaTS:         schemaTS,
 		},
-		td: desc,
+		td:         desc,
+		colsByName: make(map[string]int),
 	}
 
 	// addColumn is a helper to add a column to this descriptor.
@@ -225,6 +289,7 @@ func NewEventDescriptor(
 
 		colIdx := len(sd.cols)
 		sd.cols = append(sd.cols, resultColumn)
+		sd.colsByName[col.GetName()] = colIdx
 
 		if col.GetType().UserDefined() {
 			sd.udtCols = append(sd.udtCols, colIdx)
@@ -247,24 +312,48 @@ func NewEventDescriptor(
 		primaryKeyOrdinal.Set(desc.PublicColumns()[ord].GetID(), i)
 	}
 
-	// Remaining columns go in same order as public columns.
+	// Remaining columns go in same order as public columns,
+	// with the exception that virtual columns are reordered
+	// to be at the end.
 	inFamily := catalog.MakeTableColSet(family.ColumnIDs...)
-	for ord, col := range desc.PublicColumns() {
+	ord := 0
+	for _, col := range desc.PublicColumns() {
 		isInFamily := inFamily.Contains(col.GetID())
+		if col.IsVirtual() {
+			sd.HasVirtual = true
+		}
 		virtual := col.IsVirtual() && includeVirtualColumns
-		isValueCol := isInFamily || virtual
 		pKeyOrd, isPKey := primaryKeyOrdinal.Get(col.GetID())
-		if isValueCol || isPKey {
-			colIdx := addColumn(col, ord)
-			if isValueCol {
-				sd.valueCols = append(sd.valueCols, colIdx)
-			}
-
+		if keyOnly {
 			if isPKey {
+				colIdx := addColumn(col, ord)
+				sd.valueCols = append(sd.valueCols, colIdx)
 				sd.keyCols[pKeyOrd] = colIdx
+				ord++
+			}
+		} else {
+			if isInFamily || isPKey {
+				colIdx := addColumn(col, ord)
+				ord++
+				if isInFamily {
+					sd.valueCols = append(sd.valueCols, colIdx)
+				}
+				if isPKey {
+					sd.keyCols[pKeyOrd] = colIdx
+				}
+			} else if virtual {
+				colIdx := addColumn(col, virtualColOrd)
+				sd.valueCols = append(sd.valueCols, colIdx)
+				ord++
 			}
 		}
 	}
+
+	allCols := make([]int, len(sd.cols))
+	for i := 0; i < len(sd.cols); i++ {
+		allCols[i] = i
+	}
+	sd.allCols = allCols
 
 	return &sd, nil
 }
@@ -303,11 +392,6 @@ func (d *EventDescriptor) EqualsWithUDTCheck(
 	return false, false
 }
 
-// HasUserDefinedTypes returns true if this descriptor contains user defined columns.
-func (d *EventDescriptor) HasUserDefinedTypes() bool {
-	return len(d.udtCols) > 0
-}
-
 // TableDescriptor returns underlying table descriptor.  This method is exposed
 // to make it easier to integrate with the rest of descriptor APIs; prefer to use
 // higher level methods/structs (e.g. Metadata) instead.
@@ -325,8 +409,8 @@ type eventDecoder struct {
 	// Cached allocations for *row.Fetcher
 	rfCache *rowFetcherCache
 
-	// kvFetcher used to decode datums.
-	kvFetcher row.SpanKVFetcher
+	// kvProvider used to feed KVs into fetcher to decode them into datums.
+	kvProvider row.KVProvider
 
 	// factory for constructing event descriptors.
 	getEventDescriptor eventDescriptorFactory
@@ -335,7 +419,7 @@ type eventDecoder struct {
 	alloc tree.DatumAlloc
 
 	// State pertaining for decoding of a single key.
-	fetcher  *row.Fetcher                   // Fetcher to decode KV
+	fetcher  fetcher                        // Fetcher to decode KV
 	desc     catalog.TableDescriptor        // Current descriptor
 	family   *descpb.ColumnFamilyDescriptor // Current family
 	schemaTS hlc.Timestamp                  // Schema timestamp.
@@ -345,10 +429,11 @@ func getEventDescriptorCached(
 	desc catalog.TableDescriptor,
 	family *descpb.ColumnFamilyDescriptor,
 	includeVirtual bool,
+	keyOnly bool,
 	schemaTS hlc.Timestamp,
 	cache *cache.UnorderedCache,
 ) (*EventDescriptor, error) {
-	idVer := idVersion{id: desc.GetID(), version: desc.GetVersion(), family: family.ID}
+	idVer := CacheKey{ID: desc.GetID(), Version: desc.GetVersion(), FamilyID: family.ID}
 
 	if v, ok := cache.Get(idVer); ok {
 		ed := v.(*EventDescriptor)
@@ -357,7 +442,7 @@ func getEventDescriptorCached(
 		}
 	}
 
-	ed, err := NewEventDescriptor(desc, family, includeVirtual, schemaTS)
+	ed, err := NewEventDescriptor(desc, family, includeVirtual, keyOnly, schemaTS)
 	if err != nil {
 		return nil, err
 	}
@@ -368,14 +453,15 @@ func getEventDescriptorCached(
 // NewEventDecoder returns key value decoder.
 func NewEventDecoder(
 	ctx context.Context,
-	cfg *execinfra.ServerConfig,
+	cfg *sql.ExecutorConfig,
 	targets changefeedbase.Targets,
 	includeVirtual bool,
+	keyOnly bool,
 ) (Decoder, error) {
 	rfCache, err := newRowFetcherCache(
 		ctx,
 		cfg.Codec,
-		cfg.LeaseManager.(*lease.Manager),
+		cfg.LeaseManager,
 		cfg.CollectionFactory,
 		cfg.DB,
 		targets,
@@ -384,13 +470,13 @@ func NewEventDecoder(
 		return nil, err
 	}
 
-	eventDescriptorCache := cache.NewUnorderedCache(defaultCacheConfig)
+	eventDescriptorCache := cache.NewUnorderedCache(DefaultCacheConfig)
 	getEventDescriptor := func(
 		desc catalog.TableDescriptor,
 		family *descpb.ColumnFamilyDescriptor,
 		schemaTS hlc.Timestamp,
 	) (*EventDescriptor, error) {
-		return getEventDescriptorCached(desc, family, includeVirtual, schemaTS, eventDescriptorCache)
+		return getEventDescriptorCached(desc, family, includeVirtual, keyOnly, schemaTS, eventDescriptorCache)
 	}
 
 	return &eventDecoder{
@@ -399,21 +485,29 @@ func NewEventDecoder(
 	}, nil
 }
 
+// RowType is the type of the row being decoded.
+type RowType int
+
+const (
+	CurrentRow RowType = iota
+	PrevRow
+)
+
 // DecodeKV decodes key value at specified schema timestamp.
 func (d *eventDecoder) DecodeKV(
-	ctx context.Context, kv roachpb.KeyValue, schemaTS hlc.Timestamp,
+	ctx context.Context, kv roachpb.KeyValue, rt RowType, schemaTS hlc.Timestamp, keyOnly bool,
 ) (Row, error) {
-	if err := d.initForKey(ctx, kv.Key, schemaTS); err != nil {
+	if err := d.initForKey(ctx, kv.Key, schemaTS, keyOnly); err != nil {
 		return Row{}, err
 	}
 
-	d.kvFetcher.KVs = d.kvFetcher.KVs[:0]
-	d.kvFetcher.KVs = append(d.kvFetcher.KVs, kv)
-	if err := d.fetcher.StartScanFrom(ctx, &d.kvFetcher); err != nil {
+	d.kvProvider.KVs = d.kvProvider.KVs[:0]
+	d.kvProvider.KVs = append(d.kvProvider.KVs, kv)
+	if err := d.fetcher.ConsumeKVProvider(ctx, &d.kvProvider); err != nil {
 		return Row{}, err
 	}
 
-	datums, isDeleted, err := d.nextRow(ctx)
+	datums, isDeleted, err := d.nextRow(ctx, rt == PrevRow)
 	if err != nil {
 		return Row{}, err
 	}
@@ -425,6 +519,7 @@ func (d *eventDecoder) DecodeKV(
 
 	return Row{
 		EventDescriptor: ed,
+		MvccTimestamp:   kv.Value.Timestamp,
 		datums:          datums,
 		deleted:         isDeleted,
 		alloc:           &d.alloc,
@@ -434,14 +529,14 @@ func (d *eventDecoder) DecodeKV(
 // initForKey initializes decoder state to prepare it to decode
 // key/value at specified timestamp.
 func (d *eventDecoder) initForKey(
-	ctx context.Context, key roachpb.Key, schemaTS hlc.Timestamp,
+	ctx context.Context, key roachpb.Key, schemaTS hlc.Timestamp, keyOnly bool,
 ) error {
 	desc, familyID, err := d.rfCache.tableDescForKey(ctx, key, schemaTS)
 	if err != nil {
 		return err
 	}
 
-	fetcher, family, err := d.rfCache.RowFetcherForColumnFamily(desc, familyID)
+	fetcher, family, err := d.rfCache.RowFetcherForColumnFamily(desc, familyID, systemColumns, keyOnly)
 	if err != nil {
 		return err
 	}
@@ -449,13 +544,39 @@ func (d *eventDecoder) initForKey(
 	d.schemaTS = schemaTS
 	d.desc = desc
 	d.family = family
-	d.fetcher = fetcher
+	d.fetcher.Fetcher = fetcher
 	return nil
 }
 
+// systemColumns is a list of system columns we add to the fetcher spec.
+// It's just an alias for the colinfo.AllSystemColumns, but written out explicitly
+// to make the order of system columns clear and explicit.
+// In particular, when decoding previous row, we strip table OID column
+// since it makes little sense to include it in the previous row value.
+var systemColumns = []descpb.ColumnDescriptor{
+	colinfo.MVCCTimestampColumnDesc, colinfo.TableOIDColumnDesc,
+}
+
+type fetcher struct {
+	*row.Fetcher
+}
+
+// nextRow returns the next row from the fetcher, but strips out
+// system columns.
+func (f *fetcher) nextRow(ctx context.Context, isPrev bool) (rowenc.EncDatumRow, error) {
+	r, _, err := f.Fetcher.NextRow(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if isPrev {
+		r = r[:len(r)-len(systemColumns)]
+	}
+	return r, nil
+}
+
 // nextRow returns next encoded row, and a flag indicating if a row was deleted.
-func (d *eventDecoder) nextRow(ctx context.Context) (rowenc.EncDatumRow, bool, error) {
-	datums, _, err := d.fetcher.NextRow(ctx)
+func (d *eventDecoder) nextRow(ctx context.Context, isPrev bool) (rowenc.EncDatumRow, bool, error) {
+	datums, err := d.fetcher.nextRow(ctx, isPrev)
 	if err != nil {
 		return nil, false, err
 	}
@@ -480,11 +601,6 @@ func (d *eventDecoder) nextRow(ctx context.Context) (rowenc.EncDatumRow, bool, e
 	return datums, isDeleted, nil
 }
 
-// String returns debug string describing event source.
-func (m Metadata) String() string {
-	return fmt.Sprintf("{table: %d family: %d}", m.TableID, m.FamilyID)
-}
-
 type iter struct {
 	r    Row
 	cols []int
@@ -507,12 +623,12 @@ func (it iter) Col(fn ColumnFn) error {
 func TestingMakeEventRow(
 	desc catalog.TableDescriptor, familyID descpb.FamilyID, encRow rowenc.EncDatumRow, deleted bool,
 ) Row {
-	family, err := desc.FindFamilyByID(familyID)
+	family, err := catalog.MustFindFamilyByID(desc, familyID)
 	if err != nil {
 		panic(err) // primary column family always exists.
 	}
 	const includeVirtual = false
-	ed, err := NewEventDescriptor(desc, family, includeVirtual, hlc.Timestamp{})
+	ed, err := NewEventDescriptor(desc, family, includeVirtual, false, hlc.Timestamp{})
 	if err != nil {
 		panic(err)
 	}
@@ -521,6 +637,25 @@ func TestingMakeEventRow(
 		EventDescriptor: ed,
 		datums:          encRow,
 		deleted:         deleted,
+		alloc:           &alloc,
+	}
+}
+
+// TestingMakeEventRowFromDatums initializes a Row that will return the provided datums when
+// ForEachColumn is called. If anything else needs to be hydrated, use TestingMakeEventRow
+// instead.
+func TestingMakeEventRowFromDatums(datums tree.Datums) Row {
+	var desc EventDescriptor
+	var encRow rowenc.EncDatumRow
+	var alloc tree.DatumAlloc
+	for i, d := range datums {
+		desc.cols = append(desc.cols, ResultColumn{ord: i})
+		desc.valueCols = append(desc.valueCols, i)
+		encRow = append(encRow, rowenc.DatumToEncDatum(d.ResolvedType(), d))
+	}
+	return Row{
+		EventDescriptor: &desc,
+		datums:          encRow,
 		alloc:           &alloc,
 	}
 }
@@ -537,7 +672,7 @@ func TestingGetFamilyIDFromKey(
 // MakeRowFromTuple converts a SQL datum produced by, for example, SELECT ROW(foo.*),
 // into the same kind of cdcevent.Row you'd get as a result of an insert, but without
 // the primary key.
-func MakeRowFromTuple(evalCtx *eval.Context, t *tree.DTuple) Row {
+func MakeRowFromTuple(ctx context.Context, evalCtx *eval.Context, t *tree.DTuple) Row {
 	r := Projection{EventDescriptor: &EventDescriptor{}}
 	names := t.ResolvedType().TupleLabels()
 	for i, d := range t.D {
@@ -548,14 +683,97 @@ func MakeRowFromTuple(evalCtx *eval.Context, t *tree.DTuple) Row {
 			name = names[i]
 		}
 		r.AddValueColumn(name, d.ResolvedType())
-		if err := r.SetValueDatumAt(evalCtx, i, d); err != nil {
+		if err := r.SetValueDatumAt(i, d); err != nil {
 			if build.IsRelease() {
-				log.Warningf(context.Background(), "failed to set row value from tuple due to error %v", err)
-				_ = r.SetValueDatumAt(evalCtx, i, tree.DNull)
+				log.Warningf(ctx, "failed to set row value from tuple due to error %v", err)
+				_ = r.SetValueDatumAt(i, tree.DNull)
 			} else {
 				panic(err)
 			}
 		}
 	}
 	return Row(r)
+}
+
+// TestingMakeEventRowFromEncDatums creates event row from specified  enc datum row.
+// encRow assumed to contain *already decoded* datums.
+// The first numKeyCols are assumed to be primary key columns.
+// Columns names are generated based on the datum types.
+func TestingMakeEventRowFromEncDatums(
+	encRow rowenc.EncDatumRow, colTypes []*types.T, numKeyCols int, deleted bool,
+) Row {
+	if len(encRow) != len(colTypes) {
+		panic("unexpected length mismatch")
+	}
+	intRange := func(start, end int) (res []int) {
+		for i := 0; i < end; i++ {
+			res = append(res, i)
+		}
+		return res
+	}
+	ed := &EventDescriptor{
+		Metadata: Metadata{
+			TableID:    42,
+			TableName:  "randtbl",
+			FamilyName: "primary",
+		},
+		cols: func() (cols []ResultColumn) {
+			names := make(map[string]int, len(encRow))
+			for i, typ := range colTypes {
+				colName := fmt.Sprintf("col_%s", typ.String())
+				names[colName]++
+				if names[colName] > 1 {
+					colName += fmt.Sprintf("_%d", names[colName]-1)
+				}
+				cols = append(cols, ResultColumn{
+					ResultColumn: colinfo.ResultColumn{
+						Name:    colName,
+						Typ:     typ,
+						TableID: 42,
+					},
+					ord: i,
+				})
+			}
+			return cols
+		}(),
+		keyCols:   intRange(0, numKeyCols),
+		valueCols: intRange(0, len(encRow)),
+	}
+
+	var alloc tree.DatumAlloc
+	return Row{
+		EventDescriptor: ed,
+		datums:          encRow,
+		deleted:         deleted,
+		alloc:           &alloc,
+	}
+}
+
+// getRelevantColumnsForFamily returns an array of column ids for public columns
+// including only primary key columns and columns in the specified familyDesc,
+// If includeVirtual is true, virtual columns, which may be outside the specified
+// family, will be included.
+func getRelevantColumnsForFamily(
+	tableDesc catalog.TableDescriptor, familyDesc *descpb.ColumnFamilyDescriptor,
+) ([]descpb.ColumnID, error) {
+	cols := tableDesc.GetPrimaryIndex().CollectKeyColumnIDs()
+	for _, colID := range familyDesc.ColumnIDs {
+		cols.Add(colID)
+	}
+
+	// Maintain the ordering of tableDesc.PublicColumns(), which is
+	// matches the order of columns in the SQL table.
+	idx := 0
+	result := make([]descpb.ColumnID, cols.Len())
+	for _, colID := range tableDesc.PublicColumnIDs() {
+		if cols.Contains(colID) {
+			result[idx] = colID
+			idx++
+		}
+	}
+
+	// Some columns in familyDesc.ColumnIDs may not be public, so
+	// result may contain fewer columns than cols.
+	result = result[:idx]
+	return result, nil
 }

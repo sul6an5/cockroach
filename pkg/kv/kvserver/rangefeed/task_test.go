@@ -186,8 +186,18 @@ func (s *testIterator) UnsafeKey() storage.MVCCKey {
 	return s.curKV().Key
 }
 
-func (s *testIterator) UnsafeValue() []byte {
-	return s.curKV().Value
+func (s *testIterator) UnsafeValue() ([]byte, error) {
+	return s.curKV().Value, nil
+}
+
+func (s *testIterator) MVCCValueLenAndIsTombstone() (int, bool, error) {
+	rawV := s.curKV().Value
+	v, err := storage.DecodeMVCCValue(rawV)
+	return len(rawV), v.IsTombstone(), err
+}
+
+func (s *testIterator) ValueLen() int {
+	return len(s.curKV().Value)
 }
 
 func (s *testIterator) curKV() storage.MVCCKeyValue {

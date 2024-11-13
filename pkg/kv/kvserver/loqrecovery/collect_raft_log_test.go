@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -144,7 +146,7 @@ func checkRaftLog(
 	makeSnapshot := make(chan storage.Engine, 2)
 	snapshots := make(chan storage.Reader, 2)
 
-	raftFilter := func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+	raftFilter := func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 		t.Helper()
 		select {
 		case store := <-makeSnapshot:
@@ -177,8 +179,8 @@ func checkRaftLog(
 			nodeToMonitor: {
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						TestingApplyFilter: raftFilter,
-						DisableGCQueue:     true,
+						TestingPostApplyFilter: raftFilter,
+						DisableGCQueue:         true,
 					},
 				},
 				StoreSpecs: []base.StoreSpec{{InMemory: true}},
@@ -193,7 +195,9 @@ func checkRaftLog(
 
 	skey := action(ctx, tc)
 
-	eng := tc.GetFirstStoreFromServer(t, nodeToMonitor).Engine()
+	// TODO(sep-raft-log): the receiver doesn't use the engine, so remove this
+	// altogether and use a `chan struct{}{}`.
+	eng := tc.GetFirstStoreFromServer(t, nodeToMonitor).TODOEngine()
 	makeSnapshot <- eng
 	// After the test action is complete raft might be completely caught up with
 	// its messages, so we will write a value into the range to ensure filter
@@ -203,6 +207,7 @@ func checkRaftLog(
 		"failed to put test value")
 	reader := <-snapshots
 	assertRaftLog(t, ctx, reader)
+	defer reader.Close()
 }
 
 func requireContainsDescriptor(
@@ -215,4 +220,61 @@ func requireContainsDescriptor(
 		}
 	}
 	t.Fatalf("descriptor change sequence %v doesn't contain %v", seq, value)
+}
+
+// TestCollectLeaseholderStatus verifies that leaseholder status is collected
+// from replicas. It relies on range 1 always being present and fully replicated
+// in ReplicationAuto mode. Assertion is checking number of replicas and only
+// one of them thinking it is a leaseholder.
+func TestCollectLeaseholderStatus(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	tc := testcluster.NewTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					DisableGCQueue: true,
+				},
+			},
+			StoreSpecs: []base.StoreSpec{{InMemory: true}},
+			Insecure:   true,
+		},
+		ReplicationMode: base.ReplicationAuto,
+	})
+	tc.Start(t)
+	defer tc.Stopper().Stop(ctx)
+	require.NoError(t, tc.WaitForFullReplication())
+
+	adm, err := tc.GetAdminClient(ctx, t, 0)
+	require.NoError(t, err, "failed to get admin client")
+
+	// Note: we need to retry because replica collection is not atomic and
+	// leaseholder could move around so we could see none or more than one.
+	testutils.SucceedsSoon(t, func() error {
+		replicas, _, err := loqrecovery.CollectRemoteReplicaInfo(ctx, adm)
+		require.NoError(t, err, "failed to collect replica info")
+
+		foundLeaseholders := 0
+		foundReplicas := 0
+		for _, rs := range replicas.LocalInfo {
+			for _, rs := range rs.Replicas {
+				if rs.Desc.RangeID == 1 {
+					foundReplicas++
+					if rs.LocalAssumesLeaseholder {
+						foundLeaseholders++
+					}
+				}
+			}
+		}
+		if foundReplicas != 3 {
+			return errors.Newf("expecting total 3 replicas in meta range on all nodes, found %d", foundReplicas)
+		}
+		if foundLeaseholders != 1 {
+			return errors.Newf("expecting single leaseholder in meta range, found %d", foundLeaseholders)
+		}
+		return nil
+	})
 }

@@ -13,22 +13,25 @@ package stats
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -68,12 +71,8 @@ type TableStatisticsCache struct {
 		// from the system table.
 		numInternalQueries int64
 	}
-	ClientDB    *kv.DB
-	SQLExecutor sqlutil.InternalExecutor
-	Settings    *cluster.Settings
-
-	// Used to resolve descriptors.
-	collectionFactory *descs.CollectionFactory
+	db       descs.DB
+	settings *cluster.Settings
 
 	// Used when decoding KV from the range feed.
 	datumAlloc tree.DatumAlloc
@@ -117,17 +116,11 @@ type cacheEntry struct {
 // NewTableStatisticsCache creates a new TableStatisticsCache that can hold
 // statistics for <cacheSize> tables.
 func NewTableStatisticsCache(
-	cacheSize int,
-	db *kv.DB,
-	sqlExecutor sqlutil.InternalExecutor,
-	settings *cluster.Settings,
-	cf *descs.CollectionFactory,
+	cacheSize int, settings *cluster.Settings, db descs.DB,
 ) *TableStatisticsCache {
 	tableStatsCache := &TableStatisticsCache{
-		ClientDB:          db,
-		SQLExecutor:       sqlExecutor,
-		Settings:          settings,
-		collectionFactory: cf,
+		db:       db,
+		settings: settings,
 	}
 	tableStatsCache.mu.cache = cache.NewUnorderedCache(cache.Config{
 		Policy:      cache.CacheLRU,
@@ -151,7 +144,7 @@ func (sc *TableStatisticsCache) Start(
 	var lastTableID descpb.ID
 	var lastTS hlc.Timestamp
 
-	handleEvent := func(ctx context.Context, kv *roachpb.RangeFeedValue) {
+	handleEvent := func(ctx context.Context, kv *kvpb.RangeFeedValue) {
 		tableID, err := decodeTableStatisticsKV(codec, kv, &sc.datumAlloc)
 		if err != nil {
 			log.Warningf(ctx, "failed to decode table statistics row %v: %v", kv.Key, err)
@@ -178,8 +171,9 @@ func (sc *TableStatisticsCache) Start(
 		ctx,
 		"table-stats-cache",
 		[]roachpb.Span{statsTableSpan},
-		sc.ClientDB.Clock().Now(),
+		sc.db.KV().Clock().Now(),
 		handleEvent,
+		rangefeed.WithSystemTablePriority(),
 	)
 	return err
 }
@@ -187,13 +181,13 @@ func (sc *TableStatisticsCache) Start(
 // decodeTableStatisticsKV decodes the table ID from a range feed event on
 // system.table_statistics.
 func decodeTableStatisticsKV(
-	codec keys.SQLCodec, kv *roachpb.RangeFeedValue, da *tree.DatumAlloc,
+	codec keys.SQLCodec, kv *kvpb.RangeFeedValue, da *tree.DatumAlloc,
 ) (tableDesc descpb.ID, err error) {
 	// The primary key of table_statistics is (tableID INT, statisticID INT).
 	types := []*types.T{types.Int, types.Int}
-	dirs := []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC, catpb.IndexColumn_ASC}
+	dirs := []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC}
 	keyVals := make([]rowenc.EncDatum, 2)
-	if _, _, err := rowenc.DecodeIndexKey(codec, types, keyVals, dirs, kv.Key); err != nil {
+	if _, err := rowenc.DecodeIndexKey(codec, keyVals, dirs, kv.Key); err != nil {
 		return 0, err
 	}
 
@@ -220,10 +214,10 @@ func decodeTableStatisticsKV(
 func (sc *TableStatisticsCache) GetTableStats(
 	ctx context.Context, table catalog.TableDescriptor,
 ) ([]*TableStatistic, error) {
-	if !statsUsageAllowed(table, sc.Settings) {
+	if !statsUsageAllowed(table, sc.settings) {
 		return nil, nil
 	}
-	forecast := forecastAllowed(table, sc.Settings)
+	forecast := forecastAllowed(table, sc.settings)
 	return sc.getTableStatsFromCache(ctx, table.GetID(), &forecast)
 }
 
@@ -504,21 +498,31 @@ const (
 	distinctCountIndex
 	nullCountIndex
 	avgSizeIndex
+	partialPredicateIndex
 	histogramIndex
+	fullStatisticsIdIndex
 	statsLen
 )
 
 // NewTableStatisticProto converts a row of datums from system.table_statistics
 // into a TableStatisticsProto. Note that any user-defined types in the
 // HistogramData will be unresolved.
-func NewTableStatisticProto(datums tree.Datums) (*TableStatisticProto, error) {
+func NewTableStatisticProto(
+	datums tree.Datums, partialStatisticsColumnsVerActive bool,
+) (*TableStatisticProto, error) {
 	if datums == nil || datums.Len() == 0 {
 		return nil, nil
 	}
 
+	hgIndex := histogramIndex
+	numStats := statsLen
+	if !partialStatisticsColumnsVerActive {
+		hgIndex = histogramIndex - 1
+		numStats = statsLen - 2
+	}
 	// Validate the input length.
-	if datums.Len() != statsLen {
-		return nil, errors.Errorf("%d values returned from table statistics lookup. Expected %d", datums.Len(), statsLen)
+	if datums.Len() != numStats {
+		return nil, errors.Errorf("%d values returned from table statistics lookup. Expected %d", datums.Len(), numStats)
 	}
 
 	// Validate the input types.
@@ -537,8 +541,30 @@ func NewTableStatisticProto(datums tree.Datums) (*TableStatisticProto, error) {
 		{"distinctCount", distinctCountIndex, types.Int, false},
 		{"nullCount", nullCountIndex, types.Int, false},
 		{"avgSize", avgSizeIndex, types.Int, false},
-		{"histogram", histogramIndex, types.Bytes, true},
+		{"histogram", hgIndex, types.Bytes, true},
 	}
+
+	// It's ok for expectedTypes to be in a different order than the input datums
+	// since we don't rely on a precise order of expectedTypes when we check them
+	// below.
+	if partialStatisticsColumnsVerActive {
+		expectedTypes = append(expectedTypes,
+			[]struct {
+				fieldName    string
+				fieldIndex   int
+				expectedType *types.T
+				nullable     bool
+			}{
+				{
+					"partialPredicate", partialPredicateIndex, types.String, true,
+				},
+				{
+					"fullStatisticID", fullStatisticsIdIndex, types.Int, true,
+				},
+			}...,
+		)
+	}
+
 	for _, v := range expectedTypes {
 		if !datums[v.fieldIndex].ResolvedType().Equivalent(v.expectedType) &&
 			(!v.nullable || datums[v.fieldIndex].ResolvedType().Family() != types.UnknownFamily) {
@@ -565,10 +591,18 @@ func NewTableStatisticProto(datums tree.Datums) (*TableStatisticProto, error) {
 	if datums[nameIndex] != tree.DNull {
 		res.Name = string(*datums[nameIndex].(*tree.DString))
 	}
-	if datums[histogramIndex] != tree.DNull {
+	if partialStatisticsColumnsVerActive {
+		if datums[partialPredicateIndex] != tree.DNull {
+			res.PartialPredicate = string(*datums[partialPredicateIndex].(*tree.DString))
+		}
+		if datums[fullStatisticsIdIndex] != tree.DNull {
+			res.FullStatisticID = uint64(*datums[fullStatisticsIdIndex].(*tree.DInt))
+		}
+	}
+	if datums[hgIndex] != tree.DNull {
 		res.HistogramData = &HistogramData{}
 		if err := protoutil.Unmarshal(
-			[]byte(*datums[histogramIndex].(*tree.DBytes)),
+			[]byte(*datums[hgIndex].(*tree.DBytes)),
 			res.HistogramData,
 		); err != nil {
 			return nil, err
@@ -580,15 +614,17 @@ func NewTableStatisticProto(datums tree.Datums) (*TableStatisticProto, error) {
 // parseStats converts the given datums to a TableStatistic object. It might
 // need to run a query to get user defined type metadata.
 func (sc *TableStatisticsCache) parseStats(
-	ctx context.Context, datums tree.Datums,
+	ctx context.Context, datums tree.Datums, partialStatisticsColumnsVerActive bool,
 ) (*TableStatistic, error) {
-	tsp, err := NewTableStatisticProto(datums)
+	var tsp *TableStatisticProto
+	var err error
+	tsp, err = NewTableStatisticProto(datums, partialStatisticsColumnsVerActive)
 	if err != nil {
 		return nil, err
 	}
 	res := &TableStatistic{TableStatisticProto: *tsp}
 	if res.HistogramData != nil {
-		// Hydrate the type in case any user defined types are present.
+		// hydrate the type in case any user defined types are present.
 		// There are cases where typ is nil, so don't do anything if so.
 		if typ := res.HistogramData.ColumnType; typ != nil && typ.UserDefined() {
 			// The metadata accessed here is never older than the metadata used when
@@ -602,10 +638,10 @@ func (sc *TableStatisticsCache) parseStats(
 			// TypeDescriptor's with the timestamp that the stats were recorded with.
 			//
 			// TODO(ajwerner): We now do delete members from enum types. See #67050.
-			if err := sc.collectionFactory.Txn(ctx, sc.ClientDB, func(
-				ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+			if err := sc.db.DescsTxn(ctx, func(
+				ctx context.Context, txn descs.Txn,
 			) error {
-				resolver := descs.NewDistSQLTypeResolver(descriptors, txn)
+				resolver := descs.NewDistSQLTypeResolver(txn.Descriptors(), txn.KV())
 				var err error
 				res.HistogramData.ColumnType, err = resolver.ResolveTypeByOID(ctx, typ.Oid())
 				return err
@@ -675,6 +711,12 @@ func (tabStat *TableStatistic) setHistogramBuckets(hist histogram) {
 			UpperBound: tree.DNull,
 		}}, tabStat.Histogram...)
 	}
+	// Round NumEq and NumRange, as if this had come from HistogramData. (We also
+	// round these counts in histogram.toHistogramData.)
+	for i := 0; i < len(tabStat.Histogram); i++ {
+		tabStat.Histogram[i].NumEq = math.Round(tabStat.Histogram[i].NumEq)
+		tabStat.Histogram[i].NumRange = math.Round(tabStat.Histogram[i].NumRange)
+	}
 }
 
 // nonNullHistogram returns the TableStatistic histogram with the NULL bucket
@@ -693,6 +735,27 @@ func (tabStat *TableStatistic) String() string {
 	)
 }
 
+// IsPartial returns true if this statistic was collected with a where clause.
+func (tsp *TableStatisticProto) IsPartial() bool {
+	return tsp.PartialPredicate != ""
+}
+
+// IsMerged returns true if this statistic was created by merging a partial and
+// a full statistic.
+func (tsp *TableStatisticProto) IsMerged() bool {
+	return tsp.Name == jobspb.MergedStatsName
+}
+
+// IsForecast returns true if this statistic was created by forecasting.
+func (tsp *TableStatisticProto) IsForecast() bool {
+	return tsp.Name == jobspb.ForecastStatsName
+}
+
+// IsAuto returns true if this statistic was collected automatically.
+func (tsp *TableStatisticProto) IsAuto() bool {
+	return tsp.Name == jobspb.AutoStatsName
+}
+
 // getTableStatsFromDB retrieves the statistics in system.table_statistics
 // for the given table ID.
 //
@@ -701,7 +764,17 @@ func (tabStat *TableStatistic) String() string {
 func (sc *TableStatisticsCache) getTableStatsFromDB(
 	ctx context.Context, tableID descpb.ID, forecast bool,
 ) ([]*TableStatistic, error) {
-	const getTableStatisticsStmt = `
+	partialStatisticsColumnsVerActive := sc.settings.Version.IsActive(ctx, clusterversion.V23_1AddPartialStatisticsColumns)
+	var partialPredicateCol string
+	var fullStatisticIDCol string
+	if partialStatisticsColumnsVerActive {
+		partialPredicateCol = `
+"partialPredicate",`
+		fullStatisticIDCol = `
+,"fullStatisticID"
+`
+	}
+	getTableStatisticsStmt := fmt.Sprintf(`
 SELECT
 	"tableID",
 	"statisticID",
@@ -712,16 +785,18 @@ SELECT
 	"distinctCount",
 	"nullCount",
 	"avgSize",
+	%s
 	histogram
+	%s
 FROM system.table_statistics
 WHERE "tableID" = $1
 ORDER BY "createdAt" DESC, "columnIDs" DESC, "statisticID" DESC
-`
+`, partialPredicateCol, fullStatisticIDCol)
 	// TODO(michae2): Add an index on system.table_statistics (tableID, createdAt,
 	// columnIDs, statisticID).
 
-	it, err := sc.SQLExecutor.QueryIterator(
-		ctx, "get-table-statistics", nil /* txn */, getTableStatisticsStmt, tableID,
+	it, err := sc.db.Executor().QueryIteratorEx(
+		ctx, "get-table-statistics", nil /* txn */, sessiondata.NodeUserSessionDataOverride, getTableStatisticsStmt, tableID,
 	)
 	if err != nil {
 		return nil, err
@@ -730,7 +805,7 @@ ORDER BY "createdAt" DESC, "columnIDs" DESC, "statisticID" DESC
 	var statsList []*TableStatistic
 	var ok bool
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
-		stats, err := sc.parseStats(ctx, it.Cur())
+		stats, err := sc.parseStats(ctx, it.Cur(), partialStatisticsColumnsVerActive)
 		if err != nil {
 			log.Warningf(ctx, "could not decode statistic for table %d: %v", tableID, err)
 			continue
@@ -740,6 +815,11 @@ ORDER BY "createdAt" DESC, "columnIDs" DESC, "statisticID" DESC
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO(faizaanmadhani): Wrap merging behind a boolean so
+	// that it can be turned off.
+	merged := MergedStatistics(ctx, statsList)
+	statsList = append(merged, statsList...)
 
 	if forecast {
 		forecasts := ForecastTableStatistics(ctx, statsList)

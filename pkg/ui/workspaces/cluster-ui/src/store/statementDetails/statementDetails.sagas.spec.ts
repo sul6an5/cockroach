@@ -28,12 +28,26 @@ import {
   reducer,
   SQLDetailsStatsReducerState,
 } from "./statementDetails.reducer";
+
+import moment from "moment-timezone";
+
+const lastUpdated = moment();
+
 export type StatementDetailsRequest =
   cockroach.server.serverpb.StatementDetailsRequest;
 
 describe("SQLDetailsStats sagas", () => {
+  let spy: jest.SpyInstance;
+  beforeAll(() => {
+    spy = jest.spyOn(moment, "utc").mockImplementation(() => lastUpdated);
+  });
+
+  afterAll(() => {
+    spy.mockRestore();
+  });
+
   const action: PayloadAction<StatementDetailsRequest> = {
-    payload: cockroach.server.serverpb.StatementDetailsRequest.create({
+    payload: new cockroach.server.serverpb.StatementDetailsRequest({
       fingerprint_id: "SELECT * FROM crdb_internal.node_build_info",
       app_names: ["$ cockroach sql", "newname"],
     }),
@@ -665,10 +679,9 @@ describe("SQLDetailsStats sagas", () => {
                 lastError: null,
                 valid: true,
                 inFlight: false,
+                lastUpdated: lastUpdated,
               },
           },
-          latestQuery: "",
-          latestFormattedQuery: "",
         })
         .run();
     });
@@ -692,10 +705,9 @@ describe("SQLDetailsStats sagas", () => {
                 lastError: error,
                 valid: false,
                 inFlight: false,
+                lastUpdated: lastUpdated,
               },
           },
-          latestQuery: "",
-          latestFormattedQuery: "",
         })
         .run();
     });

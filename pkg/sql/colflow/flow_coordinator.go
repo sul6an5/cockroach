@@ -59,7 +59,6 @@ func NewFlowCoordinator(
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	input execinfra.RowSource,
-	output execinfra.RowReceiver,
 	cancelFlow context.CancelFunc,
 ) *FlowCoordinator {
 	f := flowCoordinatorPool.Get().(*FlowCoordinator)
@@ -68,11 +67,11 @@ func NewFlowCoordinator(
 	f.Init(
 		f,
 		flowCtx,
-		// FlowCoordinator doesn't modify the eval context, so it is safe to
-		// reuse the one from the flow context.
-		flowCtx.EvalCtx,
+		// The FlowCoordinator will update the eval context when closed, so we
+		// give it a copy of the eval context to preserve the "global" eval
+		// context from being mutated.
+		flowCtx.NewEvalCtx(),
 		processorID,
-		output,
 		execinfra.ProcStateOpts{
 			// We append input to inputs to drain below in order to reuse
 			// the same underlying slice from the pooled FlowCoordinator.
@@ -278,13 +277,8 @@ func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 	// Make sure that we close the coordinator and notify the batch receiver in
 	// all cases.
 	defer func() {
-		if err := f.close(ctx); err != nil && status != execinfra.ConsumerClosed {
-			f.pushError(err)
-		}
+		f.cancelFlow()
 		f.output.ProducerDone()
-		// Note that f.close is only safe to call before finishing the tracing
-		// span because some components might still use the span when they are
-		// being closed.
 		span.Finish()
 	}()
 
@@ -340,19 +334,6 @@ func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 			return
 		}
 	}
-}
-
-// close cancels the flow and closes all colexecop.Closers the coordinator is
-// responsible for.
-func (f *BatchFlowCoordinator) close(ctx context.Context) error {
-	f.cancelFlow()
-	var lastErr error
-	for _, toClose := range f.input.ToClose {
-		if err := toClose.Close(ctx); err != nil {
-			lastErr = err
-		}
-	}
-	return lastErr
 }
 
 // Release implements the execinfra.Releasable interface.

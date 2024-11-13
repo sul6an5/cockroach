@@ -17,21 +17,48 @@ package sqlinstance
 
 import (
 	"context"
+	"encoding/base64"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
+	"github.com/cockroachdb/redact/interfaces"
 )
 
 // InstanceInfo exposes information on a SQL instance such as ID, network
 // address, the associated sqlliveness.SessionID, and the instance's locality.
 type InstanceInfo struct {
-	InstanceID   base.SQLInstanceID
-	InstanceAddr string
-	SessionID    sqlliveness.SessionID
-	Locality     roachpb.Locality
+	Region          []byte
+	InstanceID      base.SQLInstanceID
+	InstanceSQLAddr string
+	InstanceRPCAddr string
+	SessionID       sqlliveness.SessionID
+	Locality        roachpb.Locality
+	BinaryVersion   roachpb.Version
 }
+
+// SafeFormat implements redact.SafeFormatter.
+func (ii InstanceInfo) SafeFormat(s interfaces.SafePrinter, verb rune) {
+	s.Printf(
+		"Instance{RegionPrefix: %v, InstanceID: %d, SQLAddr: %v, RPCAddr: %v, SessionID: %s, Locality: %v, BinaryVersion: %v}",
+		redact.SafeString(base64.StdEncoding.EncodeToString(ii.Region)),
+		ii.InstanceID,
+		ii.InstanceSQLAddr,
+		ii.InstanceRPCAddr,
+		ii.SessionID,
+		ii.Locality,
+		ii.BinaryVersion,
+	)
+}
+
+// String implements fmt.Stringer.
+func (ii InstanceInfo) String() string {
+	return redact.Sprint(ii).StripMarkers()
+}
+
+var _ redact.SafeFormatter = InstanceInfo{}
 
 // AddressResolver exposes API for retrieving the instance address and all live instances for a tenant.
 type AddressResolver interface {
@@ -43,55 +70,8 @@ type AddressResolver interface {
 	GetAllInstances(context.Context) ([]InstanceInfo, error)
 }
 
-// Provider is a wrapper around sqlinstance subsystem for external consumption.
-type Provider interface {
-	AddressResolver
-	// Instance returns the instance ID and sqlliveness.SessionID for the
-	// current SQL instance.
-	Instance(context.Context) (base.SQLInstanceID, sqlliveness.SessionID, error)
-	// Start starts the instanceprovider and initializes the current SQL instance.
-	// This will block until the underlying instance data reader has been started.
-	Start(context.Context) error
-}
-
-// fakeSQLProvider implements the sqlinstance.Provider interface as a
-// placeholder for an instance provider, when an instance provider must be
-// instantiated for a non-SQL instance. It starts a Reader to provide the
-// AddressResolver interface, but otherwise throws unsupported errors.
-type fakeSQLProvider struct{}
-
-// NewFakeSQLProvider returns a new placeholder instance Provider.
-func NewFakeSQLProvider() Provider {
-	return &fakeSQLProvider{}
-}
-
-// Start implements the sqlinstance.Provider interface.
-func (p *fakeSQLProvider) Start(ctx context.Context) error {
-	return nil
-}
-
-// Instance implements the sqlinstance.Provider interface.
-func (p *fakeSQLProvider) Instance(
-	ctx context.Context,
-) (_ base.SQLInstanceID, _ sqlliveness.SessionID, err error) {
-	return base.SQLInstanceID(0), "", NotASQLInstanceError
-}
-
-// GetInstance implements the AddressResolver interface.
-func (p *fakeSQLProvider) GetInstance(context.Context, base.SQLInstanceID) (InstanceInfo, error) {
-	return InstanceInfo{}, NotASQLInstanceError
-}
-
-// GetAllInstances implements the AddressResolver interface.
-func (p *fakeSQLProvider) GetAllInstances(context.Context) ([]InstanceInfo, error) {
-	return nil, NotASQLInstanceError
-}
-
 // NonExistentInstanceError can be returned if a SQL instance does not exist.
 var NonExistentInstanceError = errors.Errorf("non existent SQL instance")
-
-// NotStartedError can be returned if the sqlinstance subsystem has not been started yet.
-var NotStartedError = errors.Errorf("sqlinstance subsystem not started")
 
 // NotASQLInstanceError can be returned if a function is is not supported for
 // non-SQL instances.

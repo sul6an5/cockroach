@@ -13,7 +13,9 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
@@ -30,7 +32,7 @@ import (
 
 var targetObjectToPrivilegeObject = map[privilege.TargetObjectType]privilege.ObjectType{
 	privilege.Tables:    privilege.Table,
-	privilege.Sequences: privilege.Table,
+	privilege.Sequences: privilege.Sequence,
 	privilege.Types:     privilege.Type,
 	privilege.Schemas:   privilege.Schema,
 	privilege.Functions: privilege.Function,
@@ -56,10 +58,12 @@ func (p *planner) alterDefaultPrivileges(
 	if n.Database != nil {
 		database = n.Database.Normalize()
 	}
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, database,
-		tree.DatabaseLookupFlags{Required: true})
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, database)
 	if err != nil {
 		return nil, err
+	}
+	if dbDesc.GetID() == keys.SystemDatabaseID {
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "cannot alter system database")
 	}
 
 	objectType := n.Grant.Target
@@ -76,13 +80,16 @@ func (p *planner) alterDefaultPrivileges(
 
 	var schemaDescs []*schemadesc.Mutable
 	for _, sc := range n.Schemas {
-		schemaDesc, err := p.Descriptors().GetMutableSchemaByName(ctx, p.txn, dbDesc, sc.Schema(), tree.SchemaLookupFlags{Required: true})
+		immSchema, err := p.Descriptors().ByName(p.txn).Get().Schema(ctx, dbDesc, sc.Schema())
 		if err != nil {
 			return nil, err
 		}
-		mutableSchemaDesc, ok := schemaDesc.(*schemadesc.Mutable)
-		if !ok {
-			return nil, pgerror.Newf(pgcode.InvalidParameterValue, "%s is not a physical schema", schemaDesc.GetName())
+		if immSchema.SchemaKind() != catalog.SchemaUserDefined {
+			return nil, pgerror.Newf(pgcode.InvalidParameterValue, "%s is not a physical schema", immSchema.GetName())
+		}
+		mutableSchemaDesc, err := p.Descriptors().MutableByID(p.txn).Schema(ctx, immSchema.GetID())
+		if err != nil {
+			return nil, err
 		}
 		schemaDescs = append(schemaDescs, mutableSchemaDesc)
 	}
@@ -206,13 +213,17 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForSchemas(
 
 		for _, role := range roles {
 			if n.n.IsGrant {
-				defaultPrivs.GrantDefaultPrivileges(
+				if err := defaultPrivs.GrantDefaultPrivileges(
 					role, privileges, granteeSQLUsernames, objectType, grantOption,
-				)
+				); err != nil {
+					return err
+				}
 			} else {
-				defaultPrivs.RevokeDefaultPrivileges(
+				if err := defaultPrivs.RevokeDefaultPrivileges(
 					role, privileges, granteeSQLUsernames, objectType, grantOption,
-				)
+				); err != nil {
+					return err
+				}
 			}
 
 			eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}
@@ -285,13 +296,17 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForDatabase(
 
 	for _, role := range roles {
 		if n.n.IsGrant {
-			defaultPrivs.GrantDefaultPrivileges(
+			if err := defaultPrivs.GrantDefaultPrivileges(
 				role, privileges, granteeSQLUsernames, objectType, grantOption,
-			)
+			); err != nil {
+				return err
+			}
 		} else {
-			defaultPrivs.RevokeDefaultPrivileges(
+			if err := defaultPrivs.RevokeDefaultPrivileges(
 				role, privileges, granteeSQLUsernames, objectType, grantOption,
-			)
+			); err != nil {
+				return err
+			}
 		}
 
 		eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}

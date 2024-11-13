@@ -36,7 +36,10 @@ func registerSQLSmith(r registry.Registry) {
 		"seed":                      sqlsmith.Setups["seed"],
 		sqlsmith.RandTableSetupName: sqlsmith.Setups[sqlsmith.RandTableSetupName],
 		"tpch-sf1": func(r *rand.Rand) []string {
-			return []string{`RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit' WITH into_db = 'defaultdb';`}
+			return []string{`
+RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit'
+WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
+`}
 		},
 		"tpcc": func(r *rand.Rand) []string {
 			const version = "version=2.1.0,fks=true,interleaved=false,seed=1,warehouses=1"
@@ -54,7 +57,10 @@ func registerSQLSmith(r registry.Registry) {
 			} {
 				stmts = append(
 					stmts,
-					fmt.Sprintf("RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit' WITH into_db = 'defaultdb';",
+					fmt.Sprintf(`
+RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit'
+WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
+`,
 						t, version,
 					),
 				)
@@ -124,35 +130,7 @@ func registerSQLSmith(r registry.Registry) {
 		}
 
 		if settingName == "multi-region" {
-			regionsSet := make(map[string]struct{})
-			var region, zone string
-			rows, err := conn.Query("SHOW REGIONS FROM CLUSTER")
-			if err != nil {
-				t.Fatal(err)
-			}
-			for rows.Next() {
-				if err := rows.Scan(&region, &zone); err != nil {
-					t.Fatal(err)
-				}
-				regionsSet[region] = struct{}{}
-			}
-
-			var regionList []string
-			for region := range regionsSet {
-				regionList = append(regionList, region)
-			}
-
-			if len(regionList) == 0 {
-				t.Fatal(errors.New("no regions, cannot run multi-region config"))
-			}
-
-			if _, err := conn.Exec(
-				fmt.Sprintf(`ALTER DATABASE defaultdb SET PRIMARY REGION "%s";
-ALTER TABLE seed_mr_table SET LOCALITY REGIONAL BY ROW;
-INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
-			); err != nil {
-				t.Fatal(err)
-			}
+			setupMultiRegionDatabase(t, conn, logStmt)
 		}
 
 		const timeout = time.Minute
@@ -228,6 +206,11 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 					_, err := conn.Exec(stmt)
 					if err == nil {
 						logStmt(stmt)
+						stmt = "EXPLAIN " + stmt
+						_, err = conn.Exec(stmt)
+						if err == nil {
+							logStmt(stmt)
+						}
 					}
 					done <- err
 				}(ctx)
@@ -334,4 +317,39 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 	settings["multi-region"] = sqlsmith.Settings["multi-region"]
 	register("tpcc", "ddl-nodrop")
 	register("seed-multi-region", "multi-region")
+}
+
+// setupMultiRegionDatabase is used to set up a multi-region database.
+func setupMultiRegionDatabase(t test.Test, conn *gosql.DB, logStmt func(string)) {
+	t.Helper()
+	regionsSet := make(map[string]struct{})
+	var region, zone string
+	rows, err := conn.Query("SHOW REGIONS FROM CLUSTER")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		if err := rows.Scan(&region, &zone); err != nil {
+			t.Fatal(err)
+		}
+		regionsSet[region] = struct{}{}
+	}
+
+	var regionList []string
+	for region := range regionsSet {
+		regionList = append(regionList, region)
+	}
+
+	if len(regionList) == 0 {
+		t.Fatal(errors.New("no regions, cannot run multi-region config"))
+	}
+
+	stmt := fmt.Sprintf(`ALTER DATABASE defaultdb SET PRIMARY REGION "%s";
+ALTER TABLE seed_mr_table SET LOCALITY REGIONAL BY ROW;
+INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0])
+	if _, err := conn.Exec(stmt); err != nil {
+		t.Fatal(err)
+	} else {
+		logStmt(stmt)
+	}
 }

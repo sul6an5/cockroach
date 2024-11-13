@@ -9,78 +9,89 @@
 package streamproducer
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/repstream"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
-type replicationStreamManagerImpl struct{}
+type replicationStreamManagerImpl struct {
+	evalCtx *eval.Context
+	txn     isql.Txn
+}
 
 // StartReplicationStream implements streaming.ReplicationStreamManager interface.
 func (r *replicationStreamManagerImpl) StartReplicationStream(
-	evalCtx *eval.Context, txn *kv.Txn, tenantID uint64,
-) (streaming.StreamID, error) {
-	return startReplicationStreamJob(evalCtx, txn, tenantID)
+	ctx context.Context, tenantName roachpb.TenantName,
+) (streampb.ReplicationProducerSpec, error) {
+	return startReplicationProducerJob(ctx, r.evalCtx, r.txn, tenantName)
 }
 
 // HeartbeatReplicationStream implements streaming.ReplicationStreamManager interface.
 func (r *replicationStreamManagerImpl) HeartbeatReplicationStream(
-	evalCtx *eval.Context, streamID streaming.StreamID, frontier hlc.Timestamp, txn *kv.Txn,
+	ctx context.Context, streamID streampb.StreamID, frontier hlc.Timestamp,
 ) (streampb.StreamReplicationStatus, error) {
-	return heartbeatReplicationStream(evalCtx, streamID, frontier, txn)
+	return heartbeatReplicationStream(ctx, r.evalCtx, r.txn, streamID, frontier)
 }
 
 // StreamPartition implements streaming.ReplicationStreamManager interface.
 func (r *replicationStreamManagerImpl) StreamPartition(
-	evalCtx *eval.Context, streamID streaming.StreamID, opaqueSpec []byte,
+	streamID streampb.StreamID, opaqueSpec []byte,
 ) (eval.ValueGenerator, error) {
-	return streamPartition(evalCtx, streamID, opaqueSpec)
+	return streamPartition(r.evalCtx, streamID, opaqueSpec)
 }
 
-// GetReplicationStreamSpec implements ReplicationStreamManager interface.
+// GetReplicationStreamSpec implements streaming.ReplicationStreamManager interface.
 func (r *replicationStreamManagerImpl) GetReplicationStreamSpec(
-	evalCtx *eval.Context, txn *kv.Txn, streamID streaming.StreamID,
+	ctx context.Context, streamID streampb.StreamID,
 ) (*streampb.ReplicationStreamSpec, error) {
-	return getReplicationStreamSpec(evalCtx, txn, streamID)
+	return getReplicationStreamSpec(ctx, r.evalCtx, streamID)
 }
 
 // CompleteReplicationStream implements ReplicationStreamManager interface.
 func (r *replicationStreamManagerImpl) CompleteReplicationStream(
-	evalCtx *eval.Context, txn *kv.Txn, streamID streaming.StreamID, successfulIngestion bool,
+	ctx context.Context, streamID streampb.StreamID, successfulIngestion bool,
 ) error {
-	return completeReplicationStream(evalCtx, txn, streamID, successfulIngestion)
+	return completeReplicationStream(ctx, r.evalCtx, r.txn, streamID, successfulIngestion)
 }
 
 func newReplicationStreamManagerWithPrivilegesCheck(
-	evalCtx *eval.Context,
-) (streaming.ReplicationStreamManager, error) {
-	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(evalCtx.Context)
+	ctx context.Context, evalCtx *eval.Context, txn isql.Txn,
+) (eval.ReplicationStreamManager, error) {
+	hasAdminRole, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	if !isAdmin {
-		return nil,
-			pgerror.New(pgcode.InsufficientPrivilege, "replication restricted to ADMIN role")
+	if !hasAdminRole {
+		if err := evalCtx.SessionAccessor.CheckPrivilege(ctx,
+			syntheticprivilege.GlobalPrivilegeObject,
+			privilege.REPLICATION); err != nil {
+			return nil, err
+		}
 	}
 
 	execCfg := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
 	enterpriseCheckErr := utilccl.CheckEnterpriseEnabled(
-		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), execCfg.Organization(), "REPLICATION")
+		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), "REPLICATION")
 	if enterpriseCheckErr != nil {
 		return nil, pgerror.Wrap(enterpriseCheckErr,
 			pgcode.InsufficientPrivilege, "replication requires enterprise license")
 	}
 
-	return &replicationStreamManagerImpl{}, nil
+	return &replicationStreamManagerImpl{evalCtx: evalCtx, txn: txn}, nil
 }
 
 func init() {
-	streaming.GetReplicationStreamManagerHook = newReplicationStreamManagerWithPrivilegesCheck
+	repstream.GetReplicationStreamManagerHook = newReplicationStreamManagerWithPrivilegesCheck
 }

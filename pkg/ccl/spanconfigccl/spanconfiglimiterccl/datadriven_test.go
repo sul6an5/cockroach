@@ -21,6 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils/spanconfigtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -54,7 +56,7 @@ func TestDataDriven(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		// TODO(irfansharif): This is a stop-gap for tenant read-only cluster
 		// settings. See https://github.com/cockroachdb/cockroach/pull/76929. Once
 		// that's done, this test should be updated to use:
@@ -91,7 +93,7 @@ func TestDataDriven(t *testing.T) {
 			if d.HasArg("tenant") {
 				var id uint64
 				d.ScanArgs(t, "tenant", &id)
-				tenantID = roachpb.MakeTenantID(id)
+				tenantID = roachpb.MustMakeTenantID(id)
 			}
 
 			tenant, found := spanConfigTestCluster.LookupTenant(tenantID)
@@ -134,6 +136,12 @@ func TestDataDriven(t *testing.T) {
 				return output
 
 			case "override":
+				if tc.StartedDefaultTestTenant() {
+					// Tests using an override need to run from the system
+					// tenant. Skip the test if running with a default test
+					// tenant.
+					skip.IgnoreLintf(t, "unable to run with a default test tenant")
+				}
 				d.ScanArgs(t, "limit", &limitOverride)
 
 			default:

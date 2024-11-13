@@ -22,8 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -45,7 +43,7 @@ func deleteIndexData(
 	// are no longer in use. This is necessary in the case of truncate, where we
 	// schedule a GC Job in the transaction that commits the truncation.
 	parentDesc, err := sql.WaitToUpdateLeases(ctx, execCfg.LeaseManager, parentID)
-	if errors.Is(err, catalog.ErrDescriptorNotFound) {
+	if isMissingDescriptorError(err) {
 		handleTableDescriptorDeleted(ctx, parentID, progress)
 		return nil
 	}
@@ -94,7 +92,7 @@ func gcIndexes(
 	// are no longer in use. This is necessary in the case of truncate, where we
 	// schedule a GC Job in the transaction that commits the truncation.
 	parentDesc, err := sql.WaitToUpdateLeases(ctx, execCfg.LeaseManager, parentID)
-	if errors.Is(err, catalog.ErrDescriptorNotFound) {
+	if isMissingDescriptorError(err) {
 		handleTableDescriptorDeleted(ctx, parentID, progress)
 		return nil
 	}
@@ -120,27 +118,18 @@ func gcIndexes(
 		// All the data chunks have been removed. Now also removed the
 		// zone configs for the dropped indexes, if any.
 		removeIndexZoneConfigs := func(
-			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+			ctx context.Context, txn descs.Txn,
 		) error {
-			freshParentTableDesc, err := descriptors.GetMutableTableByID(
-				ctx, txn, parentID, tree.ObjectLookupFlags{
-					CommonLookupFlags: tree.CommonLookupFlags{
-						AvoidLeased:    true,
-						Required:       true,
-						IncludeDropped: true,
-						IncludeOffline: true,
-					},
-				})
+			freshParentTableDesc, err := txn.Descriptors().MutableByID(txn.KV()).Table(ctx, parentID)
 			if err != nil {
 				return err
 			}
 			return sql.RemoveIndexZoneConfigs(
-				ctx, txn, execCfg, descriptors, freshParentTableDesc, []uint32{uint32(index.IndexID)},
+				ctx, txn, execCfg, false /* kvTrace */, freshParentTableDesc, []uint32{uint32(index.IndexID)},
 			)
 		}
-		err := sql.DescsTxn(ctx, execCfg, removeIndexZoneConfigs)
-		if errors.Is(err, catalog.ErrDescriptorNotFound) ||
-			sqlerrors.IsUndefinedRelationError(err) {
+		err := execCfg.InternalDB.DescsTxn(ctx, removeIndexZoneConfigs)
+		if isMissingDescriptorError(err) {
 			handleTableDescriptorDeleted(ctx, parentID, progress)
 			return nil
 		}
@@ -190,7 +179,7 @@ func deleteIndexZoneConfigsAfterGC(
 	parentID descpb.ID,
 	progress *jobspb.SchemaChangeGCProgress,
 ) error {
-
+	checkImmediatelyOnWait := false
 	for _, index := range progress.Indexes {
 		if index.Status == jobspb.SchemaChangeGCProgress_CLEARED {
 			continue
@@ -199,37 +188,29 @@ func deleteIndexZoneConfigsAfterGC(
 		if err := waitForEmptyPrefix(
 			ctx, execCfg.DB, execCfg.SV(),
 			execCfg.GCJobTestingKnobs.SkipWaitingForMVCCGC,
+			checkImmediatelyOnWait,
 			execCfg.Codec.IndexPrefix(uint32(parentID), uint32(index.IndexID)),
 		); err != nil {
 			return errors.Wrapf(err, "waiting for gc of index %d from table %d",
 				index.IndexID, parentID)
 		}
-
+		checkImmediatelyOnWait = true
 		// All the data chunks have been removed. Now also removed the
 		// zone configs for the dropped indexes, if any.
 		removeIndexZoneConfigs := func(
-			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+			ctx context.Context, txn descs.Txn,
 		) error {
-			freshParentTableDesc, err := descriptors.GetMutableTableByID(
-				ctx, txn, parentID, tree.ObjectLookupFlags{
-					CommonLookupFlags: tree.CommonLookupFlags{
-						AvoidLeased:    true,
-						Required:       true,
-						IncludeDropped: true,
-						IncludeOffline: true,
-					},
-				})
+			freshParentTableDesc, err := txn.Descriptors().MutableByID(txn.KV()).Table(ctx, parentID)
 			if err != nil {
 				return err
 			}
 			return sql.RemoveIndexZoneConfigs(
-				ctx, txn, execCfg, descriptors, freshParentTableDesc, []uint32{uint32(index.IndexID)},
+				ctx, txn, execCfg, false /* kvTrace */, freshParentTableDesc, []uint32{uint32(index.IndexID)},
 			)
 		}
-		err := sql.DescsTxn(ctx, execCfg, removeIndexZoneConfigs)
+		err := execCfg.InternalDB.DescsTxn(ctx, removeIndexZoneConfigs)
 		switch {
-		case errors.Is(err, catalog.ErrDescriptorNotFound),
-			sqlerrors.IsUndefinedRelationError(err):
+		case isMissingDescriptorError(err):
 			log.Infof(ctx, "removing index %d zone config from table %d failed: %v",
 				index.IndexID, parentID, err)
 		case err != nil:

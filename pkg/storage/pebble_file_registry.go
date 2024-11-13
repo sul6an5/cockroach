@@ -90,8 +90,8 @@ const (
 
 // CheckNoRegistryFile checks that no registry file currently exists.
 // CheckNoRegistryFile should be called if the file registry will not be used.
-func (r *PebbleFileRegistry) CheckNoRegistryFile() error {
-	filename, err := atomicfs.ReadMarker(r.FS, r.DBDir, registryMarkerName)
+func CheckNoRegistryFile(fs vfs.FS, dbDir string) error {
+	filename, err := atomicfs.ReadMarker(fs, dbDir, registryMarkerName)
 	if oserror.IsNotExist(err) {
 		// ReadMarker may return oserror.IsNotExist if the data
 		// directory does not exist.
@@ -530,6 +530,19 @@ func (r *PebbleFileRegistry) getRegistryCopy() *enginepb.FileRegistry {
 		rv.Files[filename] = ev
 	}
 	return rv
+}
+
+// List returns a mapping of file in the registry to their enginepb.FileEntry.
+func (r *PebbleFileRegistry) List() map[string]*enginepb.FileEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Perform a defensive deep-copy of the internal map here, as there may be
+	// modifications to it after it has been returned to the caller.
+	m := make(map[string]*enginepb.FileEntry, len(r.mu.entries))
+	for k, v := range r.mu.entries {
+		m[k] = v
+	}
+	return m
 }
 
 // Close closes the record writer and record file used for the registry.

@@ -16,8 +16,8 @@ import { connect } from "react-redux";
 import { createSelector } from "reselect";
 
 import { AdminUIState } from "src/redux/state";
-import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
-import { Bytes as formatBytes } from "src/util/format";
+import { nodeSumsSelector } from "src/redux/nodes";
+import { util } from "@cockroachlabs/cluster-ui";
 import createChartComponent from "src/views/shared/util/d3-react";
 import capacityChart from "./capacity";
 import spinner from "assets/spinner.gif";
@@ -31,6 +31,7 @@ import {
   UsableTooltip,
   LiveNodesTooltip,
   SuspectNodesTooltip,
+  DrainingNodesTooltip,
   DeadNodesTooltip,
   TotalRangesTooltip,
   UnderReplicatedRangesTooltip,
@@ -47,6 +48,7 @@ interface CapacityUsageProps {
 const formatPercentage = d3.format("0.1%");
 
 function renderCapacityUsage(props: CapacityUsageProps) {
+  const { Bytes } = util;
   const { usedCapacity, usableCapacity } = props;
   const usedPercentage =
     usableCapacity !== 0 ? usedCapacity / usableCapacity : 0;
@@ -69,21 +71,21 @@ function renderCapacityUsage(props: CapacityUsageProps) {
       <UsedTooltip>Used</UsedTooltip>
     </div>,
     <div className="capacity-usage cluster-summary__metric storage-used">
-      {formatBytes(usedCapacity)}
+      {Bytes(usedCapacity)}
     </div>,
     <div className="capacity-usage cluster-summary__label storage-usable">
       <UsableTooltip>Usable</UsableTooltip>
     </div>,
     <div className="capacity-usage cluster-summary__metric storage-usable">
-      {formatBytes(usableCapacity)}
+      {Bytes(usableCapacity)}
     </div>,
   ];
 }
 
 const mapStateToCapacityUsageProps = createSelector(
-  nodesSummarySelector,
-  function (nodesSummary: NodesSummary) {
-    const { capacityUsed, capacityUsable } = nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { capacityUsed, capacityUsable } = nodeSums;
     return {
       usedCapacity: capacityUsed,
       usableCapacity: capacityUsable,
@@ -95,10 +97,11 @@ interface NodeLivenessProps {
   liveNodes: number;
   suspectNodes: number;
   deadNodes: number;
+  drainingNodes: number;
 }
 
 function renderNodeLiveness(props: NodeLivenessProps) {
-  const { liveNodes, suspectNodes, deadNodes } = props;
+  const { liveNodes, suspectNodes, deadNodes, drainingNodes } = props;
   const suspectClasses = classNames(
     "node-liveness",
     "cluster-summary__metric",
@@ -106,6 +109,15 @@ function renderNodeLiveness(props: NodeLivenessProps) {
     {
       warning: suspectNodes > 0,
       disabled: suspectNodes === 0,
+    },
+  );
+  const drainingClasses = classNames(
+    "node-liveness",
+    "cluster-summary__metric",
+    "draining-nodes",
+    {
+      warning: drainingNodes > 0,
+      disabled: drainingNodes === 0,
     },
   );
   const deadClasses = classNames(
@@ -137,6 +149,14 @@ function renderNodeLiveness(props: NodeLivenessProps) {
         Nodes
       </SuspectNodesTooltip>
     </div>,
+    <div className={drainingClasses}>{drainingNodes}</div>,
+    <div className="node-liveness cluster-summary__label draining-nodes">
+      <DrainingNodesTooltip>
+        Draining
+        <br />
+        Nodes
+      </DrainingNodesTooltip>
+    </div>,
     <div className={deadClasses}>{deadNodes}</div>,
     <div className="node-liveness cluster-summary__label dead-nodes">
       <DeadNodesTooltip>
@@ -149,13 +169,14 @@ function renderNodeLiveness(props: NodeLivenessProps) {
 }
 
 const mapStateToNodeLivenessProps = createSelector(
-  nodesSummarySelector,
-  function (nodesSummary: NodesSummary) {
-    const { nodeCounts } = nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { nodeCounts } = nodeSums;
     return {
       liveNodes: nodeCounts.healthy,
       suspectNodes: nodeCounts.suspect,
       deadNodes: nodeCounts.dead,
+      drainingNodes: nodeCounts.draining,
     };
   },
 );
@@ -220,10 +241,9 @@ function renderReplicationStatus(props: ReplicationStatusProps) {
 }
 
 const mapStateToReplicationStatusProps = createSelector(
-  nodesSummarySelector,
-  function (nodesSummary: NodesSummary) {
-    const { totalRanges, underReplicatedRanges, unavailableRanges } =
-      nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { totalRanges, underReplicatedRanges, unavailableRanges } = nodeSums;
     return {
       totalRanges: totalRanges,
       underReplicatedRanges: underReplicatedRanges,

@@ -158,6 +158,13 @@ func indexForDisplay(
 		predFmtFlag := tree.FmtParsable
 		if f.HasFlags(tree.FmtPGCatalog) {
 			predFmtFlag = tree.FmtPGCatalog
+		} else {
+			if f.HasFlags(tree.FmtMarkRedactionNode) {
+				predFmtFlag |= tree.FmtMarkRedactionNode
+			}
+			if f.HasFlags(tree.FmtOmitNameRedaction) {
+				predFmtFlag |= tree.FmtOmitNameRedaction
+			}
 		}
 		pred, err := schemaexpr.FormatExprForDisplay(ctx, table, index.Predicate, semaCtx, sessionData, predFmtFlag)
 		if err != nil {
@@ -197,11 +204,18 @@ func FormatIndexElements(
 	elemFmtFlag := tree.FmtParsable
 	if f.HasFlags(tree.FmtPGCatalog) {
 		elemFmtFlag = tree.FmtPGCatalog
+	} else {
+		if f.HasFlags(tree.FmtMarkRedactionNode) {
+			elemFmtFlag |= tree.FmtMarkRedactionNode
+		}
+		if f.HasFlags(tree.FmtOmitNameRedaction) {
+			elemFmtFlag |= tree.FmtOmitNameRedaction
+		}
 	}
 
 	startIdx := index.ExplicitColumnStartIdx()
 	for i, n := startIdx, len(index.KeyColumnIDs); i < n; i++ {
-		col, err := table.FindColumnWithID(index.KeyColumnIDs[i])
+		col, err := catalog.MustFindColumnByID(table, index.KeyColumnIDs[i])
 		if err != nil {
 			return err
 		}
@@ -219,7 +233,8 @@ func FormatIndexElements(
 		} else {
 			f.FormatNameP(&index.KeyColumnNames[i])
 		}
-		if index.Type == descpb.IndexDescriptor_INVERTED && len(index.InvertedColumnKinds) > 0 {
+		if index.Type == descpb.IndexDescriptor_INVERTED &&
+			col.GetID() == index.InvertedColumnID() && len(index.InvertedColumnKinds) > 0 {
 			switch index.InvertedColumnKinds[0] {
 			case catpb.InvertedIndexColumnKind_TRIGRAM:
 				f.WriteString(" gin_trgm_ops")
@@ -278,7 +293,7 @@ func formatStorageConfigs(
 		}
 
 		if index.GeoConfig.S2Geometry != nil {
-			col, err := table.FindColumnWithID(index.InvertedColumnID())
+			col, err := catalog.MustFindColumnByID(table, index.InvertedColumnID())
 			if err != nil {
 				return errors.Wrapf(err, "expected column %q to exist in table", index.InvertedColumnName())
 			}

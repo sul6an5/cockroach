@@ -19,27 +19,34 @@
 
 cockroachdb/docs:
   triage_column_id: 3971225
-cockroachdb/sql-experience:
+  aliases:
+    cockroachdb/docs-infra-prs: other
+cockroachdb/sql-foundations:
   aliases:
     cockroachdb/sql-syntax-prs: other
     cockroachdb/sqlproxy-prs: other
     cockroachdb/sql-api-prs: other
-  triage_column_id: 7259065
-cockroachdb/sql-schema:
-  triage_column_id: 8946818
+  triage_column_id: 19467489
+  label: T-sql-foundations
 cockroachdb/sql-queries:
   aliases:
     cockroachdb/sql-optimizer: other
     cockroachdb/sql-opt-prs: other
   triage_column_id: 13549252
-cockroachdb/sql-observability:
+cockroachdb/cluster-observability:
   triage_column_id: 12618343
 cockroachdb/kv:
   aliases:
+    cockroachdb/admission-control: other
     cockroachdb/kv-triage: roachtest
     cockroachdb/kv-prs: other
   triage_column_id: 14242655
-cockroachdb/geospatial:
+  label: T-kv
+cockroachdb/replication:
+  aliases:
+    cockroachdb/repl-prs: other
+  label: T-kv-replication
+cockroachdb/spatial:
   triage_column_id: 9487269
 cockroachdb/dev-inf:
   triage_column_id: 10210759
@@ -53,32 +60,38 @@ cockroachdb/security:
   triage_column_id: 0 # TODO
 cockroachdb/prodsec:
   triage_column_id: 0 # TODO as well
-cockroachdb/bulk-io:
+cockroachdb/disaster-recovery:
   triage_column_id: 3097123
+  label: T-disaster-recovery
 cockroachdb/cdc:
   aliases:
     cockroachdb/cdc-prs: other
-  triage_column_id: 3570120
-cockroachdb/tenant-streaming:
-  triage_column_id: 0 # TODO
+  # CDC team uses GH projects v2, which doesn't have a REST API, so no triage column ID
+  # see .github/workflows/add-issues-to-project.yml
+  label: T-cdc
 cockroachdb/server:
   aliases:
     cockroachdb/cli-prs: other
     cockroachdb/server-prs: other
     cockroachdb/http-api-prs: other
   triage_column_id: 2521812
-cockroachdb/cluster-ui:
+cockroachdb/admin-ui:
   aliases:
-    cockroachdb/cluster-ui-prs: other
+    cockroachdb/admin-ui-prs: other
   triage_column_id: 6598672
+cockroachdb/kv-obs-prs:
+  triage_column_id: 0 # TODO
 cockroachdb/obs-inf-prs:
   triage_column_id: 14196277
 cockroachdb/multi-tenant:
-  triage_column_id: 16575985
+  label: T-multitenant
 cockroachdb/jobs:
   aliases:
     cockroachdb/jobs-prs: other
   triage_column_id: 16360666
+  label: T-jobs
+cockroachdb/cloud-identity:
+  triage_column_id: 18588697
 cockroachdb/unowned:
   aliases:
     cockroachdb/rfc-prs: other

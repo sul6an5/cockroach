@@ -97,9 +97,10 @@ func isIdentityCast(fromType, toType *types.T) bool {
 		// by float64 physically.
 		return true
 	}
-	if fromType.Family() == types.UuidFamily && toType.Family() == types.BytesFamily {
-		// The cast from UUID to Bytes is an identity because we don't need to
-		// perform any conversion since both are represented in the same way.
+	if toType.Family() == types.BytesFamily && (fromType.Family() == types.UuidFamily || fromType.Family() == types.EnumFamily) {
+		// The casts from UUID or enum to Bytes is an identity because we don't
+		// need to perform any conversion since both are represented in the same
+		// way.
 		return true
 	}
 	return false
@@ -181,7 +182,11 @@ func GetCastOperator(
 			// {{end}}
 		}
 	}
-	return nil, errors.Errorf("unhandled cast %s -> %s", fromType.SQLString(), toType.SQLString())
+	return nil, errors.Errorf(
+		"unhandled cast %s -> %s",
+		fromType.SQLStringForError(),
+		toType.SQLStringForError(),
+	)
 }
 
 func IsCastSupported(fromType, toType *types.T) bool {
@@ -309,6 +314,16 @@ type castIdentityOp struct {
 
 var _ colexecop.ClosableOperator = &castIdentityOp{}
 
+// identityOrder is a slice in which every integer equals its ordinal.
+var identityOrder []int
+
+func init() {
+	identityOrder = make([]int, coldata.MaxBatchSize)
+	for i := range identityOrder {
+		identityOrder[i] = i
+	}
+}
+
 func (c *castIdentityOp) Next() coldata.Batch {
 	batch := c.Input.Next()
 	n := batch.Length()
@@ -317,17 +332,19 @@ func (c *castIdentityOp) Next() coldata.Batch {
 	}
 	projVec := batch.ColVec(c.outputIdx)
 	c.allocator.PerformOperation([]coldata.Vec{projVec}, func() {
-		maxIdx := n
+		srcVec := batch.ColVec(c.colIdx)
 		if sel := batch.Selection(); sel != nil {
 			// We don't want to perform the deselection during copying, so we
-			// will copy everything up to (and including) the last selected
-			// element, without the selection vector.
-			maxIdx = sel[n-1] + 1
+			// use a special copy in which we use the identity order but apply
+			// the selection vector.
+			projVec.CopyWithReorderedSource(srcVec, sel[:n], identityOrder)
+		} else {
+			projVec.Copy(coldata.SliceArgs{
+				Src:         srcVec,
+				SrcStartIdx: 0,
+				SrcEndIdx:   n,
+			})
 		}
-		projVec.Copy(coldata.SliceArgs{
-			Src:       batch.ColVec(c.colIdx),
-			SrcEndIdx: maxIdx,
-		})
 	})
 	return batch
 }
@@ -411,22 +428,22 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 		if sel != nil {
 			if inputVec.Nulls().MaybeHasNulls() {
 				for scratchIdx, outputIdx := range sel[:n] {
-					setNativeToDatumCast(outputCol, outputNulls, scratch, scratchIdx, outputIdx, toType, c.evalCtx, true, false)
+					setNativeToDatumCast(c.Ctx, outputCol, outputNulls, scratch, scratchIdx, outputIdx, toType, c.evalCtx, true, false)
 				}
 			} else {
 				for scratchIdx, outputIdx := range sel[:n] {
-					setNativeToDatumCast(outputCol, outputNulls, scratch, scratchIdx, outputIdx, toType, c.evalCtx, false, false)
+					setNativeToDatumCast(c.Ctx, outputCol, outputNulls, scratch, scratchIdx, outputIdx, toType, c.evalCtx, false, false)
 				}
 			}
 		} else {
 			_ = scratch[n-1]
 			if inputVec.Nulls().MaybeHasNulls() {
 				for idx := 0; idx < n; idx++ {
-					setNativeToDatumCast(outputCol, outputNulls, scratch, idx, idx, toType, c.evalCtx, true, true)
+					setNativeToDatumCast(c.Ctx, outputCol, outputNulls, scratch, idx, idx, toType, c.evalCtx, true, true)
 				}
 			} else {
 				for idx := 0; idx < n; idx++ {
-					setNativeToDatumCast(outputCol, outputNulls, scratch, idx, idx, toType, c.evalCtx, false, true)
+					setNativeToDatumCast(c.Ctx, outputCol, outputNulls, scratch, idx, idx, toType, c.evalCtx, false, true)
 				}
 			}
 		}
@@ -440,6 +457,7 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 // execgen:inline
 // execgen:template<hasNulls,scratchBCE>
 func setNativeToDatumCast(
+	ctx context.Context,
 	outputCol coldata.DatumVec,
 	outputNulls *coldata.Nulls,
 	scratch []tree.Datum,
@@ -458,7 +476,7 @@ func setNativeToDatumCast(
 		outputNulls.SetNull(outputIdx)
 		continue
 	}
-	res, err := eval.PerformCast(evalCtx, converted, toType)
+	res, err := eval.PerformCast(ctx, evalCtx, converted, toType)
 	if err != nil {
 		colexecerror.ExpectedError(err)
 	}
@@ -488,6 +506,14 @@ func (c *cast_NAMEOp) Next() coldata.Batch {
 	sel := batch.Selection()
 	inputVec := batch.ColVec(c.colIdx)
 	outputVec := batch.ColVec(c.outputIdx)
+	// {{if eq $fromFamily "types.EnumFamily"}}
+	// {{/*
+	//     TODO(yuzefovich): fromType should really be propagated as an
+	//     argument, but it is only used in one cast at the moment, so we're
+	//     being lazy.
+	// */}}
+	fromType := inputVec.Type()
+	// {{end}}
 	toType := outputVec.Type()
 	// Remove unused warnings.
 	_ = toType

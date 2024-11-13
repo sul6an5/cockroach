@@ -6,11 +6,13 @@
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
-package streamclient
+package streamclient_test
 
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -18,14 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl" // Ensure we can start tenant.
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamingtest"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamproducer" // Ensure we can start replication stream.
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationtestutils"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
@@ -34,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
@@ -41,10 +43,10 @@ import (
 )
 
 type subscriptionFeedSource struct {
-	sub Subscription
+	sub streamclient.Subscription
 }
 
-var _ streamingtest.FeedSource = (*subscriptionFeedSource)(nil)
+var _ replicationtestutils.FeedSource = (*subscriptionFeedSource)(nil)
 
 // Next implements the streamingtest.FeedSource interface.
 func (f *subscriptionFeedSource) Next() (streamingccl.Event, bool) {
@@ -64,7 +66,7 @@ func TestPartitionedStreamReplicationClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	h, cleanup := streamingtest.NewReplicationHelper(t,
+	h, cleanup := replicationtestutils.NewReplicationHelper(t,
 		base.TestServerArgs{
 			// Need to disable the test tenant until tenant-level restore is
 			// supported. Tracked with #76378.
@@ -77,7 +79,8 @@ func TestPartitionedStreamReplicationClient(t *testing.T) {
 
 	defer cleanup()
 
-	tenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID())
+	testTenantName := roachpb.TenantName("test-tenant")
+	tenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID(), testTenantName)
 	defer cleanupTenant()
 
 	ctx := context.Background()
@@ -93,25 +96,48 @@ INSERT INTO d.t1 (i) VALUES (42);
 INSERT INTO d.t2 VALUES (2);
 `)
 
-	client, err := newPartitionedStreamClient(ctx, &h.PGUrl)
+	rng, _ := randutil.NewPseudoRand()
+	maybeGenerateInlineURL := func(orig *url.URL) *url.URL {
+		if rng.Float64() > 0.5 {
+			return orig
+		}
+
+		t.Log("using inline certificates")
+		ret := *orig
+		v := ret.Query()
+		for _, opt := range []string{"sslcert", "sslkey", "sslrootcert"} {
+			path := v.Get(opt)
+			content, err := os.ReadFile(path)
+			require.NoError(t, err)
+			v.Set(opt, string(content))
+
+		}
+		v.Set("sslinline", "true")
+		ret.RawQuery = v.Encode()
+		return &ret
+	}
+
+	maybeInlineURL := maybeGenerateInlineURL(&h.PGUrl)
+	client, err := streamclient.NewPartitionedStreamClient(ctx, maybeInlineURL)
 	defer func() {
 		require.NoError(t, client.Close(ctx))
 	}()
 	require.NoError(t, err)
-	expectStreamState := func(streamID streaming.StreamID, status jobs.Status) {
+	expectStreamState := func(streamID streampb.StreamID, status jobs.Status) {
 		h.SysSQL.CheckQueryResultsRetry(t, fmt.Sprintf("SELECT status FROM system.jobs WHERE id = %d", streamID),
 			[][]string{{string(status)}})
 	}
 
-	streamID, err := client.Create(ctx, tenant.ID)
+	rps, err := client.Create(ctx, testTenantName)
 	require.NoError(t, err)
+	streamID := rps.StreamID
 	// We can create multiple replication streams for the same tenant.
-	_, err = client.Create(ctx, tenant.ID)
+	_, err = client.Create(ctx, testTenantName)
 	require.NoError(t, err)
 
 	top, err := client.Plan(ctx, streamID)
 	require.NoError(t, err)
-	require.Equal(t, 1, len(top))
+	require.Equal(t, 1, len(top.Partitions))
 	// Plan for a non-existent stream
 	_, err = client.Plan(ctx, 999)
 	require.True(t, testutils.IsError(err, fmt.Sprintf("job with ID %d does not exist", 999)), err)
@@ -141,6 +167,8 @@ INSERT INTO d.t2 VALUES (2);
 	require.NoError(t, err)
 	require.Equal(t, streampb.StreamReplicationStatus_STREAM_INACTIVE, status.StreamStatus)
 
+	initialScanTimestamp := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+
 	// Testing client.Subscribe()
 	makePartitionSpec := func(tables ...string) *streampb.StreamPartitionSpec {
 		var spans []roachpb.Span
@@ -151,7 +179,8 @@ INSERT INTO d.t2 VALUES (2);
 		}
 
 		return &streampb.StreamPartitionSpec{
-			Spans: spans,
+			InitialScanTimestamp: initialScanTimestamp,
+			Spans:                spans,
 			Config: streampb.StreamPartitionSpec_ExecutionConfig{
 				MinCheckpointFrequency: 10 * time.Millisecond,
 			},
@@ -165,33 +194,34 @@ INSERT INTO d.t2 VALUES (2);
 	}
 
 	// Ignore table t2 and only subscribe to the changes to table t1.
-	require.Equal(t, len(top), 1)
-	url, err := streamingccl.StreamAddress(top[0].SrcAddr).URL()
+	require.Equal(t, len(top.Partitions), 1)
+	url, err := streamingccl.StreamAddress(top.Partitions[0].SrcAddr).URL()
 	require.NoError(t, err)
 	// Create a new stream client with the given partition address.
-	subClient, err := newPartitionedStreamClient(ctx, url)
+	subClient, err := streamclient.NewPartitionedStreamClient(ctx, url)
 	defer func() {
 		require.NoError(t, subClient.Close(ctx))
 	}()
 	require.NoError(t, err)
-	sub, err := subClient.Subscribe(ctx, streamID, encodeSpec("t1"), hlc.Timestamp{})
+	sub, err := subClient.Subscribe(ctx, streamID, encodeSpec("t1"),
+		initialScanTimestamp, hlc.Timestamp{})
 	require.NoError(t, err)
 
-	rf := streamingtest.MakeReplicationFeed(t, &subscriptionFeedSource{sub: sub})
+	rf := replicationtestutils.MakeReplicationFeed(t, &subscriptionFeedSource{sub: sub})
 	t1Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), tenant.Codec, "d", "t1")
 
 	ctxWithCancel, cancelFn := context.WithCancel(ctx)
 	cg := ctxgroup.WithContext(ctxWithCancel)
 	cg.GoCtx(sub.Subscribe)
 	// Observe the existing single row in t1.
-	expected := streamingtest.EncodeKV(t, tenant.Codec, t1Descr, 42)
+	expected := replicationtestutils.EncodeKV(t, tenant.Codec, t1Descr, 42)
 	firstObserved := rf.ObserveKey(ctx, expected.Key)
 	require.Equal(t, expected.Value.RawBytes, firstObserved.Value.RawBytes)
 	rf.ObserveResolved(ctx, firstObserved.Value.Timestamp)
 
 	// Updates the existing row.
 	tenant.SQL.Exec(t, `UPDATE d.t1 SET b = 'world' WHERE i = 42`)
-	expected = streamingtest.EncodeKV(t, tenant.Codec, t1Descr, 42, nil, "world")
+	expected = replicationtestutils.EncodeKV(t, tenant.Codec, t1Descr, 42, nil, "world")
 
 	// Observe its changes.
 	secondObserved := rf.ObserveKey(ctx, expected.Key)
@@ -212,15 +242,16 @@ INSERT INTO d.t2 VALUES (2);
 	})
 
 	// Testing client.Complete()
-	err = client.Complete(ctx, streaming.StreamID(999), true)
-	require.True(t, testutils.IsError(err, fmt.Sprintf("job %d: not found in system.jobs table", 999)), err)
+	err = client.Complete(ctx, streampb.StreamID(999), true)
+	require.True(t, testutils.IsError(err, "job with ID 999 does not exist"), err)
 
 	// Makes producer job exit quickly.
 	h.SysSQL.Exec(t, `
 SET CLUSTER SETTING stream_replication.stream_liveness_track_frequency = '200ms';
 `)
-	streamID, err = client.Create(ctx, tenant.ID)
+	rps, err = client.Create(ctx, testTenantName)
 	require.NoError(t, err)
+	streamID = rps.StreamID
 	require.NoError(t, client.Complete(ctx, streamID, true))
 	h.SysSQL.CheckQueryResultsRetry(t,
 		fmt.Sprintf("SELECT status FROM [SHOW JOBS] WHERE job_id = %d", streamID), [][]string{{"succeeded"}})

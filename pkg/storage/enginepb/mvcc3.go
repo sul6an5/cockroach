@@ -10,7 +10,10 @@
 
 package enginepb
 
-import "github.com/cockroachdb/errors"
+import (
+	_ "github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil" // see MVCCValueHeader
+	"github.com/cockroachdb/errors"
+)
 
 // SafeValue implements the redact.SafeValue interface.
 func (MVCCStatsDelta) SafeValue() {}

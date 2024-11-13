@@ -20,12 +20,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -74,7 +75,7 @@ func TestRegistry(t *testing.T) {
 	registryMap := make(map[string]*contention.Registry)
 	// registry is the current registry.
 	var registry *contention.Registry
-	datadriven.RunTest(t, testutils.TestDataPath(t, "contention_registry"), func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "contention_registry"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "use":
 			var registryKey string
@@ -148,7 +149,7 @@ func TestRegistry(t *testing.T) {
 				return fmt.Sprintf("could not parse duration %s as int: %v", duration, err)
 			}
 			keyBytes = encoding.EncodeStringAscending(keyBytes, key)
-			addContentionEvent(registry, roachpb.ContentionEvent{
+			addContentionEvent(registry, kvpb.ContentionEvent{
 				Key: keyBytes,
 				TxnMeta: enginepb.TxnMeta{
 					ID:                contendingTxnID,
@@ -182,7 +183,7 @@ func TestRegistryConcurrentAdds(t *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
 			defer wg.Done()
-			addContentionEvent(registry, roachpb.ContentionEvent{
+			addContentionEvent(registry, kvpb.ContentionEvent{
 				Key: keys.MakeTableIDIndexID(nil /* key */, 1 /* tableID */, 1 /* indexID */),
 			})
 		}()
@@ -232,7 +233,7 @@ func TestSerializedRegistryInvariants(t *testing.T) {
 			// Always append a tenant ID at the start of the key so that in case
 			// we choose to generate a non-SQL key, it doesn't have the first
 			// byte randomly equal to tenantPrefixByte.
-			key := keys.MakeTenantPrefix(roachpb.MakeTenantID(1 + uint64(rng.Uint32())))
+			key := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(1 + uint64(rng.Uint32())))
 			if rng.Float64() > nonSQLKeyProbability {
 				// Create a key with a valid SQL prefix.
 				tableID := uint32(1 + rng.Intn(testIndexMapMaxSize+1))
@@ -240,7 +241,7 @@ func TestSerializedRegistryInvariants(t *testing.T) {
 				key = keys.MakeTableIDIndexID(key, tableID, indexID)
 			}
 			key = append(key, getKey()...)
-			addContentionEvent(r, roachpb.ContentionEvent{
+			addContentionEvent(r, kvpb.ContentionEvent{
 				Key: key,
 				TxnMeta: enginepb.TxnMeta{
 					ID:                uuid.MakeV4(),
@@ -331,7 +332,7 @@ func TestSerializedRegistryInvariants(t *testing.T) {
 	}
 }
 
-func addContentionEvent(r *contention.Registry, ev roachpb.ContentionEvent) {
+func addContentionEvent(r *contention.Registry, ev kvpb.ContentionEvent) {
 	r.AddContentionEvent(contentionpb.ExtendedContentionEvent{
 		BlockingEvent: ev,
 	})

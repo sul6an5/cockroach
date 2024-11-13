@@ -68,9 +68,9 @@ type recursiveCTERun struct {
 
 func (n *recursiveCTENode) startExec(params runParams) error {
 	n.typs = planTypes(n.initial)
-	n.workingRows.Init(n.typs, params.extendedEvalCtx, "cte" /* opName */)
+	n.workingRows.Init(params.ctx, n.typs, params.extendedEvalCtx, "cte" /* opName */)
 	if n.deduplicate {
-		n.allRows.InitWithDedup(n.typs, params.extendedEvalCtx, "cte-all" /* opName */)
+		n.allRows.InitWithDedup(params.ctx, n.typs, params.extendedEvalCtx, "cte-all" /* opName */)
 	}
 	return nil
 }
@@ -96,7 +96,7 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 				return false, err
 			}
 		}
-		n.iterator = newRowContainerIterator(params.ctx, n.workingRows, n.typs)
+		n.iterator = newRowContainerIterator(params.ctx, n.workingRows)
 		n.initialDone = true
 	}
 
@@ -128,7 +128,7 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 	defer lastWorkingRows.Close(params.ctx)
 
 	n.workingRows = rowContainerHelper{}
-	n.workingRows.Init(n.typs, params.extendedEvalCtx, "cte" /* opName */)
+	n.workingRows.Init(params.ctx, n.typs, params.extendedEvalCtx, "cte" /* opName */)
 
 	// Set up a bufferNode that can be used as a reference for a scanBufferNode.
 	buf := &bufferNode{
@@ -139,7 +139,7 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 		rows:  lastWorkingRows,
 		label: n.label,
 	}
-	newPlan, err := n.genIterationFn(newExecFactory(params.p), buf)
+	newPlan, err := n.genIterationFn(newExecFactory(params.ctx, params.p), buf)
 	if err != nil {
 		return false, err
 	}
@@ -152,7 +152,7 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 		return false, err
 	}
 
-	n.iterator = newRowContainerIterator(params.ctx, n.workingRows, n.typs)
+	n.iterator = newRowContainerIterator(params.ctx, n.workingRows)
 	n.currentRow, err = n.iterator.Next()
 	if err != nil {
 		return false, err
@@ -198,8 +198,8 @@ func (n *recursiveCTENode) AddRow(ctx context.Context, row tree.Datums) error {
 	return n.workingRows.AddRow(ctx, row)
 }
 
-// IncrementRowsAffected is part of the rowResultWriter interface.
-func (n *recursiveCTENode) IncrementRowsAffected(context.Context, int) {
+// SetRowsAffected is part of the rowResultWriter interface.
+func (n *recursiveCTENode) SetRowsAffected(context.Context, int) {
 }
 
 // SetError is part of the rowResultWriter interface.

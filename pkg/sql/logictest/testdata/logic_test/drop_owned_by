@@ -1,4 +1,4 @@
-# LogicTest: !local-legacy-schema-changer
+# LogicTest: local-mixed-22.2-23.1 default-configs !local-legacy-schema-changer
 # Skipped on legacy schema changer since it unsupported.
 
 # Test dropping nothing.
@@ -622,9 +622,9 @@ DROP OWNED BY testuser
 query TTTB
 SHOW GRANTS ON DATABASE d3
 ----
-d3  admin     ALL      true
-d3  public    CONNECT  false
-d3  root      ALL      true
+d3  admin   ALL      true
+d3  public  CONNECT  false
+d3  root    ALL      true
 
 # Drop owned by should not work if the user has synthetic privileges.
 
@@ -633,3 +633,26 @@ GRANT SYSTEM MODIFYCLUSTERSETTING TO testuser
 
 statement error pq: cannot perform drop owned by if role has synthetic privileges; testuser has entries in system.privileges
 DROP OWNED BY testuser
+
+subtest drop_function
+
+statement ok
+CREATE USER u_drop_udf;
+
+statement ok
+CREATE FUNCTION f_drop_udf() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+statement ok
+ALTER FUNCTION f_drop_udf OWNER TO u_drop_udf;
+
+# TODO(chengxiong): DROP function was only enabled in 23.1. This skip can be
+# removed in 23.2.
+skipif config local-mixed-22.2-23.1
+statement ok
+DROP OWNED BY u_drop_udf;
+
+# TODO(chengxiong): DROP function was only enabled in 23.1. This skip can be
+# removed in 23.2.
+skipif config local-mixed-22.2-23.1
+statement error pq: unknown function: f_drop_udf\(\): function undefined
+SHOW CREATE FUNCTION f_drop_udf;

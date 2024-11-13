@@ -34,7 +34,10 @@ func (ctx *FmtCtx) formatNodeOrHideConstants(n NodeFormatter) {
 			return
 		case *Placeholder:
 			// Placeholders should be printed as placeholder markers.
-			// Deliberately empty so we format as normal.
+			// Using always '$1' so we limit the amount of different
+			// fingerprints created.
+			ctx.WriteString("$1")
+			return
 		case *StrVal:
 			ctx.WriteString("'_'")
 			return
@@ -122,7 +125,7 @@ func (node *Tuple) formatHideConstants(ctx *FmtCtx) {
 		v2.Exprs = append(make(Exprs, 0, 3), v2.Exprs[:2]...)
 		if len(node.Exprs) > 2 {
 			v2.Exprs = append(v2.Exprs, arityIndicator(len(node.Exprs)-2))
-			if node.Labels != nil {
+			if len(node.Labels) > 2 {
 				v2.Labels = node.Labels[:2]
 			}
 		}

@@ -4,20 +4,20 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "storepool",
     srcs = [
+        "override_store_pool.go",
         "store_pool.go",
         "test_helpers.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/base",
         "//pkg/config/zonepb",
         "//pkg/gossip",
         "//pkg/kv/kvserver/allocator",
+        "//pkg/kv/kvserver/allocator/load",
         "//pkg/kv/kvserver/liveness",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/roachpb",
-        "//pkg/rpc",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/util/hlc",
@@ -34,12 +34,16 @@ go_library(
 
 go_test(
     name = "storepool_test",
-    srcs = ["store_pool_test.go"],
+    srcs = [
+        "override_store_pool_test.go",
+        "store_pool_test.go",
+    ],
     args = ["-test.timeout=295s"],
     embed = [":storepool"],
     deps = [
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/roachpb",
+        "//pkg/settings/cluster",
         "//pkg/testutils/gossiputil",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",

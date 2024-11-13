@@ -36,27 +36,27 @@ var _ execinfra.RowSource = &countAggregator{}
 const countRowsProcName = "count rows"
 
 func newCountAggregator(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*countAggregator, error) {
 	ag := &countAggregator{}
 	ag.input = input
 
-	if execstats.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx.CollectStats) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		ag.input = newInputStatCollector(input)
 		ag.ExecStatsForTrace = ag.execStatsForTrace
 	}
 
 	if err := ag.Init(
+		ctx,
 		ag,
 		post,
 		[]*types.T{types.Int},
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ag.input},
@@ -86,7 +86,7 @@ func (ag *countAggregator) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMeta
 		if row == nil {
 			ret := make(rowenc.EncDatumRow, 1)
 			ret[0] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(ag.count))}
-			rendered, _, err := ag.OutputHelper.ProcessRow(ag.Ctx, ret)
+			rendered, _, err := ag.OutputHelper.ProcessRow(ag.Ctx(), ret)
 			// We're done as soon as we process our one output row, so we
 			// transition into draining state. We will, however, return non-nil
 			// error (if such occurs during rendering) separately below.

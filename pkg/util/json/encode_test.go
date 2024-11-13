@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -62,7 +62,7 @@ func TestJSONRandomEncodeRoundTrip(t *testing.T) {
 }
 
 func TestFilesEncode(t *testing.T) {
-	dir := testutils.TestDataPath(t, "raw")
+	dir := datapathutils.TestDataPath(t, "raw")
 	dirContents, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +109,7 @@ func TestFilesEncode(t *testing.T) {
 			// rerun with -rewrite-results-in-testfiles.
 			t.Run(`explicit encoding`, func(t *testing.T) {
 				stringifiedEncoding := fmt.Sprintf("%v", encoded)
-				fixtureFilename := testutils.TestDataPath(
+				fixtureFilename := datapathutils.TestDataPath(
 					t, "encoded", tc.Name()+".bytes")
 
 				if *rewriteResultsInTestfiles {
@@ -256,7 +256,7 @@ const sampleJSON = `{
 }`
 
 func BenchmarkEncodeJSON(b *testing.B) {
-	j := jsonTestShorthand(sampleJSON)
+	j := parseJSON(b, sampleJSON)
 
 	b.ResetTimer()
 
@@ -266,7 +266,7 @@ func BenchmarkEncodeJSON(b *testing.B) {
 }
 
 func BenchmarkDecodeJSON(b *testing.B) {
-	j := jsonTestShorthand(sampleJSON)
+	j := parseJSON(b, sampleJSON)
 
 	b.ResetTimer()
 	bytes, err := EncodeJSON(nil, j)

@@ -16,8 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -29,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 14
+const configIdx = 13
 
 var cclLogicTestDir string
 
@@ -46,7 +45,7 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
@@ -115,6 +114,13 @@ func TestCCLLogic_multi_region_show(
 	runCCLLogicTest(t, "multi_region_show")
 }
 
+func TestCCLLogic_multi_region_survial_goal(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "multi_region_survial_goal")
+}
+
 func TestCCLLogic_multi_region_zone_config_extensions(
 	t *testing.T,
 ) {
@@ -127,6 +133,13 @@ func TestCCLLogic_multi_region_zone_configs(
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "multi_region_zone_configs")
+}
+
+func TestCCLLogic_partitioning_hash_sharded_index_mr(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "partitioning_hash_sharded_index_mr")
 }
 
 func TestCCLLogic_regional_by_row(

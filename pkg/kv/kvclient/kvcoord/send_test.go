@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -34,52 +35,50 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var _ roachpb.InternalServer = Node(0)
+var _ kvpb.InternalServer = Node(0)
 
 type Node time.Duration
 
-func (n Node) Batch(
-	ctx context.Context, args *roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+func (n Node) Batch(ctx context.Context, args *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
 	if n > 0 {
 		time.Sleep(time.Duration(n))
 	}
-	return &roachpb.BatchResponse{}, nil
+	return &kvpb.BatchResponse{}, nil
 }
 
 func (n Node) RangeLookup(
-	_ context.Context, _ *roachpb.RangeLookupRequest,
-) (*roachpb.RangeLookupResponse, error) {
+	_ context.Context, _ *kvpb.RangeLookupRequest,
+) (*kvpb.RangeLookupResponse, error) {
 	panic("unimplemented")
 }
 
-func (n Node) RangeFeed(_ *roachpb.RangeFeedRequest, _ roachpb.Internal_RangeFeedServer) error {
+func (n Node) RangeFeed(_ *kvpb.RangeFeedRequest, _ kvpb.Internal_RangeFeedServer) error {
 	panic("unimplemented")
 }
 
-func (n Node) MuxRangeFeed(server roachpb.Internal_MuxRangeFeedServer) error {
+func (n Node) MuxRangeFeed(server kvpb.Internal_MuxRangeFeedServer) error {
 	panic("unimplemented")
 }
 
 func (n Node) GossipSubscription(
-	_ *roachpb.GossipSubscriptionRequest, _ roachpb.Internal_GossipSubscriptionServer,
+	_ *kvpb.GossipSubscriptionRequest, _ kvpb.Internal_GossipSubscriptionServer,
 ) error {
 	panic("unimplemented")
 }
 
-func (n Node) Join(context.Context, *roachpb.JoinNodeRequest) (*roachpb.JoinNodeResponse, error) {
+func (n Node) Join(context.Context, *kvpb.JoinNodeRequest) (*kvpb.JoinNodeResponse, error) {
 	panic("unimplemented")
 }
 
 func (n Node) ResetQuorum(
-	context.Context, *roachpb.ResetQuorumRequest,
-) (*roachpb.ResetQuorumResponse, error) {
+	context.Context, *kvpb.ResetQuorumRequest,
+) (*kvpb.ResetQuorumResponse, error) {
 	panic("unimplemented")
 }
 
 func (n Node) TokenBucket(
-	ctx context.Context, in *roachpb.TokenBucketRequest,
-) (*roachpb.TokenBucketResponse, error) {
+	ctx context.Context, in *kvpb.TokenBucketRequest,
+) (*kvpb.TokenBucketResponse, error) {
 	panic("unimplemented")
 }
 
@@ -101,8 +100,20 @@ func (n Node) UpdateSpanConfigs(
 	panic("unimplemented")
 }
 
+func (n Node) SpanConfigConformance(
+	context.Context, *roachpb.SpanConfigConformanceRequest,
+) (*roachpb.SpanConfigConformanceResponse, error) {
+	panic("unimplemented")
+}
+
 func (n Node) TenantSettings(
-	*roachpb.TenantSettingsRequest, roachpb.Internal_TenantSettingsServer,
+	*kvpb.TenantSettingsRequest, kvpb.Internal_TenantSettingsServer,
+) error {
+	panic("unimplemented")
+}
+
+func (n Node) GetRangeDescriptors(
+	*kvpb.GetRangeDescriptorsRequest, kvpb.Internal_GetRangeDescriptorsServer,
 ) error {
 	panic("unimplemented")
 }
@@ -117,27 +128,24 @@ func TestSendToOneClient(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	// This test uses the testing function sendBatch() which does not
 	// support setting the node ID on GRPCDialNode(). Disable Node ID
 	// checks to avoid log.Fatal.
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
-	s := rpc.NewServer(rpcContext)
-	roachpb.RegisterInternalServer(s, Node(0))
+	s, err := rpc.NewServer(rpcContext)
+	require.NoError(t, err)
+	kvpb.RegisterInternalServer(s, Node(0))
 	ln, err := netutil.ListenAndServeGRPC(rpcContext.Stopper, s, util.TestAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	nodeDialer := nodedialer.New(rpcContext, func(roachpb.NodeID) (net.Addr, error) {
 		return ln.Addr(), nil
 	})
 
 	reply, err := sendBatch(ctx, t, nil, []net.Addr{ln.Addr()}, rpcContext, nodeDialer)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if reply == nil {
 		t.Errorf("expected reply")
 	}
@@ -158,14 +166,14 @@ func (f *firstNErrorTransport) IsExhausted() bool {
 func (f *firstNErrorTransport) Release() {}
 
 func (f *firstNErrorTransport) SendNext(
-	_ context.Context, _ roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	_ context.Context, _ *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	var err error
 	if f.numSent < f.numErrors {
 		err = errors.New("firstNErrorTransport injected error")
 	}
 	f.numSent++
-	return &roachpb.BatchResponse{}, err
+	return &kvpb.BatchResponse{}, err
 }
 
 func (f *firstNErrorTransport) NextInternalClient(
@@ -196,7 +204,7 @@ func TestComplexScenarios(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	// We're going to serve multiple node IDs with that one
 	// context. Disable node ID checks.
@@ -336,7 +344,7 @@ func sendBatch(
 	addrs []net.Addr,
 	rpcContext *rpc.Context,
 	nodeDialer *nodedialer.Dialer,
-) (*roachpb.BatchResponse, error) {
+) (*kvpb.BatchResponse, error) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	g := makeGossip(t, stopper, rpcContext)
@@ -378,5 +386,5 @@ func sendBatch(
 	routing, err := ds.getRoutingInfo(ctx, desc.StartKey, rangecache.EvictionToken{}, false /* useReverseScan */)
 	require.NoError(t, err)
 
-	return ds.sendToReplicas(ctx, roachpb.BatchRequest{}, routing, false /* withCommit */)
+	return ds.sendToReplicas(ctx, &kvpb.BatchRequest{}, routing, false /* withCommit */)
 }

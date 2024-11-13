@@ -13,18 +13,17 @@ package kvserver
 import (
 	"context"
 	"fmt"
-	math "math"
-	"sync"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -67,7 +66,7 @@ func NewStores(ambient log.AmbientContext, clock *hlc.Clock) *Stores {
 // the meta1 lease. Returns an error if any.
 func (ls *Stores) IsMeta1Leaseholder(ctx context.Context, now hlc.ClockTimestamp) (bool, error) {
 	repl, _, err := ls.GetReplicaForRangeID(ctx, 1)
-	if roachpb.IsRangeNotFoundError(err) {
+	if kvpb.IsRangeNotFoundError(err) {
 		return false, nil
 	}
 	if err != nil {
@@ -98,7 +97,7 @@ func (ls *Stores) GetStore(storeID roachpb.StoreID) (*Store, error) {
 	if value, ok := ls.storeMap.Load(int64(storeID)); ok {
 		return (*Store)(value), nil
 	}
-	return nil, roachpb.NewStoreNotFoundError(storeID)
+	return nil, kvpb.NewStoreNotFoundError(storeID)
 }
 
 // AddStore adds the specified store to the store map.
@@ -156,7 +155,7 @@ func (ls *Stores) VisitStores(visitor func(s *Store) error) error {
 
 // GetReplicaForRangeID returns the replica and store which contains the
 // specified range. If the replica is not found on any store then
-// roachpb.RangeNotFoundError will be returned.
+// kvpb.RangeNotFoundError will be returned.
 func (ls *Stores) GetReplicaForRangeID(
 	ctx context.Context, rangeID roachpb.RangeID,
 ) (*Replica, *Store, error) {
@@ -172,7 +171,7 @@ func (ls *Stores) GetReplicaForRangeID(
 		log.Fatalf(ctx, "unexpected error: %s", err)
 	}
 	if replica == nil {
-		return nil, nil, roachpb.NewRangeNotFoundError(rangeID, 0)
+		return nil, nil, kvpb.NewRangeNotFoundError(rangeID, 0)
 	}
 	return replica, store, nil
 }
@@ -180,63 +179,40 @@ func (ls *Stores) GetReplicaForRangeID(
 // Send implements the client.Sender interface. The store is looked up from the
 // store map using the ID specified in the request.
 func (ls *Stores) Send(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	br, writeBytes, pErr := ls.SendWithWriteBytes(ctx, ba)
 	writeBytes.Release()
 	return br, pErr
 }
 
-// StoreWriteBytes aliases admission.StoreWorkDoneInfo, since the notion of
-// "work is done" is specific to admission control and doesn't need to leak
-// everywhere.
-type StoreWriteBytes admission.StoreWorkDoneInfo
-
-var storeWriteBytesPool = sync.Pool{
-	New: func() interface{} { return &StoreWriteBytes{} },
-}
-
-func newStoreWriteBytes() *StoreWriteBytes {
-	wb := storeWriteBytesPool.Get().(*StoreWriteBytes)
-	*wb = StoreWriteBytes{}
-	return wb
-}
-
-// Release returns the *StoreWriteBytes to the pool.
-func (wb *StoreWriteBytes) Release() {
-	if wb == nil {
-		return
-	}
-	storeWriteBytesPool.Put(wb)
-}
-
 // SendWithWriteBytes is the implementation of Send with an additional
 // *StoreWriteBytes return value.
 func (ls *Stores) SendWithWriteBytes(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *StoreWriteBytes, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvadmission.StoreWriteBytes, *kvpb.Error) {
 	if err := ba.ValidateForEvaluation(); err != nil {
-		log.Fatalf(ctx, "invalid batch (%s): %s", ba, err)
+		return nil, nil, kvpb.NewError(errors.Wrapf(err, "invalid batch (%s)", ba))
 	}
 
 	store, err := ls.GetStore(ba.Replica.StoreID)
 	if err != nil {
-		return nil, nil, roachpb.NewError(err)
+		return nil, nil, kvpb.NewError(err)
 	}
 
 	br, writeBytes, pErr := store.SendWithWriteBytes(ctx, ba)
 	if br != nil && br.Error != nil {
-		panic(roachpb.ErrorUnexpectedlySet(store, br))
+		panic(kvpb.ErrorUnexpectedlySet(store, br))
 	}
 	return br, writeBytes, pErr
 }
 
-// RangeFeed registers a rangefeed over the specified span. It sends updates to
-// the provided stream and returns with an optional error when the rangefeed is
-// complete.
+// RangeFeed registers a rangefeed over the specified span. It sends
+// updates to the provided stream and returns a future with an optional error
+// when the rangefeed is complete.
 func (ls *Stores) RangeFeed(
-	args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink,
-) *roachpb.Error {
+	args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink,
+) *future.ErrorFuture {
 	ctx := stream.Context()
 	if args.RangeID == 0 {
 		log.Fatal(ctx, "rangefeed request missing range ID")
@@ -246,7 +222,7 @@ func (ls *Stores) RangeFeed(
 
 	store, err := ls.GetStore(args.Replica.StoreID)
 	if err != nil {
-		return roachpb.NewError(err)
+		return future.MakeCompletedErrorFuture(err)
 	}
 
 	return store.RangeFeed(args, stream)
@@ -269,7 +245,9 @@ func (ls *Stores) ReadBootstrapInfo(bi *gossip.BootstrapInfo) error {
 		s := (*Store)(v)
 		var storeBI gossip.BootstrapInfo
 		var ok bool
-		ok, err = storage.MVCCGetProto(ctx, s.engine, keys.StoreGossipKey(), hlc.Timestamp{}, &storeBI,
+		// TODO(sep-raft-log): probably state engine since it's random data
+		// with no durability guarantees.
+		ok, err = storage.MVCCGetProto(ctx, s.TODOEngine(), keys.StoreGossipKey(), hlc.Timestamp{}, &storeBI,
 			storage.MVCCGetOptions{})
 		if err != nil {
 			return false
@@ -318,129 +296,9 @@ func (ls *Stores) updateBootstrapInfoLocked(bi *gossip.BootstrapInfo) error {
 	var err error
 	ls.storeMap.Range(func(k int64, v unsafe.Pointer) bool {
 		s := (*Store)(v)
-		err = storage.MVCCPutProto(ctx, s.engine, nil, keys.StoreGossipKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, bi)
+		// TODO(sep-raft-log): see ReadBootstrapInfo.
+		err = storage.MVCCPutProto(ctx, s.TODOEngine(), nil, keys.StoreGossipKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, bi)
 		return err == nil
 	})
 	return err
-}
-
-// WriteClusterVersionToEngines writes the given version to the given engines,
-// Returns nil on success; otherwise returns first error encountered writing to
-// the stores. It makes no attempt to validate the supplied version.
-//
-// At the time of writing this is used during bootstrap, initial server start
-// (to perhaps fill into additional stores), and during cluster version bumps.
-func WriteClusterVersionToEngines(
-	ctx context.Context, engines []storage.Engine, cv clusterversion.ClusterVersion,
-) error {
-	for _, eng := range engines {
-		if err := WriteClusterVersion(ctx, eng, cv); err != nil {
-			return errors.Wrapf(err, "error writing version to engine %s", eng)
-		}
-	}
-	return nil
-}
-
-// SynthesizeClusterVersionFromEngines returns the cluster version that was read
-// from the engines or, if none are initialized, binaryMinSupportedVersion.
-// Typically all initialized engines will have the same version persisted,
-// though ill-timed crashes can result in situations where this is not the
-// case. Then, the largest version seen is returned.
-//
-// binaryVersion is the version of this binary. An error is returned if
-// any engine has a higher version, as this would indicate that this node
-// has previously acked the higher cluster version but is now running an
-// old binary, which is unsafe.
-//
-// binaryMinSupportedVersion is the minimum version supported by this binary. An
-// error is returned if any engine has a version lower that this.
-func SynthesizeClusterVersionFromEngines(
-	ctx context.Context,
-	engines []storage.Engine,
-	binaryVersion, binaryMinSupportedVersion roachpb.Version,
-) (clusterversion.ClusterVersion, error) {
-	// Find the most recent bootstrap info.
-	type originVersion struct {
-		roachpb.Version
-		origin string
-	}
-
-	maxPossibleVersion := roachpb.Version{Major: math.MaxInt32} // Sort above any real version.
-	minStoreVersion := originVersion{
-		Version: maxPossibleVersion,
-		origin:  "(no store)",
-	}
-
-	// We run this twice because it's only after having seen all the versions
-	// that we can decide whether the node catches a version error. However, we
-	// also want to name at least one engine that violates the version
-	// constraints, which at the latest the second loop will achieve (because
-	// then minStoreVersion don't change any more).
-	for _, eng := range engines {
-		eng := eng.(storage.Reader) // we're read only
-		var cv clusterversion.ClusterVersion
-		cv, err := ReadClusterVersion(ctx, eng)
-		if err != nil {
-			return clusterversion.ClusterVersion{}, err
-		}
-		if cv.Version == (roachpb.Version{}) {
-			// This is needed when a node first joins an existing cluster, in
-			// which case it won't know what version to use until the first
-			// Gossip update comes in.
-			cv.Version = binaryMinSupportedVersion
-		}
-
-		// Avoid running a binary with a store that is too new. For example,
-		// restarting into 1.1 after having upgraded to 1.2 doesn't work.
-		if binaryVersion.Less(cv.Version) {
-			return clusterversion.ClusterVersion{}, errors.Errorf(
-				"cockroach version v%s is incompatible with data in store %s; use version v%s or later",
-				binaryVersion, eng, cv.Version)
-		}
-
-		// Track smallest use version encountered.
-		if cv.Version.Less(minStoreVersion.Version) {
-			minStoreVersion.Version = cv.Version
-			minStoreVersion.origin = fmt.Sprint(eng)
-		}
-	}
-
-	// If no use version was found, fall back to our binaryMinSupportedVersion. This
-	// is the case when a brand new node is joining an existing cluster (which
-	// may be on any older version this binary supports).
-	if minStoreVersion.Version == maxPossibleVersion {
-		minStoreVersion.Version = binaryMinSupportedVersion
-	}
-
-	cv := clusterversion.ClusterVersion{
-		Version: minStoreVersion.Version,
-	}
-	log.Eventf(ctx, "read clusterVersion %+v", cv)
-
-	// Avoid running a binary too new for this store. This is what you'd catch
-	// if, say, you restarted directly from 1.0 into 1.2 (bumping the min
-	// version) without going through 1.1 first. It would also be what you catch if
-	// you are starting 1.1 for the first time (after 1.0), but it crashes
-	// half-way through the startup sequence (so now some stores have 1.1, but
-	// some 1.0), in which case you are expected to run 1.1 again (hopefully
-	// without the crash this time) which would then rewrite all the stores.
-	//
-	// We only verify this now because as we iterate through the stores, we
-	// may not yet have picked up the final versions we're actually planning
-	// to use.
-	if minStoreVersion.Version.Less(binaryMinSupportedVersion) {
-		return clusterversion.ClusterVersion{}, errors.Errorf("store %s, last used with cockroach version v%s, "+
-			"is too old for running version v%s (which requires data from v%s or later)",
-			minStoreVersion.origin, minStoreVersion.Version, binaryVersion, binaryMinSupportedVersion)
-	}
-	return cv, nil
-}
-
-func (ls *Stores) engines() []storage.Engine {
-	var engines []storage.Engine
-	ls.storeMap.Range(func(_ int64, v unsafe.Pointer) bool {
-		engines = append(engines, (*Store)(v).Engine())
-		return true // want more
-	})
-	return engines
 }

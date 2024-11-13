@@ -16,7 +16,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/jackc/pgconn"
@@ -33,6 +33,22 @@ func tlsConfig() (*tls.Config, error) {
 		Certificates: []tls.Certificate{cer},
 		ServerName:   "localhost",
 	}, nil
+}
+
+func TestFrontendAdmitWithNoBytes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	cli, srv := net.Pipe()
+	require.NoError(t, srv.SetReadDeadline(timeutil.Now().Add(3e9)))
+	require.NoError(t, cli.SetReadDeadline(timeutil.Now().Add(3e9)))
+
+	// Close the connection to simulate no bytes.
+	cli.Close()
+
+	fe := FrontendAdmit(srv, nil)
+	require.EqualError(t, fe.Err, noStartupMessage.Error())
+	require.NotNil(t, fe.Conn)
+	require.Nil(t, fe.Msg)
 }
 
 func TestFrontendAdmitWithClientSSLDisableAndCustomParam(t *testing.T) {
@@ -82,7 +98,7 @@ func TestFrontendAdmitWithClientSSLRequire(t *testing.T) {
 	go func() {
 		cfg, err := pgconn.ParseConfig(fmt.Sprintf(
 			"postgres://localhost?sslmode=require&sslrootcert=%s",
-			testutils.TestDataPath(t, "testserver.crt"),
+			datapathutils.TestDataPath(t, "testserver.crt"),
 		))
 		cfg.TLSConfig.ServerName = "test"
 		require.NoError(t, err)
@@ -154,6 +170,7 @@ func TestFrontendAdmitWithCancel(t *testing.T) {
 	fe := FrontendAdmit(srv, nil)
 	require.NoError(t, fe.Err)
 	require.NotNil(t, fe.Conn)
+	require.NotNil(t, fe.CancelRequest)
 	require.Nil(t, fe.Msg)
 }
 
@@ -187,11 +204,9 @@ func TestFrontendAdmitWithSSLAndCancel(t *testing.T) {
 	tlsConfig, err := tlsConfig()
 	require.NoError(t, err)
 	fe := FrontendAdmit(srv, tlsConfig)
-	require.EqualError(t, fe.Err,
-		"codeUnexpectedStartupMessage: "+
-			"unsupported post-TLS startup message: *pgproto3.CancelRequest",
-	)
+	require.NoError(t, fe.Err)
 	require.NotNil(t, fe.Conn)
+	require.NotNil(t, fe.CancelRequest)
 	require.Nil(t, fe.Msg)
 }
 

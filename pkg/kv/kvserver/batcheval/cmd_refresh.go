@@ -13,23 +13,23 @@ package batcheval
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.Refresh, DefaultDeclareKeys, Refresh)
+	RegisterReadOnlyCommand(kvpb.Refresh, DefaultDeclareKeys, Refresh)
 }
 
 // Refresh checks whether the key has any values written in the interval
 // (args.RefreshFrom, header.Timestamp].
 func Refresh(
-	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.RefreshRequest)
+	args := cArgs.Args.(*kvpb.RefreshRequest)
 	h := cArgs.Header
 
 	if h.Txn == nil {
@@ -54,25 +54,25 @@ func Refresh(
 	// specifying consistent=false. Note that we include tombstones,
 	// which must be considered as updates on refresh.
 	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Span(), refreshFrom, refreshTo)
-	val, intent, err := storage.MVCCGet(ctx, reader, args.Key, refreshTo, storage.MVCCGetOptions{
+	res, err := storage.MVCCGet(ctx, reader, args.Key, refreshTo, storage.MVCCGetOptions{
 		Inconsistent: true,
 		Tombstones:   true,
 	})
 
 	if err != nil {
 		return result.Result{}, err
-	} else if val != nil {
-		if ts := val.Timestamp; refreshFrom.Less(ts) {
+	} else if res.Value != nil {
+		if ts := res.Value.Timestamp; refreshFrom.Less(ts) {
 			return result.Result{},
-				roachpb.NewRefreshFailedError(roachpb.RefreshFailedError_REASON_COMMITTED_VALUE, args.Key, ts)
+				kvpb.NewRefreshFailedError(kvpb.RefreshFailedError_REASON_COMMITTED_VALUE, args.Key, ts)
 		}
 	}
 
 	// Check if an intent which is not owned by this transaction was written
 	// at or beneath the refresh timestamp.
-	if intent != nil && intent.Txn.ID != h.Txn.ID {
-		return result.Result{}, roachpb.NewRefreshFailedError(roachpb.RefreshFailedError_REASON_INTENT,
-			intent.Key, intent.Txn.WriteTimestamp)
+	if res.Intent != nil && res.Intent.Txn.ID != h.Txn.ID {
+		return result.Result{}, kvpb.NewRefreshFailedError(kvpb.RefreshFailedError_REASON_INTENT,
+			res.Intent.Key, res.Intent.Txn.WriteTimestamp)
 	}
 
 	return result.Result{}, nil

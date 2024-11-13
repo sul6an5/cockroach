@@ -22,8 +22,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
@@ -124,7 +125,7 @@ func (a *AggregatorSpec) summary() (string, []string) {
 	return "Aggregator", details
 }
 
-func appendColumns(details []string, columns []descpb.IndexFetchSpec_Column) []string {
+func appendColumns(details []string, columns []fetchpb.IndexFetchSpec_Column) []string {
 	var b strings.Builder
 	b.WriteString("Columns:")
 	const wrapAt = 100
@@ -155,7 +156,7 @@ func (tr *TableReaderSpec) summary() (string, []string) {
 		keyDirs := make([]encoding.Direction, len(tr.FetchSpec.KeyAndSuffixColumns))
 		for i := range keyDirs {
 			keyDirs[i] = encoding.Ascending
-			if tr.FetchSpec.KeyAndSuffixColumns[i].Direction == catpb.IndexColumn_DESC {
+			if tr.FetchSpec.KeyAndSuffixColumns[i].Direction == catenumpb.IndexColumn_DESC {
 				keyDirs[i] = encoding.Descending
 			}
 		}
@@ -500,6 +501,11 @@ func (c *RestoreDataSpec) summary() (string, []string) {
 }
 
 // summary implements the diagramCellType interface.
+func (c *CloudStorageTestSpec) summary() (string, []string) {
+	return "CloudStorageTestSpec", []string{}
+}
+
+// summary implements the diagramCellType interface.
 func (c *SplitAndScatterSpec) summary() (string, []string) {
 	detail := fmt.Sprintf("%d chunks", len(c.Chunks))
 	return "SplitAndScatterSpec", []string{detail}
@@ -588,6 +594,44 @@ func (s *TTLSpec) summary() (string, []string) {
 		fmt.Sprintf("TableID: %d", details.TableID),
 		fmt.Sprintf("TableVersion: %d", details.TableVersion),
 	}
+}
+
+// summary implements the diagramCellType interface.
+func (s *HashGroupJoinerSpec) summary() (string, []string) {
+	_, details := s.HashJoinerSpec.summary()
+	if len(s.JoinOutputColumns) > 0 {
+		details = append(details, "Join Projection: "+colListStr(s.JoinOutputColumns))
+	}
+	_, aggDetails := s.AggregatorSpec.summary()
+	if len(s.AggregatorSpec.GroupCols) > 0 {
+		// For hash group-join the equality columns of the join are always the
+		// same as the grouping columns of the aggregations, so we remove this
+		// duplicated information (which is included as the first line in the
+		// summary of the aggregation spec).
+		aggDetails = aggDetails[1:]
+	}
+	details = append(details, aggDetails...)
+	return "HashGroupJoiner", details
+}
+
+// summary implements the diagramCellType interface.
+func (g *GenerativeSplitAndScatterSpec) summary() (string, []string) {
+	detail := fmt.Sprintf("%d import spans", g.NumEntries)
+	return "GenerativeSplitAndScatterSpec", []string{detail}
+}
+
+// summary implements the diagramCellType interface.
+func (i *InsertSpec) summary() (string, []string) {
+	return "Insert", []string{
+		fmt.Sprintf("TableID: %d", i.Table.ID),
+		fmt.Sprintf("AutoCommit: %t", i.AutoCommit),
+	}
+}
+
+// summary implements the diagramCellType interface.
+func (i *IngestStoppedSpec) summary() (string, []string) {
+	detail := fmt.Sprintf("job %d ingest stopped spans", i.JobID)
+	return "IngestStoppedSpec", []string{detail}
 }
 
 type diagramCell struct {

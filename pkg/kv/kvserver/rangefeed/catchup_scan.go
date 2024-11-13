@@ -12,12 +12,17 @@ package rangefeed
 
 import (
 	"bytes"
+	"context"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
@@ -62,6 +67,8 @@ type CatchUpIterator struct {
 	close     func()
 	span      roachpb.Span
 	startTime hlc.Timestamp // exclusive
+	pacer     *admission.Pacer
+	OnEmit    func(key, endKey roachpb.Key, ts hlc.Timestamp, vh enginepb.MVCCValueHeader)
 }
 
 // NewCatchUpIterator returns a CatchUpIterator for the given Reader over the
@@ -70,7 +77,11 @@ type CatchUpIterator struct {
 // NB: startTime is exclusive, i.e. the first possible event will be emitted at
 // Timestamp.Next().
 func NewCatchUpIterator(
-	reader storage.Reader, span roachpb.Span, startTime hlc.Timestamp, closer func(),
+	reader storage.Reader,
+	span roachpb.Span,
+	startTime hlc.Timestamp,
+	closer func(),
+	pacer *admission.Pacer,
 ) *CatchUpIterator {
 	return &CatchUpIterator{
 		simpleCatchupIter: storage.NewMVCCIncrementalIterator(reader,
@@ -89,6 +100,7 @@ func NewCatchUpIterator(
 		close:     closer,
 		span:      span,
 		startTime: startTime,
+		pacer:     pacer,
 	}
 }
 
@@ -96,6 +108,7 @@ func NewCatchUpIterator(
 // callback.
 func (i *CatchUpIterator) Close() {
 	i.simpleCatchupIter.Close()
+	i.pacer.Close()
 	if i.close != nil {
 		i.close()
 	}
@@ -104,7 +117,7 @@ func (i *CatchUpIterator) Close() {
 // TODO(ssd): Clarify memory ownership. Currently, the memory backing
 // the RangeFeedEvents isn't modified by the caller after this
 // returns. However, we may revist this in #69596.
-type outputEventFn func(e *roachpb.RangeFeedEvent) error
+type outputEventFn func(e *kvpb.RangeFeedEvent) error
 
 // CatchUpScan iterates over all changes in the configured key/time span, and
 // emits them as RangeFeedEvents via outputFn in chronological order.
@@ -117,14 +130,16 @@ type outputEventFn func(e *roachpb.RangeFeedEvent) error
 // For example, with MVCC range tombstones [a-f)@5 and [a-f)@3 overlapping point
 // keys a@6, a@4, and b@2, the emitted order is [a-f)@3,[a-f)@5,a@4,a@6,b@2 because
 // the start key "a" is ordered before all of the timestamped point keys.
-func (i *CatchUpIterator) CatchUpScan(outputFn outputEventFn, withDiff bool) error {
+func (i *CatchUpIterator) CatchUpScan(
+	ctx context.Context, outputFn outputEventFn, withDiff bool,
+) error {
 	var a bufalloc.ByteAllocator
 	// MVCCIterator will encounter historical values for each key in
 	// reverse-chronological order. To output in chronological order, store
 	// events for the same key until a different key is encountered, then output
 	// the encountered values in reverse. This also allows us to buffer events
 	// as we fill in previous values.
-	reorderBuf := make([]roachpb.RangeFeedEvent, 0, 5)
+	reorderBuf := make([]kvpb.RangeFeedEvent, 0, 5)
 
 	outputEvents := func() error {
 		for i := len(reorderBuf) - 1; i >= 0; i-- {
@@ -132,7 +147,7 @@ func (i *CatchUpIterator) CatchUpScan(outputFn outputEventFn, withDiff bool) err
 			if err := outputFn(&e); err != nil {
 				return err
 			}
-			reorderBuf[i] = roachpb.RangeFeedEvent{} // Drop references to values to allow GC
+			reorderBuf[i] = kvpb.RangeFeedEvent{} // Drop references to values to allow GC
 		}
 		reorderBuf = reorderBuf[:0]
 		return nil
@@ -143,11 +158,21 @@ func (i *CatchUpIterator) CatchUpScan(outputFn outputEventFn, withDiff bool) err
 	var lastKey roachpb.Key
 	var meta enginepb.MVCCMetadata
 	i.SeekGE(storage.MVCCKey{Key: i.span.Key})
+
+	every := log.Every(100 * time.Millisecond)
 	for {
 		if ok, err := i.Valid(); err != nil {
 			return err
 		} else if !ok {
 			break
+		}
+
+		if err := i.pacer.Pace(ctx); err != nil {
+			// We're unable to pace things automatically -- shout loudly
+			// semi-infrequently but don't fail the rangefeed itself.
+			if every.ShouldLog() {
+				log.Errorf(ctx, "automatic pacing: %v", err)
+			}
 		}
 
 		// Emit any new MVCC range tombstones when their start key is encountered.
@@ -166,14 +191,22 @@ func (i *CatchUpIterator) CatchUpScan(outputFn outputEventFn, withDiff bool) err
 					var span roachpb.Span
 					a, span.Key = a.Copy(rangeKeys.Bounds.Key, 0)
 					a, span.EndKey = a.Copy(rangeKeys.Bounds.EndKey, 0)
-					err := outputFn(&roachpb.RangeFeedEvent{
-						DeleteRange: &roachpb.RangeFeedDeleteRange{
+					ts := rangeKeys.Versions[j].Timestamp
+					err := outputFn(&kvpb.RangeFeedEvent{
+						DeleteRange: &kvpb.RangeFeedDeleteRange{
 							Span:      span,
-							Timestamp: rangeKeys.Versions[j].Timestamp,
+							Timestamp: ts,
 						},
 					})
 					if err != nil {
 						return err
+					}
+					if i.OnEmit != nil {
+						v, err := storage.DecodeMVCCValue(rangeKeys.Versions[j].Value)
+						if err != nil {
+							return err
+						}
+						i.OnEmit(span.Key, span.EndKey, ts, v.MVCCValueHeader)
 					}
 				}
 			}
@@ -187,7 +220,10 @@ func (i *CatchUpIterator) CatchUpScan(outputFn outputEventFn, withDiff bool) err
 		}
 
 		unsafeKey := i.UnsafeKey()
-		unsafeValRaw := i.UnsafeValue()
+		unsafeValRaw, err := i.UnsafeValue()
+		if err != nil {
+			return err
+		}
 		if !unsafeKey.IsValue() {
 			// Found a metadata key.
 			if err := protoutil.Unmarshal(unsafeValRaw, &meta); err != nil {
@@ -293,8 +329,8 @@ func (i *CatchUpIterator) CatchUpScan(outputFn outputEventFn, withDiff bool) err
 
 			if !ignore {
 				// Add value to reorderBuf to be output.
-				var event roachpb.RangeFeedEvent
-				event.MustSetValue(&roachpb.RangeFeedValue{
+				var event kvpb.RangeFeedEvent
+				event.MustSetValue(&kvpb.RangeFeedValue{
 					Key: key,
 					Value: roachpb.Value{
 						RawBytes:  val,
@@ -302,6 +338,9 @@ func (i *CatchUpIterator) CatchUpScan(outputFn outputEventFn, withDiff bool) err
 					},
 				})
 				reorderBuf = append(reorderBuf, event)
+				if i.OnEmit != nil {
+					i.OnEmit(key, nil, ts, mvccVal.MVCCValueHeader)
+				}
 			}
 		}
 

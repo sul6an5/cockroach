@@ -43,6 +43,7 @@ func TestExternalHashAggregator(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -100,7 +101,7 @@ func TestExternalHashAggregator(t *testing.T) {
 			}
 			log.Infof(ctx, "diskSpillingEnabled=%t/spillForced=%t/memoryLimitBytes=%d/numRepartitions=%d/%s", cfg.diskSpillingEnabled, cfg.spillForced, cfg.memoryLimitBytes, numForcedRepartitions, tc.name)
 			constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-				&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+				ctx, &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 			)
 			require.NoError(t, err)
 			verifier := colexectestutils.OrderedVerifier
@@ -111,13 +112,14 @@ func TestExternalHashAggregator(t *testing.T) {
 			}
 			var numExpectedClosers int
 			if cfg.diskSpillingEnabled {
-				// The external sorter, the disk spiller, and the external hash
-				// aggregator should be added as Closers.
-				numExpectedClosers = 3
+				// The external sorter (accounting for two closers), the disk
+				// spiller, and the external hash aggregator should be added as
+				// Closers.
+				numExpectedClosers = 4
 				if len(tc.spec.OutputOrdering.Columns) > 0 {
 					// When the output ordering is required, we also plan
-					// another external sort.
-					numExpectedClosers++
+					// another external sort which accounts for two closers.
+					numExpectedClosers += 2
 				}
 			} else {
 				// Only the in-memory hash aggregator should be added.
@@ -171,6 +173,7 @@ func BenchmarkExternalHashAggregator(b *testing.B) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -198,7 +201,7 @@ func BenchmarkExternalHashAggregator(b *testing.B) {
 			for _, groupSize := range groupSizes {
 				benchmarkAggregateFunction(
 					b, aggType{
-						new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+						new: func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
 							op, _, err := createExternalHashAggregator(
 								ctx, flowCtx, args, queueCfg, &colexecop.TestingSemaphore{},
 								0 /* numForcedRepartitions */, &monitorRegistry,

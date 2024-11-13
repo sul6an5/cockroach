@@ -13,6 +13,7 @@ package batcheval
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -21,69 +22,49 @@ import (
 )
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.Get, DefaultDeclareIsolatedKeys, Get)
+	RegisterReadOnlyCommand(kvpb.Get, DefaultDeclareIsolatedKeys, Get)
 }
 
 // Get returns the value for a specified key.
 func Get(
-	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.GetRequest)
+	args := cArgs.Args.(*kvpb.GetRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.GetResponse)
+	reply := resp.(*kvpb.GetResponse)
 
-	if h.MaxSpanRequestKeys < 0 || h.TargetBytes < 0 {
-		// Receipt of a GetRequest with negative MaxSpanRequestKeys or TargetBytes
-		// indicates that the request was part of a batch that has already exhausted
-		// its limit, which means that we should *not* serve the request and return
-		// a ResumeSpan for this GetRequest.
-		//
-		// This mirrors the logic in MVCCScan, though the logic in MVCCScan is
-		// slightly lower in the stack.
-		reply.ResumeSpan = &roachpb.Span{Key: args.Key}
-		if h.MaxSpanRequestKeys < 0 {
-			reply.ResumeReason = roachpb.RESUME_KEY_LIMIT
-		} else if h.TargetBytes < 0 {
-			reply.ResumeReason = roachpb.RESUME_BYTE_LIMIT
-		}
-		return result.Result{}, nil
-	}
-
-	var val *roachpb.Value
-	var intent *roachpb.Intent
-	var err error
-	val, intent, err = storage.MVCCGet(ctx, reader, args.Key, h.Timestamp, storage.MVCCGetOptions{
-		Inconsistent:     h.ReadConsistency != roachpb.CONSISTENT,
-		SkipLocked:       h.WaitPolicy == lock.WaitPolicy_SkipLocked,
-		Txn:              h.Txn,
-		FailOnMoreRecent: args.KeyLocking != lock.None,
-		Uncertainty:      cArgs.Uncertainty,
-		MemoryAccount:    cArgs.EvalCtx.GetResponseMemoryAccount(),
-		LockTable:        cArgs.Concurrency,
+	getRes, err := storage.MVCCGet(ctx, reader, args.Key, h.Timestamp, storage.MVCCGetOptions{
+		Inconsistent:          h.ReadConsistency != kvpb.CONSISTENT,
+		SkipLocked:            h.WaitPolicy == lock.WaitPolicy_SkipLocked,
+		Txn:                   h.Txn,
+		FailOnMoreRecent:      args.KeyLocking != lock.None,
+		ScanStats:             cArgs.ScanStats,
+		Uncertainty:           cArgs.Uncertainty,
+		MemoryAccount:         cArgs.EvalCtx.GetResponseMemoryAccount(),
+		LockTable:             cArgs.Concurrency,
+		DontInterleaveIntents: cArgs.DontInterleaveIntents,
+		MaxKeys:               cArgs.Header.MaxSpanRequestKeys,
+		TargetBytes:           cArgs.Header.TargetBytes,
+		AllowEmpty:            cArgs.Header.AllowEmpty,
 	})
 	if err != nil {
 		return result.Result{}, err
 	}
-	if val != nil {
-		// NB: This calculation is different from Scan, since Scan responses include
-		// the key/value pair while Get only includes the value.
-		numBytes := int64(len(val.RawBytes))
-		if h.TargetBytes > 0 && h.AllowEmpty && numBytes > h.TargetBytes {
-			reply.ResumeSpan = &roachpb.Span{Key: args.Key}
-			reply.ResumeReason = roachpb.RESUME_BYTE_LIMIT
-			reply.ResumeNextBytes = numBytes
-			return result.Result{}, nil
-		}
-		reply.NumKeys = 1
-		reply.NumBytes = numBytes
+	reply.ResumeSpan = getRes.ResumeSpan
+	reply.ResumeReason = getRes.ResumeReason
+	reply.ResumeNextBytes = getRes.ResumeNextBytes
+	reply.NumKeys = getRes.NumKeys
+	reply.NumBytes = getRes.NumBytes
+	if reply.ResumeSpan != nil {
+		return result.Result{}, nil
 	}
 	var intents []roachpb.Intent
-	if intent != nil {
-		intents = append(intents, *intent)
+	if getRes.Intent != nil {
+		intents = append(intents, *getRes.Intent)
 	}
 
-	reply.Value = val
-	if h.ReadConsistency == roachpb.READ_UNCOMMITTED {
+	reply.Value = getRes.Value
+	if h.ReadConsistency == kvpb.READ_UNCOMMITTED {
 		var intentVals []roachpb.KeyValue
 		// NOTE: MVCCGet uses a Prefix iterator, so we want to use one in
 		// CollectIntentRows as well so that we're guaranteed to use the same
@@ -102,7 +83,7 @@ func Get(
 	}
 
 	var res result.Result
-	if args.KeyLocking != lock.None && h.Txn != nil && val != nil {
+	if args.KeyLocking != lock.None && h.Txn != nil && getRes.Value != nil {
 		acq := roachpb.MakeLockAcquisition(h.Txn, args.Key, lock.Unreplicated)
 		res.Local.AcquiredLocks = []roachpb.LockAcquisition{acq}
 	}

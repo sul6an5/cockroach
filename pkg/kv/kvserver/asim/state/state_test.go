@@ -11,10 +11,12 @@
 package state
 
 import (
+	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/workload"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/stretchr/testify/require"
 )
@@ -40,6 +42,10 @@ func TestRangeSplit(t *testing.T) {
 
 	repl1, _ := s.AddReplica(r1.RangeID(), s1.StoreID())
 
+	// Set the replica load of the existing replica to 100 write keys, to assert
+	// on the post split 50/50 load distribution.
+	s.load[r1.rangeID].ApplyLoad(workload.LoadEvent{Writes: 100, Reads: 100, WriteSize: 100, ReadSize: 100})
+
 	k2 := Key(1)
 	lhs, rhs, ok := s.SplitRange(k2)
 	require.True(t, ok)
@@ -49,12 +55,30 @@ func TestRangeSplit(t *testing.T) {
 	// The end key of the lhs should be the start key of the rhs.
 	require.Equal(t, lhs.Descriptor().EndKey, rhs.Descriptor().StartKey)
 	// The lhs inherits the pre-split replicas.
-	require.Equal(t, repl1, lhs.Replicas()[s1.StoreID()])
+	lhsRepl, ok := lhs.Replica(s1.StoreID())
+	require.True(t, ok)
+	require.Equal(t, repl1, lhsRepl)
 	// The rhs should have a replica added to it as well. It should hold the
 	// lease if the lhs replica does.
-	newRepl, ok := rhs.Replicas()[s1.StoreID()]
+	newRepl, ok := rhs.Replica(s1.StoreID())
 	require.True(t, ok)
 	require.Equal(t, repl1.HoldsLease(), newRepl.HoldsLease())
+	// Assert that the lhs now has half the previous load counters.
+	lhsLoad := s.load[lhs.RangeID()].(*ReplicaLoadCounter)
+	rhsLoad := s.load[rhs.RangeID()].(*ReplicaLoadCounter)
+	lhsQPS := lhsLoad.loadStats.TestingGetSum(load.Queries)
+	rhsQPS := rhsLoad.loadStats.TestingGetSum(load.Queries)
+	require.Equal(t, int64(50), lhsLoad.ReadKeys)
+	require.Equal(t, int64(50), lhsLoad.WriteKeys)
+	require.Equal(t, int64(50), lhsLoad.WriteBytes)
+	require.Equal(t, int64(50), lhsLoad.ReadBytes)
+	require.Equal(t, float64(100), lhsQPS)
+	// Assert that the rhs load is identical to the lhs load.
+	require.Equal(t, lhsLoad.ReadKeys, rhsLoad.ReadKeys)
+	require.Equal(t, lhsLoad.WriteKeys, rhsLoad.WriteKeys)
+	require.Equal(t, lhsLoad.WriteBytes, lhsLoad.WriteBytes)
+	require.Equal(t, lhsLoad.ReadBytes, rhsLoad.ReadBytes)
+	require.Equal(t, lhsQPS, rhsQPS)
 }
 
 func TestRangeMap(t *testing.T) {
@@ -212,8 +236,8 @@ func TestAddReplica(t *testing.T) {
 	require.Equal(t, ReplicaID(1), r2repl1.ReplicaID())
 	require.Equal(t, ReplicaID(2), r2repl2.ReplicaID())
 
-	require.Len(t, s1.Replicas(), 2)
-	require.Len(t, s2.Replicas(), 1)
+	require.Len(t, s.Replicas(s1.StoreID()), 2)
+	require.Len(t, s.Replicas(s2.StoreID()), 1)
 }
 
 // TestWorkloadApply asserts that applying workload on a key, will be reflected
@@ -236,7 +260,7 @@ func TestWorkloadApply(t *testing.T) {
 
 	applyLoadToStats := func(key int64, count int) {
 		for i := 0; i < count; i++ {
-			s.ApplyLoad(workload.LoadBatch{workload.LoadEvent{Key: key, Reads: 1}})
+			s.ApplyLoad(workload.LoadBatch{workload.LoadEvent{Key: key, Writes: 1}})
 		}
 	}
 
@@ -246,22 +270,53 @@ func TestWorkloadApply(t *testing.T) {
 
 	// Assert that the leaseholder replica load correctly matches the number of
 	// requests made.
-	require.Equal(t, float64(100), s.UsageInfo(r1.RangeID()).QueriesPerSecond)
-	require.Equal(t, float64(1000), s.UsageInfo(r2.RangeID()).QueriesPerSecond)
-	require.Equal(t, float64(10000), s.UsageInfo(r3.RangeID()).QueriesPerSecond)
+	require.Equal(t, float64(100), s.ReplicaLoad(r1.RangeID(), s1.StoreID()).Load().WritesPerSecond)
+	require.Equal(t, float64(1000), s.ReplicaLoad(r2.RangeID(), s2.StoreID()).Load().WritesPerSecond)
+	require.Equal(t, float64(10000), s.ReplicaLoad(r3.RangeID(), s3.StoreID()).Load().WritesPerSecond)
 
-	expectedLoad := roachpb.StoreCapacity{QueriesPerSecond: 100, LeaseCount: 1, RangeCount: 1}
-	_ = s.StoreDescriptors()
-	sc1 := s1.Descriptor().Capacity
-	sc2 := s2.Descriptor().Capacity
-	sc3 := s3.Descriptor().Capacity
+	expectedLoad := roachpb.StoreCapacity{WritesPerSecond: 100, LeaseCount: 1, RangeCount: 1}
+	sc1 := Capacity(s, s1.StoreID())
+	sc2 := Capacity(s, s2.StoreID())
+	sc3 := Capacity(s, s3.StoreID())
 
 	// Assert that the store load is also updated upon request GetStoreLoad.
 	require.Equal(t, expectedLoad, sc1)
-	expectedLoad.QueriesPerSecond *= 10
+	expectedLoad.WritesPerSecond *= 10
 	require.Equal(t, expectedLoad, sc2)
-	expectedLoad.QueriesPerSecond *= 10
+	expectedLoad.WritesPerSecond *= 10
 	require.Equal(t, expectedLoad, sc3)
+}
+
+// TestReplicaLoadQPS asserts that the rated replica load accounting maintains
+// the average per second corresponding to the tick clock.
+func TestReplicaLoadQPS(t *testing.T) {
+	settings := config.DefaultSimulationSettings()
+	s := NewState(settings)
+	start := settings.StartTime
+
+	n1 := s.AddNode()
+	k1 := Key(100)
+	qps := 1000
+	s1, _ := s.AddStore(n1.NodeID())
+	_, r1, _ := s.SplitRange(k1)
+	s.AddReplica(r1.RangeID(), s1.StoreID())
+
+	applyLoadToStats := func(key int64, count int) {
+		for i := 0; i < count; i++ {
+			s.ApplyLoad(workload.LoadBatch{workload.LoadEvent{Key: key, Writes: 1}})
+		}
+	}
+
+	s.TickClock(start)
+	s.ReplicaLoad(r1.RangeID(), s1.StoreID()).ResetLoad()
+	for i := 1; i < 100; i++ {
+		applyLoadToStats(int64(k1), qps)
+		s.TickClock(OffsetTick(start, int64(i)))
+	}
+
+	// Assert that the rated avg comes out to rate of queries applied per
+	// second.
+	require.Equal(t, float64(qps), s.ReplicaLoad(r1.RangeID(), s1.StoreID()).Load().QueriesPerSecond)
 }
 
 // TestKeyTranslation asserts that key encoding between roachpb keys and
@@ -280,5 +335,116 @@ func TestKeyTranslation(t *testing.T) {
 			rkey,
 			mappedKey,
 		)
+	}
+}
+
+func TestOrderedStateLists(t *testing.T) {
+	assertListsOrdered := func(s State) {
+		rangeIDs := []RangeID{}
+		for _, rng := range s.Ranges() {
+			rangeIDs = append(rangeIDs, rng.RangeID())
+		}
+		require.IsIncreasing(t, rangeIDs, "range list is not sorted %v", rangeIDs)
+
+		storeIDs := []StoreID{}
+		for _, store := range s.Stores() {
+			storeIDs = append(storeIDs, store.StoreID())
+		}
+		require.IsIncreasing(t, storeIDs, "store list is not sorted %v", storeIDs)
+
+		nodeIDs := []NodeID{}
+		for _, node := range s.Nodes() {
+			nodeIDs = append(nodeIDs, node.NodeID())
+		}
+		require.IsIncreasing(t, nodeIDs, "node list is not sorted %v", nodeIDs)
+
+		for _, storeID := range storeIDs {
+			storeRangeIDs := []RangeID{}
+			for _, repl := range s.Replicas(storeID) {
+				storeRangeIDs = append(storeRangeIDs, repl.Range())
+			}
+			require.IsIncreasing(
+				t,
+				storeRangeIDs,
+				"replica (rangeID) list for a store is not sorted %v", storeRangeIDs,
+			)
+		}
+	}
+	settings := config.DefaultSimulationSettings()
+
+	// Test an empty state, where there should be nothing.
+	s := NewState(settings)
+	assertListsOrdered(s)
+	// Test an even distribution with 100 stores, 10k ranges and 1m keyspace.
+	s = NewStateEvenDistribution(100, 10000, 3, 1000000, settings)
+	assertListsOrdered(s)
+	// Test a skewed distribution with 100 stores, 10k ranges and 1m keyspace.
+	s = NewStateSkewedDistribution(100, 10000, 3, 1000000, settings)
+	assertListsOrdered(s)
+}
+
+// TestNewStateDeterministic asserts that the state returned from the new state
+// utility functions is deterministic.
+func TestNewStateDeterministic(t *testing.T) {
+	settings := config.DefaultSimulationSettings()
+
+	testCases := []struct {
+		desc       string
+		newStateFn func() State
+	}{
+		{
+			desc:       "even distribution",
+			newStateFn: func() State { return NewStateEvenDistribution(7, 1400, 3, 10000, settings) },
+		},
+		{
+			desc:       "skewed distribution",
+			newStateFn: func() State { return NewStateSkewedDistribution(7, 1400, 3, 10000, settings) },
+		},
+		{
+			desc: "replica distribution raw ",
+			newStateFn: func() State {
+				return NewStateWithDistribution([]float64{0.2, 0.2, 0.2, 0.2, 0.2}, 5, 3, 10000, settings)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			ref := tc.newStateFn()
+			for i := 0; i < 5; i++ {
+				require.Equal(t, ref.Ranges(), tc.newStateFn().Ranges())
+			}
+		})
+	}
+}
+
+// TestSplitRangeDeterministic asserts that range splits are deterministic.
+func TestSplitRangeDeterministic(t *testing.T) {
+	settings := config.DefaultSimulationSettings()
+	run := func() (State, func(key Key) (Range, Range, bool)) {
+		s := NewStateWithDistribution(
+			[]float64{0.2, 0.2, 0.2, 0.2, 0.2},
+			5,
+			3,
+			10000,
+			settings,
+		)
+		return s, func(key Key) (Range, Range, bool) {
+			return s.SplitRange(key)
+		}
+	}
+	stateA, runA := run()
+	stateB, runB := run()
+
+	// Check that the states are initially equal.
+	require.Equal(t, stateA.Ranges(), stateB.Ranges(), "initial states for testing splits are not equal")
+	rand := rand.New(rand.NewSource(42))
+	for i := 1; i < 1000; i++ {
+		splitKey := rand.Intn(10000)
+		lhsA, rhsA, okA := runA(Key(splitKey))
+		lhsB, rhsB, okB := runB(Key(splitKey))
+		require.Equal(t, okA, okB, "ok not equal, failed after %d splits", i)
+		require.Equal(t, lhsA, lhsB, "lhs not equal, failed after %d splits", i)
+		require.Equal(t, rhsA, rhsB, "rhs not equal, failed after %d splits", i)
 	}
 }

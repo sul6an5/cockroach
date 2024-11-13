@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedbuffer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -54,8 +55,7 @@ func (sd *spanConfigDecoder) decode(kv roachpb.KeyValue) (spanconfig.Record, err
 	{
 		types := []*types.T{sd.columns[0].GetType()}
 		startKeyRow := make([]rowenc.EncDatum, 1)
-		_, _, err := rowenc.DecodeIndexKey(keys.SystemSQLCodec, types, startKeyRow, nil /* colDirs */, kv.Key)
-		if err != nil {
+		if _, err := rowenc.DecodeIndexKey(keys.SystemSQLCodec, startKeyRow, nil /* colDirs */, kv.Key); err != nil {
 			return spanconfig.Record{}, errors.Wrapf(err, "failed to decode key: %v", kv.Key)
 		}
 		if err := startKeyRow[0].EnsureDecoded(types[0], &sd.alloc); err != nil {
@@ -91,7 +91,7 @@ func (sd *spanConfigDecoder) decode(kv roachpb.KeyValue) (spanconfig.Record, err
 }
 
 func (sd *spanConfigDecoder) translateEvent(
-	ctx context.Context, ev *roachpb.RangeFeedValue,
+	ctx context.Context, ev *kvpb.RangeFeedValue,
 ) rangefeedbuffer.Event {
 	deleted := !ev.Value.IsPresent()
 	var value roachpb.Value

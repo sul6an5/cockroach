@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -28,13 +30,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -42,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
@@ -50,7 +56,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 func TestReplicateQueueRebalance(t *testing.T) {
@@ -162,6 +168,197 @@ func TestReplicateQueueRebalance(t *testing.T) {
 		// on our tracked ranges. If we don't have atomic changes, we can't avoid
 		// it.
 		t.Error(info)
+	}
+}
+
+// TestReplicateQueueRebalanceMultiStore creates a test cluster with and without
+// multiple stores, splits some ranges, and then waits until the replicate queue
+// rebalances the replicas and leases.
+func TestReplicateQueueRebalanceMultiStore(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderRace(t)
+	skip.UnderShort(t)
+
+	testCases := []struct {
+		name          string
+		nodes         int
+		storesPerNode int
+	}{
+		{"simple", 5, 1},
+		{"multi-store", 4, 2},
+	}
+
+	// Speed up the test.
+	allocatorimpl.MinLeaseTransferStatsDuration = 1 * time.Millisecond
+	allocatorimpl.LeaseRebalanceThreshold = 0.01
+	allocatorimpl.LeaseRebalanceThresholdMin = 0.0
+
+	const useDisk = false // for debugging purposes
+	spec := func(node int, store int) base.StoreSpec {
+		return base.DefaultTestStoreSpec
+	}
+	if useDisk {
+		td, err := os.MkdirTemp("", "test")
+		require.NoError(t, err)
+		t.Logf("store dirs in %s", td)
+		spec = func(node int, store int) base.StoreSpec {
+			return base.StoreSpec{
+				Path: filepath.Join(td, fmt.Sprintf("n%ds%d", node, store)),
+				Size: base.SizeSpec{},
+			}
+		}
+		t.Cleanup(func() {
+			if t.Failed() {
+				return
+			}
+			_ = os.RemoveAll(td)
+		})
+	}
+	for _, testCase := range testCases {
+
+		t.Run(testCase.name, func(t *testing.T) {
+			// Set up a test cluster with multiple stores per node if needed.
+			args := base.TestClusterArgs{
+				ReplicationMode:   base.ReplicationAuto,
+				ServerArgsPerNode: map[int]base.TestServerArgs{},
+			}
+			for i := 0; i < testCase.nodes; i++ {
+				perNode := base.TestServerArgs{
+					ScanMinIdleTime: time.Millisecond,
+					ScanMaxIdleTime: time.Millisecond,
+				}
+				perNode.StoreSpecs = make([]base.StoreSpec, testCase.storesPerNode)
+				for idx := range perNode.StoreSpecs {
+					perNode.StoreSpecs[idx] = spec(i+1, idx+1)
+				}
+				args.ServerArgsPerNode[i] = perNode
+			}
+			tc := testcluster.StartTestCluster(t, testCase.nodes,
+				args)
+			defer tc.Stopper().Stop(context.Background())
+			ctx := context.Background()
+			for _, server := range tc.Servers {
+				st := server.ClusterSettings()
+				st.Manual.Store(true)
+			}
+
+			// Add a few ranges per store.
+			numStores := testCase.nodes * testCase.storesPerNode
+			newRanges := numStores * 2
+			trackedRanges := map[roachpb.RangeID]struct{}{}
+			for i := 0; i < newRanges; i++ {
+				tableID := bootstrap.TestingUserDescID(uint32(i))
+				splitKey := keys.SystemSQLCodec.TablePrefix(tableID)
+				// Retry the splits on descriptor errors which are likely as the replicate
+				// queue is already hard at work.
+				testutils.SucceedsSoon(t, func() error {
+					desc := tc.LookupRangeOrFatal(t, splitKey)
+					if i > 0 && len(desc.Replicas().VoterDescriptors()) > 3 {
+						// Some system ranges have five replicas but user ranges only three,
+						// so we'll see downreplications early in the startup process which
+						// we want to ignore. Delay the splits so that we don't create
+						// more over-replicated ranges.
+						// We don't do this for i=0 since that range stays at five replicas.
+						return errors.Errorf("still downreplicating: %s", &desc)
+					}
+					_, rightDesc, err := tc.SplitRange(splitKey)
+					if err != nil {
+						return err
+					}
+					t.Logf("split off %s", &rightDesc)
+					if i > 0 {
+						trackedRanges[rightDesc.RangeID] = struct{}{}
+					}
+					return nil
+				})
+			}
+
+			countReplicas := func() (total int, perStore []int) {
+				perStore = make([]int, numStores)
+				for _, s := range tc.Servers {
+					err := s.Stores().VisitStores(func(s *kvserver.Store) error {
+						require.Zero(t, perStore[s.StoreID()-1])
+						perStore[s.StoreID()-1] = s.ReplicaCount()
+						total += s.ReplicaCount()
+						return nil
+					})
+					require.NoError(t, err)
+				}
+				return total, perStore
+			}
+			countLeases := func() (total int, perStore []int) {
+				perStore = make([]int, numStores)
+				for _, s := range tc.Servers {
+					err := s.Stores().VisitStores(func(s *kvserver.Store) error {
+						c, err := s.Capacity(ctx, false)
+						require.NoError(t, err)
+						leases := int(c.LeaseCount)
+						require.Zero(t, perStore[s.StoreID()-1])
+						perStore[s.StoreID()-1] = leases
+						total += leases
+						return nil
+					})
+					require.NoError(t, err)
+				}
+				return total, perStore
+			}
+
+			// The requirement for minimum leases is low because of the following: in
+			// the case of 8 stores we create 8*2=16 ranges, we also have another 52
+			// ranges in the cluster which brings us up to 68 leases (ranges) total.
+			// Each store should have around 68/8=8.5 leases. With a leasesThreshold
+			// of 70% the test expects floor(8.5*0.7)=5 leases per store. The
+			// allocator should allow up to ceil(8.5)=9 leases per store, meaning,
+			// that in the worst case 7 stores can have up to 9 leases each, which
+			// leaves us with 68-7*9=5 leases on the 8th store, which is exactly what
+			// the test expects (and therefore should not be flaky). Note that without
+			// setting LeaseRebalanceThreshold and LeaseRebalanceThresholdMin above we
+			// would need more than 100 ranges per store, which will make this test
+			// significantly slower (5-10 minutes). Currently this test should succeed
+			// within a minute normally.
+			const replicasThreshold = 0.9
+			const leasesThreshold = 0.7
+			testutils.SucceedsWithin(t, func() error {
+				totalReplicas, replicasPerStore := countReplicas()
+				minReplicas := int(math.Floor(replicasThreshold * (float64(totalReplicas) / float64(numStores))))
+				t.Logf("current replica state (want at least %d replicas on all stores): %d", minReplicas, replicasPerStore)
+				for _, c := range replicasPerStore {
+					if c < minReplicas {
+						err := errors.Errorf(
+							"not balanced (want at least %d replicas on all stores): %d", minReplicas, replicasPerStore)
+						log.Infof(ctx, "%v", err)
+						return err
+					}
+				}
+				totalLeases, leasesPerStore := countLeases()
+				minLeases := int(math.Floor(leasesThreshold * (float64(totalLeases) / float64(numStores))))
+				t.Logf("current lease state (want at least %d leases on all stores): %d", minLeases, leasesPerStore)
+				for _, c := range leasesPerStore {
+					if c < minLeases {
+						err := errors.Errorf(
+							"not balanced (want at least %d leases on all stores): %d", minLeases, leasesPerStore)
+						log.Infof(ctx, "%v", err)
+						return err
+					}
+				}
+				return nil
+			}, 4*time.Minute)
+
+			// Query the range log to see if anything unexpected happened. Concretely,
+			// we'll make sure that our tracked ranges never had >3 replicas.
+			infos, err := queryRangeLog(tc.Conns[0], `SELECT info FROM system.rangelog ORDER BY timestamp DESC`)
+			require.NoError(t, err)
+			for _, info := range infos {
+				if _, ok := trackedRanges[info.UpdatedDesc.RangeID]; !ok || len(info.UpdatedDesc.Replicas().VoterDescriptors()) <= 3 {
+					continue
+				}
+				// If we have atomic changes enabled, we expect to never see four replicas
+				// on our tracked ranges. If we don't have atomic changes, we can't avoid
+				// it.
+				t.Error(info)
+			}
+		})
 	}
 }
 
@@ -424,6 +621,8 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	skip.UnderRace(t, "takes a long time or times out under race")
+	skip.UnderDeadlockWithIssue(t, 94383)
+	skip.UnderMetamorphicWithIssue(t, 99207)
 
 	ctx := context.Background()
 
@@ -625,6 +824,7 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 func TestReplicateQueueTracingOnError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := log.ScopeWithoutShowLogs(t)
+	_ = log.SetVModule("replicate_queue=2")
 	defer s.Close(t)
 
 	// NB: This test injects a fake failure during replica rebalancing, and we use
@@ -656,8 +856,7 @@ func TestReplicateQueueTracingOnError(t *testing.T) {
 	tc.AddVotersOrFatal(t, scratchKey, tc.Target(decomNodeIdx))
 	tc.AddVotersOrFatal(t, scratchKey, tc.Target(decomNodeIdx+1))
 	adminSrv := tc.Server(decomNodeIdx)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(
-		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
+	conn, err := adminSrv.RPCContext().GRPCDialNode(adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
 	require.NoError(t, err)
 	adminClient := serverpb.NewAdminClient(conn)
 	_, err = adminClient.Decommission(
@@ -784,8 +983,7 @@ func TestReplicateQueueDecommissionPurgatoryError(t *testing.T) {
 	tc.AddVotersOrFatal(t, scratchKey, tc.Target(decomNodeIdx))
 	tc.AddVotersOrFatal(t, scratchKey, tc.Target(decomNodeIdx+1))
 	adminSrv := tc.Server(decomNodeIdx)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(
-		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
+	conn, err := adminSrv.RPCContext().GRPCDialNode(adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
 	require.NoError(t, err)
 	adminClient := serverpb.NewAdminClient(conn)
 	_, err = adminClient.Decommission(
@@ -1519,7 +1717,7 @@ func filterRangeLog(
 	eventType kvserverpb.RangeLogEventType,
 	reason kvserverpb.RangeLogEventReason,
 ) ([]kvserverpb.RangeLogEvent_Info, error) {
-	return queryRangeLog(conn, `SELECT info FROM system.rangelog WHERE "rangeID" = $1 AND "eventType" = $2 AND info LIKE concat('%', $3, '%');`, rangeID, eventType.String(), reason)
+	return queryRangeLog(conn, `SELECT info FROM system.rangelog WHERE "rangeID" = $1 AND "eventType" = $2 AND info LIKE concat('%', $3, '%') ORDER BY timestamp ASC;`, rangeID, eventType.String(), reason)
 }
 
 func toggleReplicationQueues(tc *testcluster.TestCluster, active bool) {
@@ -1612,9 +1810,9 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	for i := 0; i < 1.5*rangeMaxSize; i++ {
 		sb.WriteRune('a')
 	}
-	_, err = db.Exec("insert into t(i,s) values (1, $1)", sb.String())
+	_, err = db.Exec("INSERT INTO t(i,s) VALUES (1, $1)", sb.String())
 	require.NoError(t, err)
-	_, err = db.Exec("insert into t(i,s) values (2, 'b')")
+	_, err = db.Exec("INSERT INTO t(i,s) VALUES (2, 'b')")
 	require.NoError(t, err)
 
 	// Now ask everybody to up-replicate.
@@ -1635,11 +1833,12 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		forceProcess()
 		r := db.QueryRow(
-			"select replicas from [show ranges from table t] where start_key='/2'")
+			"SELECT replicas FROM [SHOW RANGES FROM TABLE t] WHERE start_key LIKE '%/2'")
 		var repl string
 		if err := r.Scan(&repl); err != nil {
 			return err
 		}
+		t.Logf("replicas: %v", repl)
 		if repl != "{1,2,3,4,5}" {
 			return fmt.Errorf("not up-replicated yet. replicas: %s", repl)
 		}
@@ -1650,7 +1849,7 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		forceProcess()
 		r := db.QueryRow(
-			"select replicas from [show ranges from table t] where start_key is null")
+			"SELECT replicas FROM [SHOW RANGES FROM TABLE t] WHERE start_key LIKE '%TableMin%'")
 		var repl string
 		if err := r.Scan(&repl); err != nil {
 			return err
@@ -1677,7 +1876,7 @@ func (h delayingRaftMessageHandler) HandleRaftRequest(
 	ctx context.Context,
 	req *kvserverpb.RaftMessageRequest,
 	respStream kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	if h.rangeID != req.RangeID {
 		return h.RaftMessageHandler.HandleRaftRequest(ctx, req, respStream)
 	}
@@ -1733,10 +1932,10 @@ func TestTransferLeaseToLaggingNode(t *testing.T) {
 	var rangeID roachpb.RangeID
 	var leaseHolderNodeID uint64
 	s := sqlutils.MakeSQLRunner(tc.Conns[0])
-	s.Exec(t, "insert into system.comments values(0,0,0,'abc')")
+	s.Exec(t, "INSERT INTO system.comments VALUES(0,0,0,'abc')")
 	s.QueryRow(t,
-		"select range_id, lease_holder from "+
-			"[show ranges from table system.comments] limit 1",
+		"SELECT range_id, lease_holder FROM "+
+			"[SHOW RANGES FROM TABLE system.comments WITH DETAILS] LIMIT 1",
 	).Scan(&rangeID, &leaseHolderNodeID)
 	remoteNodeID := uint64(1)
 	if leaseHolderNodeID == 1 {
@@ -1873,6 +2072,8 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
@@ -1885,6 +2086,7 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 			// statuses pre and post enabling the replicate queue.
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings:                 st,
 				DisableDefaultTestTenant: true,
 				ScanMinIdleTime:          time.Millisecond,
 				ScanMaxIdleTime:          time.Millisecond,
@@ -1965,4 +2167,279 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func iterateOverAllStores(
+	t *testing.T, tc *testcluster.TestCluster, f func(*kvserver.Store) error,
+) {
+	for _, server := range tc.Servers {
+		require.NoError(t, server.Stores().VisitStores(f))
+	}
+}
+
+// TestPromoteNonVoterInAddVoter tests the prioritization of promoting
+// non-voters when switching from ZONE to REGION survival i.e.
+//
+// ZONE survival configuration:
+// Region 1: Voter, Voter, Voter
+// Region 2: Non-Voter
+// Region 3: Non-Voter
+// to REGION survival configuration:
+// Region 1: Voter, Voter
+// Region 2: Voter, Voter
+// Region 3: Voter
+//
+// Here we have 7 stores: 3 in Region 1, 2 in Region 2, and 2 in Region 3.
+//
+// The expected behaviour is that there should not be any add voter events in
+// the range log where the added replica type is a LEARNER.
+func TestPromoteNonVoterInAddVoter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test is slow under stress and can time out when upreplicating /
+	// rebalancing to ensure all stores have the same range count initially, due
+	// to slow heartbeats.
+	skip.UnderStress(t)
+
+	ctx := context.Background()
+
+	// Create 7 stores: 3 in Region 1, 2 in Region 2, and 2 in Region 3.
+	const numNodes = 7
+	serverArgs := make(map[int]base.TestServerArgs)
+	regions := [numNodes]int{1, 1, 1, 2, 2, 3, 3}
+	for i := 0; i < numNodes; i++ {
+		serverArgs[i] = base.TestServerArgs{
+			Locality: roachpb.Locality{
+				Tiers: []roachpb.Tier{
+					{
+						Key: "region", Value: strconv.Itoa(regions[i]),
+					},
+				},
+			},
+		}
+	}
+
+	// Start test cluster.
+	clusterArgs := base.TestClusterArgs{
+		ReplicationMode:   base.ReplicationAuto,
+		ServerArgsPerNode: serverArgs,
+	}
+	tc := testcluster.StartTestCluster(t, numNodes, clusterArgs)
+	defer tc.Stopper().Stop(ctx)
+	db := tc.ServerConn(0)
+
+	setConstraintFn := func(object string, numReplicas, numVoters int, additionalConstraints string) {
+		_, err := db.Exec(
+			fmt.Sprintf("ALTER %s CONFIGURE ZONE USING num_replicas = %d, num_voters = %d%s",
+				object, numReplicas, numVoters, additionalConstraints))
+		require.NoError(t, err)
+	}
+
+	// Ensure all stores have the same range count initially, to allow for more
+	// predictable behaviour when the allocator ranks stores using balance score.
+	setConstraintFn("DATABASE system", 7, 7, "")
+	setConstraintFn("RANGE system", 7, 7, "")
+	setConstraintFn("RANGE liveness", 7, 7, "")
+	setConstraintFn("RANGE meta", 7, 7, "")
+	setConstraintFn("RANGE default", 7, 7, "")
+	testutils.SucceedsSoon(t, func() error {
+		if err := forceScanOnAllReplicationQueues(tc); err != nil {
+			return err
+		}
+		rangeCount := -1
+		allEqualRangeCount := true
+		iterateOverAllStores(t, tc, func(s *kvserver.Store) error {
+			if rangeCount == -1 {
+				rangeCount = s.ReplicaCount()
+			} else if rangeCount != s.ReplicaCount() {
+				allEqualRangeCount = false
+			}
+			return nil
+		})
+		if !allEqualRangeCount {
+			return errors.New("Range counts are not all equal")
+		}
+		return nil
+	})
+
+	// Create a new range to simulate switching from ZONE to REGION survival.
+	_, err := db.Exec("CREATE TABLE t (i INT PRIMARY KEY, s STRING)")
+	require.NoError(t, err)
+
+	// ZONE survival configuration.
+	setConstraintFn("TABLE t", 5, 3,
+		", constraints = '{\"+region=2\": 1, \"+region=3\": 1}', voter_constraints = '{\"+region=1\": 3}'")
+
+	// computeNumberOfReplicas is used to find the number of voters and
+	// non-voters to check if we are meeting our zone configuration.
+	computeNumberOfReplicas := func(
+		t *testing.T,
+		tc *testcluster.TestCluster,
+		db *gosql.DB,
+	) (numVoters, numNonVoters int, err error) {
+		if err := forceScanOnAllReplicationQueues(tc); err != nil {
+			return 0, 0, err
+		}
+
+		var rangeID roachpb.RangeID
+		if err := db.QueryRow("SELECT range_id FROM [SHOW RANGES FROM TABLE t] LIMIT 1").Scan(&rangeID); err != nil {
+			return 0, 0, err
+		}
+		iterateOverAllStores(t, tc, func(s *kvserver.Store) error {
+			if replica, err := s.GetReplica(rangeID); err == nil && replica.OwnsValidLease(ctx, replica.Clock().NowAsClockTimestamp()) {
+				desc := replica.Desc()
+				numVoters = len(desc.Replicas().VoterDescriptors())
+				numNonVoters = len(desc.Replicas().NonVoterDescriptors())
+			}
+			return nil
+		})
+		return numVoters, numNonVoters, nil
+	}
+
+	// Ensure we are meeting our ZONE survival configuration.
+	testutils.SucceedsSoon(t, func() error {
+		numVoters, numNonVoters, err := computeNumberOfReplicas(t, tc, db)
+		require.NoError(t, err)
+		if numVoters != 3 {
+			return errors.Newf("expected 3 voters; got %d", numVoters)
+		}
+		if numNonVoters != 2 {
+			return errors.Newf("expected 2 non-voters; got %v", numNonVoters)
+		}
+		return nil
+	})
+
+	// REGION survival configuration.
+	setConstraintFn("TABLE t", 5, 5,
+		", constraints = '{}', voter_constraints = '{\"+region=1\": 2, \"+region=2\": 2, \"+region=3\": 1}'")
+	require.NoError(t, err)
+
+	// Ensure we are meeting our REGION survival configuration.
+	testutils.SucceedsSoon(t, func() error {
+		numVoters, numNonVoters, err := computeNumberOfReplicas(t, tc, db)
+		require.NoError(t, err)
+		if numVoters != 5 {
+			return errors.Newf("expected 5 voters; got %d", numVoters)
+		}
+		if numNonVoters != 0 {
+			return errors.Newf("expected 0 non-voters; got %v", numNonVoters)
+		}
+		return nil
+	})
+
+	// Retrieve the add voter events from the range log.
+	var rangeID roachpb.RangeID
+	err = db.QueryRow("SELECT range_id FROM [SHOW RANGES FROM TABLE t] LIMIT 1").Scan(&rangeID)
+	require.NoError(t, err)
+	addVoterEvents, err := filterRangeLog(tc.Conns[0], rangeID, kvserverpb.RangeLogEventType_add_voter, kvserverpb.ReasonRangeUnderReplicated)
+	require.NoError(t, err)
+
+	// Check if an add voter event has an added replica of type LEARNER, and if
+	// it does, it shows that we are adding a new voter rather than promoting an
+	// existing non-voter, which is unexpected.
+	for _, addVoterEvent := range addVoterEvents {
+		switch addVoterEvent.AddedReplica.Type {
+		case roachpb.LEARNER:
+			require.Failf(
+				t,
+				"Expected to promote non-voter, instead added voter",
+				"Added voter store ID: %v\nAdd voter events: %v",
+				addVoterEvent.AddedReplica.StoreID, addVoterEvents)
+		case roachpb.VOTER_FULL:
+		default:
+			require.Failf(
+				t,
+				"Unexpected added replica type",
+				"Replica type: %v\nAdd voter events: %v",
+				addVoterEvent.AddedReplica.Type, addVoterEvents)
+		}
+	}
+}
+
+// TestReplicateQueueExpirationLeasesOnly tests that changing
+// kv.expiration_leases_only.enabled switches all leases to the correct kind.
+func TestReplicateQueueExpirationLeasesOnly(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t) // too slow under stressrace
+	skip.UnderDeadlock(t)
+	skip.UnderShort(t)
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Settings: st,
+			// Speed up the replicate queue, which switches the lease type.
+			ScanMinIdleTime: time.Millisecond,
+			ScanMaxIdleTime: time.Millisecond,
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	require.NoError(t, tc.WaitForFullReplication())
+
+	db := tc.Server(0).DB()
+	sqlDB := tc.ServerConn(0)
+
+	// Split off a few ranges so we have something to work with.
+	scratchKey := tc.ScratchRange(t)
+	for i := 0; i <= 255; i++ {
+		splitKey := append(scratchKey.Clone(), byte(i))
+		require.NoError(t, db.AdminSplit(ctx, splitKey, hlc.MaxTimestamp))
+	}
+
+	countLeases := func() (epoch int64, expiration int64) {
+		for i := 0; i < tc.NumServers(); i++ {
+			require.NoError(t, tc.Server(i).GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
+				require.NoError(t, s.ComputeMetrics(ctx))
+				expiration += s.Metrics().LeaseExpirationCount.Value()
+				epoch += s.Metrics().LeaseEpochCount.Value()
+				return nil
+			}))
+		}
+		return
+	}
+
+	// We expect to have both expiration and epoch leases at the start, since the
+	// meta and liveness ranges require expiration leases. However, it's possible
+	// that there are a few other stray expiration leases too, since lease
+	// transfers use expiration leases as well.
+	epochLeases, expLeases := countLeases()
+	require.NotZero(t, epochLeases)
+	require.NotZero(t, expLeases)
+	initialExpLeases := expLeases
+	t.Logf("initial: epochLeases=%d expLeases=%d", epochLeases, expLeases)
+
+	// Switch to expiration leases and wait for them to change.
+	_, err := sqlDB.ExecContext(ctx, `SET CLUSTER SETTING kv.expiration_leases_only.enabled = true`)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		epochLeases, expLeases = countLeases()
+		t.Logf("enabling: epochLeases=%d expLeases=%d", epochLeases, expLeases)
+		return epochLeases == 0 && expLeases > 0
+	}, 30*time.Second, 500*time.Millisecond) // accomodate stress/deadlock builds
+
+	// Run a scan across the ranges, just to make sure they work.
+	scanCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err = db.Scan(scanCtx, scratchKey, scratchKey.PrefixEnd(), 1)
+	require.NoError(t, err)
+
+	// Switch back to epoch leases and wait for them to change. We still expect to
+	// have some required expiration leases, but they should be at or below the
+	// number of expiration leases we had at the start (primarily the meta and
+	// liveness ranges, but possibly a few more since lease transfers also use
+	// expiration leases).
+	_, err = sqlDB.ExecContext(ctx, `SET CLUSTER SETTING kv.expiration_leases_only.enabled = false`)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		epochLeases, expLeases = countLeases()
+		t.Logf("disabling: epochLeases=%d expLeases=%d", epochLeases, expLeases)
+		return epochLeases > 0 && expLeases > 0 && expLeases <= initialExpLeases
+	}, 30*time.Second, 500*time.Millisecond)
 }

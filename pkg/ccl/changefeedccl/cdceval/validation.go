@@ -25,127 +25,149 @@ import (
 	"github.com/lib/pq/oid"
 )
 
-// NormalizeAndValidateSelectForTarget normalizes select expression and verifies
-// expression is valid for a table and target family.  includeVirtual indicates
-// if virtual columns should be considered valid in the expressions.
-// Normalization steps include:
-//   - Table name replaces with table reference
-//   - UDTs values replaced with their physical representation (to keep expression stable
-//     across data type changes).
+// NormalizedSelectClause represents normalized and error checked cdc expression.
+// Basically, it is a select clause returned by normalizeSelectClause.
+// Methods on this expression modify the select clause in place, but this
+// marker type is needed so that we can ensure functions that rely on
+// normalized input aren't called out of order.
+type NormalizedSelectClause struct {
+	*tree.SelectClause
+	desc *cdcevent.EventDescriptor
+}
+
+// SelectStatementForFamily returns tree.Select representing this object.
+func (n *NormalizedSelectClause) SelectStatementForFamily() *tree.Select {
+	if !n.desc.HasOtherFamilies {
+		return &tree.Select{Select: n.SelectClause}
+	}
+
+	// Configure index flags to restrict access to specific column family. To do
+	// this, we construct table expression with appropriate index flag. We want to
+	// make sure that when we do that, we do not mutate underlying select clause.
+	// This is done so that the same NormalizedSelectClause can be used to build
+	// expression evaluation for different table column families.
+	sc := *n.SelectClause
+	sc.From.Tables = append(tree.TableExprs(nil), n.SelectClause.From.Tables...)
+	sc.From.Tables[0] = &tree.AliasedTableExpr{
+		Expr:       n.SelectClause.From.Tables[0],
+		IndexFlags: &tree.IndexFlags{FamilyID: &n.desc.FamilyID},
+	}
+
+	return &tree.Select{Select: &sc}
+}
+
+// normalizeAndValidateSelectForTarget normalizes select expression and verifies
+// expression is valid for a table and target family.
 //
 // The normalized (updated) select clause expression can be serialized into protocol
 // buffer using cdceval.AsStringUnredacted.
-func NormalizeAndValidateSelectForTarget(
+// TODO(yevgeniy): Add support for virtual columns.
+func normalizeAndValidateSelectForTarget(
 	ctx context.Context,
-	execCtx sql.JobExecContext,
+	execCfg *sql.ExecutorConfig,
 	desc catalog.TableDescriptor,
+	schemaTS hlc.Timestamp,
 	target jobspb.ChangefeedTargetSpecification,
 	sc *tree.SelectClause,
-	includeVirtual bool,
+	keyOnly bool,
 	splitColFams bool,
-) (n NormalizedSelectClause, _ jobspb.ChangefeedTargetSpecification, _ error) {
-	execCtx.SemaCtx()
-	execCfg := execCtx.ExecCfg()
-	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.EnablePredicateProjectionChangefeed) {
-		return n, target, errors.Newf(
+	semaCtx *tree.SemaContext,
+) (_ *NormalizedSelectClause, retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = errors.Newf("expression (%s) currently unsupported in CREATE CHANGEFEED: %s",
+				tree.AsString(sc), r)
+		}
+	}()
+
+	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2EnablePredicateProjectionChangefeed) {
+		return nil, errors.Newf(
 			`filters and projections not supported until upgrade to version %s or higher is finalized`,
-			clusterversion.EnablePredicateProjectionChangefeed.String())
+			clusterversion.TODODelete_V22_2EnablePredicateProjectionChangefeed.String())
 	}
 
 	// This really shouldn't happen as it's enforced by sql.y.
 	if len(sc.From.Tables) != 1 {
-		return n, target, pgerror.Newf(pgcode.Syntax, "invalid CDC expression: only 1 table supported")
+		return nil, pgerror.Newf(pgcode.Syntax,
+			"expected 1 table, found %d", len(sc.From.Tables))
 	}
 
 	// Sanity check target and descriptor refer to the same table.
 	if target.TableID != desc.GetID() {
-		return n, target, errors.AssertionFailedf("target table id (%d) does not match descriptor id (%d)",
+		return nil, errors.AssertionFailedf("target table id (%d) does not match descriptor id (%d)",
 			target.TableID, desc.GetID())
-	}
-
-	// This method is meant to be called early on when changefeed is created --
-	// i.e. during planning. As such, we expect execution context to have
-	// associated Txn() -- without which we cannot perform normalization.  Verify
-	// this assumption (txn is needed for type resolution).
-	if execCtx.Txn() == nil {
-		return n, target, errors.AssertionFailedf("expected non-nil transaction")
-	}
-
-	// Perform normalization.
-	var err error
-	normalized, err := normalizeSelectClause(ctx, *execCtx.SemaCtx(), sc, desc)
-	if err != nil {
-		return n, target, err
 	}
 
 	columnVisitor := checkColumnsVisitor{
 		desc:         desc,
 		splitColFams: splitColFams,
 	}
-
-	err = columnVisitor.FindColumnFamilies(normalized)
+	err := columnVisitor.FindColumnFamilies(sc)
 	if err != nil {
-		return n, target, err
+		return nil, err
 	}
-
-	target, err = setTargetType(desc, target, &columnVisitor)
+	target, err = getExpressionTargetSpecification(desc, target, &columnVisitor)
 	if err != nil {
-		return n, target, err
+		return nil, err
 	}
 
-	ed, err := newEventDescriptorForTarget(desc, target, schemaTS(execCtx), includeVirtual)
+	// TODO(yevgeniy): support virtual columns.
+	const includeVirtual = false
+	d, err := newEventDescriptorForTarget(desc, target, schemaTS, includeVirtual, keyOnly)
 	if err != nil {
-		return n, target, err
+		return nil, err
 	}
 
-	evalCtx := &execCtx.ExtendedEvalContext().Context
-	// Try to constrain spans by select clause.  We don't care about constrained
-	// spans here, but constraining spans kicks off optimizer which detects many
-	// errors.
-	if _, _, err := constrainSpansBySelectClause(
-		ctx, execCtx, evalCtx, execCfg.Codec, sc, ed,
-	); err != nil {
-		return n, target, err
-	}
-
-	// Construct and initialize evaluator.  This performs some static checks,
-	// and (importantly) type checks expressions.
-	evaluator, err := NewEvaluator(evalCtx, sc)
+	// Perform normalization.
+	normalized, err := normalizeSelectClause(ctx, semaCtx, sc, d)
 	if err != nil {
-		return n, target, err
+		return nil, err
 	}
 
-	return normalized, target, evaluator.initEval(ctx, ed)
+	return normalized, nil
 }
 
-func setTargetType(
+func getExpressionTargetSpecification(
 	desc catalog.TableDescriptor,
 	target jobspb.ChangefeedTargetSpecification,
 	cv *checkColumnsVisitor,
 ) (jobspb.ChangefeedTargetSpecification, error) {
 	allFamilies := desc.GetFamilies()
 
+	if target.FamilyName != "" {
+		// Use target if family name set explicitly.
+		return target, nil
+	}
+
 	if len(allFamilies) == 1 {
+		// There is only 1 column family, so use that.
 		target.Type = jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY
 		return target, nil
 	}
 
-	var referencedFamilies []string
-
 	keyColSet := desc.GetPrimaryIndex().CollectKeyColumnIDs()
 	refColSet := catalog.MakeTableColSet(cv.columns...)
 	nonKeyColSet := refColSet.Difference(keyColSet)
+	numReferencedNonKeyFamilies := func() (ref int) {
+		_ = desc.ForeachFamily(func(family *descpb.ColumnFamilyDescriptor) error {
+			if catalog.MakeTableColSet(family.ColumnIDs...).Intersects(nonKeyColSet) {
+				ref++
+			}
+			return nil
+		})
+		return ref
+	}()
 
 	if cv.seenStar {
-		if nonKeyColSet.Len() > 0 {
-			return target, pgerror.Newf(pgcode.InvalidParameterValue, "can't reference non-primary key columns as well as star on a multi column family table")
+		if nonKeyColSet.Len() > 0 && numReferencedNonKeyFamilies > 1 {
+			return target, pgerror.Newf(pgcode.InvalidParameterValue,
+				"can't reference non-primary key columns as well as star on a multi column family table")
 		}
-		if cv.splitColFams {
-			target.Type = jobspb.ChangefeedTargetSpecification_EACH_FAMILY
-			return target, pgerror.Newf(pgcode.FeatureNotSupported,
-				"split_column_families is not supported with changefeed expressions yet")
+		if !cv.splitColFams {
+			return target, pgerror.Newf(pgcode.InvalidParameterValue,
+				"targeting a table with multiple column families requires "+
+					"WITH split_column_families and will emit multiple events per row.")
 		}
-		return target, pgerror.Newf(pgcode.InvalidParameterValue, "targeting a table with multiple column families requires WITH split_column_families and will emit multiple events per row.")
 	}
 
 	// If no non-primary key columns are being referenced, then we can assume that if
@@ -164,7 +186,8 @@ func setTargetType(
 		}
 	}
 
-	// If referenced families aren't being retrived properly try using rowenc.NeededFamilyIDs
+	// If referenced families aren't being retrieved properly try using rowenc.NeededFamilyIDs
+	var referencedFamilies []string
 	for _, family := range allFamilies {
 		famColSet := catalog.MakeTableColSet(family.ColumnIDs...)
 		if nonKeyColSet.Intersects(famColSet) {
@@ -177,6 +200,10 @@ func setTargetType(
 		return target, pgerror.Newf(pgcode.InvalidParameterValue,
 			"expressions can't reference columns from more than one column family")
 	}
+	if len(referencedFamilies) == 0 {
+		return target, pgerror.Newf(
+			pgcode.AssertFailure, "expression does not reference any column family")
+	}
 	target.Type = jobspb.ChangefeedTargetSpecification_COLUMN_FAMILY
 	target.FamilyName = referencedFamilies[0]
 	return target, nil
@@ -187,12 +214,13 @@ func newEventDescriptorForTarget(
 	target jobspb.ChangefeedTargetSpecification,
 	schemaTS hlc.Timestamp,
 	includeVirtual bool,
+	keyOnly bool,
 ) (*cdcevent.EventDescriptor, error) {
 	family, err := getTargetFamilyDescriptor(desc, target)
 	if err != nil {
 		return nil, err
 	}
-	return cdcevent.NewEventDescriptor(desc, family, includeVirtual, schemaTS)
+	return cdcevent.NewEventDescriptor(desc, family, includeVirtual, keyOnly, schemaTS)
 }
 
 func getTargetFamilyDescriptor(
@@ -200,7 +228,7 @@ func getTargetFamilyDescriptor(
 ) (*descpb.ColumnFamilyDescriptor, error) {
 	switch target.Type {
 	case jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY:
-		return desc.FindFamilyByID(0)
+		return catalog.MustFindFamilyByID(desc, 0 /* id */)
 	case jobspb.ChangefeedTargetSpecification_COLUMN_FAMILY:
 		var fd *descpb.ColumnFamilyDescriptor
 		for _, family := range desc.GetFamilies() {
@@ -223,180 +251,100 @@ func getTargetFamilyDescriptor(
 	}
 }
 
-// NormalizedSelectClause is a select clause returned by normalizeSelectClause.
-// normalizeSelectClause also modifies the select clause in place, but this
-// marker type is needed so that we can ensure functions that rely on
-// normalized input aren't called out of order.
-type NormalizedSelectClause tree.SelectClause
-
-// Clause returns a pointer to the underlying SelectClause (still in normalized
-// form).
-func (n NormalizedSelectClause) Clause() *tree.SelectClause {
-	sc := tree.SelectClause(n)
-	return &sc
-}
-
 // normalizeSelectClause performs normalization step for select clause.
 // Returns normalized select clause.
 func normalizeSelectClause(
 	ctx context.Context,
-	semaCtx tree.SemaContext,
+	semaCtx *tree.SemaContext,
 	sc *tree.SelectClause,
-	desc catalog.TableDescriptor,
-) (normalizedSelectClause NormalizedSelectClause, _ error) {
-	// Turn FROM clause to table reference.
-	// Note: must specify AliasClause for TableRef expression; otherwise we
-	// won't be able to deserialize string representation (grammar requires
-	// "select ... from [table_id as alias]")
-	var alias tree.AliasClause
-	switch t := sc.From.Tables[0].(type) {
-	case *tree.AliasedTableExpr:
-		alias = t.As
-	case tree.TablePattern:
-	default:
-		// This is verified by sql.y -- but be safe.
-		return normalizedSelectClause, errors.AssertionFailedf("unexpected table expression type %T",
-			sc.From.Tables[0])
-	}
+	desc *cdcevent.EventDescriptor,
+) (*NormalizedSelectClause, error) {
+	// Keep track of user defined types used in the expression.
+	var udts map[oid.Oid]struct{}
 
-	if alias.Alias == "" {
-		alias.Alias = tree.Name(desc.GetName())
-	}
-	sc.From.Tables[0] = &tree.TableRef{
-		TableID: int64(desc.GetID()),
-		As:      alias,
-	}
-
-	// Setup sema ctx to handle cdc expressions. We want to make sure we only
-	// override some properties, while keeping other properties (type resolver)
-	// intact.
-	semaCtx.FunctionResolver = &CDCFunctionResolver{}
-	semaCtx.Properties.Require("cdc", rejectInvalidCDCExprs)
-
-	resolveType := func(ref tree.ResolvableTypeReference) (tree.ResolvableTypeReference, bool, error) {
+	resolveType := func(ref tree.ResolvableTypeReference) (tree.ResolvableTypeReference, error) {
 		typ, err := tree.ResolveType(ctx, ref, semaCtx.GetTypeResolver())
 		if err != nil {
-			return nil, false, pgerror.Wrapf(err, pgcode.IndeterminateDatatype,
+			return nil, pgerror.Wrapf(err, pgcode.IndeterminateDatatype,
 				"could not resolve type %s", ref.SQLString())
 		}
-		return &tree.OIDTypeReference{OID: typ.Oid()}, typ.UserDefined(), nil
-	}
 
-	// Verify that any UDTs used in the statement reference only the UDTs that are
-	// part of the target table descriptor.
-	v := &tree.TypeCollectorVisitor{
-		OIDs: make(map[oid.Oid]struct{}),
-	}
-
-	stmt, err := tree.SimpleStmtVisit(sc, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-		// Replace type references with resolved type.
-		switch e := expr.(type) {
-		case *tree.AnnotateTypeExpr:
-			typ, udt, err := resolveType(e.Type)
-			if err != nil {
-				return false, expr, err
+		if typ.UserDefined() {
+			if udts == nil {
+				udts = make(map[oid.Oid]struct{})
 			}
-			if !udt {
-				// Only care about user defined types.
-				return true, expr, nil
-			}
-			e.Type = typ
-
-		case *tree.CastExpr:
-			typ, udt, err := resolveType(e.Type)
-			if err != nil {
-				return false, expr, err
-			}
-			if !udt {
-				// Only care about user defined types.
-				return true, expr, nil
-			}
-
-			e.Type = typ
+			udts[typ.Oid()] = struct{}{}
 		}
+		return typ, nil
+	}
 
-		// Collect resolved type OIDs.
-		recurse, newExpr = v.VisitPre(expr)
-		return recurse, newExpr, nil
-	})
+	stmt, err := tree.SimpleStmtVisit(
+		sc,
+		func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+			// Replace type references with resolved type.
+			switch e := expr.(type) {
+			case *tree.AnnotateTypeExpr:
+				typ, err := resolveType(e.Type)
+				if err != nil {
+					return false, expr, err
+				}
+				e.Type = typ
+				return true, e, nil
+			case *tree.CastExpr:
+				typ, err := resolveType(e.Type)
+				if err != nil {
+					return false, expr, err
+				}
+				e.Type = typ
+				return true, e, nil
+			case *tree.FuncExpr:
+				if err := checkFunctionSupported(ctx, e, semaCtx); err != nil {
+					return false, e, err
+				}
+				return true, expr, nil
+			case *tree.Subquery:
+				return false, e, pgerror.New(
+					pgcode.FeatureNotSupported, "sub-query expressions not supported by CDC")
+			default:
+				return true, expr, nil
+			}
+		})
 
 	if err != nil {
-		return normalizedSelectClause, err
-	}
-	switch t := stmt.(type) {
-	case *tree.SelectClause:
-		normalizedSelectClause = NormalizedSelectClause(*t)
-	default:
-		// We walked tree.SelectClause -- getting anything else would be surprising.
-		return normalizedSelectClause, errors.AssertionFailedf("unexpected result type %T", stmt)
+		return nil, err
 	}
 
-	if len(v.OIDs) == 0 {
-		return normalizedSelectClause, nil
+	var norm *NormalizedSelectClause
+	switch t := stmt.(type) {
+	case *tree.SelectClause:
+		norm = &NormalizedSelectClause{
+			SelectClause: t,
+			desc:         desc,
+		}
+	default:
+		// We walked tree.SelectClause -- getting anything else would be surprising.
+		return nil, errors.AssertionFailedf("unexpected result type %T", stmt)
+	}
+
+	if len(udts) == 0 {
+		return norm, nil
 	}
 
 	// Verify that the only user defined types used are the types referenced by
 	// target table.
 	allowedOIDs := make(map[oid.Oid]struct{})
-	for _, c := range desc.UserDefinedTypeColumns() {
+	for _, c := range desc.TableDescriptor().UserDefinedTypeColumns() {
 		allowedOIDs[c.GetType().Oid()] = struct{}{}
 	}
 
-	for id := range v.OIDs {
+	for id := range udts {
 		if _, isAllowed := allowedOIDs[id]; !isAllowed {
-			return normalizedSelectClause, pgerror.Newf(pgcode.FeatureNotSupported,
+			return nil, pgerror.Newf(pgcode.FeatureNotSupported,
 				"use of user defined types not referenced by target table is not supported")
 		}
 	}
 
-	return normalizedSelectClause, nil
-}
-
-type checkForPrevVisitor struct {
-	semaCtx   tree.SemaContext
-	ctx       context.Context
-	foundPrev bool
-}
-
-// VisitPre implements the Visitor interface.
-func (v *checkForPrevVisitor) VisitPre(expr tree.Expr) (bool, tree.Expr) {
-	if exprRequiresPreviousValue(v.ctx, v.semaCtx, expr) {
-		v.foundPrev = true
-		// no need to keep recursing
-		return false, expr
-	}
-	return true, expr
-}
-
-// VisitPost implements the Visitor interface.
-func (v *checkForPrevVisitor) VisitPost(e tree.Expr) tree.Expr {
-	return e
-}
-
-// exprRequiresPreviousValue returns true if the top-level expression
-// is a function call that cdc implements using the diff from a rangefeed.
-func exprRequiresPreviousValue(ctx context.Context, semaCtx tree.SemaContext, e tree.Expr) bool {
-	if f, ok := e.(*tree.FuncExpr); ok {
-		funcDef, err := f.Func.Resolve(ctx, semaCtx.SearchPath, semaCtx.FunctionResolver)
-		if err != nil {
-			return false
-		}
-		return funcDef.Name == "cdc_prev"
-	}
-	return false
-}
-
-// SelectClauseRequiresPrev checks whether a changefeed expression will need a row's previous values
-// to be fetched in order to evaluate it.
-func SelectClauseRequiresPrev(
-	ctx context.Context, semaCtx tree.SemaContext, sc NormalizedSelectClause,
-) (bool, error) {
-	c := checkForPrevVisitor{semaCtx: semaCtx, ctx: ctx}
-	_, err := tree.SimpleStmtVisit(sc.Clause(), func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-		recurse, newExpr = c.VisitPre(expr)
-		return recurse, newExpr, nil
-	})
-	return c.foundPrev, err
+	return norm, nil
 }
 
 type checkColumnsVisitor struct {
@@ -418,22 +366,21 @@ func (c *checkColumnsVisitor) VisitCols(expr tree.Expr) (bool, tree.Expr) {
 		return c.VisitCols(vn)
 
 	case *tree.ColumnItem:
-		col, err := c.desc.FindColumnWithName(e.ColumnName)
+		col, err := catalog.MustFindColumnByTreeName(c.desc, e.ColumnName)
 		if err != nil {
 			c.err = err
 			return false, expr
 		}
-		colID := col.GetID()
-		c.columns = append(c.columns, colID)
 
-	case tree.UnqualifiedStar:
+		c.columns = append(c.columns, col.GetID())
+	case tree.UnqualifiedStar, *tree.AllColumnsSelector:
 		c.seenStar = true
 	}
 	return true, expr
 }
 
-func (c *checkColumnsVisitor) FindColumnFamilies(sc NormalizedSelectClause) error {
-	_, err := tree.SimpleStmtVisit(sc.Clause(), func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+func (c *checkColumnsVisitor) FindColumnFamilies(sc *tree.SelectClause) error {
+	_, err := tree.SimpleStmtVisit(sc, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		recurse, newExpr = c.VisitCols(expr)
 		return recurse, newExpr, nil
 	})

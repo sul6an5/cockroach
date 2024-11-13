@@ -18,13 +18,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	pgproto3 "github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgproto3/v2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -76,7 +77,7 @@ type connector struct {
 
 	// DialTenantLatency tracks how long it takes to retrieve the address for
 	// a tenant and set up a tcp connection to the address.
-	DialTenantLatency *metric.Histogram
+	DialTenantLatency metric.IHistogram
 
 	// DialTenantRetries counts how often dialing a tenant is retried.
 	DialTenantRetries *metric.Counter
@@ -111,14 +112,14 @@ func (c *connector) OpenTenantConnWithToken(
 	}
 	defer func() {
 		if retErr != nil {
-			serverConn.Close()
+			_ = serverConn.Close()
 		}
 	}()
 
 	// When we use token-based authentication, we will still get the initial
 	// connection data messages (e.g. ParameterStatus and BackendKeyData).
 	// Since this method is only used during connection migration (i.e. proxy
-	// is connecting to the SQL pod), we'll discard all of the messages, and
+	// is connecting to the SQL pod), we'll discard all the messages, and
 	// only return once we've seen a ReadyForQuery message.
 	newBackendKeyData, err := readTokenAuthResult(serverConn)
 	if err != nil {
@@ -156,7 +157,7 @@ func (c *connector) OpenTenantConnWithAuth(
 	}
 	defer func() {
 		if retErr != nil {
-			serverConn.Close()
+			_ = serverConn.Close()
 		}
 	}()
 
@@ -250,18 +251,20 @@ func (c *connector) dialTenantCluster(
 				// Report the failure to the directory cache so that it can
 				// refresh any stale information that may have caused the
 				// problem.
-				if err = reportFailureToDirectoryCache(
+				if reportErr := reportFailureToDirectoryCache(
 					ctx, c.TenantID, serverAssignment.Addr(), c.DirectoryCache,
-				); err != nil {
+				); reportErr != nil {
 					reportFailureErrs++
 					if reportFailureErr.ShouldLog() {
 						log.Ops.Errorf(ctx,
 							"report failure (%d errors skipped): %v",
 							reportFailureErrs,
-							err,
+							reportErr,
 						)
 						reportFailureErrs = 0
 					}
+					// nolint:errwrap
+					err = errors.Wrapf(err, "reporting failure: %s", reportErr.Error())
 				}
 				continue
 			}
@@ -273,8 +276,15 @@ func (c *connector) dialTenantCluster(
 	// err will never be nil here regardless of whether we retry infinitely or
 	// a bounded number of times. In our case, since we retry infinitely, the
 	// only possibility is when ctx's Done channel is closed (which implies that
-	// ctx.Err() != nil.
-	//
+	// ctx.Err() != nil).
+	if err == nil || ctx.Err() == nil {
+		// nolint:errwrap
+		return nil, errors.AssertionFailedf(
+			"unexpected retry loop exit, err=%v, ctxErr=%v",
+			err,
+			ctx.Err(),
+		)
+	}
 	// If the error is already marked, just return that.
 	if errors.IsAny(err, context.Canceled, context.DeadlineExceeded) {
 		return nil, err
@@ -297,7 +307,7 @@ func (c *connector) lookupAddr(ctx context.Context) (string, error) {
 
 	// Lookup tenant in the directory cache. Once we have retrieve the list of
 	// pods, use the Balancer for load balancing.
-	pods, err := c.DirectoryCache.LookupTenantPods(ctx, c.TenantID, c.ClusterName)
+	pods, err := c.DirectoryCache.LookupTenantPods(ctx, c.TenantID)
 	switch {
 	case err == nil:
 		runningPods := make([]*tenant.Pod, 0, len(pods))
@@ -317,13 +327,14 @@ func (c *connector) lookupAddr(ctx context.Context) (string, error) {
 
 	case status.Code(err) == codes.FailedPrecondition:
 		if st, ok := status.FromError(err); ok {
-			return "", newErrorf(codeUnavailable, "%v", st.Message())
+			return "", withCode(errors.Newf("%v", st.Message()), codeUnavailable)
 		}
-		return "", newErrorf(codeUnavailable, "unavailable")
+		return "", withCode(errors.New("unavailable"), codeUnavailable)
 
 	case status.Code(err) == codes.NotFound:
-		return "", newErrorf(codeParamsRoutingFailed,
-			"cluster %s-%d not found", c.ClusterName, c.TenantID.ToUint64())
+		return "", withCode(
+			errors.Newf("cluster %s-%d not found", c.ClusterName, c.TenantID.ToUint64()),
+			codeParamsRoutingFailed)
 
 	default:
 		return "", markAsRetriableConnectorError(err)
@@ -344,25 +355,17 @@ func (c *connector) dialSQLServer(
 		return c.testingKnobs.dialSQLServer(serverAssignment)
 	}
 
-	// Use a TLS config if one was provided. If TLSConfig is nil, Clone will
-	// return nil.
-	tlsConf := c.TLSConfig.Clone()
-	if tlsConf != nil {
-		// serverAssignment.Addr() will always have a port. We use an empty
-		// string as the default port as we only care about extracting the host.
-		outgoingHost, _, err := addr.SplitHostPort(serverAssignment.Addr(), "" /* defaultPort */)
-		if err != nil {
+	var tlsConf *tls.Config
+	if c.TLSConfig != nil {
+		var err error
+		if tlsConf, err = tlsConfigForTenant(c.TenantID, serverAssignment.Addr(), c.TLSConfig); err != nil {
 			return nil, err
 		}
-		// Always set ServerName. If InsecureSkipVerify is true, this will
-		// be ignored.
-		tlsConf.ServerName = outgoingHost
 	}
 
 	conn, err := BackendDial(c.StartupMsg, serverAssignment.Addr(), tlsConf)
 	if err != nil {
-		var codeErr *codeError
-		if errors.As(err, &codeErr) && codeErr.code == codeBackendDown {
+		if getErrorCode(err) == codeBackendDown {
 			return nil, markAsRetriableConnectorError(err)
 		}
 		return nil, err
@@ -429,4 +432,53 @@ var reportFailureToDirectoryCache = func(
 	directoryCache tenant.DirectoryCache,
 ) error {
 	return directoryCache.ReportFailure(ctx, tenantID, addr)
+}
+
+// tlsConfigForTenant customizes the tls configuration for connecting to a
+// specific tenant's sql server. Tenant certificates have two key features:
+//
+//  1. OU=Tenant
+//  2. CommonName=<tenant_id>
+//
+// The certificate is also expected to have a dns san that matches the
+// sqlServerAddr.
+func tlsConfigForTenant(
+	tenantID roachpb.TenantID, sqlServerAddr string, baseConfig *tls.Config,
+) (*tls.Config, error) {
+	config := baseConfig.Clone()
+
+	// serverAssignment.Addr() will always have a port. We use an empty
+	// string as the default port as we only care about extracting the host.
+	outgoingHost, _, err := addr.SplitHostPort(sqlServerAddr, "" /* defaultPort */)
+	if err != nil {
+		return nil, err
+	}
+
+	// Always set ServerName. If InsecureSkipVerify is true, this will be
+	// ignored.
+	config.ServerName = outgoingHost
+
+	config.VerifyConnection = func(state tls.ConnectionState) error {
+		if config.InsecureSkipVerify {
+			return nil
+		}
+		if len(state.VerifiedChains) == 0 || len(state.VerifiedChains[0]) == 0 {
+			// This should never happen. VerifyConnection is only called if the
+			// server provided a cert and the cert's CA was valid.
+			return errors.AssertionFailedf("VerifyConnection called with no verified chains")
+		}
+		serverCert := state.VerifiedChains[0][0]
+
+		// TODO(jeffswenson): once URI SANs are added to the tenant sql
+		// servers, this should validate the URI SAN.
+		if !security.IsTenantCertificate(serverCert) {
+			return errors.Newf("%s's certificate is not a tenant cert", outgoingHost)
+		}
+		if serverCert.Subject.CommonName != tenantID.String() {
+			return errors.Newf("expected a cert for tenant %d found '%s'", tenantID, serverCert.Subject.CommonName)
+		}
+		return nil
+	}
+
+	return config, nil
 }

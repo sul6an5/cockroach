@@ -17,7 +17,7 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
 import "jobs/jobspb/jobs.proto";
 import "roachpb/io-formats.proto";
@@ -25,7 +25,7 @@ import "sql/catalog/descpb/structured.proto";
 import "util/hlc/timestamp.proto";
 import "gogoproto/gogo.proto";
 import "roachpb/data.proto";
-import "roachpb/api.proto";
+import "kv/kvpb/api.proto";
 import "cloud/cloudpb/external_storage.proto";
 
 // BackfillerSpec is the specification for a "schema change backfiller".
@@ -37,8 +37,10 @@ import "cloud/cloudpb/external_storage.proto";
 // descriptor in the database, and doesn't emit any rows nor support
 // any post-processing.
 message BackfillerSpec {
+  // TODO(lidor): job_id is not needed when interoperability with 22.2 is
+  // dropped, the new way to send the job tag is using 'job_tag' in the
+  // SetupFlowRequest message.
   optional int64 job_id = 13 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
-
   enum Type {
     Invalid = 0;
     Column = 1;
@@ -105,6 +107,9 @@ message JobProgress {
 }
 
 message ReadImportDataSpec {
+  // TODO(lidor): job_id is not needed when interoperability with 22.2 is
+  // dropped, the new way to send the job tag is using 'job_tag' in the
+  // SetupFlowRequest message.
   optional int64 job_id = 19 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
   reserved 1;
   optional roachpb.IOFileFormat format = 8 [(gogoproto.nullable) = false];
@@ -176,6 +181,11 @@ message ReadImportDataSpec {
   // NEXTID: 20.
 }
 
+message IngestStoppedSpec {
+  optional int64 job_id = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID",
+  (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/jobs/jobspb.JobID"];
+}
+
 // StreamIngestionPartitionSpec contains information about a partition and how
 // to connect to it.
 message StreamIngestionPartitionSpec {
@@ -194,8 +204,20 @@ message StreamIngestionDataSpec {
   // PartitionSpecs maps partition IDs to their specifications.
   map<string, StreamIngestionPartitionSpec> partition_specs = 6 [(gogoproto.nullable) = false];
 
-  // The processor will ingest events from StartTime onwards.
-  optional util.hlc.Timestamp start_time = 2 [(gogoproto.nullable) = false];
+  // PreviousHighWaterTimestamp specifies the timestamp from which spans will
+  // start ingesting data in the replication job. This timestamp is empty unless
+  // the replication job resumes after a progress checkpoint has been recorded.
+  // While it is empty we use the InitialScanTimestamp described below.
+  optional util.hlc.Timestamp previous_high_water_timestamp = 2 [(gogoproto.nullable) = false];
+
+  // InitialScanTimestamp is the timestamp at which the partition will run the
+  // initial rangefeed scan before replicating further changes to the target
+  // spans. This timestamp is always non-empty, but a partition will only run an
+  // initial scan if no progress has been recorded prior to the current
+  // resumption of the replication job. Otherwise, all spans will start
+  // ingesting data from the PreviousHighWaterTimestamp described above.
+  optional util.hlc.Timestamp initial_scan_timestamp = 11 [(gogoproto.nullable) = false];
+
   // StreamAddress locate the stream so that a stream client can be initialized.
   optional string stream_address = 3 [(gogoproto.nullable) = false];
   // JobID is the job ID of the stream ingestion job.
@@ -241,6 +263,9 @@ message StreamIngestionFrontierSpec {
 }
 
 message BackupDataSpec {
+  // TODO(lidor): job_id is not needed when interoperability with 22.2 is
+  // dropped, the new way to send the job tag is using 'job_tag' in the
+  // SetupFlowRequest message.
   optional int64 job_id = 11 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
   repeated roachpb.Span spans = 1 [(gogoproto.nullable) = false];
   repeated roachpb.Span introduced_spans = 2 [(gogoproto.nullable) = false];
@@ -294,6 +319,9 @@ message RestoreSpanEntry {
 }
 
 message RestoreDataSpec {
+  // TODO(lidor): job_id is not needed when interoperability with 22.2 is
+  // dropped, the new way to send the job tag is using 'job_tag' in the
+  // SetupFlowRequest message.
   optional int64 job_id = 6 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
   optional util.hlc.Timestamp restore_time = 1 [(gogoproto.nullable) = false];
   optional roachpb.FileEncryptionOptions encryption = 2;
@@ -309,6 +337,9 @@ message RestoreDataSpec {
 }
 
 message SplitAndScatterSpec {
+  // TODO(lidor): job_id is not needed when interoperability with 22.2 is
+  // dropped, the new way to send the job tag is using 'job_tag' in the
+  // SetupFlowRequest message.
   optional int64 job_id = 4 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
   message RestoreEntryChunk {
     repeated RestoreSpanEntry entries = 1 [(gogoproto.nullable) = false];
@@ -364,4 +395,54 @@ message IndexBackfillMergerSpec {
   optional util.hlc.Timestamp mergeTimestamp = 8 [(gogoproto.nullable) = false];
 
   // NEXT ID: 9.
+}
+
+message GenerativeSplitAndScatterSpec {
+  repeated TableRekey table_rekeys = 1 [(gogoproto.nullable) = false];
+  repeated TenantRekey tenant_rekeys = 2 [(gogoproto.nullable) = false];
+  optional bool validate_only = 3 [(gogoproto.nullable) = false];
+
+  // URIs is the URIs of the backup manifests.
+  repeated string uris = 4 [(gogoproto.customname) = "URIs"];
+  optional jobs.jobspb.BackupEncryptionOptions encryption = 5;
+
+  // EndTime is the time of the restore.
+  optional util.hlc.Timestamp endTime = 9 [(gogoproto.nullable) = false];
+  // Spans is the required spans in the restore.
+  repeated roachpb.Span spans = 10 [(gogoproto.nullable) = false];
+  repeated jobs.jobspb.RestoreDetails.BackupLocalityInfo backup_locality_info = 11 [(gogoproto.nullable) = false];
+  // HighWater is the high watermark of the previous run of restore.
+  optional bytes high_water = 12;
+  // User who initiated the restore.
+  optional string user_proto = 13 [(gogoproto.nullable) = false, (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security/username.SQLUsernameProto"];
+  // ChunkSize is the number of import spans per chunk.
+  optional int64 chunk_size = 14[(gogoproto.nullable) = false];
+  // TargetSize is the target size for each import span.
+  optional int64 target_size = 15[(gogoproto.nullable) = false];
+  // NumEntries is the total number of import spans in this restore.
+  optional int64 num_entries = 16[(gogoproto.nullable) = false];
+  // NumNodes is the number of nodes available for dist restore.
+  optional int64 num_nodes = 17[(gogoproto.nullable) = false];
+  optional int64 job_id = 18 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
+  optional bool use_simple_import_spans = 19 [(gogoproto.nullable) = false];
+  optional bool use_frontier_checkpointing = 20 [(gogoproto.nullable) = false];
+  repeated jobs.jobspb.RestoreProgress.FrontierEntry checkpointed_spans = 21 [(gogoproto.nullable) = false];
+}
+
+
+
+message CloudStorageTestSpec {
+  optional string location = 1 [(gogoproto.nullable) = false];
+  message Params {
+    // TransferSize determines the size of the file that is written and then
+    // read back in its entirety in each iteration of the test.
+    optional int64 transfer_size = 1 [(gogoproto.nullable) = false];
+    // MinDuration causes the test to be run repeatedly until the duration has
+    // elapsed.
+    optional int64 min_duration = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "time.Duration"];
+    // Concurrency causes multiple tests to be run in parallel.
+    optional int64 concurrency = 3 [(gogoproto.nullable) = false];
+  }
+  optional Params params = 2 [(gogoproto.nullable) = false];
+  // NEXT ID: 3;
 }

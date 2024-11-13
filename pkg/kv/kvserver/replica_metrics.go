@@ -13,16 +13,16 @@ package kvserver
 import (
 	"context"
 	"math"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/raft/v3"
 )
 
 // ReplicaMetrics contains details on the current status of the replica.
@@ -60,7 +60,7 @@ type ReplicaMetrics struct {
 
 // Metrics returns the current metrics for the replica.
 func (r *Replica) Metrics(
-	ctx context.Context, now hlc.ClockTimestamp, livenessMap liveness.IsLiveMap, clusterNodes int,
+	ctx context.Context, now hlc.ClockTimestamp, livenessMap livenesspb.IsLiveMap, clusterNodes int,
 ) ReplicaMetrics {
 	r.store.unquiescedReplicas.Lock()
 	_, ticking := r.store.unquiescedReplicas.m[r.RangeID]
@@ -84,7 +84,7 @@ func (r *Replica) Metrics(
 		livenessMap:           livenessMap,
 		clusterNodes:          clusterNodes,
 		desc:                  r.mu.state.Desc,
-		raftStatus:            r.raftStatusRLocked(),
+		raftStatus:            r.raftSparseStatusRLocked(),
 		leaseStatus:           r.leaseStatusAtRLocked(ctx, now),
 		storeID:               r.store.StoreID(),
 		quiescent:             r.mu.quiescent,
@@ -107,10 +107,10 @@ func (r *Replica) Metrics(
 type calcReplicaMetricsInput struct {
 	raftCfg               *base.RaftConfig
 	conf                  roachpb.SpanConfig
-	livenessMap           liveness.IsLiveMap
+	livenessMap           livenesspb.IsLiveMap
 	clusterNodes          int
 	desc                  *roachpb.RangeDescriptor
-	raftStatus            *raft.Status
+	raftStatus            *raftSparseStatus
 	leaseStatus           kvserverpb.LeaseStatus
 	storeID               roachpb.StoreID
 	quiescent             bool
@@ -138,7 +138,7 @@ func calcReplicaMetrics(d calcReplicaMetricsInput) ReplicaMetrics {
 
 	// The raft leader computes the number of raft entries that replicas are
 	// behind.
-	leader := isRaftLeader(d.raftStatus)
+	leader := d.raftStatus != nil && d.raftStatus.RaftState == raft.StateLeader
 	var leaderBehindCount, leaderPausedFollowerCount int64
 	if leader {
 		leaderBehindCount = calcBehindCount(d.raftStatus, d.desc, d.livenessMap)
@@ -194,7 +194,7 @@ func calcRangeCounter(
 	storeID roachpb.StoreID,
 	desc *roachpb.RangeDescriptor,
 	leaseStatus kvserverpb.LeaseStatus,
-	livenessMap liveness.IsLiveMap,
+	livenessMap livenesspb.IsLiveMap,
 	numVoters, numReplicas int32,
 	clusterNodes int,
 ) (rangeCounter, unavailable, underreplicated, overreplicated bool) {
@@ -220,10 +220,10 @@ func calcRangeCounter(
 		status := desc.Replicas().ReplicationStatus(func(rDesc roachpb.ReplicaDescriptor) bool {
 			return livenessMap[rDesc.NodeID].IsLive
 		},
-			// neededVoters - we don't care about the under/over-replication
-			// determinations from the report because it's too magic. We'll do our own
-			// determination below.
-			0)
+			// needed{Voters,NonVoters} - we don't care about the
+			// under/over-replication determinations from the report because
+			// it's too magic. We'll do our own determination below.
+			0, -1)
 		unavailable = !status.Available
 		liveVoters := calcLiveVoterReplicas(desc, livenessMap)
 		liveNonVoters := calcLiveNonVoterReplicas(desc, livenessMap)
@@ -240,17 +240,17 @@ func calcRangeCounter(
 // replica is determined by checking its node in the provided liveness map. This
 // method is used when indicating under-replication so only voter replicas are
 // considered.
-func calcLiveVoterReplicas(desc *roachpb.RangeDescriptor, livenessMap liveness.IsLiveMap) int {
+func calcLiveVoterReplicas(desc *roachpb.RangeDescriptor, livenessMap livenesspb.IsLiveMap) int {
 	return calcLiveReplicas(desc.Replicas().VoterDescriptors(), livenessMap)
 }
 
 // calcLiveNonVoterReplicas returns a count of the live non-voter replicas; a live
 // replica is determined by checking its node in the provided liveness map.
-func calcLiveNonVoterReplicas(desc *roachpb.RangeDescriptor, livenessMap liveness.IsLiveMap) int {
+func calcLiveNonVoterReplicas(desc *roachpb.RangeDescriptor, livenessMap livenesspb.IsLiveMap) int {
 	return calcLiveReplicas(desc.Replicas().NonVoterDescriptors(), livenessMap)
 }
 
-func calcLiveReplicas(repls []roachpb.ReplicaDescriptor, livenessMap liveness.IsLiveMap) int {
+func calcLiveReplicas(repls []roachpb.ReplicaDescriptor, livenessMap livenesspb.IsLiveMap) int {
 	var live int
 	for _, rd := range repls {
 		if livenessMap[rd.NodeID].IsLive {
@@ -263,7 +263,7 @@ func calcLiveReplicas(repls []roachpb.ReplicaDescriptor, livenessMap liveness.Is
 // calcBehindCount returns a total count of log entries that follower replicas
 // are behind. This can only be computed on the raft leader.
 func calcBehindCount(
-	raftStatus *raft.Status, desc *roachpb.RangeDescriptor, livenessMap liveness.IsLiveMap,
+	raftStatus *raftSparseStatus, desc *roachpb.RangeDescriptor, livenessMap livenesspb.IsLiveMap,
 ) int64 {
 	var behindCount int64
 	for _, rd := range desc.Replicas().Descriptors() {
@@ -278,57 +278,9 @@ func calcBehindCount(
 	return behindCount
 }
 
-// QueriesPerSecond returns the range's average QPS if it is the current
-// leaseholder. If it isn't, this will return 0 because the replica does not
-// know about the reads that the leaseholder is serving.
-//
-// A "Query" is a BatchRequest (regardless of its contents) arriving at the
-// leaseholder with a gateway node set in the header (i.e. excluding requests
-// that weren't sent through a DistSender, which in practice should be
-// practically none). See Replica.getBatchRequestQPS() for how this is
-// accounted for.
-func (r *Replica) QueriesPerSecond() (float64, time.Duration) {
-	return r.loadStats.batchRequests.AverageRatePerSecond()
-}
-
-// RequestsPerSecond returns the range's average requests received per second.
-// A batch request may have one to many requests.
-func (r *Replica) RequestsPerSecond() float64 {
-	rps, _ := r.loadStats.requests.AverageRatePerSecond()
-	return rps
-}
-
-// WritesPerSecond returns the range's average keys written per second. A
-// "Write" is a mutation applied by Raft as measured by
-// engine.RocksDBBatchCount(writeBatch). This corresponds roughly to the number
-// of keys mutated by a write. For example, writing 12 intents would count as 24
-// writes (12 for the metadata, 12 for the versions). A DeleteRange that
-// ultimately only removes one key counts as one (or two if it's transactional).
-func (r *Replica) WritesPerSecond() float64 {
-	wps, _ := r.loadStats.writeKeys.AverageRatePerSecond()
-	return wps
-}
-
-// ReadsPerSecond returns the range's average keys read per second. A "Read" is
-// a key access during evaluation of a batch request. This includes both
-// follower and leaseholder reads.
-func (r *Replica) ReadsPerSecond() float64 {
-	rps, _ := r.loadStats.readKeys.AverageRatePerSecond()
-	return rps
-}
-
-// WriteBytesPerSecond returns the range's average bytes written per second. A "Write" is
-// as described in WritesPerSecond.
-func (r *Replica) WriteBytesPerSecond() float64 {
-	wbps, _ := r.loadStats.writeBytes.AverageRatePerSecond()
-	return wbps
-}
-
-// ReadBytesPerSecond returns the range's average bytes read per second. A "Read" is
-// as described in ReadsPerSecond.
-func (r *Replica) ReadBytesPerSecond() float64 {
-	rbps, _ := r.loadStats.readBytes.AverageRatePerSecond()
-	return rbps
+// LoadStats returns the load statistics for the replica.
+func (r *Replica) LoadStats() load.ReplicaLoadStats {
+	return r.loadStats.Stats()
 }
 
 func (r *Replica) needsSplitBySizeRLocked() bool {

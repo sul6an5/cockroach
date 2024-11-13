@@ -1,3 +1,5 @@
+# tenant-capability-override-opt: can_check_consistency=true
+
 statement ok
 CREATE TABLE foo (a int)
 
@@ -1187,10 +1189,10 @@ SELECT round(123.456::float, -1), round(123.456::float, -2), round(123.456::floa
 ----
 120 100 0
 
-query RRRR
-SELECT round(123.456::decimal, -1), round(123.456::decimal, -2), round(123.456::decimal, -3), round(123.456::decimal, -200)
+query RRRRR
+SELECT round(123.456::decimal, -1), round(123.456::decimal, -2), round(123.456::decimal, -3), round(123.456::decimal, -200), round(-0.1::decimal)
 ----
-1.2E+2  1E+2  0E+3  0E+200
+1.2E+2  1E+2  0E+3  0E+200  0
 
 query RRRR
 SELECT round('nan'::decimal), round('nan'::decimal, 1), round('nan'::float), round('nan'::float, 1)
@@ -2179,10 +2181,23 @@ text[]
 statement ok
 SELECT format_type(oid, NULL) FROM pg_type
 
+# Ensure that implicit record types for virtual tables can be formatted.
+query T
+select format_type('pg_namespace'::regtype, null);
+----
+pg_namespace
+
 query T
 SELECT pg_catalog.pg_get_userbyid((SELECT oid FROM pg_roles WHERE rolname='root'))
 ----
 root
+
+query T
+SELECT pg_catalog.pg_get_userbyid(d.datdba)
+FROM pg_database d
+WHERE d.datname = 'system'
+----
+node
 
 query T
 SELECT pg_catalog.pg_get_userbyid(20)
@@ -2250,10 +2265,13 @@ SELECT pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_in
 ----
 b
 
+# The empty string should be returned for index 3. Previously, there was a bug
+# where this would return the primary key column name, since the primary key
+# is stored in the index.
 query T
 SELECT pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_indexdef_cols_idx'), 3, false)
 ----
-rowid
+·
 
 query I
 SELECT length(pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_indexdef_cols_idx'), 4, false))
@@ -2300,6 +2318,14 @@ query T
 SELECT pg_catalog.pg_get_viewdef('pg_viewdef_view'::regclass::oid, false)
 ----
 SELECT a, b FROM test.public.pg_viewdef_test
+
+statement ok
+CREATE MATERIALIZED VIEW test.pg_viewdef_mview AS SELECT b, a FROM test.pg_viewdef_test
+
+query T
+SELECT pg_catalog.pg_get_viewdef('pg_viewdef_mview'::regclass::oid)
+----
+SELECT b, a FROM test.public.pg_viewdef_test
 
 statement ok
 CREATE TABLE test.pg_constraintdef_test (
@@ -2444,7 +2470,7 @@ be09b235155bae6cb96b94ce4645260937e856ac3907d710850256e6351f50b428f948a7af339374
 f7fbba6e0636f890e56fbbf3283e524c6fa3204ae298382d624741d0dc6638326e282c41be5e4254d8820772c5518a2c5a8c0c7f7eda19594a7eb539453e1ed7
 95bce0fdbcf48ba9c944dae46238d89bbd6df696a0d0b7cc8fc16eeabd30c03d6d2506cfcce81de320b37bc677df1bd045ac9231b43ae11807773db3909d1220
 b2d173023893f71caadf7cb2f9557355462570de2c9c971b9cfa5494936e28df8e13d0db4d550aab66d5e7a002f678ddb02def092c069ce473cf5fb293953986
-960b0fed9378be1e9adefd91e1be6ac9c1de7208008dfec438ff845135727bebea0f7458a5181079f61288176e0168cfea501b900c3e495b3ab9bbe4d372486d
+17ecb6d43868f7502f588817661f5edb85b8e408d304ffbdeddd6b1abbec00dc5dda907b930356f1a031be368ea053626af59a9e74fbe55cf9cb7855acfd5f17
 d82c4eb5261cb9c8aa9855edd67d1bd10482f41529858d925094d173fa662aa91ff39bc5b188615273484021dfb16fd8284cf684ccf0fc795be3aa2fc1e6c181
 
 # We only support one encoding, UTF8, which is hardcoded to id 6 just like in
@@ -2499,6 +2525,18 @@ query TT
 SELECT array_to_string(NULL, ','), array_to_string(NULL, 'foo', 'zerp')
 ----
 NULL  NULL
+
+# Builtin array_to_string should recursively search nested arrays.
+query T
+SELECT array_to_string(ARRAY[ARRAY[ARRAY[5,6], ARRAY[2,3]], ARRAY[ARRAY[7,8], ARRAY[4,44]]], ' ');
+----
+5 6 2 3 7 8 4 44
+
+# Builtin array_to_string should recursively search nested arrays.
+query T
+SELECT array_to_string(ARRAY[(SELECT ARRAY[1,2]::int2vector)],' ');
+----
+1 2
 
 # Examples from https://www.postgresql.org/docs/9.3/functions-string.html#FUNCTIONS-STRING-FORMAT
 query T
@@ -2613,6 +2651,28 @@ query BBB
 SELECT pg_type_is_visible('int'::regtype), pg_type_is_visible(NULL), pg_type_is_visible(99999)
 ----
 true  NULL  NULL
+
+# Sanity check pg_get_function_arguments.
+query T
+SELECT pg_get_function_arguments('convert_from'::regproc::oid)
+----
+bytea, text
+
+# This produces an empty string in Postgres too.
+query T
+SELECT pg_get_function_arguments('version'::regproc::oid)
+----
+·
+
+query T
+SELECT pg_get_function_arguments('array_length'::regproc)
+----
+anyarray, int8
+
+query T
+SELECT pg_get_function_arguments((select oid from pg_proc where proname='variance' and proargtypes[0] = 'int'::regtype))
+----
+int8
 
 # Sanity check pg_get_function_identity_arguments.
 query T
@@ -3641,3 +3701,313 @@ TIMESTAMP '2000-01-01 00:00:00',
 INTERVAL '2 days',
 DATE '2000-01-01',
 TIMESTAMPTZ '2000-01-01 01:30:00');
+
+query T
+SELECT encode(decompress(compress('Hello World', 'gzip'), 'gzip'), 'escape');
+----
+Hello World
+
+query T
+SELECT encode(decompress(compress('Hello World', 'zstd'), 'zstd'), 'escape');
+----
+Hello World
+
+query T
+SELECT encode(decompress(compress('Hello World', 'snappy'), 'snappy'), 'escape');
+----
+Hello World
+
+query T
+SELECT encode(decompress(compress('Hello World', 'lz4'), 'LZ4'), 'escape');
+----
+Hello World
+
+query error pq: decompress\(\): lz4: bad magic number
+SELECT encode(decompress(compress('Hello World', 'snappy'), 'lz4'), 'escape');
+
+query error pq: compress\(\): only 'gzip', 'lz4', 'snappy', or 'zstd' compression codecs are supported
+SELECT compress('Hello World', 'infiniteCompressionCodec');
+
+subtest crdb_internal.hide_sql_constants
+query T
+SELECT crdb_internal.hide_sql_constants('select 1, 2, 3')
+----
+SELECT _, _, _
+
+# Passing a redacted sql stmt shouldn't have any effect.
+query T
+SELECT crdb_internal.hide_sql_constants('select _, _, _')
+----
+SELECT _, _, _
+
+query T
+SELECT crdb_internal.hide_sql_constants(ARRAY('select 1', NULL, 'select ''hello''', '', 'not a sql stmt'))
+----
+{"SELECT _",NULL,"SELECT '_'","",""}
+
+query T
+SELECT crdb_internal.hide_sql_constants(ARRAY['banana'])
+----
+{""}
+
+query T
+SELECT crdb_internal.hide_sql_constants('SELECT ''yes'' IN (''no'', ''maybe'', ''yes'')')
+----
+SELECT '_' IN ('_', '_', __more1_10__)
+
+query T
+SELECT crdb_internal.hide_sql_constants('')
+----
+·
+
+query T
+SELECT crdb_internal.hide_sql_constants(NULL)
+----
+NULL
+
+query T
+SELECT crdb_internal.hide_sql_constants('not a sql stmt')
+----
+·
+
+
+query T
+select crdb_internal.hide_sql_constants(e'\r');
+----
+·
+
+
+query T
+SELECT crdb_internal.hide_sql_constants(create_statement) from crdb_internal.create_statements where descriptor_name = 'foo'
+----
+CREATE TABLE public.foo (a INT8 NULL, rowid INT8 NOT NULL NOT VISIBLE DEFAULT unique_rowid(), CONSTRAINT foo_pkey PRIMARY KEY (rowid ASC))
+
+# More tests are in parse_ident_builtin_test.go.
+query T
+SELECT parse_ident(str) FROM ( VALUES
+  ('a.b.c'),
+  ('"YesCaps".NoCaps'),
+  ('"a""b".xyz'),
+  ('"a\b".xyz')
+) tbl(str)
+----
+{a,b,c}
+{YesCaps,nocaps}
+{"a\"b",xyz}
+{"a\\b",xyz}
+
+query T
+SELECT parse_ident('ab.xyz()', false)
+----
+{ab,xyz}
+
+query error string is not a valid identifier: \"ab.xyz\(\)\"
+SELECT parse_ident('ab.xyz()', true)
+
+# Test that we return appropriate user-facing errors when trying to decode invalid bytes.
+query error pgcode 22023 pq: crdb_internal.job_payload_type\(\): invalid protocol message: proto: wrong wireType = 1 for field Import
+select crdb_internal.job_payload_type('invalid'::BYTES);
+
+query error pgcode 22023 pq: crdb_internal.job_payload_type\(\): invalid type in job payload protocol message: Payload.Type called on a payload with an unknown details type: <nil>
+select crdb_internal.job_payload_type('');
+
+subtest crdb_internal.redactable_sql_constants
+query T
+SELECT crdb_internal.redactable_sql_constants(NULL)
+----
+NULL
+
+query T
+SELECT crdb_internal.redactable_sql_constants('')
+----
+‹›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('SELECT 1, 2, 3')
+----
+SELECT ‹1›, ‹2›, ‹3›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('UPDATE mytable SET col = ''abc'' WHERE key = 0')
+----
+UPDATE mytable SET col = ‹'abc'› WHERE key = ‹0›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('not a sql statement')
+----
+‹not a sql statement›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('1')
+----
+‹1›
+
+statement error unknown signature: crdb_internal.redactable_sql_constants\(int\)
+SELECT crdb_internal.redactable_sql_constants(1)
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY[]::string[])
+----
+{}
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY[''])
+----
+{‹›}
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY[NULL])
+----
+{NULL}
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY['banana'])
+----
+{‹banana›}
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY['SELECT 1', NULL, 'SELECT ''hello''', ''])
+----
+{"SELECT ‹1›",NULL,"SELECT ‹'hello'›",‹›}
+
+query T
+SELECT crdb_internal.redactable_sql_constants('SELECT ''yes'' IN (''no'', ''maybe'', ''yes'')')
+----
+SELECT ‹'yes'› IN (‹'no'›, ‹'maybe'›, ‹'yes'›)
+
+query T
+SELECT crdb_internal.redactable_sql_constants(e'\r')
+----
+‹
+›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('SELECT crdb_internal.redactable_sql_constants('''')')
+----
+SELECT crdb_internal.redactable_sql_constants(‹''›)
+
+query T
+SELECT crdb_internal.redactable_sql_constants('WITH j AS (VALUES (0.1, false, ''{}''::jsonb, ARRAY[''x'', ''y'', ''''])) INSERT INTO i SELECT *, 7 FROM j WHERE true')
+----
+WITH j AS (VALUES (‹0.1›, ‹false›, ‹'{}'›::JSONB, ARRAY[‹'x'›, ‹'y'›, ‹''›])) INSERT INTO i SELECT *, ‹7› FROM j WHERE ‹true›
+
+query T
+SELECT crdb_internal.redactable_sql_constants(create_statement)
+FROM crdb_internal.create_statements
+WHERE descriptor_name = 'foo'
+----
+CREATE TABLE public.foo (a INT8 NULL, rowid INT8 NOT NULL NOT VISIBLE DEFAULT unique_rowid(), CONSTRAINT foo_pkey PRIMARY KEY (rowid ASC))
+
+statement ok
+CREATE TABLE redactable_sql_constants_table (
+  a INT PRIMARY KEY,
+  b STRING DEFAULT 'yo' CHECK (b != 'grapefruit'),
+  c STRING AS (b || 'foo') VIRTUAL,
+  FAMILY (a, b),
+  INDEX (b) WHERE b > 'z'
+);
+
+query T
+SELECT crdb_internal.redactable_sql_constants(create_statement)
+FROM crdb_internal.create_statements
+WHERE descriptor_name = 'redactable_sql_constants_table'
+----
+CREATE TABLE public.redactable_sql_constants_table (a INT8 NOT NULL, b STRING NULL DEFAULT ‹'yo'›:::STRING, c STRING NULL AS (b || ‹'foo'›:::STRING) VIRTUAL, CONSTRAINT redactable_sql_constants_table_pkey PRIMARY KEY (a ASC), INDEX redactable_sql_constants_table_b_idx (b ASC) WHERE b > ‹'z'›:::STRING, FAMILY fam_0_a_b (a, b), CONSTRAINT check_b CHECK (b != ‹'grapefruit'›:::STRING))
+
+statement ok
+DROP TABLE redactable_sql_constants_table
+
+subtest crdb_internal.redact
+
+query T
+SELECT crdb_internal.redact(NULL)
+----
+NULL
+
+query T
+SELECT crdb_internal.redact('')
+----
+·
+
+query T
+SELECT crdb_internal.redact('0')
+----
+0
+
+query T
+SELECT crdb_internal.redact('‹0›')
+----
+‹×›
+
+query T
+SELECT crdb_internal.redact('‹‹0››')
+----
+‹‹×››
+
+query T
+SELECT crdb_internal.redact('‹0› ‹0›')
+----
+‹×› ‹×›
+
+query T
+SELECT crdb_internal.redact('‹‹0›')
+----
+‹‹×›
+
+query T
+SELECT crdb_internal.redact(ARRAY[]::string[])
+----
+{}
+
+query T
+SELECT crdb_internal.redact(ARRAY[NULL])
+----
+{NULL}
+
+query T
+SELECT crdb_internal.redact(ARRAY[''])
+----
+{""}
+
+query T
+SELECT crdb_internal.redact(ARRAY['‹0›', '', NULL, '‹0› ‹0›', '‹0'])
+----
+{‹×›,"",NULL,"‹×› ‹×›",‹0}
+
+query T
+SELECT crdb_internal.redact(crdb_internal.redactable_sql_constants('SELECT 1, 2, 3'))
+----
+SELECT ‹×›, ‹×›, ‹×›
+
+query T
+SELECT crdb_internal.redact(crdb_internal.redactable_sql_constants(ARRAY['SELECT 1', NULL, 'SELECT ''hello''', '']))
+----
+{"SELECT ‹×›",NULL,"SELECT ‹×›",‹×›}
+
+subtest check_consistency
+
+# Sanity-check crdb_internal.check_consistency.
+
+statement error start key must be >=
+SELECT crdb_internal.check_consistency(true, '\x00', crdb_internal.tenant_span()[2])
+
+statement error end key must be <=
+SELECT crdb_internal.check_consistency(true, crdb_internal.tenant_span()[1], '\xffff00')
+
+statement error start key must be less than end key
+SELECT crdb_internal.check_consistency(true, crdb_internal.tenant_span()[2], crdb_internal.tenant_span()[2])
+
+query TT
+SELECT status, regexp_replace(detail, '[0-9]+', '', 'g')
+FROM crdb_internal.check_consistency(true, crdb_internal.tenant_span()[1], crdb_internal.tenant_span()[2])
+ORDER BY range_id
+LIMIT 1
+----
+RANGE_CONSISTENT  stats: {ContainsEstimates: LastUpdateNanos: IntentAge: GCBytesAge: LiveBytes: LiveCount: KeyBytes: KeyCount: ValBytes: ValCount: IntentBytes: IntentCount: SeparatedIntentCount: RangeKeyCount: RangeKeyBytes: RangeValCount: RangeValBytes: SysBytes: SysCount: AbortSpanBytes:}
+
+# Fill a table with consistency check results. This used to panic.
+# See: https://github.com/cockroachdb/cockroach/issues/88222
+statement ok
+CREATE TABLE conscheckresult AS (SELECT * FROM crdb_internal.check_consistency(false, '', ''));
+
+subtest end

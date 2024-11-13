@@ -13,12 +13,11 @@ package batcheval
 import (
 	"bytes"
 	"context"
-	"fmt"
-	"math"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
@@ -33,18 +32,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.EndTxn, declareKeysEndTxn, EndTxn)
+	RegisterReadWriteCommand(kvpb.EndTxn, declareKeysEndTxn, EndTxn)
 }
 
 // declareKeysWriteTransaction is the shared portion of
 // declareKeys{End,Heartbeat}Transaction.
 func declareKeysWriteTransaction(
-	_ ImmutableRangeState, header *roachpb.Header, req roachpb.Request, latchSpans *spanset.SpanSet,
+	_ ImmutableRangeState, header *kvpb.Header, req kvpb.Request, latchSpans *spanset.SpanSet,
 ) {
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
@@ -56,12 +57,12 @@ func declareKeysWriteTransaction(
 
 func declareKeysEndTxn(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
-	req roachpb.Request,
+	header *kvpb.Header,
+	req kvpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
-	et := req.(*roachpb.EndTxnRequest)
+	et := req.(*kvpb.EndTxnRequest)
 	declareKeysWriteTransaction(rs, header, req, latchSpans)
 	var minTxnTS hlc.Timestamp
 	if header.Txn != nil {
@@ -211,12 +212,12 @@ func declareKeysEndTxn(
 // TODO(nvanbenschoten): rename this file to cmd_end_txn.go once some of andrei's
 // recent PRs have landed.
 func EndTxn(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.EndTxnRequest)
+	args := cArgs.Args.(*kvpb.EndTxnRequest)
 	h := cArgs.Header
 	ms := cArgs.Stats
-	reply := resp.(*roachpb.EndTxnResponse)
+	reply := resp.(*kvpb.EndTxnResponse)
 
 	if err := VerifyTransaction(h, args, roachpb.PENDING, roachpb.STAGING, roachpb.ABORTED); err != nil {
 		return result.Result{}, err
@@ -272,8 +273,8 @@ func EndTxn(
 			// meantime. The TransactionStatusError is going to be handled by the
 			// txnCommitter interceptor.
 			log.VEventf(ctx, 2, "transaction found to be already committed")
-			return result.Result{}, roachpb.NewTransactionStatusError(
-				roachpb.TransactionStatusError_REASON_TXN_COMMITTED,
+			return result.Result{}, kvpb.NewTransactionStatusError(
+				kvpb.TransactionStatusError_REASON_TXN_COMMITTED,
 				"already committed")
 
 		case roachpb.ABORTED:
@@ -307,7 +308,7 @@ func EndTxn(
 			// can go.
 			reply.Txn.LockSpans = args.LockSpans
 			return result.FromEndTxn(reply.Txn, true /* alwaysReturn */, args.Poison),
-				roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_ABORTED_RECORD_FOUND)
+				kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_ABORTED_RECORD_FOUND)
 
 		case roachpb.PENDING:
 			if h.Txn.Epoch < reply.Txn.Epoch {
@@ -338,8 +339,29 @@ func EndTxn(
 
 	// Attempt to commit or abort the transaction per the args.Commit parameter.
 	if args.Commit {
+		// Bump the transaction's provisional commit timestamp to account for any
+		// transaction pushes, if necessary. See the state machine diagram in
+		// Replica.CanCreateTxnRecord for details.
+		switch {
+		case !recordAlreadyExisted, existingTxn.Status == roachpb.PENDING:
+			BumpToMinTxnCommitTS(ctx, cArgs.EvalCtx, reply.Txn)
+		case existingTxn.Status == roachpb.STAGING:
+			// Don't check timestamp cache. The transaction could not have been pushed
+			// while its record was in the STAGING state so checking is unnecessary.
+			// Furthermore, checking the timestamp cache and increasing the commit
+			// timestamp at this point would be incorrect, because the transaction may
+			// have entered the implicit commit state.
+		default:
+			panic("unreachable")
+		}
+
+		// Determine whether the transaction's commit is successful or should
+		// trigger a retry error.
+		// NOTE: if the transaction is in the implicit commit state and this EndTxn
+		// request is marking the commit as explicit, this check must succeed. We
+		// assert this in txnCommitter.makeTxnCommitExplicitAsync.
 		if retry, reason, extraMsg := IsEndTxnTriggeringRetryError(reply.Txn, args); retry {
-			return result.Result{}, roachpb.NewTransactionRetryError(reason, extraMsg)
+			return result.Result{}, kvpb.NewTransactionRetryError(reason, extraMsg)
 		}
 
 		// If the transaction needs to be staged as part of an implicit commit
@@ -395,7 +417,7 @@ func EndTxn(
 		// committed. Doing so is only possible if we can guarantee that under no
 		// circumstances can an implicitly committed transaction be rolled back.
 		if reply.Txn.Status == roachpb.STAGING {
-			err := roachpb.NewIndeterminateCommitError(*reply.Txn)
+			err := kvpb.NewIndeterminateCommitError(*reply.Txn)
 			log.VEventf(ctx, 1, "%v", err)
 			return result.Result{}, err
 		}
@@ -445,7 +467,7 @@ func EndTxn(
 	txnResult.Local.UpdatedTxns = []*roachpb.Transaction{reply.Txn}
 	txnResult.Local.ResolvedLocks = resolvedLocks
 
-	// Run the rest of the commit triggers if successfully committed.
+	// Run the commit triggers if successfully committed.
 	if reply.Txn.Status == roachpb.COMMITTED {
 		triggerResult, err := RunCommitTrigger(
 			ctx, cArgs.EvalCtx, readWriter.(storage.Batch), ms, args, reply.Txn,
@@ -472,12 +494,12 @@ func IsEndTxnExceedingDeadline(commitTS hlc.Timestamp, deadline hlc.Timestamp) b
 // committed and needs to return a TransactionRetryError. It also returns the
 // reason and possibly an extra message to be used for the error.
 func IsEndTxnTriggeringRetryError(
-	txn *roachpb.Transaction, args *roachpb.EndTxnRequest,
-) (retry bool, reason roachpb.TransactionRetryReason, extraMsg string) {
+	txn *roachpb.Transaction, args *kvpb.EndTxnRequest,
+) (retry bool, reason kvpb.TransactionRetryReason, extraMsg redact.RedactableString) {
 	// If we saw any WriteTooOldErrors, we must restart to avoid lost
 	// update anomalies.
 	if txn.WriteTooOld {
-		retry, reason = true, roachpb.RETRY_WRITE_TOO_OLD
+		retry, reason = true, kvpb.RETRY_WRITE_TOO_OLD
 	} else {
 		readTimestamp := txn.ReadTimestamp
 		isTxnPushed := txn.WriteTimestamp != readTimestamp
@@ -485,22 +507,23 @@ func IsEndTxnTriggeringRetryError(
 		// Return a transaction retry error if the commit timestamp isn't equal to
 		// the txn timestamp.
 		if isTxnPushed {
-			retry, reason = true, roachpb.RETRY_SERIALIZABLE
+			retry, reason = true, kvpb.RETRY_SERIALIZABLE
 		}
 	}
 
 	// A transaction must obey its deadline, if set.
 	if !retry && IsEndTxnExceedingDeadline(txn.WriteTimestamp, args.Deadline) {
 		exceededBy := txn.WriteTimestamp.GoTime().Sub(args.Deadline.GoTime())
-		extraMsg = fmt.Sprintf(
+		extraMsg = redact.Sprintf(
 			"txn timestamp pushed too much; deadline exceeded by %s (%s > %s)",
 			exceededBy, txn.WriteTimestamp, args.Deadline)
-		retry, reason = true, roachpb.RETRY_COMMIT_DEADLINE_EXCEEDED
+		retry, reason = true, kvpb.RETRY_COMMIT_DEADLINE_EXCEEDED
 	}
 	return retry, reason, extraMsg
 }
 
 const lockResolutionBatchSize = 500
+const lockResolutionBatchByteSize = 4 << 20 // 4 MB.
 
 // resolveLocalLocks synchronously resolves any locks that are local to this
 // range in the same batch and returns those lock spans. The remainder are
@@ -514,9 +537,34 @@ func resolveLocalLocks(
 	desc *roachpb.RangeDescriptor,
 	readWriter storage.ReadWriter,
 	ms *enginepb.MVCCStats,
-	args *roachpb.EndTxnRequest,
+	args *kvpb.EndTxnRequest,
 	txn *roachpb.Transaction,
 	evalCtx EvalContext,
+) (resolvedLocks []roachpb.LockUpdate, externalLocks []roachpb.Span, _ error) {
+	var resolveAllowance int64 = lockResolutionBatchSize
+	var targetBytes int64 = lockResolutionBatchByteSize
+	if args.InternalCommitTrigger != nil {
+		// If this is a system transaction (such as a split or merge), don't
+		// enforce the resolve allowance. These transactions rely on having
+		// their locks resolved synchronously.
+		resolveAllowance = 0
+		targetBytes = 0
+	}
+	return resolveLocalLocksWithPagination(ctx, desc, readWriter, ms, args, txn, evalCtx, resolveAllowance, targetBytes)
+}
+
+// resolveLocalLocksWithPagination is resolveLocalLocks but with a max key and
+// target bytes limit.
+func resolveLocalLocksWithPagination(
+	ctx context.Context,
+	desc *roachpb.RangeDescriptor,
+	readWriter storage.ReadWriter,
+	ms *enginepb.MVCCStats,
+	args *kvpb.EndTxnRequest,
+	txn *roachpb.Transaction,
+	evalCtx EvalContext,
+	maxKeys int64,
+	targetBytes int64,
 ) (resolvedLocks []roachpb.LockUpdate, externalLocks []roachpb.Span, _ error) {
 	if mergeTrigger := args.InternalCommitTrigger.GetMergeTrigger(); mergeTrigger != nil {
 		// If this is a merge, then use the post-merge descriptor to determine
@@ -525,94 +573,100 @@ func resolveLocalLocks(
 		desc = &mergeTrigger.LeftDesc
 	}
 
-	var resolveAllowance int64 = lockResolutionBatchSize
-	if args.InternalCommitTrigger != nil {
-		// If this is a system transaction (such as a split or merge), don't enforce the resolve allowance.
-		// These transactions rely on having their locks resolved synchronously.
-		resolveAllowance = math.MaxInt64
-	}
-
-	for _, span := range args.LockSpans {
-		if err := func() error {
-			if resolveAllowance == 0 {
+	remainingLockSpans := args.LockSpans
+	f := func(maxKeys, targetBytes int64) (numKeys int64, numBytes int64, resumeReason kvpb.ResumeReason, err error) {
+		if len(remainingLockSpans) == 0 {
+			return 0, 0, 0, iterutil.StopIteration()
+		}
+		span := remainingLockSpans[0]
+		remainingLockSpans = remainingLockSpans[1:]
+		update := roachpb.MakeLockUpdate(txn, span)
+		if len(span.EndKey) == 0 {
+			// For single-key lock updates, do a KeyAddress-aware check of
+			// whether it's contained in our Range.
+			if !kvserverbase.ContainsKey(desc, span.Key) {
 				externalLocks = append(externalLocks, span)
-				return nil
+				return 0, 0, 0, nil
 			}
-			update := roachpb.MakeLockUpdate(txn, span)
-			if len(span.EndKey) == 0 {
-				// For single-key lock updates, do a KeyAddress-aware check of
-				// whether it's contained in our Range.
-				if !kvserverbase.ContainsKey(desc, span.Key) {
-					externalLocks = append(externalLocks, span)
-					return nil
-				}
-				// It may be tempting to reuse an iterator here, but this call
-				// can create the iterator with Prefix:true which is much faster
-				// than seeking -- especially for intents that are missing, e.g.
-				// due to async intent resolution. See:
-				// https://github.com/cockroachdb/cockroach/issues/64092
-				//
-				// Note that the underlying pebbleIterator will still be reused
-				// since readWriter is a pebbleBatch in the typical case.
-				ok, err := storage.MVCCResolveWriteIntent(ctx, readWriter, ms, update)
-				if err != nil {
-					return err
-				}
-				if ok {
-					resolveAllowance--
-				}
+			// It may be tempting to reuse an iterator here, but this call
+			// can create the iterator with Prefix:true which is much faster
+			// than seeking -- especially for intents that are missing, e.g.
+			// due to async intent resolution. See:
+			// https://github.com/cockroachdb/cockroach/issues/64092
+			//
+			// Note that the underlying pebbleIterator will still be reused
+			// since readWriter is a pebbleBatch in the typical case.
+			ok, numBytes, resumeSpan, err := storage.MVCCResolveWriteIntent(ctx, readWriter, ms, update,
+				storage.MVCCResolveWriteIntentOptions{TargetBytes: targetBytes})
+			if err != nil {
+				return 0, 0, 0, errors.Wrapf(err, "resolving write intent at %s on end transaction [%s]", span, txn.Status)
+			}
+			if ok {
+				numKeys = 1
+			}
+			if resumeSpan != nil {
+				externalLocks = append(externalLocks, *resumeSpan)
+				resumeReason = kvpb.RESUME_BYTE_LIMIT
+			} else {
+				// !ok && resumeSpan == nil is a valid condition that means
+				// that no intent was found.
 				resolvedLocks = append(resolvedLocks, update)
 				// If requested, replace point tombstones with range tombstones.
 				if ok && evalCtx.EvalKnobs().UseRangeTombstonesForPointDeletes {
 					if err := storage.ReplacePointTombstonesWithRangeTombstones(
 						ctx, spanset.DisableReadWriterAssertions(readWriter),
 						ms, update.Key, update.EndKey); err != nil {
-						return err
+						return 0, 0, 0, errors.Wrapf(err,
+							"replacing point tombstones with range tombstones for write intent at %s on end transaction [%s]",
+							span, txn.Status)
 					}
 				}
-				return nil
 			}
-			// For update ranges, cut into parts inside and outside our key
-			// range. Resolve locally inside, delegate the rest. In particular,
-			// an update range for range-local data is correctly considered local.
-			inSpan, outSpans := kvserverbase.IntersectSpan(span, desc)
-			externalLocks = append(externalLocks, outSpans...)
-			if inSpan != nil {
-				update.Span = *inSpan
-				num, resumeSpan, err := storage.MVCCResolveWriteIntentRange(
-					ctx, readWriter, ms, update, resolveAllowance)
-				if err != nil {
-					return err
-				}
-				if evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution != nil {
-					atomic.AddInt64(evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution, num)
-				}
-				resolveAllowance -= num
-				if resumeSpan != nil {
-					if resolveAllowance != 0 {
-						log.Fatalf(ctx, "expected resolve allowance to be exactly 0 resolving %s; got %d", update.Span, resolveAllowance)
-					}
-					update.EndKey = resumeSpan.Key
-					externalLocks = append(externalLocks, *resumeSpan)
-				}
-				resolvedLocks = append(resolvedLocks, update)
-				// If requested, replace point tombstones with range tombstones.
-				if evalCtx.EvalKnobs().UseRangeTombstonesForPointDeletes {
-					if err := storage.ReplacePointTombstonesWithRangeTombstones(
-						ctx, spanset.DisableReadWriterAssertions(readWriter),
-						ms, update.Key, update.EndKey); err != nil {
-						return err
-					}
-				}
-				return nil
-			}
-			return nil
-		}(); err != nil {
-			return nil, nil, errors.Wrapf(err, "resolving lock at %s on end transaction [%s]", span, txn.Status)
+			return numKeys, numBytes, resumeReason, nil
 		}
+		// For update ranges, cut into parts inside and outside our key
+		// range. Resolve locally inside, delegate the rest. In particular,
+		// an update range for range-local data is correctly considered local.
+		inSpan, outSpans := kvserverbase.IntersectSpan(span, desc)
+		externalLocks = append(externalLocks, outSpans...)
+		if inSpan != nil {
+			update.Span = *inSpan
+			numKeys, numBytes, resumeSpan, resumeReason, err := storage.MVCCResolveWriteIntentRange(ctx, readWriter, ms, update,
+				storage.MVCCResolveWriteIntentRangeOptions{MaxKeys: maxKeys, TargetBytes: targetBytes})
+			if err != nil {
+				return 0, 0, 0, errors.Wrapf(err, "resolving write intent range at %s on end transaction [%s]", span, txn.Status)
+			}
+			if evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution != nil {
+				atomic.AddInt64(evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution, numKeys)
+			}
+			if resumeSpan != nil {
+				update.EndKey = resumeSpan.Key
+				externalLocks = append(externalLocks, *resumeSpan)
+			}
+			resolvedLocks = append(resolvedLocks, update)
+			// If requested, replace point tombstones with range tombstones.
+			if evalCtx.EvalKnobs().UseRangeTombstonesForPointDeletes {
+				if err := storage.ReplacePointTombstonesWithRangeTombstones(
+					ctx, spanset.DisableReadWriterAssertions(readWriter),
+					ms, update.Key, update.EndKey); err != nil {
+					return 0, 0, 0, errors.Wrapf(err,
+						"replacing point tombstones with range tombstones for write intent range at %s on end transaction [%s]",
+						span, txn.Status)
+				}
+			}
+			return numKeys, numBytes, resumeReason, nil
+		}
+		return 0, 0, 0, nil
 	}
 
-	removedAny := resolveAllowance != lockResolutionBatchSize
+	numKeys, _, _, err := storage.MVCCPaginate(ctx, maxKeys, targetBytes, false /* allowEmpty */, f)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	externalLocks = append(externalLocks, remainingLockSpans...)
+
+	removedAny := numKeys > 0
 	if WriteAbortSpanOnResolve(txn.Status, args.Poison, removedAny) {
 		if err := UpdateAbortSpan(ctx, evalCtx, readWriter, ms, txn.TxnMeta, args.Poison); err != nil {
 			return nil, nil, err
@@ -630,7 +684,7 @@ func updateStagingTxn(
 	readWriter storage.ReadWriter,
 	ms *enginepb.MVCCStats,
 	key []byte,
-	args *roachpb.EndTxnRequest,
+	args *kvpb.EndTxnRequest,
 	txn *roachpb.Transaction,
 ) error {
 	txn.LockSpans = args.LockSpans
@@ -648,7 +702,7 @@ func updateFinalizedTxn(
 	readWriter storage.ReadWriter,
 	ms *enginepb.MVCCStats,
 	key []byte,
-	args *roachpb.EndTxnRequest,
+	args *kvpb.EndTxnRequest,
 	txn *roachpb.Transaction,
 	recordAlreadyExisted bool,
 	externalLocks []roachpb.Span,
@@ -678,7 +732,7 @@ func RunCommitTrigger(
 	rec EvalContext,
 	batch storage.Batch,
 	ms *enginepb.MVCCStats,
-	args *roachpb.EndTxnRequest,
+	args *kvpb.EndTxnRequest,
 	txn *roachpb.Transaction,
 ) (result.Result, error) {
 	ct := args.InternalCommitTrigger
@@ -707,7 +761,7 @@ func RunCommitTrigger(
 			ctx, rec, batch, *ms, ct.SplitTrigger, txn.WriteTimestamp,
 		)
 		if err != nil {
-			return result.Result{}, roachpb.NewReplicaCorruptionError(err)
+			return result.Result{}, kvpb.NewReplicaCorruptionError(err)
 		}
 		*ms = newMS
 		return res, nil
@@ -715,7 +769,7 @@ func RunCommitTrigger(
 	if mt := ct.GetMergeTrigger(); mt != nil {
 		res, err := mergeTrigger(ctx, rec, batch, ms, mt, txn.WriteTimestamp)
 		if err != nil {
-			return result.Result{}, roachpb.NewReplicaCorruptionError(err)
+			return result.Result{}, kvpb.NewReplicaCorruptionError(err)
 		}
 		return res, nil
 	}
@@ -947,7 +1001,10 @@ func splitTrigger(
 	// TODO(nvanbenschoten): this is a simple heuristic. If we had a cheap way to
 	// determine the relative sizes of the LHS and RHS, we could be more
 	// sophisticated here and always choose to scan the cheaper side.
-	emptyRHS, err := isGlobalKeyspaceEmpty(batch, &split.RightDesc)
+	emptyRHS, err := storage.MVCCIsSpanEmpty(ctx, batch, storage.MVCCIsSpanEmptyOptions{
+		StartKey: split.RightDesc.StartKey.AsRawKey(),
+		EndKey:   split.RightDesc.EndKey.AsRawKey(),
+	})
 	if err != nil {
 		return enginepb.MVCCStats{}, result.Result{}, errors.Wrapf(err,
 			"unable to determine whether right hand side of split is empty")
@@ -977,21 +1034,6 @@ func splitTrigger(
 // LHS ranges. However, to improve test coverage, we use a metamorphic value.
 var splitScansRightForStatsFirst = util.ConstantWithMetamorphicTestBool(
 	"split-scans-right-for-stats-first", false)
-
-// isGlobalKeyspaceEmpty returns whether the global keyspace of the provided
-// range is entirely empty. The function returns false if the global keyspace
-// contains at least one key.
-func isGlobalKeyspaceEmpty(reader storage.Reader, d *roachpb.RangeDescriptor) (bool, error) {
-	span := d.KeySpan().AsRawSpanWithNoLocals()
-	iter := reader.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{UpperBound: span.EndKey})
-	defer iter.Close()
-	iter.SeekGE(storage.MakeMVCCMetadataKey(span.Key))
-	ok, err := iter.Valid()
-	if err != nil {
-		return false, err
-	}
-	return !ok /* empty */, nil
-}
 
 // makeScanStatsFn constructs a splitStatsScanFn for the provided post-split
 // range descriptor which computes the range's statistics.
@@ -1110,12 +1152,9 @@ func splitTriggerHelper(
 		if gcThreshold.IsEmpty() {
 			log.VEventf(ctx, 1, "LHS's GCThreshold of split is not set")
 		}
-		gcHint := &roachpb.GCHint{}
-		if split.WriteGCHint {
-			gcHint, err = sl.LoadGCHint(ctx, batch)
-			if err != nil {
-				return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load GCHint")
-			}
+		gcHint, err := sl.LoadGCHint(ctx, batch)
+		if err != nil {
+			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load GCHint")
 		}
 
 		// Writing the initial state is subtle since this also seeds the Raft
@@ -1151,24 +1190,9 @@ func splitTriggerHelper(
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load replica version")
 		}
-		// The RHS should populate RaftAppliedIndexTerm if the LHS is doing so.
-		// Alternatively, we could be more aggressive and also look at the cluster
-		// version, but this is simpler -- if the keyspace occupied by the
-		// original unsplit range has not been migrated yet, by an ongoing
-		// migration, both LHS and RHS will be migrated later.
-		rangeAppliedState, err := sl.LoadRangeAppliedState(ctx, batch)
-		if err != nil {
-			return enginepb.MVCCStats{}, result.Result{},
-				errors.Wrap(err, "unable to load range applied state")
-		}
-		writeRaftAppliedIndexTerm := false
-		if rangeAppliedState.RaftAppliedIndexTerm > 0 {
-			writeRaftAppliedIndexTerm = true
-		}
 		*h.AbsPostSplitRight(), err = stateloader.WriteInitialReplicaState(
 			ctx, batch, *h.AbsPostSplitRight(), split.RightDesc, rightLease,
-			*gcThreshold, *gcHint, replicaVersion, writeRaftAppliedIndexTerm,
-			split.WriteGCHint,
+			*gcThreshold, *gcHint, replicaVersion,
 		)
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to write initial Replica state")
@@ -1286,8 +1310,8 @@ func mergeTrigger(
 		if err != nil {
 			return result.Result{}, err
 		}
-		if lhsHint.Merge(rhsHint) {
-			updated, err := lhsLoader.SetGCHint(ctx, batch, ms, lhsHint, merge.WriteGCHint)
+		if lhsHint.Merge(rhsHint, rec.GetMVCCStats().HasNoUserData(), merge.RightMVCCStats.HasNoUserData()) {
+			updated, err := lhsLoader.SetGCHint(ctx, batch, ms, lhsHint)
 			if err != nil {
 				return result.Result{}, err
 			}

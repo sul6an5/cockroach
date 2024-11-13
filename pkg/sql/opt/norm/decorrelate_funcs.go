@@ -66,6 +66,20 @@ func (c *CustomFuncs) deriveHasHoistableSubquery(scalar opt.ScalarExpr) bool {
 	case *memo.UDFExpr:
 		// Do not attempt to hoist UDFs.
 		return false
+
+	case *memo.EqExpr:
+		// Hoist subqueries in expressions like (Eq (Variable) (Subquery)) if
+		// the corresponding session setting is enabled.
+		// TODO(mgartner): We could hoist if we have an IS NOT DISTINCT FROM
+		// expression. But it won't currently lead to a lookup join due to
+		// #100855 and the plan could be worse, so we avoid it for now.
+		if c.f.evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries {
+			_, isLeftVar := scalar.Child(0).(*memo.VariableExpr)
+			_, isRightSubquery := scalar.Child(1).(*memo.SubqueryExpr)
+			if isLeftVar && isRightSubquery {
+				return true
+			}
+		}
 	}
 
 	// If HasHoistableSubquery is true for any child, then it's true for this
@@ -92,6 +106,17 @@ func (c *CustomFuncs) deriveHasHoistableSubquery(scalar opt.ScalarExpr) bool {
 				if child == t.OrElse {
 					memo.BuildSharedProps(child, &sharedProps, c.f.evalCtx)
 					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakproof()
+				}
+
+			case *memo.CoalesceExpr:
+				// The first argument does not need to be leakproof because it
+				// is always evaluated.
+				for j := 1; j < len(t.Args); j++ {
+					memo.BuildSharedProps(t.Args[j], &sharedProps, c.f.evalCtx)
+					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakproof()
+					if !hasHoistableSubquery {
+						break
+					}
 				}
 
 			case *memo.WhenExpr:
@@ -796,7 +821,14 @@ func (r *subqueryHoister) hoistAll(scalar opt.ScalarExpr) opt.ScalarExpr {
 	switch scalar.Op() {
 	case opt.SubqueryOp, opt.ExistsOp, opt.AnyOp, opt.ArrayFlattenOp:
 		subquery := scalar.Child(0).(memo.RelExpr)
-		if subquery.Relational().OuterCols.Empty() {
+		// According to the implementation of deriveHasHoistableSubquery,
+		// Exists, Any, and ArrayFlatten expressions are only hoistable if they
+		// are correlated. Uncorrelated subquery expressions are hoistable if
+		// the corresponding session setting is enabled and they are part of an
+		// equality expression with a variable.
+		uncorrelatedHoistAllowed := scalar.Op() == opt.SubqueryOp &&
+			r.f.evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries
+		if subquery.Relational().OuterCols.Empty() && !uncorrelatedHoistAllowed {
 			break
 		}
 
@@ -905,7 +937,25 @@ func (r *subqueryHoister) constructGroupByExists(subquery memo.RelExpr) memo.Rel
 	)
 }
 
-// constructGroupByAny transforms a scalar Any expression like this:
+// constructGroupByAny transforms a scalar Any expression into a scalar GroupBy
+// expression that returns a one row, one column relation. See
+// CustomFuncs.ConstructGroupByAny for more details.
+func (r *subqueryHoister) constructGroupByAny(
+	scalar opt.ScalarExpr, cmp opt.Operator, input memo.RelExpr,
+) memo.RelExpr {
+	// When the scalar value is not a simple variable or constant expression,
+	// then cache its value using a projection, since it will be referenced
+	// multiple times.
+	if scalar.Op() != opt.VariableOp && !opt.IsConstValueOp(scalar) {
+		typ := scalar.DataType()
+		scalarColID := r.f.Metadata().AddColumn("scalar", typ)
+		r.hoisted = r.c.ProjectExtraCol(r.hoisted, scalar, scalarColID)
+		scalar = r.f.ConstructVariable(scalarColID)
+	}
+	return r.c.ConstructGroupByAny(scalar, cmp, input)
+}
+
+// ConstructGroupByAny transforms a scalar Any expression like this:
 //
 //	z = ANY(SELECT x FROM xy)
 //
@@ -979,71 +1029,258 @@ func (r *subqueryHoister) constructGroupByExists(subquery memo.RelExpr) memo.Rel
 // TryDecorrelateScalarGroupBy rule, which will push a left join into the
 // GroupBy. Null values produced by the left join will simply be ignored by
 // BOOL_OR, and so cannot be used for any other purpose.
-func (r *subqueryHoister) constructGroupByAny(
+func (c *CustomFuncs) ConstructGroupByAny(
 	scalar opt.ScalarExpr, cmp opt.Operator, input memo.RelExpr,
 ) memo.RelExpr {
-	// When the scalar value is not a simple variable or constant expression,
-	// then cache its value using a projection, since it will be referenced
-	// multiple times.
-	if scalar.Op() != opt.VariableOp && !opt.IsConstValueOp(scalar) {
-		typ := scalar.DataType()
-		scalarColID := r.f.Metadata().AddColumn("scalar", typ)
-		r.hoisted = r.c.ProjectExtraCol(r.hoisted, scalar, scalarColID)
-		scalar = r.f.ConstructVariable(scalarColID)
+	inputVar := c.f.funcs.referenceSingleColumn(input)
+	notNullColID := c.f.Metadata().AddColumn("notnull", types.Bool)
+	aggColID := c.f.Metadata().AddColumn("bool_or", types.Bool)
+	aggVar := c.f.ConstructVariable(aggColID)
+	caseColID := c.f.Metadata().AddColumn("case", types.Bool)
+
+	var scalarNotNull opt.ScalarExpr
+	if scalar.DataType().Family() == types.TupleFamily {
+		scalarNotNull = c.f.ConstructIsTupleNotNull(scalar)
+	} else {
+		scalarNotNull = c.f.ConstructIsNot(scalar, memo.NullSingleton)
 	}
 
-	inputVar := r.f.funcs.referenceSingleColumn(input)
-	notNullColID := r.f.Metadata().AddColumn("notnull", types.Bool)
-	aggColID := r.f.Metadata().AddColumn("bool_or", types.Bool)
-	aggVar := r.f.ConstructVariable(aggColID)
-	caseColID := r.f.Metadata().AddColumn("case", types.Bool)
+	var inputNotNull opt.ScalarExpr
+	if inputVar.DataType().Family() == types.TupleFamily {
+		inputNotNull = c.f.ConstructIsTupleNotNull(inputVar)
+	} else {
+		inputNotNull = c.f.ConstructIsNot(inputVar, memo.NullSingleton)
+	}
 
-	return r.f.ConstructProject(
-		r.f.ConstructScalarGroupBy(
-			r.f.ConstructProject(
-				r.f.ConstructSelect(
+	return c.f.ConstructProject(
+		c.f.ConstructScalarGroupBy(
+			c.f.ConstructProject(
+				c.f.ConstructSelect(
 					input,
-					memo.FiltersExpr{r.f.ConstructFiltersItem(
-						r.f.ConstructIsNot(
-							r.f.funcs.ConstructBinary(cmp, scalar, inputVar),
+					memo.FiltersExpr{c.f.ConstructFiltersItem(
+						c.f.ConstructIsNot(
+							c.f.funcs.ConstructBinary(cmp, scalar, inputVar),
 							memo.FalseSingleton,
 						),
 					)},
 				),
-				memo.ProjectionsExpr{r.f.ConstructProjectionsItem(
-					r.f.ConstructIsNot(inputVar, memo.NullSingleton),
+				memo.ProjectionsExpr{c.f.ConstructProjectionsItem(
+					inputNotNull,
 					notNullColID,
 				)},
 				opt.ColSet{},
 			),
-			memo.AggregationsExpr{r.f.ConstructAggregationsItem(
-				r.f.ConstructBoolOr(
-					r.f.ConstructVariable(notNullColID),
+			memo.AggregationsExpr{c.f.ConstructAggregationsItem(
+				c.f.ConstructBoolOr(
+					c.f.ConstructVariable(notNullColID),
 				),
 				aggColID,
 			)},
 			memo.EmptyGroupingPrivate,
 		),
-		memo.ProjectionsExpr{r.f.ConstructProjectionsItem(
-			r.f.ConstructCase(
-				r.f.ConstructTrue(),
+		memo.ProjectionsExpr{c.f.ConstructProjectionsItem(
+			c.f.ConstructCase(
+				c.f.ConstructTrue(),
 				memo.ScalarListExpr{
-					r.f.ConstructWhen(
-						r.f.ConstructAnd(
+					c.f.ConstructWhen(
+						c.f.ConstructAnd(
 							aggVar,
-							r.f.ConstructIsNot(scalar, memo.NullSingleton),
+							scalarNotNull,
 						),
-						r.f.ConstructTrue(),
+						c.f.ConstructTrue(),
 					),
-					r.f.ConstructWhen(
-						r.f.ConstructIs(aggVar, memo.NullSingleton),
-						r.f.ConstructFalse(),
+					c.f.ConstructWhen(
+						c.f.ConstructIs(aggVar, memo.NullSingleton),
+						c.f.ConstructFalse(),
 					),
 				},
-				r.f.ConstructNull(types.Bool),
+				c.f.ConstructNull(types.Bool),
 			),
 			caseColID,
 		)},
 		opt.ColSet{},
 	)
+}
+
+// CanMaybeRemapOuterCols performs a best-effort check to minimize the cases
+// where TryRemapOuterCols is called unnecessarily.
+func (c *CustomFuncs) CanMaybeRemapOuterCols(input memo.RelExpr, filters memo.FiltersExpr) bool {
+	// The usages of ComputeEquivClosureNoCopy are ok because of the copy below.
+	outerCols := input.Relational().OuterCols.Copy()
+	equivGroup := input.Relational().FuncDeps.ComputeEquivClosureNoCopy(outerCols)
+	for i := range filters {
+		if equivGroup.Intersects(input.Relational().OutputCols) {
+			return true
+		}
+		equivGroup = filters[i].ScalarProps().FuncDeps.ComputeEquivClosureNoCopy(equivGroup)
+	}
+	return equivGroup.Intersects(input.Relational().OutputCols)
+}
+
+// TryRemapOuterCols attempts to replace outer column references in the given
+// expression with equivalent non-outer columns using equalities from the given
+// filters. It accomplishes this by traversing the operator tree for each outer
+// column with the set of equivalent non-outer columns, wherever it would be
+// valid to push down a filter on those non-outer columns. If a reference to the
+// outer column is discovered during this traversal, it is valid to replace it
+// with one of the non-outer columns in the set.
+func (c *CustomFuncs) TryRemapOuterCols(
+	expr memo.RelExpr, filters memo.FiltersExpr,
+) (remapped memo.RelExpr, wasRemapped bool) {
+	outerCols := expr.Relational().OuterCols
+	remapped = expr
+	for col, ok := outerCols.Next(0); ok; col, ok = outerCols.Next(col + 1) {
+		// substituteCols is the set of input columns for which it may be possible to
+		// push a filter constraining the column to be equal to an outer column.
+		// Doing so would allow the column to be substituted for the outer column.
+		substituteCols := expr.Relational().FuncDeps.ComputeEquivGroup(col)
+		for i := range filters {
+			// ComputeEquivClosureNoCopy is ok here because ComputeEquivGroup builds
+			// a new ColSet.
+			substituteCols = filters[i].ScalarProps().FuncDeps.ComputeEquivClosureNoCopy(substituteCols)
+		}
+		substituteCols.DifferenceWith(outerCols)
+		remapped = c.tryRemapOuterCols(remapped, col, substituteCols).(memo.RelExpr)
+	}
+	wasRemapped = remapped != expr
+	return remapped, wasRemapped
+}
+
+// tryRemapOuterCols handles the traversal and outer-column replacement for
+// TryRemapOuterCols. It returns the replacement expression and whether an
+// outer-column reference was successfully remapped.
+func (c *CustomFuncs) tryRemapOuterCols(
+	expr opt.Expr, outerCol opt.ColumnID, substituteCols opt.ColSet,
+) opt.Expr {
+	if substituteCols.Empty() {
+		// It is not possible to remap any references to the current outer
+		// column within this expression.
+		return expr
+	}
+	switch t := expr.(type) {
+	case *memo.VariableExpr:
+		if t.Col == outerCol {
+			if replaceCol, ok := substituteCols.Next(0); ok {
+				// This outer-column reference can be remapped.
+				return c.f.ConstructVariable(replaceCol)
+			}
+		}
+	case memo.RelExpr:
+		if !t.Relational().OuterCols.Contains(outerCol) {
+			// This expression does not reference the current outer column.
+			return t
+		}
+		// Modifications to substituteCols may be necessary in order to allow
+		// outer-column remapping within (the children of) a RelExpr. Note that
+		// getSubstituteColsRelExpr copies substituteCols before modifying it, so
+		// different branches of the traversal don't interact with the same ColSet.
+		substituteCols = c.getSubstituteColsRelExpr(t, substituteCols)
+	case opt.ScalarExpr:
+		// Any substitute columns that reach a ScalarExpr are valid candidates
+		// for outer-column replacement. No changes to substituteCols required.
+	}
+	replaceFn := func(e opt.Expr) opt.Expr {
+		return c.tryRemapOuterCols(e, outerCol, substituteCols)
+	}
+	return c.f.Replace(expr, replaceFn)
+}
+
+// getSubstituteColsRelExpr modifies the given set of substitute columns to
+// reflect the set of columns for which an equality with an outer column could
+// be pushed through the given expression. The logic of getSubstituteColsRelExpr
+// mirrors that of the filter push-down rules in select.opt and join.opt.
+// TODO(drewk): null-rejection has to push down a 'col IS NOT NULL' filter -
+// we should be able to share logic. Doing so would remove the issue of rule
+// cycles. Any other rules that reuse this logic should reconsider the
+// simplification made in getSubstituteColsSetOp.
+//
+// getSubstituteColsRelExpr copies substituteCols before performing any
+// modifications, so the original ColSet is not mutated.
+func (c *CustomFuncs) getSubstituteColsRelExpr(
+	expr memo.RelExpr, substituteCols opt.ColSet,
+) opt.ColSet {
+	// Remove any columns that are not in the output of this expression.
+	// Non-output columns can be in substituteCols after a recursive call
+	// into the input of an expression that either has multiple relational
+	// inputs (e.g. Joins) or can synthesize columns (e.g. Projects).
+	//
+	// Note that substituteCols is copied here, so subsequent mutations can be
+	// performed in place.
+	substituteCols = substituteCols.Intersection(expr.Relational().OutputCols)
+
+	// Depending on the expression, further modifications to substituteCols
+	// may be necessary.
+	switch t := expr.(type) {
+	case *memo.SelectExpr:
+		// [MergeSelects]
+		// No restrictions on push-down for the cols in substituteCols.
+	case *memo.ProjectExpr, *memo.ProjectSetExpr:
+		// [PushSelectIntoProject]
+		// [PushSelectIntoProjectSet]
+		// Filter push-down candidates can only reference input columns.
+		inputCols := t.Child(0).(memo.RelExpr).Relational().OutputCols
+		substituteCols.IntersectionWith(inputCols)
+	case *memo.InnerJoinExpr, *memo.InnerJoinApplyExpr:
+		// [MergeSelectInnerJoin]
+		// [PushFilterIntoJoinLeft]
+		// [PushFilterIntoJoinRight]
+		// No restrictions on push-down for the cols in substituteCols.
+	case *memo.LeftJoinExpr, *memo.LeftJoinApplyExpr, *memo.SemiJoinExpr,
+		*memo.SemiJoinApplyExpr, *memo.AntiJoinExpr, *memo.AntiJoinApplyExpr:
+		// [PushSelectIntoJoinLeft]
+		// [PushSelectCondLeftIntoJoinLeftAndRight]
+		substituteCols = getSubstituteColsLeftSemiAntiJoin(t, substituteCols)
+	case *memo.GroupByExpr, *memo.DistinctOnExpr:
+		// [PushSelectIntoGroupBy]
+		// Filters must refer only to grouping and ConstAgg columns.
+		private := t.Private().(*memo.GroupingPrivate)
+		aggs := t.Child(1).(*memo.AggregationsExpr)
+		substituteCols.IntersectionWith(c.GroupingAndConstCols(private, *aggs))
+	case *memo.UnionExpr, *memo.UnionAllExpr, *memo.IntersectExpr,
+		*memo.IntersectAllExpr, *memo.ExceptExpr, *memo.ExceptAllExpr:
+		// [PushFilterIntoSetOp]
+		substituteCols = getSubstituteColsSetOp(t, substituteCols)
+	default:
+		// Filter push-down through this expression is not supported.
+		substituteCols = opt.ColSet{}
+	}
+	return substituteCols
+}
+
+func getSubstituteColsLeftSemiAntiJoin(join memo.RelExpr, substituteCols opt.ColSet) opt.ColSet {
+	// It is always valid to push an equality between an outer and non-outer
+	// left column into the left input of a LeftJoin, SemiJoin, or AntiJoin. If
+	// one of the join filters constrains that left column to be equal to a right
+	// column, it is also possible to remap and push the equality into the right
+	// input. See the PushSelectCondLeftIntoJoinLeftAndRight rule for more info.
+	//
+	// We can satisfy these requirements by first restricting substituteCols
+	// to left input columns, then extending it with right input columns
+	// that are held equivalent by the join filters.
+	left := join.Child(0).(memo.RelExpr)
+	on := join.Child(2).(*memo.FiltersExpr)
+	substituteCols.IntersectionWith(left.Relational().OutputCols)
+	for i := range *on {
+		// The usage of ComputeEquivClosureNoCopy is ok because
+		// getSubstituteColsRelExpr copies the set.
+		substituteCols = (*on)[i].ScalarProps().FuncDeps.ComputeEquivClosureNoCopy(substituteCols)
+	}
+	return substituteCols
+}
+
+func getSubstituteColsSetOp(set memo.RelExpr, substituteCols opt.ColSet) opt.ColSet {
+	// Because TryRemapOuterCols is the equivalent of pushing down an
+	// equality filter between an input column and an outer column, we don't
+	// have to worry about composite sensitivity here (see CanMapOnSetOp).
+	// Map the output columns contained in substituteCols to the columns from
+	// both inputs.
+	var newSubstituteCols opt.ColSet
+	private := set.Private().(*memo.SetPrivate)
+	for i, outCol := range private.OutCols {
+		if substituteCols.Contains(outCol) {
+			newSubstituteCols.Add(private.LeftCols[i])
+			newSubstituteCols.Add(private.RightCols[i])
+		}
+	}
+	return newSubstituteCols
 }

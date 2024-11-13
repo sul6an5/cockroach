@@ -7,6 +7,30 @@ CREATE TABLE db.public.tbl (i INT PRIMARY KEY);
 +schema {104 0 public} -> 105
 +object {104 105 tbl} -> 106
 
+stage-exec phase=PostCommitPhase stage=:
+INSERT INTO db.public.tbl VALUES($stageKey);
+INSERT INTO db.public.tbl VALUES($stageKey + 1);
+----
+
+# Each insert will be injected twice per stage, so we should always,
+# see a count of 2.
+stage-query phase=PostCommitPhase stage=:
+SELECT count(*)=$successfulStageCount*2 FROM db.public.tbl;
+----
+true
+
+
+stage-exec phase=PostCommitNonRevertiblePhase stage=:
+INSERT INTO db.public.tbl VALUES($stageKey);
+INSERT INTO db.public.tbl VALUES($stageKey + 1);
+----
+
+# Each insert will be injected twice per stage, so we should always,
+# see a count of 2.
+stage-query phase=PostCommitNonRevertiblePhase stage=:
+SELECT count(*)=$successfulStageCount*2 FROM db.public.tbl;
+----
+true
 
 test
 ALTER TABLE db.public.tbl ADD COLUMN j INT
@@ -17,7 +41,15 @@ checking for feature: ALTER TABLE
 increment telemetry for sql.schema.alter_table
 increment telemetry for sql.schema.alter_table.add_column
 increment telemetry for sql.schema.new_column_type.int8
-## StatementPhase stage 1 of 1 with 5 MutationType ops
+write *eventpb.AlterTable to event log:
+  mutationId: 1
+  sql:
+    descriptorId: 106
+    statement: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8
+    tag: ALTER TABLE
+    user: root
+  tableName: db.public.tbl
+## StatementPhase stage 1 of 1 with 4 MutationType ops
 upsert descriptor #106
   ...
      - columnIds:
@@ -30,9 +62,7 @@ upsert descriptor #106
        name: primary
      formatVersion: 3
      id: 106
-  -  modificationTime:
-  -    wallTime: "1640995200000000000"
-  +  modificationTime: {}
+     modificationTime: {}
   +  mutations:
   +  - column:
   +      id: 2
@@ -65,10 +95,12 @@ upsert descriptor #106
      unexposedParentSchemaId: 105
   -  version: "1"
   +  version: "2"
-write *eventpb.AlterTable to event log: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8
 # end StatementPhase
 # begin PreCommitPhase
-## PreCommitPhase stage 1 of 1 with 2 MutationType ops
+## PreCommitPhase stage 1 of 2 with 1 MutationType op
+undo all catalog changes within txn #1
+persist all catalog changes to storage
+## PreCommitPhase stage 2 of 2 with 6 MutationType ops
 upsert descriptor #106
   ...
      createAsOfTime:
@@ -88,7 +120,49 @@ upsert descriptor #106
   +    targets: <redacted>
      families:
      - columnIds:
+       - 1
+  +    - 2
+       columnNames:
+       - i
+  +    - j
+  +    defaultColumnId: 2
+       name: primary
+     formatVersion: 3
+     id: 106
+     modificationTime: {}
+  +  mutations:
+  +  - column:
+  +      id: 2
+  +      name: j
+  +      nullable: true
+  +      pgAttributeNum: 2
+  +      type:
+  +        family: IntFamily
+  +        oid: 20
+  +        width: 64
+  +    direction: ADD
+  +    mutationId: 1
+  +    state: DELETE_ONLY
+     name: tbl
+  -  nextColumnId: 2
+  +  nextColumnId: 3
+     nextConstraintId: 2
+     nextFamilyId: 1
   ...
+       partitioning: {}
+       sharded: {}
+  +    storeColumnIds:
+  +    - 2
+  +    storeColumnNames:
+  +    - j
+       unique: true
+       version: 4
+  ...
+       time: {}
+     unexposedParentSchemaId: 105
+  -  version: "1"
+  +  version: "2"
+persist all catalog changes to storage
 create job #1 (non-cancelable: false): "ALTER TABLE db.public.tbl ADD COLUMN j INT8"
   descriptor IDs: [106]
 # end PreCommitPhase
@@ -98,21 +172,19 @@ notified job registry to adopt jobs: [1]
 begin transaction #2
 commit transaction #2
 begin transaction #3
-## PostCommitPhase stage 1 of 2 with 3 MutationType ops
+## PostCommitPhase stage 1 of 1 with 3 MutationType ops
 upsert descriptor #106
   ...
-     formatVersion: 3
-     id: 106
-  -  modificationTime:
-  -    wallTime: "1640995200000000001"
-  +  modificationTime: {}
-     mutations:
-     - column:
+           statement: ALTER TABLE db.public.tbl ADD COLUMN j INT8
+           statementTag: ALTER TABLE
+  -    revertible: true
+       targetRanks: <redacted>
+       targets: <redacted>
   ...
        direction: ADD
        mutationId: 1
   -    state: DELETE_ONLY
-  +    state: DELETE_AND_WRITE_ONLY
+  +    state: WRITE_ONLY
      name: tbl
      nextColumnId: 3
   ...
@@ -120,10 +192,12 @@ upsert descriptor #106
      unexposedParentSchemaId: 105
   -  version: "2"
   +  version: "3"
-update progress of schema change job #1: "PostCommitPhase stage 2 of 2 with 2 MutationType ops pending"
+persist all catalog changes to storage
+update progress of schema change job #1: "PostCommitNonRevertiblePhase stage 1 of 1 with 2 MutationType ops pending"
+set schema change job #1 to non-cancellable
 commit transaction #3
 begin transaction #4
-## PostCommitPhase stage 2 of 2 with 4 MutationType ops
+## PostCommitNonRevertiblePhase stage 1 of 1 with 4 MutationType ops
 upsert descriptor #106
   ...
          oid: 20
@@ -148,16 +222,13 @@ upsert descriptor #106
   -        redactedStatement: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8
   -        statement: ALTER TABLE db.public.tbl ADD COLUMN j INT8
   -        statementTag: ALTER TABLE
-  -    revertible: true
   -    targetRanks: <redacted>
   -    targets: <redacted>
      families:
      - columnIds:
   ...
-     formatVersion: 3
      id: 106
-  -  modificationTime:
-  -    wallTime: "1640995200000000003"
+     modificationTime: {}
   -  mutations:
   -  - column:
   -      id: 2
@@ -170,8 +241,7 @@ upsert descriptor #106
   -        width: 64
   -    direction: ADD
   -    mutationId: 1
-  -    state: DELETE_AND_WRITE_ONLY
-  +  modificationTime: {}
+  -    state: WRITE_ONLY
   +  mutations: []
      name: tbl
      nextColumnId: 3
@@ -180,9 +250,13 @@ upsert descriptor #106
      unexposedParentSchemaId: 105
   -  version: "3"
   +  version: "4"
-write *eventpb.FinishSchemaChange to event log
+persist all catalog changes to storage
 adding table for stats refresh: 106
 update progress of schema change job #1: "all stages completed"
 set schema change job #1 to non-cancellable
+updated schema change job #1 descriptor IDs to []
+write *eventpb.FinishSchemaChange to event log:
+  sc:
+    descriptorId: 106
 commit transaction #4
 # end PostCommitPhase

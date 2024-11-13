@@ -20,13 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable"
 )
 
 // SSTWriter writes SSTables.
 type SSTWriter struct {
 	fw *sstable.Writer
-	f  io.Writer
 	// DataSize tracks the total key and value bytes added so far.
 	DataSize int64
 	scratch  []byte
@@ -35,26 +35,29 @@ type SSTWriter struct {
 }
 
 var _ Writer = &SSTWriter{}
+var _ ExportWriter = &SSTWriter{}
 
-// writeCloseSyncer interface copied from pebble.sstable.
-type writeCloseSyncer interface {
-	io.WriteCloser
-	Sync() error
-}
-
-// noopSyncCloser is used to wrap io.Writers for sstable.Writer so that callers
-// can decide when to close/sync.
-type noopSyncCloser struct {
+// noopFinishAbort is used to wrap io.Writers for sstable.Writer.
+type noopFinishAbort struct {
 	io.Writer
 }
 
-func (noopSyncCloser) Sync() error {
+var _ objstorage.Writable = (*noopFinishAbort)(nil)
+
+// Write is part of the objstorage.Writable interface.
+func (n *noopFinishAbort) Write(p []byte) error {
+	// An io.Writer always returns an error if it can't write the entire slice.
+	_, err := n.Writer.Write(p)
+	return err
+}
+
+// Finish is part of the objstorage.Writable interface.
+func (*noopFinishAbort) Finish() error {
 	return nil
 }
 
-func (noopSyncCloser) Close() error {
-	return nil
-}
+// Abort is part of the objstorage.Writable interface.
+func (*noopFinishAbort) Abort() {}
 
 // MakeIngestionWriterOptions returns writer options suitable for writing SSTs
 // that will subsequently be ingested (e.g. with AddSSTable).
@@ -62,13 +65,25 @@ func MakeIngestionWriterOptions(ctx context.Context, cs *cluster.Settings) sstab
 	// By default, take a conservative approach and assume we don't have newer
 	// table features available. Upgrade to an appropriate version only if the
 	// cluster supports it.
-	format := sstable.TableFormatPebblev1 // Block properties.
-	if cs.Version.IsActive(ctx, clusterversion.EnablePebbleFormatVersionRangeKeys) {
-		format = sstable.TableFormatPebblev2 // Range keys.
+	format := sstable.TableFormatPebblev2
+	if cs.Version.IsActive(ctx, clusterversion.V23_1EnablePebbleFormatSSTableValueBlocks) &&
+		ValueBlocksEnabled.Get(&cs.SV) {
+		format = sstable.TableFormatPebblev3
 	}
 	opts := DefaultPebbleOptions().MakeWriterOptions(0, format)
 	opts.MergerName = "nullptr"
 	return opts
+}
+
+// makeSSTRewriteOptions should be used instead of MakeIngestionWriterOptions
+// when we are going to rewrite ssts. It additionally returns the minimum
+// table format that we accept, since sst rewriting will often preserve the
+// input table format.
+func makeSSTRewriteOptions(
+	ctx context.Context, cs *cluster.Settings,
+) (opts sstable.WriterOptions, minTableFormat sstable.TableFormat) {
+	// v22.2 clusters use sstable.TableFormatPebblev2.
+	return MakeIngestionWriterOptions(ctx, cs), sstable.TableFormatPebblev2
 }
 
 // MakeBackupSSTWriter creates a new SSTWriter tailored for backup SSTs which
@@ -77,24 +92,23 @@ func MakeBackupSSTWriter(ctx context.Context, cs *cluster.Settings, f io.Writer)
 	// By default, take a conservative approach and assume we don't have newer
 	// table features available. Upgrade to an appropriate version only if the
 	// cluster supports it.
-	opts := DefaultPebbleOptions().MakeWriterOptions(0, sstable.TableFormatPebblev1)
-	if cs.Version.IsActive(ctx, clusterversion.EnablePebbleFormatVersionRangeKeys) {
-		opts.TableFormat = sstable.TableFormatPebblev2 // Range keys.
-	}
+	format := sstable.TableFormatPebblev2
+
+	// TODO(sumeer): add code to use TableFormatPebblev3 after confirming that
+	// we won't run afoul of any stale tooling that reads backup ssts.
+	opts := DefaultPebbleOptions().MakeWriterOptions(0, format)
+
 	// Don't need BlockPropertyCollectors for backups.
 	opts.BlockPropertyCollectors = nil
-
 	// Disable bloom filters since we only ever iterate backups.
 	opts.FilterPolicy = nil
 	// Bump up block size, since we almost never seek or do point lookups, so more
 	// block checksums and more index entries are just overhead and smaller blocks
 	// reduce compression ratio.
 	opts.BlockSize = 128 << 10
-
 	opts.MergerName = "nullptr"
 	return SSTWriter{
-		fw:                sstable.NewWriter(noopSyncCloser{f}, opts),
-		f:                 f,
+		fw:                sstable.NewWriter(&noopFinishAbort{f}, opts),
 		supportsRangeKeys: opts.TableFormat >= sstable.TableFormatPebblev2,
 	}
 }
@@ -103,12 +117,11 @@ func MakeBackupSSTWriter(ctx context.Context, cs *cluster.Settings, f io.Writer)
 // These SSTs have bloom filters enabled (as set in DefaultPebbleOptions) and
 // format set to RocksDBv2.
 func MakeIngestionSSTWriter(
-	ctx context.Context, cs *cluster.Settings, f writeCloseSyncer,
+	ctx context.Context, cs *cluster.Settings, w objstorage.Writable,
 ) SSTWriter {
 	opts := MakeIngestionWriterOptions(ctx, cs)
 	return SSTWriter{
-		fw:                sstable.NewWriter(f, opts),
-		f:                 f,
+		fw:                sstable.NewWriter(w, opts),
 		supportsRangeKeys: opts.TableFormat >= sstable.TableFormatPebblev2,
 	}
 }
@@ -418,33 +431,39 @@ func (fw *SSTWriter) ShouldWriteLocalTimestamps(context.Context) bool {
 	return false
 }
 
-// MemFile is a file-like struct that buffers all data written to it in memory.
-// Implements the writeCloseSyncer interface and is intended for use with
-// SSTWriter.
-type MemFile struct {
+// BufferedSize implements the Writer interface.
+func (fw *SSTWriter) BufferedSize() int {
+	return 0
+}
+
+// MemObject is an in-memory implementation of objstorage.Writable, intended
+// use with SSTWriter.
+type MemObject struct {
 	bytes.Buffer
 }
 
+var _ objstorage.Writable = (*MemObject)(nil)
+
+// Write is part of the objstorage.Writable interface.
+func (f *MemObject) Write(p []byte) error {
+	_, err := f.Buffer.Write(p)
+	return err
+}
+
+// Finish is part of the objstorage.Writable interface.
+func (*MemObject) Finish() error {
+	return nil
+}
+
+// Abort is part of the objstorage.Writable interface.
+func (*MemObject) Abort() {}
+
 // Close implements the writeCloseSyncer interface.
-func (*MemFile) Close() error {
+func (*MemObject) Close() error {
 	return nil
 }
 
-// Flush implements the same interface as the standard library's *bufio.Writer's
-// Flush method. The Pebble sstable Writer tests whether files implement a Flush
-// method. If not, it wraps the file with a bufio.Writer to buffer writes to the
-// underlying file. This buffering is not necessary for an in-memory file. We
-// signal this by implementing Flush as a noop.
-func (*MemFile) Flush() error {
-	return nil
-}
-
-// Sync implements the writeCloseSyncer interface.
-func (*MemFile) Sync() error {
-	return nil
-}
-
-// Data returns the in-memory buffer behind this MemFile.
-func (f *MemFile) Data() []byte {
+// Data returns the in-memory buffer behind this MemObject.
+func (f *MemObject) Data() []byte {
 	return f.Bytes()
 }

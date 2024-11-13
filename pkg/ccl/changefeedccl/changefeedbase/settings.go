@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -47,7 +48,7 @@ var PerChangefeedMemLimit = settings.RegisterByteSizeSetting(
 	settings.TenantWritable,
 	"changefeed.memory.per_changefeed_limit",
 	"controls amount of data that can be buffered per changefeed",
-	1<<27, // 128MiB
+	1<<29, // 512MiB
 )
 
 // SlowSpanLogThreshold controls when we will log slow spans.
@@ -107,7 +108,7 @@ var FrontierCheckpointMaxBytes = settings.RegisterByteSizeSetting(
 	settings.TenantWritable,
 	"changefeed.frontier_checkpoint_max_bytes",
 	"controls the maximum size of the checkpoint as a total size of key bytes",
-	1<<20,
+	1<<20, // 1 MiB
 )
 
 // ScanRequestLimit is the number of Scan requests that can run at once.
@@ -121,12 +122,15 @@ var ScanRequestLimit = settings.RegisterIntSetting(
 )
 
 // ScanRequestSize is the target size of the scan request response.
+//
+// TODO(cdc,yevgeniy,irfansharif): 16 MiB is too large for "elastic" work such
+// as this; reduce the default. Evaluate this as part of #90089.
 var ScanRequestSize = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"changefeed.backfill.scan_request_size",
 	"the maximum number of bytes returned by each scan request",
-	16<<20,
-)
+	1<<19, // 1/2 MiB
+).WithPublic()
 
 // SinkThrottleConfig describes throttling configuration for the sink.
 // 0 values for any of the settings disable that setting.
@@ -207,22 +211,13 @@ var ProtectTimestampInterval = settings.RegisterDurationSetting(
 	settings.PositiveDuration,
 )
 
-// ActiveProtectedTimestampsEnabled enables always having protected timestamps
-// laid down that are periodically advanced to the highwater mark.
-var ActiveProtectedTimestampsEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"changefeed.active_protected_timestamps.enabled",
-	"if set, rather than only protecting changefeed targets from garbage collection during backfills, data will always be protected up to the changefeed's frontier",
-	true,
-)
-
 // BatchReductionRetryEnabled enables the temporary reduction of batch sizes upon kafka message too large errors
 var BatchReductionRetryEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"changefeed.batch_reduction_retry_enabled",
 	"if true, kafka changefeeds upon erroring on an oversized batch will attempt to resend the messages with progressively lower batch sizes",
-	true,
-)
+	false,
+).WithPublic()
 
 // UseMuxRangeFeed enables the use of MuxRangeFeed RPC.
 var UseMuxRangeFeed = settings.RegisterBoolSetting(
@@ -230,4 +225,83 @@ var UseMuxRangeFeed = settings.RegisterBoolSetting(
 	"changefeed.mux_rangefeed.enabled",
 	"if true, changefeed uses multiplexing rangefeed RPC",
 	false,
+)
+
+// EventConsumerWorkers specifies the maximum number of workers to use when
+// processing  events.
+var EventConsumerWorkers = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"changefeed.event_consumer_workers",
+	"the number of workers to use when processing events: <0 disables, "+
+		"0 assigns a reasonable default, >0 assigns the setting value. for experimental/core "+
+		"changefeeds and changefeeds using parquet format, this is disabled",
+	0,
+).WithPublic()
+
+// EventConsumerWorkerQueueSize specifies the maximum number of events a worker buffer.
+var EventConsumerWorkerQueueSize = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"changefeed.event_consumer_worker_queue_size",
+	"if changefeed.event_consumer_workers is enabled, this setting sets the maxmimum number of events "+
+		"which a worker can buffer",
+	int64(util.ConstantWithMetamorphicTestRange("changefeed.event_consumer_worker_queue_size", 16, 0, 16)),
+	settings.NonNegativeInt,
+).WithPublic()
+
+// EventConsumerPacerRequestSize specifies how often (measured in CPU time)
+// that event consumer workers request CPU time from admission control.
+// For example, every N milliseconds of CPU work, request N more
+// milliseconds of CPU time.
+var EventConsumerPacerRequestSize = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"changefeed.cpu.per_event_consumer_worker_allocation",
+	"an event consumer worker will perform a blocking request for CPU time "+
+		"before consuming events. after fully utilizing this CPU time, it will "+
+		"request more",
+	50*time.Millisecond,
+	settings.PositiveDuration,
+)
+
+// PerEventElasticCPUControlEnabled determines whether changefeed event
+// processing integrates with elastic CPU control.
+var PerEventElasticCPUControlEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.cpu.per_event_elastic_control.enabled",
+	"determines whether changefeed event processing integrates with elastic CPU control",
+	true,
+)
+
+// RequireExternalConnectionSink is used to restrict non-admins with the CHANGEFEED privilege
+// to create changefeeds to external connections only.
+var RequireExternalConnectionSink = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.permissions.require_external_connection_sink",
+	"if enabled, this settings restricts users with the CHANGEFEED privilege"+
+		" to create changefeeds with external connection sinks only."+
+		" see https://www.cockroachlabs.com/docs/stable/create-external-connection.html",
+	false,
+)
+
+// SinkIOWorkers controls the number of IO workers used by sinks that use
+// parallelIO to be able to send multiple requests in parallel.
+var SinkIOWorkers = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"changefeed.sink_io_workers",
+	"the number of workers used by changefeeds when sending requests to the sink "+
+		"(currently webhook only): <0 disables, 0 assigns a reasonable default, >0 assigns the setting value.",
+	0,
+).WithPublic()
+
+// SinkPacerRequestSize specifies how often (measured in CPU time)
+// that the Sink batching worker request CPU time from admission control. For
+// example, every N milliseconds of CPU work, request N more milliseconds of CPU
+// time.
+var SinkPacerRequestSize = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"changefeed.cpu.sink_encoding_allocation",
+	"an event consumer worker will perform a blocking request for CPU time "+
+		"before consuming events. after fully utilizing this CPU time, it will "+
+		"request more",
+	50*time.Millisecond,
+	settings.PositiveDuration,
 )

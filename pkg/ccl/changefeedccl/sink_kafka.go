@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 )
 
 // maybeLocker is a wrapper around a Locker that allows for successive Unlocks
@@ -134,6 +137,41 @@ type kafkaSink struct {
 	disableInternalRetry bool
 }
 
+func (s *kafkaSink) getConcreteType() sinkType {
+	return sinkTypeKafka
+}
+
+var saramaCompressionCodecOptions = map[string]sarama.CompressionCodec{
+	"NONE":   sarama.CompressionNone,
+	"GZIP":   sarama.CompressionGZIP,
+	"SNAPPY": sarama.CompressionSnappy,
+	"LZ4":    sarama.CompressionLZ4,
+	"ZSTD":   sarama.CompressionZSTD,
+}
+
+func validateCompressionCodec(s string) (sarama.CompressionCodec, error) {
+	codec, ok := saramaCompressionCodecOptions[s]
+	if !ok {
+		return -1, errors.Newf("could not validate compression codec '%s'", s)
+	}
+	return codec, nil
+}
+
+type compressionCodec sarama.CompressionCodec
+
+func (j *compressionCodec) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	codec, err := validateCompressionCodec(s)
+	if err != nil {
+		return err
+	}
+	*j = compressionCodec(codec)
+	return nil
+}
+
 type saramaConfig struct {
 	// These settings mirror ones in sarama config.
 	// We just tag them w/ JSON annotations.
@@ -145,6 +183,8 @@ type saramaConfig struct {
 		Frequency   jsonDuration `json:",omitempty"`
 		MaxMessages int          `json:",omitempty"`
 	}
+
+	Compression compressionCodec `json:",omitempty"`
 
 	RequiredAcks string `json:",omitempty"`
 
@@ -181,6 +221,10 @@ func defaultSaramaConfig() *saramaConfig {
 	config.Flush.Messages = 0
 	config.Flush.Frequency = jsonDuration(0)
 	config.Flush.Bytes = 0
+
+	// The default compression protocol is sarama.CompressionNone,
+	// which is 0.
+	config.Compression = 0
 
 	// This works around what seems to be a bug in sarama where it isn't
 	// computing the right value to compare against `Producer.MaxMessageBytes`
@@ -266,8 +310,10 @@ func (s *kafkaSink) newSyncProducer(client kafkaClient) (sarama.SyncProducer, er
 
 // Close implements the Sink interface.
 func (s *kafkaSink) Close() error {
-	close(s.stopWorkerCh)
-	s.worker.Wait()
+	if s.stopWorkerCh != nil {
+		close(s.stopWorkerCh)
+		s.worker.Wait()
+	}
 
 	if s.producer != nil {
 		// Ignore errors related to outstanding messages since we're either shutting
@@ -400,6 +446,10 @@ func (s *kafkaSink) startInflightMessage(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.mu.flushErr != nil {
+		return s.mu.flushErr
+	}
+
 	s.mu.inflight++
 	if log.V(2) {
 		log.Infof(ctx, "emitting %d inflight records to kafka", s.mu.inflight)
@@ -475,6 +525,8 @@ func (s *kafkaSink) workerLoop() {
 		var ackError error
 
 		select {
+		case <-s.ctx.Done():
+			return
 		case <-s.stopWorkerCh:
 			return
 		case m := <-s.producer.Successes():
@@ -499,7 +551,7 @@ func (s *kafkaSink) workerLoop() {
 		}
 		s.mu.inflight--
 
-		if !isRetrying() && s.isInternalRetryable(ackError) {
+		if !isRetrying() && s.mu.flushErr == nil && s.isInternalRetryable(ackError) {
 			startInternalRetry(ackError)
 		}
 
@@ -553,6 +605,7 @@ func (s *kafkaSink) finishProducerMessage(ackMsg *sarama.ProducerMessage, ackErr
 func (s *kafkaSink) handleBufferedRetries(msgs []*sarama.ProducerMessage, retryErr error) error {
 	lastSendErr := retryErr
 	activeConfig := s.kafkaCfg
+	log.Infof(s.ctx, "kafka sink handling %d buffered messages for internal retry", len(msgs))
 
 	// Ensure memory for messages are always cleaned up
 	defer func() {
@@ -598,6 +651,15 @@ func (s *kafkaSink) handleBufferedRetries(msgs []*sarama.ProducerMessage, retryE
 		// SendMessages will attempt to send all messages into an AsyncProducer with
 		// the client's config and then block until the results come in.
 		lastSendErr = newProducer.SendMessages(msgs)
+		if lastSendErr != nil {
+			// nolint:errcmp
+			if sendErrs, ok := lastSendErr.(sarama.ProducerErrors); ok && len(sendErrs) > 0 {
+				// Just check the first error since all these messages being retried
+				// were likely from a single partition and therefore would've been
+				// marked with the same error.
+				lastSendErr = sendErrs[0].Err
+			}
+		}
 
 		if err := newProducer.Close(); err != nil {
 			log.Errorf(s.ctx, "closing of previous sarama producer for retry failed with: %s", err.Error())
@@ -680,6 +742,58 @@ func (j *jsonDuration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+type tokenProvider struct {
+	tokenSource oauth2.TokenSource
+}
+
+var _ sarama.AccessTokenProvider = (*tokenProvider)(nil)
+
+// Token implements the sarama.AccessTokenProvider interface.  This is called by
+// Sarama when connecting to the broker.
+func (t *tokenProvider) Token() (*sarama.AccessToken, error) {
+	token, err := t.tokenSource.Token()
+	if err != nil {
+		// Errors will result in Sarama retrying the broker connection and logging
+		// the transient error, with a Broker connection error surfacing after retry
+		// attempts have been exhausted.
+		return nil, err
+	}
+
+	return &sarama.AccessToken{Token: token.AccessToken}, nil
+}
+
+func newTokenProvider(
+	ctx context.Context, dialConfig kafkaDialConfig,
+) (sarama.AccessTokenProvider, error) {
+	// grant_type is by default going to be set to 'client_credentials' by the
+	// clientcredentials library as defined by the spec, however non-compliant
+	// auth server implementations may want a custom type
+	var endpointParams url.Values
+	if dialConfig.saslGrantType != `` {
+		endpointParams = url.Values{"grant_type": {dialConfig.saslGrantType}}
+	}
+
+	tokenURL, err := url.Parse(dialConfig.saslTokenURL)
+	if err != nil {
+		return nil, errors.Wrap(err, "malformed token url")
+	}
+
+	// the clientcredentials.Config's TokenSource method creates an
+	// oauth2.TokenSource implementation which returns tokens for the given
+	// endpoint, returning the same cached result until its expiration has been
+	// reached, and then once expired re-requesting a new token from the endpoint.
+	cfg := clientcredentials.Config{
+		ClientID:       dialConfig.saslClientID,
+		ClientSecret:   dialConfig.saslClientSecret,
+		TokenURL:       tokenURL.String(),
+		Scopes:         dialConfig.saslScopes,
+		EndpointParams: endpointParams,
+	}
+	return &tokenProvider{
+		tokenSource: cfg.TokenSource(ctx),
+	}, nil
+}
+
 // Apply configures provided kafka configuration struct based on this config.
 func (c *saramaConfig) Apply(kafka *sarama.Config) error {
 	// Sarama limits the size of each message to be MaxMessageSize (1MB) bytes.
@@ -706,6 +820,7 @@ func (c *saramaConfig) Apply(kafka *sarama.Config) error {
 		}
 		kafka.Producer.RequiredAcks = parsedAcks
 	}
+	kafka.Producer.Compression = sarama.CompressionCodec(c.Compression)
 	return nil
 }
 
@@ -733,21 +848,28 @@ func getSaramaConfig(
 	return
 }
 
+type kafkaDialConfig struct {
+	tlsEnabled       bool
+	tlsSkipVerify    bool
+	caCert           []byte
+	clientCert       []byte
+	clientKey        []byte
+	saslEnabled      bool
+	saslHandshake    bool
+	saslUser         string
+	saslPassword     string
+	saslMechanism    string
+	saslTokenURL     string
+	saslClientID     string
+	saslClientSecret string
+	saslScopes       []string
+	saslGrantType    string
+}
+
 func buildKafkaConfig(
-	u sinkURL, jsonStr changefeedbase.SinkSpecificJSONConfig,
+	ctx context.Context, u sinkURL, jsonStr changefeedbase.SinkSpecificJSONConfig,
 ) (*sarama.Config, error) {
-	dialConfig := struct {
-		tlsEnabled    bool
-		tlsSkipVerify bool
-		caCert        []byte
-		clientCert    []byte
-		clientKey     []byte
-		saslEnabled   bool
-		saslHandshake bool
-		saslUser      string
-		saslPassword  string
-		saslMechanism string
-	}{}
+	dialConfig := kafkaDialConfig{}
 
 	if _, err := u.consumeBool(changefeedbase.SinkParamTLSEnabled, &dialConfig.tlsEnabled); err != nil {
 		return nil, err
@@ -788,30 +910,56 @@ func buildKafkaConfig(
 		dialConfig.saslMechanism = sarama.SASLTypePlaintext
 	}
 	switch dialConfig.saslMechanism {
-	case sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeSCRAMSHA512, sarama.SASLTypePlaintext:
+	case sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeSCRAMSHA512, sarama.SASLTypeOAuth, sarama.SASLTypePlaintext:
 	default:
-		return nil, errors.Errorf(`param %s must be one of %s, %s, or %s`,
+		return nil, errors.Errorf(`param %s must be one of %s, %s, %s, or %s`,
 			changefeedbase.SinkParamSASLMechanism,
-			sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeSCRAMSHA512, sarama.SASLTypePlaintext)
+			sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeSCRAMSHA512, sarama.SASLTypeOAuth, sarama.SASLTypePlaintext)
+	}
+
+	var requiredSASLParams []string
+	if dialConfig.saslMechanism == sarama.SASLTypeOAuth {
+		requiredSASLParams = []string{changefeedbase.SinkParamSASLClientID, changefeedbase.SinkParamSASLClientSecret, changefeedbase.SinkParamSASLTokenURL}
+	} else {
+		requiredSASLParams = []string{changefeedbase.SinkParamSASLUser, changefeedbase.SinkParamSASLPassword}
+	}
+	for _, param := range requiredSASLParams {
+		if dialConfig.saslEnabled {
+			if len(u.q[param]) == 0 {
+				errStr := fmt.Sprintf(`%s must be provided when SASL is enabled`, param)
+				if dialConfig.saslMechanism != sarama.SASLTypePlaintext {
+					errStr += fmt.Sprintf(` using mechanism %s`, dialConfig.saslMechanism)
+				}
+				return nil, errors.Errorf("%s", errStr)
+			}
+		} else {
+			if len(u.q[param]) > 0 {
+				return nil, errors.Errorf(`%s must be enabled if %s is provided`, changefeedbase.SinkParamSASLEnabled, param)
+			}
+		}
+	}
+
+	if dialConfig.saslMechanism != sarama.SASLTypeOAuth {
+		oauthParams := []string{changefeedbase.SinkParamSASLClientID, changefeedbase.SinkParamSASLClientSecret, changefeedbase.SinkParamSASLTokenURL, changefeedbase.SinkParamSASLGrantType, changefeedbase.SinkParamSASLScopes}
+		for _, param := range oauthParams {
+			if len(u.q[param]) > 0 {
+				return nil, errors.Errorf(`%s is only a valid parameter for %s=%s`, param, changefeedbase.SinkParamSASLMechanism, sarama.SASLTypeOAuth)
+			}
+		}
 	}
 
 	dialConfig.saslUser = u.consumeParam(changefeedbase.SinkParamSASLUser)
 	dialConfig.saslPassword = u.consumeParam(changefeedbase.SinkParamSASLPassword)
-	if dialConfig.saslEnabled {
-		if dialConfig.saslUser == `` {
-			return nil, errors.Errorf(`%s must be provided when SASL is enabled`, changefeedbase.SinkParamSASLUser)
-		}
-		if dialConfig.saslPassword == `` {
-			return nil, errors.Errorf(`%s must be provided when SASL is enabled`, changefeedbase.SinkParamSASLPassword)
-		}
-	} else {
-		if dialConfig.saslUser != `` {
-			return nil, errors.Errorf(`%s must be enabled if a SASL user is provided`, changefeedbase.SinkParamSASLEnabled)
-		}
-		if dialConfig.saslPassword != `` {
-			return nil, errors.Errorf(`%s must be enabled if a SASL password is provided`, changefeedbase.SinkParamSASLEnabled)
-		}
+	dialConfig.saslTokenURL = u.consumeParam(changefeedbase.SinkParamSASLTokenURL)
+	dialConfig.saslClientID = u.consumeParam(changefeedbase.SinkParamSASLClientID)
+	dialConfig.saslScopes = u.Query()[changefeedbase.SinkParamSASLScopes]
+	dialConfig.saslGrantType = u.consumeParam(changefeedbase.SinkParamSASLGrantType)
+
+	var decodedClientSecret []byte
+	if err := u.decodeBase64(changefeedbase.SinkParamSASLClientSecret, &decodedClientSecret); err != nil {
+		return nil, err
 	}
+	dialConfig.saslClientSecret = string(decodedClientSecret)
 
 	config := sarama.NewConfig()
 	config.ClientID = `CockroachDB`
@@ -863,6 +1011,12 @@ func buildKafkaConfig(
 			config.Net.SASL.SCRAMClientGeneratorFunc = sha512ClientGenerator
 		case sarama.SASLTypeSCRAMSHA256:
 			config.Net.SASL.SCRAMClientGeneratorFunc = sha256ClientGenerator
+		case sarama.SASLTypeOAuth:
+			var err error
+			config.Net.SASL.TokenProvider, err = newTokenProvider(ctx, dialConfig)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -897,7 +1051,7 @@ func makeKafkaSink(
 		return nil, errors.Errorf(`%s is not yet supported`, changefeedbase.SinkParamSchemaTopic)
 	}
 
-	config, err := buildKafkaConfig(u, jsonStr)
+	config, err := buildKafkaConfig(ctx, u, jsonStr)
 	if err != nil {
 		return nil, err
 	}

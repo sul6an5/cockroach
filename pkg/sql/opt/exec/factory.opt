@@ -215,11 +215,17 @@ define StreamingSetOp {
 # left node to completion and possibly short-circuit if the limit is reached
 # before executing the right node. The limit is guaranteed but the short-circuit
 # behavior is not.
+#
+# If true, EnforceHomeRegion specifies that the UNION ALL operation should
+# error out if it attempts to read rows beyond the leftmost branch. This
+# should only be set if performing the UNION ALL on behalf of a
+# locality-optimized search.
 define UnionAll {
     Left exec.Node
     Right exec.Node
     ReqOrdering exec.OutputOrdering
     HardLimit uint64
+    EnforceHomeRegion bool
 }
 
 # Sort performs a resorting of the rows produced by the input node.
@@ -266,7 +272,8 @@ define IndexJoin {
 # contains the lookup join conditions targeting ranges located on local nodes
 # (relative to the gateway region), and remoteLookupExpr contains the lookup
 # join conditions targeting remote nodes; lookupCols are ordinals for the table
-# columns we are retrieving.
+# columns we are retrieving. If RemoteOnlyLookups is true, all lookups target
+# rows in remote regions.
 #
 # The node produces the columns in the input and (unless join type is
 # LeftSemiJoin or LeftAntiJoin) the lookupCols, ordered by ordinal. The ON
@@ -287,6 +294,7 @@ define LookupJoin {
     ReqOrdering exec.OutputOrdering
     Locking opt.Locking
     LimitHint int64
+    RemoteOnlyLookups bool
 }
 
 # InvertedJoin performs a lookup join into an inverted index.
@@ -556,11 +564,17 @@ define Upsert {
 # The fetchCols set contains the ordinal positions of the fetch columns in
 # the target table. The input must contain those columns in the same order
 # as they appear in the table schema.
+#
+# The passthrough parameter contains all the result columns that are part of
+# the input node that the update node needs to return (passing through from
+# the input). The pass through columns are used to return any column from the
+# USING tables that are referenced in the RETURNING clause.
 define Delete {
     Input exec.Node
     Table cat.Table
     FetchCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
+    Passthrough colinfo.ResultColumns
 
     # If set, the operator will commit the transaction as part of its execution.
     # This is false when executing inside an explicit transaction, or there are
@@ -765,4 +779,9 @@ define CreateFunction {
 define LiteralValues {
     Rows tree.ExprContainer
     Columns colinfo.ResultColumns
+}
+
+# ShowCompletions implements SHOW COMPLETIONS.
+define ShowCompletions {
+    Command *tree.ShowCompletions
 }

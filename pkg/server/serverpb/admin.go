@@ -10,6 +10,8 @@
 
 package serverpb
 
+import context "context"
+
 // Add adds values from ots to ts.
 func (ts *TableStatsResponse) Add(ots *TableStatsResponse) {
 	ts.RangeCount += ots.RangeCount
@@ -35,4 +37,29 @@ func (ts *TableStatsResponse) Add(ots *TableStatsResponse) {
 			ts.NodeCount--
 		}
 	}
+}
+
+func (r DecommissionPreCheckResponse_NodeReadiness) String() string {
+	switch r {
+	case DecommissionPreCheckResponse_UNKNOWN:
+		return "unknown"
+	case DecommissionPreCheckResponse_READY:
+		return "ready"
+	case DecommissionPreCheckResponse_ALREADY_DECOMMISSIONED:
+		return "already decommissioned"
+	case DecommissionPreCheckResponse_ALLOCATION_ERRORS:
+		return "allocation errors"
+	default:
+		panic("unknown decommission node readiness")
+	}
+}
+
+type TenantAdminServer interface {
+	Liveness(context.Context, *LivenessRequest) (*LivenessResponse, error)
+}
+
+// Empty is true if there are no unavailable ranges and no error performing
+// healthcheck.
+func (r *RecoveryVerifyResponse_UnavailableRanges) Empty() bool {
+	return len(r.Ranges) == 0 && len(r.Error) == 0
 }

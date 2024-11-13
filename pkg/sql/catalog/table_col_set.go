@@ -12,12 +12,12 @@ package catalog
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
 // TableColSet efficiently stores an unordered set of column ids.
 type TableColSet struct {
-	set util.FastIntSet
+	set intsets.Fast
 }
 
 // MakeTableColSet returns a set initialized with the given values.
@@ -31,6 +31,9 @@ func MakeTableColSet(vals ...descpb.ColumnID) TableColSet {
 
 // Add adds a column to the set. No-op if the column is already in the set.
 func (s *TableColSet) Add(col descpb.ColumnID) { s.set.Add(int(col)) }
+
+// Remove removes a column from the set. No-op if the column is not in the set.
+func (s *TableColSet) Remove(col descpb.ColumnID) { s.set.Remove(int(col)) }
 
 // Contains returns true if the set contains the column.
 func (s TableColSet) Contains(col descpb.ColumnID) bool { return s.set.Contains(int(col)) }
@@ -66,6 +69,11 @@ func (s TableColSet) Intersection(other TableColSet) TableColSet {
 // Difference returns the column IDs in s which are not in other.
 func (s TableColSet) Difference(other TableColSet) TableColSet {
 	return TableColSet{set: s.set.Difference(other.set)}
+}
+
+// Equals returns the column IDs in s are equal to the ones in other.
+func (s TableColSet) Equals(other TableColSet) bool {
+	return s.set.Equals(other.set)
 }
 
 // Ordered returns a slice with all the descpb.ColumnIDs in the set, in

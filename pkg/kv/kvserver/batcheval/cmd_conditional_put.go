@@ -14,25 +14,25 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.ConditionalPut, declareKeysConditionalPut, ConditionalPut)
+	RegisterReadWriteCommand(kvpb.ConditionalPut, declareKeysConditionalPut, ConditionalPut)
 }
 
 func declareKeysConditionalPut(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
-	req roachpb.Request,
+	header *kvpb.Header,
+	req kvpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 	maxOffset time.Duration,
 ) {
-	args := req.(*roachpb.ConditionalPutRequest)
+	args := req.(*kvpb.ConditionalPutRequest)
 	if args.Inline {
 		DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
 	} else {
@@ -44,9 +44,9 @@ func declareKeysConditionalPut(
 // the expected value matches. If not, the return value contains
 // the actual value.
 func ConditionalPut(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.ConditionalPutRequest)
+	args := cArgs.Args.(*kvpb.ConditionalPutRequest)
 	h := cArgs.Header
 
 	var ts hlc.Timestamp
@@ -54,24 +54,14 @@ func ConditionalPut(
 		ts = h.Timestamp
 	}
 
-	var expVal []byte
-	if len(args.ExpBytes) != 0 {
-		expVal = args.ExpBytes
-	} else {
-		// Compatibility with 20.1 requests.
-		if args.DeprecatedExpValue != nil {
-			expVal = args.DeprecatedExpValue.TagAndDataBytes()
-		}
-	}
-
 	handleMissing := storage.CPutMissingBehavior(args.AllowIfDoesNotExist)
 	var err error
 	if args.Blind {
 		err = storage.MVCCBlindConditionalPut(
-			ctx, readWriter, cArgs.Stats, args.Key, ts, cArgs.Now, args.Value, expVal, handleMissing, h.Txn)
+			ctx, readWriter, cArgs.Stats, args.Key, ts, cArgs.Now, args.Value, args.ExpBytes, handleMissing, h.Txn)
 	} else {
 		err = storage.MVCCConditionalPut(
-			ctx, readWriter, cArgs.Stats, args.Key, ts, cArgs.Now, args.Value, expVal, handleMissing, h.Txn)
+			ctx, readWriter, cArgs.Stats, args.Key, ts, cArgs.Now, args.Value, args.ExpBytes, handleMissing, h.Txn)
 	}
 	// NB: even if MVCC returns an error, it may still have written an intent
 	// into the batch. This allows callers to consume errors like WriteTooOld

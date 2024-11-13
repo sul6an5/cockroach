@@ -12,7 +12,7 @@ package registry
 
 import (
 	"context"
-	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -22,6 +22,10 @@ import (
 
 // LibGEOS is a list of native libraries for libgeos.
 var LibGEOS = []string{"libgeos", "libgeos_c"}
+
+// PrometheusNameSpace is the namespace which all metrics exposed on the roachtest
+// endpoint should use.
+var PrometheusNameSpace = "roachtest"
 
 // TestSpec is a spec for a roachtest.
 type TestSpec struct {
@@ -80,30 +84,67 @@ type TestSpec struct {
 	// cannot be run with encryption enabled.
 	EncryptionSupport EncryptionSupport
 
+	// SkipPostValidations is a bit-set of post-validations that should be skipped
+	// after the test completes. This is useful for tests that are known to be
+	// incompatible with some validations. By default, tests will run all
+	// validations.
+	SkipPostValidations PostValidation
+
 	// Run is the test function.
 	Run func(ctx context.Context, t test.Test, c cluster.Cluster)
 }
 
-// MatchOrSkip returns true if the filter matches the test. If the filter does
+// PostValidation is a type of post-validation that runs after a test completes.
+type PostValidation int
+
+const (
+	// PostValidationReplicaDivergence detects replica divergence (i.e. ranges in
+	// which replicas have arrived at the same log position with different
+	// states).
+	PostValidationReplicaDivergence PostValidation = 1 << iota
+	// PostValidationInvalidDescriptors checks if there exists any descriptors in
+	// the crdb_internal.invalid_objects virtual table.
+	PostValidationInvalidDescriptors
+)
+
+// MatchType is the type of match a file has to a TestFilter.
+type MatchType int
+
+const (
+	// Matched means that the file passes the filter and the tags.
+	Matched MatchType = iota
+	// FailedFilter means that the file fails the filter.
+	FailedFilter
+	// FailedTags means that the file passed the filter but failed the tags
+	// match.
+	FailedTags
+)
+
+// Match returns Matched if the filter matches the test. If the filter does
 // not match the test because the tag filter does not match, the test is
-// matched, but marked as skipped.
-//
-// TODO(tbg): it's gross that this sets t.Skip, let the caller do this.
-func (t *TestSpec) MatchOrSkip(filter *TestFilter) bool {
+// marked as FailedTags.
+func (t *TestSpec) Match(filter *TestFilter) MatchType {
 	if !filter.Name.MatchString(t.Name) {
-		return false
+		return FailedFilter
 	}
 	if len(t.Tags) == 0 {
 		if !filter.Tag.MatchString("default") {
-			t.Skip = fmt.Sprintf("%s does not match [default]", filter.RawTag)
+			return FailedTags
 		}
-		return true
+		return Matched
 	}
 	for _, t := range t.Tags {
 		if filter.Tag.MatchString(t) {
-			return true
+			return Matched
 		}
 	}
-	t.Skip = fmt.Sprintf("%s does not match %s", filter.RawTag, t.Tags)
-	return true
+	return FailedTags
+}
+
+// PromSub replaces all non prometheus friendly chars with "_". Note,
+// before creating a metric, read up on prom metric naming conventions:
+// https://prometheus.io/docs/practices/naming/
+func PromSub(raw string) string {
+	invalidPromRE := regexp.MustCompile("[^a-zA-Z0-9_]")
+	return invalidPromRE.ReplaceAllLiteralString(raw, "_")
 }

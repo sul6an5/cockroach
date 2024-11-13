@@ -15,18 +15,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -89,12 +88,12 @@ func init() {
 }
 
 func newStreamIngestionFrontierProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.StreamIngestionFrontierSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	frontier, err := span.MakeFrontierAt(spec.HighWaterAtStart, spec.TrackedSpans...)
 	if err != nil {
@@ -106,7 +105,7 @@ func newStreamIngestionFrontierProcessor(
 		}
 	}
 
-	heartbeatSender, err := newHeartbeatSender(flowCtx, spec)
+	heartbeatSender, err := newHeartbeatSender(ctx, flowCtx, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -128,12 +127,12 @@ func newStreamIngestionFrontierProcessor(
 		persistedHighWater: spec.HighWaterAtStart,
 	}
 	if err := sf.Init(
+		ctx,
 		sf,
 		post,
 		input.OutputTypes(),
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{sf.input},
@@ -156,7 +155,7 @@ func (sf *streamIngestionFrontier) MustBeStreaming() bool {
 type heartbeatSender struct {
 	lastSent        time.Time
 	client          streamclient.Client
-	streamID        streaming.StreamID
+	streamID        streampb.StreamID
 	frontierUpdates chan hlc.Timestamp
 	frontier        hlc.Timestamp
 	flowCtx         *execinfra.FlowCtx
@@ -169,15 +168,15 @@ type heartbeatSender struct {
 }
 
 func newHeartbeatSender(
-	flowCtx *execinfra.FlowCtx, spec execinfrapb.StreamIngestionFrontierSpec,
+	ctx context.Context, flowCtx *execinfra.FlowCtx, spec execinfrapb.StreamIngestionFrontierSpec,
 ) (*heartbeatSender, error) {
-	streamClient, err := streamclient.GetFirstActiveClient(flowCtx.EvalCtx.Ctx(), spec.StreamAddresses)
+	streamClient, err := streamclient.GetFirstActiveClient(ctx, spec.StreamAddresses)
 	if err != nil {
 		return nil, err
 	}
 	return &heartbeatSender{
 		client:          streamClient,
-		streamID:        streaming.StreamID(spec.StreamID),
+		streamID:        streampb.StreamID(spec.StreamID),
 		flowCtx:         flowCtx,
 		frontierUpdates: make(chan hlc.Timestamp),
 		cancel:          func() {},
@@ -297,13 +296,13 @@ func (sf *streamIngestionFrontier) Next() (
 
 		if err := sf.maybeUpdatePartitionProgress(); err != nil {
 			// Updating the partition progress isn't a fatal error.
-			log.Errorf(sf.Ctx, "failed to update partition progress: %+v", err)
+			log.Errorf(sf.Ctx(), "failed to update partition progress: %+v", err)
 		}
 
 		// Send back a row to the job so that it can update the progress.
 		select {
-		case <-sf.Ctx.Done():
-			sf.MoveToDraining(sf.Ctx.Err())
+		case <-sf.Ctx().Done():
+			sf.MoveToDraining(sf.Ctx().Err())
 			return nil, sf.DrainHelper()
 			// Send the latest persisted highwater in the heartbeat to the source cluster
 			// as even with retries we will never request an earlier row than it, and
@@ -314,7 +313,7 @@ func (sf *streamIngestionFrontier) Next() (
 		case <-sf.heartbeatSender.stoppedChan:
 			err := sf.heartbeatSender.wait()
 			if err != nil {
-				log.Errorf(sf.Ctx, "heartbeat sender exited with error: %s", err)
+				log.Errorf(sf.Ctx(), "heartbeat sender exited with error: %s", err)
 			}
 			sf.MoveToDraining(err)
 			return nil, sf.DrainHelper()
@@ -325,7 +324,7 @@ func (sf *streamIngestionFrontier) Next() (
 
 func (sf *streamIngestionFrontier) close() {
 	if err := sf.heartbeatSender.stop(); err != nil {
-		log.Errorf(sf.Ctx, "heartbeat sender exited with error: %s", err)
+		log.Errorf(sf.Ctx(), "heartbeat sender exited with error: %s", err)
 	}
 	if sf.InternalClose() {
 		sf.metrics.RunningCount.Dec(1)
@@ -378,11 +377,11 @@ func (sf *streamIngestionFrontier) noteResolvedTimestamps(
 				redact.Safe(resolved.Timestamp), redact.Safe(sf.highWaterAtStart))
 		}
 
-		if changed, err := sf.frontier.Forward(resolved.Span, resolved.Timestamp); err == nil {
-			frontierChanged = frontierChanged || changed
-		} else {
+		changed, err := sf.frontier.Forward(resolved.Span, resolved.Timestamp)
+		if err != nil {
 			return false, err
 		}
+		frontierChanged = frontierChanged || changed
 	}
 
 	return frontierChanged, nil
@@ -391,7 +390,7 @@ func (sf *streamIngestionFrontier) noteResolvedTimestamps(
 // maybeUpdatePartitionProgress polls the frontier and updates the job progress with
 // partition-specific information to track the status of each partition.
 func (sf *streamIngestionFrontier) maybeUpdatePartitionProgress() error {
-	ctx := sf.Ctx
+	ctx := sf.Ctx()
 	updateFreq := JobCheckpointFrequency.Get(&sf.flowCtx.Cfg.Settings.SV)
 	if updateFreq == 0 || timeutil.Since(sf.lastPartitionUpdate) < updateFreq {
 		return nil
@@ -411,8 +410,8 @@ func (sf *streamIngestionFrontier) maybeUpdatePartitionProgress() error {
 
 	sf.lastPartitionUpdate = timeutil.Now()
 
-	err := registry.UpdateJobWithTxn(ctx, jobID, nil, false, func(
-		txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+	if err := registry.UpdateJobWithTxn(ctx, jobID, nil, false, func(
+		txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
 	) error {
 		if err := md.CheckRunningOrReverting(); err != nil {
 			return err
@@ -438,14 +437,38 @@ func (sf *streamIngestionFrontier) maybeUpdatePartitionProgress() error {
 		if md.RunStats != nil && md.RunStats.NumRuns > 1 {
 			ju.UpdateRunStats(1, md.RunStats.LastRun)
 		}
+
+		// Update the protected timestamp record protecting the destination tenant's
+		// keyspan if the highWatermark has moved forward since the last time we
+		// recorded progress. This makes older revisions of replicated values with a
+		// timestamp less than highWatermark - ReplicationTTLSeconds, eligible for
+		// garbage collection.
+		replicationDetails := md.Payload.GetStreamIngestion()
+		if replicationDetails.ProtectedTimestampRecordID == nil {
+			return errors.AssertionFailedf("expected replication job to have a protected timestamp " +
+				"record over the destination tenant's keyspan")
+		}
+		ptp := sf.flowCtx.Cfg.ProtectedTimestampProvider.WithTxn(txn)
+		record, err := ptp.GetRecord(ctx, *replicationDetails.ProtectedTimestampRecordID)
+		if err != nil {
+			return err
+		}
+		newProtectAbove := highWatermark.Add(
+			-int64(replicationDetails.ReplicationTTLSeconds)*time.Second.Nanoseconds(), 0)
+		if record.Timestamp.Less(newProtectAbove) {
+			return ptp.UpdateTimestamp(ctx, *replicationDetails.ProtectedTimestampRecordID, newProtectAbove)
+		}
 		return nil
-	})
-
-	if err == nil {
-		sf.metrics.JobProgressUpdates.Inc(1)
-		sf.persistedHighWater = f.Frontier()
-		sf.metrics.FrontierCheckpointSpanCount.Update(int64(len(frontierResolvedSpans)))
+	}); err != nil {
+		return err
 	}
-
-	return err
+	sf.metrics.JobProgressUpdates.Inc(1)
+	sf.persistedHighWater = f.Frontier()
+	sf.metrics.FrontierCheckpointSpanCount.Update(int64(len(frontierResolvedSpans)))
+	if !sf.persistedHighWater.IsEmpty() {
+		// Only update the frontier lag if the high water mark has been updated,
+		// implying the initial scan has completed.
+		sf.metrics.FrontierLagNanos.Update(timeutil.Since(sf.persistedHighWater.GoTime()).Nanoseconds())
+	}
+	return nil
 }

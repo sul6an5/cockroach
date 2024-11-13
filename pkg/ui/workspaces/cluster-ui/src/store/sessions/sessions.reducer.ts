@@ -11,7 +11,7 @@
 import { createSlice, PayloadAction } from "@reduxjs/toolkit";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { DOMAIN_NAME, noopReducer } from "../utils";
-import moment, { Moment } from "moment";
+import moment, { Moment } from "moment-timezone";
 
 type SessionsResponse = cockroach.server.serverpb.ListSessionsResponse;
 
@@ -29,7 +29,7 @@ const initialState: SessionsState = {
   valid: true,
 };
 
-const ssessionsSlice = createSlice({
+const sessionsSlice = createSlice({
   name: `${DOMAIN_NAME}/sessions`,
   initialState,
   reducers: {
@@ -52,4 +52,4 @@ const ssessionsSlice = createSlice({
   },
 });
 
-export const { reducer, actions } = ssessionsSlice;
+export const { reducer, actions } = sessionsSlice;

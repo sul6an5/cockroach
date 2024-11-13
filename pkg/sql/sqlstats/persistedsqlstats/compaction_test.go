@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,16 +21,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -53,8 +52,7 @@ func TestSQLStatsCompactorNilTestingKnobCheck(t *testing.T) {
 
 	statsCompactor := persistedsqlstats.NewStatsCompactor(
 		server.ClusterSettings(),
-		server.InternalExecutor().(sqlutil.InternalExecutor),
-		server.DB(),
+		server.InternalDB().(isql.DB),
 		metric.NewCounter(metric.Metadata{}),
 		nil, /* knobs */
 	)
@@ -141,10 +139,13 @@ func TestSQLStatsCompactor(t *testing.T) {
 	defer server.Stopper().Stop(ctx)
 
 	sqlConn := sqlutils.MakeSQLRunner(conn)
-	internalExecutor := server.InternalExecutor().(sqlutil.InternalExecutor)
+	internalExecutor := server.InternalExecutor().(isql.Executor)
 
 	// Disable automatic flush since the test will handle the flush manually.
 	sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.flush.interval = '24h'")
+	// Change the automatic compaction job to avoid it running during the test.
+	// Test creates a new compactor and calls it directly.
+	sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.cleanup.recurrence = '@yearly';")
 
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("stmtCount=%d/maxPersistedRowLimit=%d/rowsDeletePerTxn=%d",
@@ -156,9 +157,7 @@ func TestSQLStatsCompactor(t *testing.T) {
 				ctx,
 				"truncate-stmt-stats",
 				nil,
-				sessiondata.InternalExecutorOverride{
-					User: username.NodeUserName(),
-				},
+				sessiondata.NodeUserSessionDataOverride,
 				"TRUNCATE system.statement_statistics",
 			)
 			require.NoError(t, err)
@@ -166,9 +165,7 @@ func TestSQLStatsCompactor(t *testing.T) {
 				ctx,
 				"truncate-txn-stats",
 				nil,
-				sessiondata.InternalExecutorOverride{
-					User: username.NodeUserName(),
-				},
+				sessiondata.NodeUserSessionDataOverride,
 				"TRUNCATE system.transaction_statistics",
 			)
 			require.NoError(t, err)
@@ -193,8 +190,7 @@ func TestSQLStatsCompactor(t *testing.T) {
 
 			statsCompactor := persistedsqlstats.NewStatsCompactor(
 				server.ClusterSettings(),
-				server.InternalExecutor().(sqlutil.InternalExecutor),
-				server.DB(),
+				server.InternalDB().(isql.DB),
 				metric.NewCounter(metric.Metadata{}),
 				&sqlstats.TestingKnobs{
 					AOSTClause:             "AS OF SYSTEM TIME '-1us'",
@@ -213,32 +209,29 @@ func TestSQLStatsCompactor(t *testing.T) {
 			require.Equal(t, tc.maxPersistedRowLimit, len(expectedDeletedStmtFingerprints))
 			require.Equal(t, tc.maxPersistedRowLimit, len(expectedDeletedTxnFingerprints))
 
-			run := func() {
-				// The two interceptors (kvInterceptor and cleanupInterceptor) are
-				// injected into kvserver and StatsCompactor respectively.
-				// The cleanupInterceptor calculates the number of expected "wide scan"
-				// that should be issued by the StatsCompactor.
-				// The kvInterceptor counts the number of actual "wide scan" KV Request
-				// issued.
-				kvInterceptor.reset()
-				cleanupInterceptor.reset()
-				kvInterceptor.enable()
-				defer kvInterceptor.disable()
+			// The two interceptors (kvInterceptor and cleanupInterceptor) are
+			// injected into kvserver and StatsCompactor respectively.
+			// The cleanupInterceptor calculates the number of expected "wide scan"
+			// that should be issued by the StatsCompactor.
+			// The kvInterceptor counts the number of actual "wide scan" KV Request
+			// issued.
+			kvInterceptor.reset()
+			cleanupInterceptor.reset()
+			kvInterceptor.enable()
 
-				err := statsCompactor.DeleteOldestEntries(ctx)
-				require.NoError(t, err)
+			err = statsCompactor.DeleteOldestEntries(ctx)
+			kvInterceptor.disable()
+			require.NoError(t, err)
 
-				expectedNumberOfWideScans := cleanupInterceptor.getExpectedNumberOfWideScans()
-				actualNumberOfWideScans := kvInterceptor.getTotalWideScans()
+			expectedNumberOfWideScans := cleanupInterceptor.getExpectedNumberOfWideScans()
+			actualNumberOfWideScans := kvInterceptor.getTotalWideScans()
 
-				require.Equal(t,
-					expectedNumberOfWideScans,
-					actualNumberOfWideScans,
-					"expected %d number of wide scans issued, but %d number of "+
-						"wide scan issued", expectedNumberOfWideScans, actualNumberOfWideScans,
-				)
-			}
-			run()
+			require.Equal(t,
+				expectedNumberOfWideScans,
+				actualNumberOfWideScans,
+				"expected %d number of wide scans issued, but %d number of "+
+					"wide scan issued", expectedNumberOfWideScans, actualNumberOfWideScans,
+			)
 
 			actualStmtFingerprints, actualTxnFingerprints :=
 				getTopSortedFingerprints(t, sqlConn, 0 /* limit */)
@@ -268,81 +261,6 @@ func TestSQLStatsCompactor(t *testing.T) {
 	}
 }
 
-// TestSQLStatsForegroundInterference ensures that the background SQL Stats
-// cleanup job does not delete any rows in the current aggregation window. Doing
-// so would cause contentions, which can potentially lead to long runtime of the
-// SQL Stats cleanup job. We test this behavior by generating some rows in the
-// stats system table that are in the current aggregation window and previous
-// aggregation window. Before running the SQL Stats compaction, we lower the
-// row limit in the stats table so that all thw rows will be deleted by the
-// StatsCompactor, if all the generated rows live outside the current
-// aggregation window. This test asserts that, since some of generated rows live
-// in the current aggregation interval, those rows will not be deleted by the
-// StatsCompactor.
-func TestSQLStatsForegroundInterference(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	var tm atomic.Value
-	// Initialize the time to 2 aggregation interval in the past.
-	tm.Store(timeutil.Now().Add(-2 * persistedsqlstats.SQLStatsAggregationInterval.Default()))
-
-	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs.SQLStatsKnobs.(*sqlstats.TestingKnobs).StubTimeNow = func() time.Time {
-		return tm.Load().(time.Time)
-	}
-	s, conn, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-
-	serverSQLStats :=
-		s.SQLServer().(*sql.Server).
-			GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
-
-	sqlConn := sqlutils.MakeSQLRunner(conn)
-	sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.persisted_rows.max = 1")
-
-	// Generate some data that are older than the current aggregation window,
-	// and then generate some that are within the current aggregation window.
-	generateFingerprints(t, sqlConn, 10 /* distinctFingerprints */)
-	serverSQLStats.Flush(ctx)
-
-	tm.Store(timeutil.Now())
-	generateFingerprints(t, sqlConn, 10 /* distinctFingerprints */)
-	serverSQLStats.Flush(ctx)
-
-	statsCompactor := persistedsqlstats.NewStatsCompactor(
-		s.ClusterSettings(),
-		s.InternalExecutor().(sqlutil.InternalExecutor),
-		s.DB(),
-		metric.NewCounter(metric.Metadata{}),
-		params.Knobs.SQLStatsKnobs.(*sqlstats.TestingKnobs),
-	)
-
-	// Run the compactor.
-	require.NoError(t, statsCompactor.DeleteOldestEntries(ctx))
-
-	result := sqlConn.QueryStr(t, `
-	SELECT count(*)
-	FROM system.statement_statistics`)[0][0]
-
-	stmtStatsCount, err := strconv.Atoi(result)
-	require.NoError(t, err)
-	require.GreaterOrEqual(t, stmtStatsCount, 10,
-		"expected at least 10 fingerprints in statement statistics table, "+
-			"but only %d is present", stmtStatsCount)
-
-	result = sqlConn.QueryStr(t, `
-	SELECT count(*)
-	FROM system.transaction_statistics`)[0][0]
-
-	txnStatsCount, err := strconv.Atoi(result)
-	require.NoError(t, err)
-	require.GreaterOrEqual(t, txnStatsCount, 10,
-		"expected at least 10 fingerprints in transaction statistics table, "+
-			"but only %d is present", txnStatsCount)
-}
-
 func TestSQLStatsCompactionJobMarkedAsAutomatic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -350,19 +268,18 @@ func TestSQLStatsCompactionJobMarkedAsAutomatic(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 
+	t.Logf("starting test server")
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 3 /* numNodes */, base.TestClusterArgs{
-		ServerArgs: params,
-	})
-	defer tc.Stopper().Stop(ctx)
+	server, conn, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(ctx)
 
-	server := tc.Server(0 /* idx */)
-	conn := tc.ServerConn(0 /* idx */)
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
+	t.Logf("launching the stats compaction job")
 	jobID, err := launchSQLStatsCompactionJob(server)
 	require.NoError(t, err)
 
+	t.Logf("checking the job status")
 	// Ensure the sqlstats job is hidden from the SHOW JOBS command.
 	sqlDB.CheckQueryResults(
 		t,
@@ -376,6 +293,8 @@ func TestSQLStatsCompactionJobMarkedAsAutomatic(t *testing.T) {
 		fmt.Sprintf("SELECT count(*) FROM [SHOW AUTOMATIC JOBS] WHERE job_id = %d", jobID),
 		[][]string{{"1"}},
 	)
+
+	t.Logf("test complete")
 }
 
 func launchSQLStatsCompactionJob(server serverutils.TestServerInterface) (jobspb.JobID, error) {
@@ -475,14 +394,14 @@ func (k *kvScanInterceptor) disable() {
 	atomic.StoreInt32(&k.enabled, 0)
 }
 
-func (k *kvScanInterceptor) intercept(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+func (k *kvScanInterceptor) intercept(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 	if atomic.LoadInt32(&k.enabled) == 0 {
 		return nil
 	}
-	if req, ok := ba.GetArg(roachpb.Scan); ok {
-		_, tableID, _ := encoding.DecodeUvarintAscending(req.(*roachpb.ScanRequest).Key)
+	if req, ok := ba.GetArg(kvpb.Scan); ok {
+		_, tableID, _ := encoding.DecodeUvarintAscending(req.(*kvpb.ScanRequest).Key)
 		if tableID == stmtStatsTableID || tableID == txnStatsTableID {
-			prettyKey := roachpb.PrettyPrintKey([]encoding.Direction{}, req.(*roachpb.ScanRequest).Key)
+			prettyKey := roachpb.PrettyPrintKey([]encoding.Direction{}, req.(*kvpb.ScanRequest).Key)
 
 			keyMatchedWideScan := kvReqWideScanStartKeyPattern.MatchString(prettyKey)
 

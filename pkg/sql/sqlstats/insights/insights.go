@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -143,10 +144,24 @@ type Writer interface {
 	ObserveTransaction(sessionID clusterunique.ID, transaction *Transaction)
 }
 
+// WriterProvider offers a Writer.
+// Pass true for internal when called by the internal executor.
+type WriterProvider func(internal bool) Writer
+
 // Reader offers access to the currently retained set of insights.
 type Reader interface {
 	// IterateInsights calls visitor with each of the currently retained set of insights.
 	IterateInsights(context.Context, func(context.Context, *Insight))
+}
+
+type LatencyInformation interface {
+	GetPercentileValues(fingerprintID appstatspb.StmtFingerprintID, shouldFlush bool) PercentileValues
+}
+
+type PercentileValues struct {
+	P50 float64
+	P90 float64
+	P99 float64
 }
 
 // Provider offers access to the insights subsystem.
@@ -155,18 +170,32 @@ type Provider interface {
 	Start(ctx context.Context, stopper *stop.Stopper)
 
 	// Writer returns an object that observes statement and transaction executions.
-	Writer() Writer
+	// Pass true for internal when called by the internal executor.
+	Writer(internal bool) Writer
 
 	// Reader returns an object that offers read access to any detected insights.
 	Reader() Reader
+
+	// LatencyInformation returns an object that offers read access to latency information,
+	// such as percentiles.
+	LatencyInformation() LatencyInformation
 }
 
 // New builds a new Provider.
 func New(st *cluster.Settings, metrics Metrics) Provider {
-	return newConcurrentBufferIngester(
-		newRegistry(st, &compositeDetector{detectors: []detector{
-			&latencyThresholdDetector{st: st},
-			newAnomalyDetector(st, metrics),
-		}}),
-	)
+	store := newStore(st)
+	anomalyDetector := newAnomalyDetector(st, metrics)
+
+	return &defaultProvider{
+		store: store,
+		ingester: newConcurrentBufferIngester(
+			newRegistry(st, &compositeDetector{detectors: []detector{
+				&latencyThresholdDetector{st: st},
+				anomalyDetector,
+			}}, &compositeSink{sinks: []sink{
+				store,
+			}}),
+		),
+		anomalyDetector: anomalyDetector,
+	}
 }

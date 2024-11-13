@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -52,11 +53,11 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 	s, _, origDB := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					// We'll eventually expect to see an EndTxn(commit=false)
 					// with the right intents.
 					if args.Req.IsSingleEndTxnRequest() {
-						et := args.Req.Requests[0].GetInner().(*roachpb.EndTxnRequest)
+						et := args.Req.Requests[0].GetInner().(*kvpb.EndTxnRequest)
 						if !et.Commit && et.Key.Equal(key) &&
 							reflect.DeepEqual(et.LockSpans, []roachpb.Span{{Key: key}, {Key: key2}}) {
 							atomic.StoreInt64(&cleanupSeen, 1)
@@ -81,7 +82,7 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 		if err := conflictTxn.Put(ctx, key, "pusher was here"); err != nil {
 			return err
 		}
-		return conflictTxn.CommitOrCleanup(ctx)
+		return conflictTxn.Commit(ctx)
 	}
 
 	// Make a db with a short heartbeat interval.
@@ -128,7 +129,7 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 
 	// Check that further sends through the aborted txn are rejected. The
 	// TxnCoordSender is supposed to synthesize a TransactionAbortedError.
-	if err := txn.CommitOrCleanup(ctx); !testutils.IsError(
+	if err := txn.Commit(ctx); !testutils.IsError(
 		err, "TransactionRetryWithProtoRefreshError: TransactionAbortedError",
 	) {
 		t.Fatalf("expected aborted error, got: %s", err)

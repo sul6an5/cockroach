@@ -12,102 +12,121 @@ skipif config 3node-tenant-default-configs
 query TTTTT
 SELECT schema_name, table_name, type, owner, locality FROM [SHOW TABLES FROM system] ORDER BY 2
 ----
-public  comments                         table     NULL  NULL
-public  database_role_settings           table     NULL  NULL
-public  descriptor                       table     NULL  NULL
-public  eventlog                         table     NULL  NULL
-public  external_connections             table     NULL  NULL
-public  jobs                             table     NULL  NULL
-public  join_tokens                      table     NULL  NULL
-public  lease                            table     NULL  NULL
-public  locations                        table     NULL  NULL
-public  migrations                       table     NULL  NULL
-public  namespace                        table     NULL  NULL
-public  privileges                       table     NULL  NULL
-public  protected_ts_meta                table     NULL  NULL
-public  protected_ts_records             table     NULL  NULL
-public  rangelog                         table     NULL  NULL
-public  replication_constraint_stats     table     NULL  NULL
-public  replication_critical_localities  table     NULL  NULL
-public  replication_stats                table     NULL  NULL
-public  reports_meta                     table     NULL  NULL
-public  role_id_seq                      sequence  NULL  NULL
-public  role_members                     table     NULL  NULL
-public  role_options                     table     NULL  NULL
-public  scheduled_jobs                   table     NULL  NULL
-public  settings                         table     NULL  NULL
-public  span_configurations              table     NULL  NULL
-public  sql_instances                    table     NULL  NULL
-public  sqlliveness                      table     NULL  NULL
-public  statement_bundle_chunks          table     NULL  NULL
-public  statement_diagnostics            table     NULL  NULL
-public  statement_diagnostics_requests   table     NULL  NULL
-public  statement_statistics             table     NULL  NULL
-public  table_statistics                 table     NULL  NULL
-public  tenant_settings                  table     NULL  NULL
-public  tenant_usage                     table     NULL  NULL
-public  tenants                          table     NULL  NULL
-public  transaction_statistics           table     NULL  NULL
-public  ui                               table     NULL  NULL
-public  users                            table     NULL  NULL
-public  web_sessions                     table     NULL  NULL
-public  zones                            table     NULL  NULL
+public  comments                         table     node  NULL
+public  database_role_settings           table     node  NULL
+public  descriptor                       table     node  NULL
+public  descriptor_id_seq                sequence  node  NULL
+public  eventlog                         table     node  NULL
+public  external_connections             table     node  NULL
+public  job_info                         table     node  NULL
+public  jobs                             table     node  NULL
+public  join_tokens                      table     node  NULL
+public  lease                            table     node  NULL
+public  locations                        table     node  NULL
+public  migrations                       table     node  NULL
+public  namespace                        table     node  NULL
+public  privileges                       table     node  NULL
+public  protected_ts_meta                table     node  NULL
+public  protected_ts_records             table     node  NULL
+public  rangelog                         table     node  NULL
+public  replication_constraint_stats     table     node  NULL
+public  replication_critical_localities  table     node  NULL
+public  replication_stats                table     node  NULL
+public  reports_meta                     table     node  NULL
+public  role_id_seq                      sequence  node  NULL
+public  role_members                     table     node  NULL
+public  role_options                     table     node  NULL
+public  scheduled_jobs                   table     node  NULL
+public  settings                         table     node  NULL
+public  span_configurations              table     node  NULL
+public  span_stats_buckets               table     node  NULL
+public  span_stats_samples               table     node  NULL
+public  span_stats_tenant_boundaries     table     node  NULL
+public  span_stats_unique_keys           table     node  NULL
+public  sql_instances                    table     node  NULL
+public  sqlliveness                      table     node  NULL
+public  statement_activity               table     node  NULL
+public  statement_bundle_chunks          table     node  NULL
+public  statement_diagnostics            table     node  NULL
+public  statement_diagnostics_requests   table     node  NULL
+public  statement_statistics             table     node  NULL
+public  table_statistics                 table     node  NULL
+public  task_payloads                    table     node  NULL
+public  tenant_id_seq                    sequence  node  NULL
+public  tenant_settings                  table     node  NULL
+public  tenant_tasks                     table     node  NULL
+public  tenant_usage                     table     node  NULL
+public  tenants                          table     node  NULL
+public  transaction_activity             table     node  NULL
+public  transaction_statistics           table     node  NULL
+public  ui                               table     node  NULL
+public  users                            table     node  NULL
+public  web_sessions                     table     node  NULL
+public  zones                            table     node  NULL
 
 onlyif config 3node-tenant-default-configs
 query TTTTT
 SELECT schema_name, table_name, type, owner, locality FROM [SHOW TABLES FROM system] ORDER BY 2
 ----
-public  comments                         table     NULL  NULL
-public  database_role_settings           table     NULL  NULL
-public  descriptor                       table     NULL  NULL
-public  descriptor_id_seq                sequence  NULL  NULL
-public  eventlog                         table     NULL  NULL
-public  external_connections             table     NULL  NULL
-public  jobs                             table     NULL  NULL
-public  join_tokens                      table     NULL  NULL
-public  lease                            table     NULL  NULL
-public  locations                        table     NULL  NULL
-public  migrations                       table     NULL  NULL
-public  namespace                        table     NULL  NULL
-public  privileges                       table     NULL  NULL
-public  protected_ts_meta                table     NULL  NULL
-public  protected_ts_records             table     NULL  NULL
-public  rangelog                         table     NULL  NULL
-public  replication_constraint_stats     table     NULL  NULL
-public  replication_critical_localities  table     NULL  NULL
-public  replication_stats                table     NULL  NULL
-public  reports_meta                     table     NULL  NULL
-public  role_id_seq                      sequence  NULL  NULL
-public  role_members                     table     NULL  NULL
-public  role_options                     table     NULL  NULL
-public  scheduled_jobs                   table     NULL  NULL
-public  settings                         table     NULL  NULL
-public  span_count                       table     NULL  NULL
-public  sql_instances                    table     NULL  NULL
-public  sqlliveness                      table     NULL  NULL
-public  statement_bundle_chunks          table     NULL  NULL
-public  statement_diagnostics            table     NULL  NULL
-public  statement_diagnostics_requests   table     NULL  NULL
-public  statement_statistics             table     NULL  NULL
-public  table_statistics                 table     NULL  NULL
-public  transaction_statistics           table     NULL  NULL
-public  ui                               table     NULL  NULL
-public  users                            table     NULL  NULL
-public  web_sessions                     table     NULL  NULL
-public  zones                            table     NULL  NULL
+public  comments                         table     node  NULL
+public  database_role_settings           table     node  NULL
+public  descriptor                       table     node  NULL
+public  descriptor_id_seq                sequence  node  NULL
+public  eventlog                         table     node  NULL
+public  external_connections             table     node  NULL
+public  job_info                         table     node  NULL
+public  jobs                             table     node  NULL
+public  join_tokens                      table     node  NULL
+public  lease                            table     node  NULL
+public  locations                        table     node  NULL
+public  migrations                       table     node  NULL
+public  namespace                        table     node  NULL
+public  privileges                       table     node  NULL
+public  protected_ts_meta                table     node  NULL
+public  protected_ts_records             table     node  NULL
+public  rangelog                         table     node  NULL
+public  replication_constraint_stats     table     node  NULL
+public  replication_critical_localities  table     node  NULL
+public  replication_stats                table     node  NULL
+public  reports_meta                     table     node  NULL
+public  role_id_seq                      sequence  node  NULL
+public  role_members                     table     node  NULL
+public  role_options                     table     node  NULL
+public  scheduled_jobs                   table     node  NULL
+public  settings                         table     node  NULL
+public  span_count                       table     node  NULL
+public  span_stats_buckets               table     node  NULL
+public  span_stats_samples               table     node  NULL
+public  span_stats_tenant_boundaries     table     node  NULL
+public  span_stats_unique_keys           table     node  NULL
+public  sql_instances                    table     node  NULL
+public  sqlliveness                      table     node  NULL
+public  statement_activity               table     node  NULL
+public  statement_bundle_chunks          table     node  NULL
+public  statement_diagnostics            table     node  NULL
+public  statement_diagnostics_requests   table     node  NULL
+public  statement_statistics             table     node  NULL
+public  table_statistics                 table     node  NULL
+public  transaction_activity             table     node  NULL
+public  transaction_statistics           table     node  NULL
+public  ui                               table     node  NULL
+public  users                            table     node  NULL
+public  web_sessions                     table     node  NULL
+public  zones                            table     node  NULL
 
 
 # The test expectations are different on tenants because of
 # descriptor_id_sq, tenant, tenant_usage, and span_configurations.
 skipif config 3node-tenant-default-configs
 query I rowsort
-SELECT id FROM system.descriptor
+SELECT id FROM system.descriptor ORDER BY 1
 ----
 1
 3
 4
 5
 6
+7
 8
 11
 12
@@ -144,6 +163,16 @@ SELECT id FROM system.descriptor
 50
 51
 52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
 100
 101
 102
@@ -153,7 +182,7 @@ SELECT id FROM system.descriptor
 
 onlyif config 3node-tenant-default-configs
 query I rowsort
-SELECT id FROM system.descriptor
+SELECT id FROM system.descriptor ORDER BY 1
 ----
 1
 3
@@ -194,6 +223,13 @@ SELECT id FROM system.descriptor
 50
 51
 52
+53
+54
+55
+56
+57
+58
+59
 100
 101
 102
@@ -242,10 +278,11 @@ config  BYTES  true   NULL  ·  {primary}  false
 query TTBTTTB
 SHOW COLUMNS FROM system.lease
 ----
-descID      INT8       false  NULL  ·  {primary}  false
-version     INT8       false  NULL  ·  {primary}  false
-nodeID      INT8       false  NULL  ·  {primary}  false
-expiration  TIMESTAMP  false  NULL  ·  {primary}  false
+descID       INT8       false  NULL  ·  {primary}  false
+version      INT8       false  NULL  ·  {primary}  false
+nodeID       INT8       false  NULL  ·  {primary}  false
+expiration   TIMESTAMP  false  NULL  ·  {primary}  false
+crdb_region  BYTES      false  NULL  ·  {primary}  false
 
 query TTBTTTB
 SHOW COLUMNS FROM system.eventlog
@@ -278,33 +315,36 @@ lastUpdated  TIMESTAMP  false  NULL  ·  {primary}  false
 query TTBTTTB
 SHOW COLUMNS FROM system.jobs
 ----
-id                 INT8       false  unique_rowid()     ·  {jobs_created_by_type_created_by_id_idx,jobs_run_stats_idx,jobs_status_created_idx,primary}  false
-status             STRING     false  NULL               ·  {jobs_created_by_type_created_by_id_idx,jobs_run_stats_idx,jobs_status_created_idx,primary}  false
-created            TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_run_stats_idx,jobs_status_created_idx,primary}                                         false
-payload            BYTES      false  NULL               ·  {primary}                                                                                    false
-progress           BYTES      true   NULL               ·  {primary}                                                                                    false
-created_by_type    STRING     true   NULL               ·  {jobs_created_by_type_created_by_id_idx,primary}                                             false
-created_by_id      INT8       true   NULL               ·  {jobs_created_by_type_created_by_id_idx,primary}                                             false
-claim_session_id   BYTES      true   NULL               ·  {jobs_run_stats_idx,primary}                                                                 false
-claim_instance_id  INT8       true   NULL               ·  {jobs_run_stats_idx,primary}                                                                 false
-num_runs           INT8       true   NULL               ·  {jobs_run_stats_idx,primary}                                                                 false
-last_run           TIMESTAMP  true   NULL               ·  {jobs_run_stats_idx,primary}                                                                 false
+id                 INT8       false  unique_rowid()  ·  {jobs_created_by_type_created_by_id_idx,jobs_job_type_idx,jobs_run_stats_idx,jobs_status_created_idx,primary}  false
+status             STRING     false  NULL            ·  {jobs_created_by_type_created_by_id_idx,jobs_run_stats_idx,jobs_status_created_idx,primary}                    false
+created            TIMESTAMP  false  now()           ·  {jobs_run_stats_idx,jobs_status_created_idx,primary}                                                           false
+payload            BYTES      true   NULL            ·  {primary}                                                                                                      false
+progress           BYTES      true   NULL            ·  {primary}                                                                                                      false
+created_by_type    STRING     true   NULL            ·  {jobs_created_by_type_created_by_id_idx,primary}                                                               false
+created_by_id      INT8       true   NULL            ·  {jobs_created_by_type_created_by_id_idx,primary}                                                               false
+claim_session_id   BYTES      true   NULL            ·  {jobs_run_stats_idx,primary}                                                                                   false
+claim_instance_id  INT8       true   NULL            ·  {jobs_run_stats_idx,primary}                                                                                   false
+num_runs           INT8       true   NULL            ·  {jobs_run_stats_idx,primary}                                                                                   false
+last_run           TIMESTAMP  true   NULL            ·  {jobs_run_stats_idx,primary}                                                                                   false
+job_type           STRING     true   NULL            ·  {jobs_job_type_idx,primary}                                                                                    false
+
 
 query TTBTTTB
 SHOW COLUMNS FROM system.settings
 ----
-name         STRING     false  NULL               ·  {primary}  false
-value        STRING     false  NULL               ·  {primary}  false
-lastUpdated  TIMESTAMP  false  now():::TIMESTAMP  ·  {primary}  false
-valueType    STRING     true   NULL               ·  {primary}  false
+name         STRING     false  NULL   ·  {primary}  false
+value        STRING     false  NULL   ·  {primary}  false
+lastUpdated  TIMESTAMP  false  now()  ·  {primary}  false
+valueType    STRING     true   NULL   ·  {primary}  false
 
 query TTBTTTB
 SHOW COLUMNS FROM system.role_members
 ----
-role     STRING  false  NULL  ·  {primary,role_members_member_idx,role_members_role_idx}  false
-member   STRING  false  NULL  ·  {primary,role_members_member_idx,role_members_role_idx}  false
-isAdmin  BOOL    false  NULL  ·  {primary}                                                false
-
+role       STRING  false  NULL  ·  {primary,role_members_member_id_idx,role_members_member_idx,role_members_role_id_idx,role_members_role_id_member_id_key,role_members_role_idx}  false
+member     STRING  false  NULL  ·  {primary,role_members_member_id_idx,role_members_member_idx,role_members_role_id_idx,role_members_role_id_member_id_key,role_members_role_idx}  false
+isAdmin    BOOL    false  NULL  ·  {primary}                                                                                                                                       false
+role_id    OID     false  NULL  ·  {primary,role_members_role_id_idx,role_members_role_id_member_id_key}                                                                           false
+member_id  OID     false  NULL  ·  {primary,role_members_member_id_idx,role_members_role_id_member_id_key}                                                                         false
 
 # Verify default privileges on system tables.
 query TTTB
@@ -338,6 +378,8 @@ system  public  database_role_settings           root    SELECT  true
 system  public  database_role_settings           root    UPDATE  true
 system  public  descriptor                       admin   SELECT  true
 system  public  descriptor                       root    SELECT  true
+system  public  descriptor_id_seq                admin   SELECT  true
+system  public  descriptor_id_seq                root    SELECT  true
 system  public  eventlog                         admin   DELETE  true
 system  public  eventlog                         admin   INSERT  true
 system  public  eventlog                         admin   SELECT  true
@@ -354,6 +396,14 @@ system  public  external_connections             root    DELETE  true
 system  public  external_connections             root    INSERT  true
 system  public  external_connections             root    SELECT  true
 system  public  external_connections             root    UPDATE  true
+system  public  job_info                         admin   DELETE  true
+system  public  job_info                         admin   INSERT  true
+system  public  job_info                         admin   SELECT  true
+system  public  job_info                         admin   UPDATE  true
+system  public  job_info                         root    DELETE  true
+system  public  job_info                         root    INSERT  true
+system  public  job_info                         root    SELECT  true
+system  public  job_info                         root    UPDATE  true
 system  public  jobs                             admin   DELETE  true
 system  public  jobs                             admin   INSERT  true
 system  public  jobs                             admin   SELECT  true
@@ -494,6 +544,38 @@ system  public  span_configurations              root    DELETE  true
 system  public  span_configurations              root    INSERT  true
 system  public  span_configurations              root    SELECT  true
 system  public  span_configurations              root    UPDATE  true
+system  public  span_stats_buckets               admin   DELETE  true
+system  public  span_stats_buckets               admin   INSERT  true
+system  public  span_stats_buckets               admin   SELECT  true
+system  public  span_stats_buckets               admin   UPDATE  true
+system  public  span_stats_buckets               root    DELETE  true
+system  public  span_stats_buckets               root    INSERT  true
+system  public  span_stats_buckets               root    SELECT  true
+system  public  span_stats_buckets               root    UPDATE  true
+system  public  span_stats_samples               admin   DELETE  true
+system  public  span_stats_samples               admin   INSERT  true
+system  public  span_stats_samples               admin   SELECT  true
+system  public  span_stats_samples               admin   UPDATE  true
+system  public  span_stats_samples               root    DELETE  true
+system  public  span_stats_samples               root    INSERT  true
+system  public  span_stats_samples               root    SELECT  true
+system  public  span_stats_samples               root    UPDATE  true
+system  public  span_stats_tenant_boundaries     admin   DELETE  true
+system  public  span_stats_tenant_boundaries     admin   INSERT  true
+system  public  span_stats_tenant_boundaries     admin   SELECT  true
+system  public  span_stats_tenant_boundaries     admin   UPDATE  true
+system  public  span_stats_tenant_boundaries     root    DELETE  true
+system  public  span_stats_tenant_boundaries     root    INSERT  true
+system  public  span_stats_tenant_boundaries     root    SELECT  true
+system  public  span_stats_tenant_boundaries     root    UPDATE  true
+system  public  span_stats_unique_keys           admin   DELETE  true
+system  public  span_stats_unique_keys           admin   INSERT  true
+system  public  span_stats_unique_keys           admin   SELECT  true
+system  public  span_stats_unique_keys           admin   UPDATE  true
+system  public  span_stats_unique_keys           root    DELETE  true
+system  public  span_stats_unique_keys           root    INSERT  true
+system  public  span_stats_unique_keys           root    SELECT  true
+system  public  span_stats_unique_keys           root    UPDATE  true
 system  public  sql_instances                    admin   DELETE  true
 system  public  sql_instances                    admin   INSERT  true
 system  public  sql_instances                    admin   SELECT  true
@@ -510,6 +592,8 @@ system  public  sqlliveness                      root    DELETE  true
 system  public  sqlliveness                      root    INSERT  true
 system  public  sqlliveness                      root    SELECT  true
 system  public  sqlliveness                      root    UPDATE  true
+system  public  statement_activity               admin   SELECT  true
+system  public  statement_activity               root    SELECT  true
 system  public  statement_bundle_chunks          admin   DELETE  true
 system  public  statement_bundle_chunks          admin   INSERT  true
 system  public  statement_bundle_chunks          admin   SELECT  true
@@ -544,6 +628,16 @@ system  public  table_statistics                 root    DELETE  true
 system  public  table_statistics                 root    INSERT  true
 system  public  table_statistics                 root    SELECT  true
 system  public  table_statistics                 root    UPDATE  true
+system  public  task_payloads                    admin   DELETE  true
+system  public  task_payloads                    admin   INSERT  true
+system  public  task_payloads                    admin   SELECT  true
+system  public  task_payloads                    admin   UPDATE  true
+system  public  task_payloads                    root    DELETE  true
+system  public  task_payloads                    root    INSERT  true
+system  public  task_payloads                    root    SELECT  true
+system  public  task_payloads                    root    UPDATE  true
+system  public  tenant_id_seq                    admin   SELECT  true
+system  public  tenant_id_seq                    root    SELECT  true
 system  public  tenant_settings                  admin   DELETE  true
 system  public  tenant_settings                  admin   INSERT  true
 system  public  tenant_settings                  admin   SELECT  true
@@ -552,6 +646,14 @@ system  public  tenant_settings                  root    DELETE  true
 system  public  tenant_settings                  root    INSERT  true
 system  public  tenant_settings                  root    SELECT  true
 system  public  tenant_settings                  root    UPDATE  true
+system  public  tenant_tasks                     admin   DELETE  true
+system  public  tenant_tasks                     admin   INSERT  true
+system  public  tenant_tasks                     admin   SELECT  true
+system  public  tenant_tasks                     admin   UPDATE  true
+system  public  tenant_tasks                     root    DELETE  true
+system  public  tenant_tasks                     root    INSERT  true
+system  public  tenant_tasks                     root    SELECT  true
+system  public  tenant_tasks                     root    UPDATE  true
 system  public  tenant_usage                     admin   DELETE  true
 system  public  tenant_usage                     admin   INSERT  true
 system  public  tenant_usage                     admin   SELECT  true
@@ -562,6 +664,8 @@ system  public  tenant_usage                     root    SELECT  true
 system  public  tenant_usage                     root    UPDATE  true
 system  public  tenants                          admin   SELECT  true
 system  public  tenants                          root    SELECT  true
+system  public  transaction_activity             admin   SELECT  true
+system  public  transaction_activity             root    SELECT  true
 system  public  transaction_statistics           admin   SELECT  true
 system  public  transaction_statistics           root    SELECT  true
 system  public  ui                               admin   DELETE  true
@@ -638,6 +742,14 @@ system  public  external_connections             root    DELETE  true
 system  public  external_connections             root    INSERT  true
 system  public  external_connections             root    SELECT  true
 system  public  external_connections             root    UPDATE  true
+system  public  job_info                         admin   DELETE  true
+system  public  job_info                         admin   INSERT  true
+system  public  job_info                         admin   SELECT  true
+system  public  job_info                         admin   UPDATE  true
+system  public  job_info                         root    DELETE  true
+system  public  job_info                         root    INSERT  true
+system  public  job_info                         root    SELECT  true
+system  public  job_info                         root    UPDATE  true
 system  public  jobs                             admin   DELETE  true
 system  public  jobs                             admin   INSERT  true
 system  public  jobs                             admin   SELECT  true
@@ -778,6 +890,38 @@ system  public  span_count                       root    DELETE  true
 system  public  span_count                       root    INSERT  true
 system  public  span_count                       root    SELECT  true
 system  public  span_count                       root    UPDATE  true
+system  public  span_stats_buckets               admin   DELETE  true
+system  public  span_stats_buckets               admin   INSERT  true
+system  public  span_stats_buckets               admin   SELECT  true
+system  public  span_stats_buckets               admin   UPDATE  true
+system  public  span_stats_buckets               root    DELETE  true
+system  public  span_stats_buckets               root    INSERT  true
+system  public  span_stats_buckets               root    SELECT  true
+system  public  span_stats_buckets               root    UPDATE  true
+system  public  span_stats_samples               admin   DELETE  true
+system  public  span_stats_samples               admin   INSERT  true
+system  public  span_stats_samples               admin   SELECT  true
+system  public  span_stats_samples               admin   UPDATE  true
+system  public  span_stats_samples               root    DELETE  true
+system  public  span_stats_samples               root    INSERT  true
+system  public  span_stats_samples               root    SELECT  true
+system  public  span_stats_samples               root    UPDATE  true
+system  public  span_stats_tenant_boundaries     admin   DELETE  true
+system  public  span_stats_tenant_boundaries     admin   INSERT  true
+system  public  span_stats_tenant_boundaries     admin   SELECT  true
+system  public  span_stats_tenant_boundaries     admin   UPDATE  true
+system  public  span_stats_tenant_boundaries     root    DELETE  true
+system  public  span_stats_tenant_boundaries     root    INSERT  true
+system  public  span_stats_tenant_boundaries     root    SELECT  true
+system  public  span_stats_tenant_boundaries     root    UPDATE  true
+system  public  span_stats_unique_keys           admin   DELETE  true
+system  public  span_stats_unique_keys           admin   INSERT  true
+system  public  span_stats_unique_keys           admin   SELECT  true
+system  public  span_stats_unique_keys           admin   UPDATE  true
+system  public  span_stats_unique_keys           root    DELETE  true
+system  public  span_stats_unique_keys           root    INSERT  true
+system  public  span_stats_unique_keys           root    SELECT  true
+system  public  span_stats_unique_keys           root    UPDATE  true
 system  public  sql_instances                    admin   DELETE  true
 system  public  sql_instances                    admin   INSERT  true
 system  public  sql_instances                    admin   SELECT  true
@@ -794,6 +938,8 @@ system  public  sqlliveness                      root    DELETE  true
 system  public  sqlliveness                      root    INSERT  true
 system  public  sqlliveness                      root    SELECT  true
 system  public  sqlliveness                      root    UPDATE  true
+system  public  statement_activity               admin   SELECT  true
+system  public  statement_activity               root    SELECT  true
 system  public  statement_bundle_chunks          admin   DELETE  true
 system  public  statement_bundle_chunks          admin   INSERT  true
 system  public  statement_bundle_chunks          admin   SELECT  true
@@ -828,6 +974,8 @@ system  public  table_statistics                 root    DELETE  true
 system  public  table_statistics                 root    INSERT  true
 system  public  table_statistics                 root    SELECT  true
 system  public  table_statistics                 root    UPDATE  true
+system  public  transaction_activity             admin   SELECT  true
+system  public  transaction_activity             root    SELECT  true
 system  public  transaction_statistics           admin   SELECT  true
 system  public  transaction_statistics           root    SELECT  true
 system  public  ui                               admin   DELETE  true
@@ -1058,10 +1206,10 @@ UPSERT INTO system.settings (name, value) VALUES ('somesetting', 'somevalueother
 
 user root
 
-query TTB
+query TTBOO
 SELECT * from system.role_members
 ----
-admin  root  true
+admin  root  true  2  1
 
 statement ok
 SET DATABASE = "";

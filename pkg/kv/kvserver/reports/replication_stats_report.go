@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -88,7 +88,7 @@ func (r RangeReport) CountRange(zKey ZoneKey, status roachpb.RangeStatusReport) 
 }
 
 func (r *replicationStatsReportSaver) loadPreviousVersion(
-	ctx context.Context, ex sqlutil.InternalExecutor, txn *kv.Txn,
+	ctx context.Context, ex isql.Executor, txn *kv.Txn,
 ) error {
 	// The data for the previous save needs to be loaded if:
 	// - this is the first time that we call this method and lastUpdatedAt has never been set
@@ -134,7 +134,7 @@ func (r *replicationStatsReportSaver) loadPreviousVersion(
 }
 
 func (r *replicationStatsReportSaver) updateTimestamp(
-	ctx context.Context, ex sqlutil.InternalExecutor, txn *kv.Txn, reportTS time.Time,
+	ctx context.Context, ex isql.Executor, txn *kv.Txn, reportTS time.Time,
 ) error {
 	if !r.lastGenerated.IsZero() && reportTS == r.lastGenerated {
 		return errors.Errorf(
@@ -161,11 +161,7 @@ func (r *replicationStatsReportSaver) updateTimestamp(
 // takes ownership.
 // reportTS is the time that will be set in the updated_at column for every row.
 func (r *replicationStatsReportSaver) Save(
-	ctx context.Context,
-	report RangeReport,
-	reportTS time.Time,
-	db *kv.DB,
-	ex sqlutil.InternalExecutor,
+	ctx context.Context, report RangeReport, reportTS time.Time, db *kv.DB, ex isql.Executor,
 ) error {
 	r.lastUpdatedRowCount = 0
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -217,7 +213,7 @@ func (r *replicationStatsReportSaver) Save(
 
 // upsertStat upserts a row into system.replication_stats.
 func (r *replicationStatsReportSaver) upsertStats(
-	ctx context.Context, txn *kv.Txn, key ZoneKey, stats zoneRangeStatus, ex sqlutil.InternalExecutor,
+	ctx context.Context, txn *kv.Txn, key ZoneKey, stats zoneRangeStatus, ex isql.Executor,
 ) error {
 	var err error
 	previousStats, hasOldVersion := r.previousVersion[key]
@@ -401,7 +397,10 @@ func (v *replicationStatsVisitor) countRange(
 ) {
 	status := r.Replicas().ReplicationStatus(func(rDesc roachpb.ReplicaDescriptor) bool {
 		return v.nodeChecker(rDesc.NodeID)
-	}, replicationFactor)
+		// NB: this reporting code was written before ReplicationStatus reported
+		// on non-voting replicas. This code will also soon be removed in favor
+		// of something that works with multi-tenancy (#89987).
+	}, replicationFactor, -1 /* neededNonVoters */)
 	// Note that a range can be under-replicated and over-replicated at the same
 	// time if it has many replicas, but sufficiently many of them are on dead
 	// nodes.

@@ -36,7 +36,7 @@ func schemaExists(
 		}
 	}
 	// Now lookup in the namespace for other schemas.
-	schemaID, err := col.Direct().LookupSchemaID(ctx, txn, parentID, schema)
+	schemaID, err := col.LookupSchemaID(ctx, txn, parentID, schema)
 	if err != nil || schemaID == descpb.InvalidID {
 		return false, descpb.InvalidID, err
 	}
@@ -56,7 +56,7 @@ func (p *planner) writeSchemaDesc(ctx context.Context, desc *schemadesc.Mutable)
 func (p *planner) writeSchemaDescChange(
 	ctx context.Context, desc *schemadesc.Mutable, jobDesc string,
 ) error {
-	record, recordExists := p.extendedEvalCtx.SchemaChangeJobRecords[desc.ID]
+	record, recordExists := p.extendedEvalCtx.jobs.uniqueToCreate[desc.ID]
 	if recordExists {
 		// Update it.
 		record.AppendDescription(jobDesc)
@@ -77,7 +77,7 @@ func (p *planner) writeSchemaDescChange(
 			Progress:      jobspb.SchemaChangeProgress{},
 			NonCancelable: true,
 		}
-		p.extendedEvalCtx.SchemaChangeJobRecords[desc.ID] = &jobRecord
+		p.extendedEvalCtx.jobs.uniqueToCreate[desc.ID] = &jobRecord
 		log.Infof(ctx, "queued new schema change job %d for schema %d", jobRecord.JobID, desc.ID)
 	}
 

@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -34,7 +35,7 @@ func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		dir, dirCleanupFn := testutils.TempDir(t)
 		defer dirCleanupFn()
 
@@ -69,7 +70,7 @@ func TestDataDriven(t *testing.T) {
 			if d.HasArg("tenant") {
 				var id uint64
 				d.ScanArgs(t, "tenant", &id)
-				tenantID = roachpb.MakeTenantID(id)
+				tenantID = roachpb.MustMakeTenantID(id)
 			}
 
 			tenant, found := externalConnTestCluster.LookupTenant(tenantID)
@@ -122,7 +123,11 @@ func TestDataDriven(t *testing.T) {
 
 			case "inspect-system-table":
 				rows := tenant.Query(`
-SELECT connection_name, connection_type, crdb_internal.pb_to_json('cockroach.cloud.externalconn.connectionpb.ConnectionDetails', connection_details), owner
+SELECT connection_name,
+       connection_type,
+       crdb_internal.pb_to_json('cockroach.cloud.externalconn.connectionpb.ConnectionDetails', connection_details),
+       owner,
+       owner_id
 FROM system.external_connections;
 `)
 				output, err := sqlutils.RowsToDataDrivenOutput(rows)

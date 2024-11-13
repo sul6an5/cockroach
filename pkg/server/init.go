@@ -20,12 +20,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -249,7 +252,7 @@ func (s *initServer) ServeAndWait(
 			//
 			// TODO(irfansharif): We're calling Initialize a second time here.
 			// There's no real reason to anymore, we can use
-			// SetActiveClusterVersion instead. This will let us make
+			// SetActiveVersion instead. This will let us make
 			// `Initialize` a bit stricter, which is a nice simplification to
 			// have.
 			//
@@ -368,7 +371,7 @@ func (s *initServer) startJoinLoop(ctx context.Context, stopper *stop.Stopper) (
 		if err != nil {
 			// Try the next node if unsuccessful.
 
-			if IsWaitingForInit(err) {
+			if grpcutil.IsWaitingForInit(err) {
 				log.Infof(ctx, "%s is itself waiting for init, will retry", addr)
 			} else {
 				log.Warningf(ctx, "outgoing join rpc to %s unsuccessful: %v", addr, err.Error())
@@ -414,7 +417,7 @@ func (s *initServer) startJoinLoop(ctx context.Context, stopper *stop.Stopper) (
 				// could match against connection errors to generate nicer
 				// logging. See grpcutil.connectionRefusedRe.
 
-				if IsWaitingForInit(err) {
+				if grpcutil.IsWaitingForInit(err) {
 					log.Infof(ctx, "%s is itself waiting for init, will retry", addr)
 				} else {
 					log.Warningf(ctx, "outgoing join rpc to %s unsuccessful: %v", addr, err.Error())
@@ -446,8 +449,12 @@ func (s *initServer) startJoinLoop(ctx context.Context, stopper *stop.Stopper) (
 // attemptJoinTo attempts to join to the node running at the given address.
 func (s *initServer) attemptJoinTo(
 	ctx context.Context, addr string,
-) (*roachpb.JoinNodeResponse, error) {
-	conn, err := grpc.DialContext(ctx, addr, s.config.dialOpts...)
+) (*kvpb.JoinNodeResponse, error) {
+	dialOpts, err := s.config.getDialOpts(ctx, addr, rpc.SystemClass)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -457,22 +464,16 @@ func (s *initServer) attemptJoinTo(
 	}()
 
 	binaryVersion := s.config.binaryVersion
-	req := &roachpb.JoinNodeRequest{
+	req := &kvpb.JoinNodeRequest{
 		BinaryVersion: &binaryVersion,
 	}
 
-	initClient := roachpb.NewInternalClient(conn)
+	initClient := kvpb.NewInternalClient(conn)
 	resp, err := initClient.Join(ctx, req)
 	if err != nil {
-		// If the target node does not implement the Join RPC, or explicitly
-		// returns errJoinRPCUnsupported (because the cluster version
-		// introducing its usage is not yet active), we error out so the init
-		// server knows to fall back on the gossip-based discovery mechanism for
-		// the clusterID.
-
 		status, ok := grpcstatus.FromError(errors.UnwrapAll(err))
 		if !ok {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to join cluster")
 		}
 
 		// TODO(irfansharif): Here we're logging the error and also returning
@@ -504,7 +505,7 @@ func (s *initServer) tryBootstrap(ctx context.Context) (*initState, error) {
 
 	// We use our binary version to bootstrap the cluster.
 	cv := clusterversion.ClusterVersion{Version: s.config.binaryVersion}
-	if err := kvserver.WriteClusterVersionToEngines(ctx, s.inspectedDiskState.uninitializedEngines, cv); err != nil {
+	if err := kvstorage.WriteClusterVersionToEngines(ctx, s.inspectedDiskState.uninitializedEngines, cv); err != nil {
 		return nil, err
 	}
 
@@ -522,7 +523,7 @@ func (s *initServer) DiskClusterVersion() clusterversion.ClusterVersion {
 // and persists the appropriate cluster version to disk. After having done so,
 // it returns an initState that captures the newly initialized store.
 func (s *initServer) initializeFirstStoreAfterJoin(
-	ctx context.Context, resp *roachpb.JoinNodeResponse,
+	ctx context.Context, resp *kvpb.JoinNodeResponse,
 ) (*initState, error) {
 	// We expect all the stores to be empty at this point, except for
 	// the store cluster version key. Assert so.
@@ -536,7 +537,7 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 
 	firstEngine := s.inspectedDiskState.uninitializedEngines[0]
 	clusterVersion := clusterversion.ClusterVersion{Version: *resp.ActiveVersion}
-	if err := kvserver.WriteClusterVersion(ctx, firstEngine, clusterVersion); err != nil {
+	if err := kvstorage.WriteClusterVersion(ctx, firstEngine, clusterVersion); err != nil {
 		return nil, err
 	}
 
@@ -544,7 +545,7 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 	if err != nil {
 		return nil, err
 	}
-	if err := kvserver.InitEngine(ctx, firstEngine, sIdent); err != nil {
+	if err := kvstorage.InitEngine(ctx, firstEngine, sIdent); err != nil {
 		return nil, err
 	}
 
@@ -555,11 +556,12 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 }
 
 func assertEnginesEmpty(engines []storage.Engine) error {
-	storeClusterVersionKey := keys.StoreClusterVersionKey()
+	storeClusterVersionKey := keys.DeprecatedStoreClusterVersionKey()
 
 	for _, engine := range engines {
 		err := func() error {
 			iter := engine.NewEngineIterator(storage.IterOptions{
+				KeyTypes:   storage.IterKeyTypePointsAndRanges,
 				UpperBound: roachpb.KeyMax,
 			})
 			defer iter.Close()
@@ -570,11 +572,12 @@ func assertEnginesEmpty(engines []storage.Engine) error {
 				if err != nil {
 					return err
 				}
+				hasPoint, hasRange := iter.HasPointAndRange()
 
 				// The store cluster version key is written multiple times,
 				// including before bootstrapping or joining a cluster.
 				// Skip it if it exists.
-				if storeClusterVersionKey.Equal(k.Key) {
+				if hasPoint && !hasRange && storeClusterVersionKey.Equal(k.Key) {
 					continue
 				}
 				return errors.New("engine is not empty")
@@ -597,8 +600,8 @@ type initServerCfg struct {
 	defaultSystemZoneConfig   zonepb.ZoneConfig
 	defaultZoneConfig         zonepb.ZoneConfig
 
-	// dialOpts holds onto the dial options used when sending out Join RPCs.
-	dialOpts []grpc.DialOption
+	// getDialOpts retrieves the gRPC dial options to use to issue Join RPCs.
+	getDialOpts func(ctx context.Context, target string, class rpc.ConnectionClass) ([]grpc.DialOption, error)
 
 	// bootstrapAddresses is a list of node addresses (populated using --join
 	// addresses) that is used to form a connected graph/network of CRDB servers.
@@ -617,15 +620,28 @@ type initServerCfg struct {
 }
 
 func newInitServerConfig(
-	ctx context.Context, cfg Config, dialOpts []grpc.DialOption,
+	ctx context.Context,
+	cfg Config,
+	getDialOpts func(context.Context, string, rpc.ConnectionClass) ([]grpc.DialOption, error),
 ) initServerCfg {
 	binaryVersion := cfg.Settings.Version.BinaryVersion()
+	binaryMinSupportedVersion := cfg.Settings.Version.BinaryMinSupportedVersion()
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
+		// If BinaryVersionOverride is set, and our `binaryMinSupportedVersion` is
+		// at its default value, we must bootstrap the cluster at
+		// `binaryMinSupportedVersion`. This cluster will then run the necessary
+		// upgrades until `BinaryVersionOverride` before being ready to use in the
+		// test.
+		//
+		// Refer to the header comment on BinaryVersionOverride for more details.
 		if ov := knobs.(*TestingKnobs).BinaryVersionOverride; ov != (roachpb.Version{}) {
-			binaryVersion = ov
+			if binaryMinSupportedVersion.Equal(clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)) {
+				binaryVersion = clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)
+			} else {
+				binaryVersion = ov
+			}
 		}
 	}
-	binaryMinSupportedVersion := cfg.Settings.Version.BinaryMinSupportedVersion()
 	if binaryVersion.Less(binaryMinSupportedVersion) {
 		log.Fatalf(ctx, "binary version (%s) less than min supported version (%s)",
 			binaryVersion, binaryMinSupportedVersion)
@@ -638,7 +654,7 @@ func newInitServerConfig(
 		binaryVersion:             binaryVersion,
 		defaultSystemZoneConfig:   cfg.DefaultSystemZoneConfig,
 		defaultZoneConfig:         cfg.DefaultZoneConfig,
-		dialOpts:                  dialOpts,
+		getDialOpts:               getDialOpts,
 		bootstrapAddresses:        bootstrapAddresses,
 		testingKnobs:              cfg.TestingKnobs,
 	}
@@ -668,8 +684,8 @@ func inspectEngines(
 			}
 		}
 
-		storeIdent, err := kvserver.ReadStoreIdent(ctx, eng)
-		if errors.HasType(err, (*kvserver.NotBootstrappedError)(nil)) {
+		storeIdent, err := kvstorage.ReadStoreIdent(ctx, eng)
+		if errors.HasType(err, (*kvstorage.NotBootstrappedError)(nil)) {
 			uninitializedEngines = append(uninitializedEngines, eng)
 			continue
 		} else if err != nil {
@@ -692,7 +708,7 @@ func inspectEngines(
 
 		initializedEngines = append(initializedEngines, eng)
 	}
-	clusterVersion, err := kvserver.SynthesizeClusterVersionFromEngines(
+	clusterVersion, err := kvstorage.SynthesizeClusterVersionFromEngines(
 		ctx, initializedEngines, binaryVersion, binaryMinSupportedVersion,
 	)
 	if err != nil {

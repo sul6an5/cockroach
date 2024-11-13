@@ -27,27 +27,29 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -80,6 +82,23 @@ type leaseTest struct {
 	leaseManagerTestingKnobs lease.ManagerTestingKnobs
 }
 
+func init() {
+	lease.MoveTablePrimaryIndexIDto2 = func(
+		ctx context.Context, t *testing.T, s serverutils.TestServerInterface, id descpb.ID,
+	) {
+		require.NoError(t, sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			t, err := col.MutableByID(txn.KV()).Table(ctx, id)
+			if err != nil {
+				return err
+			}
+			t.PrimaryIndex.ID = 2
+			t.NextIndexID++
+			return col.WriteDesc(ctx, false /* kvTrace */, t, txn.KV())
+		}))
+	}
+
+}
+
 func newLeaseTest(tb testing.TB, params base.TestServerArgs) *leaseTest {
 	s, db, kvDB := serverutils.StartServer(tb, params)
 	leaseTest := &leaseTest{
@@ -101,10 +120,13 @@ func (t *leaseTest) cleanup() {
 }
 
 func (t *leaseTest) getLeases(descID descpb.ID) string {
-	sql := `
-SELECT version, "nodeID" FROM system.lease WHERE "descID" = $1 ORDER BY version, "nodeID"
+	const sql = `
+  SELECT version, "nodeID"
+    FROM system.lease
+   WHERE "descID" = $1 AND "nodeID" > $2
+ORDER BY version, "nodeID";
 `
-	rows, err := t.db.Query(sql, descID)
+	rows, err := t.db.Query(sql, descID, baseIDForLeaseTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +140,7 @@ SELECT version, "nodeID" FROM system.lease WHERE "descID" = $1 ORDER BY version,
 		if err := rows.Scan(&version, &instanceID); err != nil {
 			t.Fatal(err)
 		}
-		fmt.Fprintf(&buf, "%s/%d/%d", prefix, version, instanceID)
+		fmt.Fprintf(&buf, "%s/%d/%d", prefix, version, instanceID-baseIDForLeaseTest)
 		prefix = " "
 	}
 	if err := rows.Err(); err != nil {
@@ -204,10 +226,13 @@ func (t *leaseTest) mustPublish(ctx context.Context, nodeID uint32, descID descp
 	}
 }
 
+const baseIDForLeaseTest = 1000
+
 // node gets a Manager corresponding to a mock node. A new lease
 // manager is initialized for each node. This allows for more complex
 // inter-node lease testing.
 func (t *leaseTest) node(nodeID uint32) *lease.Manager {
+	nodeID += baseIDForLeaseTest
 	mgr := t.nodes[nodeID]
 	if mgr == nil {
 		var c base.NodeIDContainer
@@ -225,10 +250,10 @@ func (t *leaseTest) node(nodeID uint32) *lease.Manager {
 		mgr = lease.NewLeaseManager(
 			ambientCtx,
 			nc,
-			cfgCpy.DB,
+			cfgCpy.InternalDB,
 			cfgCpy.Clock,
-			cfgCpy.InternalExecutor,
 			cfgCpy.Settings,
+			t.server.SettingsWatcher().(*settingswatcher.SettingsWatcher),
 			cfgCpy.Codec,
 			t.leaseManagerTestingKnobs,
 			t.server.Stopper(),
@@ -255,7 +280,7 @@ func TestLeaseManager(testingT *testing.T) {
 	t := newLeaseTest(testingT, params)
 	defer t.cleanup()
 
-	const descID = keys.LeaseTableID
+	descID := t.makeTableForTest()
 	ctx := context.Background()
 
 	// We can't acquire a lease on a non-existent table.
@@ -279,7 +304,7 @@ func TestLeaseManager(testingT *testing.T) {
 
 	// It is an error to acquire a lease for a specific version that doesn't
 	// exist yet.
-	expected = "version 2 for descriptor lease does not exist yet"
+	expected = "version 2 for descriptor foo does not exist yet"
 	if _, err := t.acquireMinVersion(1, descID, 2); !testutils.IsError(err, expected) {
 		t.Fatalf("expected %s, but found %v", expected, err)
 	}
@@ -342,6 +367,14 @@ func TestLeaseManager(testingT *testing.T) {
 	t.expectLeases(descID, "/3/2 /4/1")
 }
 
+func (t *leaseTest) makeTableForTest() descpb.ID {
+	tdb := sqlutils.MakeSQLRunner(t.db)
+	tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
+	var descID descpb.ID
+	tdb.QueryRow(t, "SELECT 'foo'::regclass::int").Scan(&descID)
+	return descID
+}
+
 func createTestServerParams() base.TestServerArgs {
 	params, _ := tests.CreateTestServerParams()
 	params.Settings = cluster.MakeTestingClusterSettings()
@@ -368,7 +401,7 @@ func TestLeaseManagerReacquire(testingT *testing.T) {
 	t := newLeaseTest(testingT, params)
 	defer t.cleanup()
 
-	const descID = keys.LeaseTableID
+	descID := t.makeTableForTest()
 
 	l1 := t.mustAcquire(1, descID)
 	t.expectLeases(descID, "/1/1")
@@ -402,7 +435,7 @@ func TestLeaseManagerPublishVersionChanged(testingT *testing.T) {
 	t := newLeaseTest(testingT, params)
 	defer t.cleanup()
 
-	const descID = keys.LeaseTableID
+	descID := t.makeTableForTest()
 
 	// Start two goroutines that are concurrently trying to publish a new version
 	// of the descriptor. The first goroutine progresses to the update function
@@ -498,7 +531,7 @@ func TestLeaseManagerDrain(testingT *testing.T) {
 	defer t.cleanup()
 
 	ctx := context.Background()
-	const descID = keys.LeaseTableID
+	descID := t.makeTableForTest()
 
 	{
 		l1 := t.mustAcquire(1, descID)
@@ -510,8 +543,8 @@ func TestLeaseManagerDrain(testingT *testing.T) {
 		// starts draining.
 		l1RemovalTracker := leaseRemovalTracker.TrackRemoval(l1.Underlying())
 
-		t.nodes[1].SetDraining(ctx, true, nil /* reporter */)
-		t.nodes[2].SetDraining(ctx, true, nil /* reporter */)
+		t.node(1).SetDraining(ctx, true, nil /* reporter */)
+		t.node(2).SetDraining(ctx, true, nil /* reporter */)
 
 		// Leases cannot be acquired when in draining mode.
 		if _, err := t.acquire(1, descID); !testutils.IsError(err, "cannot acquire lease when draining") {
@@ -534,7 +567,7 @@ func TestLeaseManagerDrain(testingT *testing.T) {
 	{
 		// Check that leases with a refcount of 0 are correctly kept in the
 		// store once the drain mode has been exited.
-		t.nodes[1].SetDraining(ctx, false, nil /* reporter */)
+		t.node(1).SetDraining(ctx, false, nil /* reporter */)
 		l1 := t.mustAcquire(1, descID)
 		t.mustRelease(1, l1, nil)
 		t.expectLeases(descID, "/1/1")
@@ -629,10 +662,14 @@ func TestLeasesOnDeletedTableAreReleasedImmediately(t *testing.T) {
 			TestingDescriptorRefreshedEvent: func(descriptor *descpb.Descriptor) {
 				mu.Lock()
 				defer mu.Unlock()
-				if waitTableID != descpb.GetDescriptorID(descriptor) {
+				id, _, _, state, err := descpb.GetDescriptorMetadata(descriptor)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if waitTableID != id {
 					return
 				}
-				if descpb.GetDescriptorState(descriptor) == descpb.DescriptorState_DROP {
+				if state == descpb.DescriptorState_DROP {
 					close(deleted)
 					waitTableID = 0
 				}
@@ -1300,7 +1337,6 @@ func TestLeaseRenewedAutomatically(testingT *testing.T) {
 
 	var testAcquiredCount int32
 	var testAcquisitionBlockCount int32
-
 	params := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLLeaseManager: &lease.ManagerTestingKnobs{
@@ -1311,12 +1347,12 @@ func TestLeaseRenewedAutomatically(testingT *testing.T) {
 					if err != nil {
 						return
 					}
-					if !catalog.IsSystemDescriptor(desc) {
+					if _, isTable := desc.(catalog.TableDescriptor); isTable && !catalog.IsSystemDescriptor(desc) {
 						atomic.AddInt32(&testAcquiredCount, 1)
 					}
 				},
-				LeaseAcquireResultBlockEvent: func(_ lease.AcquireBlockType, id descpb.ID) {
-					if uint32(id) < bootstrap.TestingMinUserDescID() {
+				LeaseAcquireResultBlockEvent: func(typ lease.AcquireType, id descpb.ID) {
+					if uint32(id) < bootstrap.TestingMinUserDescID() || typ == lease.AcquireBackground {
 						return
 					}
 					atomic.AddInt32(&testAcquisitionBlockCount, 1)
@@ -1725,17 +1761,21 @@ CREATE TABLE t.test0 (k CHAR PRIMARY KEY, v CHAR);
 
 			// Look up the descriptor.
 			descKey := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descID)
-			dbDesc := &descpb.Descriptor{}
-			ts, err := txn.GetProtoTs(ctx, descKey, dbDesc)
+			res, err := txn.Get(ctx, descKey)
 			if err != nil {
 				t.Fatalf("error while reading proto: %v", err)
 			}
+			b, err := descbuilder.FromSerializedValue(res.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
 			// Look at the descriptor that comes back from the database.
-			dbTable, _, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(dbDesc, ts)
-
-			if dbTable.Version != table.GetVersion() || dbTable.ModificationTime != table.GetModificationTime() {
-				t.Fatalf("db has version %d at ts %s, expected version %d at ts %s",
-					dbTable.Version, dbTable.ModificationTime, table.GetVersion(), table.GetModificationTime())
+			if b != nil && b.DescriptorType() == catalog.Table {
+				dbTable := b.BuildImmutable()
+				if v, modTime := dbTable.GetVersion(), dbTable.GetModificationTime(); v != table.GetVersion() || modTime != table.GetModificationTime() {
+					t.Fatalf("db has version %d at ts %s, expected version %d at ts %s",
+						v, modTime, table.GetVersion(), table.GetModificationTime())
+				}
 			}
 		}
 		wg.Done()
@@ -1751,10 +1791,10 @@ func TestLeaseRenewedPeriodically(testingT *testing.T) {
 	ctx := context.Background()
 
 	var mu syncutil.Mutex
-	releasedIDs := make(map[descpb.ID]struct{})
-
+	releasedIDs := catalog.DescriptorIDSet{}
 	var testAcquiredCount int32
 	var testAcquisitionBlockCount int32
+	var expected catalog.DescriptorIDSet
 
 	params := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
@@ -1767,16 +1807,18 @@ func TestLeaseRenewedPeriodically(testingT *testing.T) {
 						atomic.AddInt32(&testAcquiredCount, 1)
 					}
 				},
-				LeaseReleasedEvent: func(id descpb.ID, _ descpb.DescriptorVersion, _ error) {
-					if uint32(id) < bootstrap.TestingMinUserDescID() {
-						return
-					}
+				LeaseReleasedEvent: func(id descpb.ID, v descpb.DescriptorVersion, err error) {
 					mu.Lock()
 					defer mu.Unlock()
-					releasedIDs[id] = struct{}{}
+					if !expected.Contains(id) {
+						return
+					}
+					releasedIDs.Add(id)
 				},
-				LeaseAcquireResultBlockEvent: func(_ lease.AcquireBlockType, id descpb.ID) {
-					if uint32(id) < bootstrap.TestingMinUserDescID() {
+				LeaseAcquireResultBlockEvent: func(typ lease.AcquireType, id descpb.ID) {
+					mu.Lock()
+					defer mu.Unlock()
+					if !expected.Contains(id) || typ == lease.AcquireBackground {
 						return
 					}
 					atomic.AddInt32(&testAcquisitionBlockCount, 1)
@@ -1808,19 +1850,23 @@ CREATE TABLE t.test2 ();
 		t.Fatal(err)
 	}
 
-	test1Desc := desctestutils.TestingGetPublicTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "test2")
+	test1Desc := desctestutils.TestingGetPublicTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "test1")
 	test2Desc := desctestutils.TestingGetPublicTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "test2")
 	dbID := test2Desc.GetParentID()
-
-	atomic.StoreInt32(&testAcquisitionBlockCount, 0)
-
-	numReleasedLeases := func() int {
+	func() {
 		mu.Lock()
 		defer mu.Unlock()
-		return len(releasedIDs)
+		expected = catalog.MakeDescriptorIDSet(test1Desc.GetID(), test2Desc.GetID())
+		atomic.StoreInt32(&testAcquisitionBlockCount, 0)
+	}()
+
+	releasedLeases := func() catalog.DescriptorIDSet {
+		mu.Lock()
+		defer mu.Unlock()
+		return catalog.MakeDescriptorIDSet(releasedIDs.Ordered()...)
 	}
-	if count := numReleasedLeases(); count != 0 {
-		t.Fatalf("expected no leases to be releases, released %d", count)
+	if released := releasedLeases(); released.Len() != 0 {
+		t.Fatalf("expected no leases to be released, released %v", released.Ordered())
 	}
 
 	// Acquire a lease on test1 by name.
@@ -1862,9 +1908,9 @@ CREATE TABLE t.test2 ();
 		if count := atomic.LoadInt32(&testAcquiredCount); count <= 4 {
 			return errors.Errorf("expected more than 4 leases to be acquired, but acquired %d times", count)
 		}
-
-		if count := numReleasedLeases(); count != 2 {
-			return errors.Errorf("expected 2 leases to be releases, released %d", count)
+		released := releasedLeases()
+		if notYetReleased := expected.Difference(released); notYetReleased.Len() != 0 {
+			return errors.Errorf("expected %v to be released, released %v", expected.Ordered(), released.Ordered())
 		}
 		return nil
 	})
@@ -2252,8 +2298,11 @@ func TestRangefeedUpdatesHandledProperlyInTheFaceOfRaces(t *testing.T) {
 			// Use this testing knob to ensure that we see an update for the desc
 			// in question. We don't care about events to refresh the first version
 			// which can happen under rare stress scenarios.
-			if descpb.GetDescriptorID(descriptor) == interestingTable.Load().(descpb.ID) &&
-				descpb.GetDescriptorVersion(descriptor) >= 2 {
+			id, version, _, _, err := descpb.GetDescriptorMetadata(descriptor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if id == interestingTable.Load().(descpb.ID) && version >= 2 {
 				select {
 				case descUpdateChan <- descriptor:
 				case <-unblockAll:
@@ -2321,7 +2370,9 @@ func TestRangefeedUpdatesHandledProperlyInTheFaceOfRaces(t *testing.T) {
 	case err := <-selectDone:
 		t.Fatalf("select succeeded before expected: %v", err)
 	case desc := <-descUpdateChan:
-		require.Equal(t, descpb.DescriptorVersion(2), descpb.GetDescriptorVersion(desc))
+		_, version, _, _, err := descpb.GetDescriptorMetadata(desc)
+		require.NoError(t, err)
+		require.Equal(t, descpb.DescriptorVersion(2), version)
 	}
 
 	// Allow the original lease acquisition to proceed.
@@ -2354,7 +2405,7 @@ func TestLeaseWithOfflineTables(t *testing.T) {
 	var lmKnobs lease.ManagerTestingKnobs
 	blockDescRefreshed := make(chan struct{}, 1)
 	lmKnobs.TestingDescriptorRefreshedEvent = func(desc *descpb.Descriptor) {
-		tbl, _, _, _, _ := descpb.FromDescriptor(desc)
+		tbl, _, _, _, _ := descpb.GetDescriptors(desc)
 		if tbl != nil && testTableID() == tbl.ID {
 			blockDescRefreshed <- struct{}{}
 		}
@@ -2387,16 +2438,13 @@ func TestLeaseWithOfflineTables(t *testing.T) {
 	setTableState := func(expected descpb.DescriptorState, next descpb.DescriptorState) {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
-			ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+			ctx context.Context, txn isql.Txn, descsCol *descs.Collection,
 		) error {
-			flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireTableDesc)
-			flags.CommonLookupFlags.IncludeOffline = true
-			flags.CommonLookupFlags.IncludeDropped = true
-			desc, err := descsCol.GetMutableTableByID(ctx, txn, testTableID(), flags)
+			desc, err := descsCol.MutableByID(txn.KV()).Table(ctx, testTableID())
 			require.NoError(t, err)
 			require.Equal(t, desc.State, expected)
 			desc.State = next
-			return descsCol.WriteDesc(ctx, false /* kvTrace */, desc, txn)
+			return descsCol.WriteDesc(ctx, false /* kvTrace */, desc, txn.KV())
 		}))
 
 		// Wait for the lease manager's refresh worker to have processed the
@@ -2511,11 +2559,13 @@ func TestHistoricalAcquireDroppedDescriptor(t *testing.T) {
 			Knobs: base.TestingKnobs{
 				SQLLeaseManager: &lease.ManagerTestingKnobs{
 					TestingDescriptorRefreshedEvent: func(descriptor *descpb.Descriptor) {
-						name := descpb.GetDescriptorName(descriptor)
+						_, _, name, state, err := descpb.GetDescriptorMetadata(descriptor)
+						if err != nil {
+							t.Fatal(err)
+						}
 						if name != typeName || seenDrop == nil {
 							return
 						}
-						state := descpb.GetDescriptorState(descriptor)
 						if state == descpb.DescriptorState_DROP {
 							close(seenDrop)
 							seenDrop = nil
@@ -2612,7 +2662,7 @@ func TestDropDescriptorRacesWithAcquisition(t *testing.T) {
 	testingKnobs := base.TestingKnobs{
 		SQLLeaseManager: &lease.ManagerTestingKnobs{
 			TestingDescriptorUpdateEvent: func(descriptor *descpb.Descriptor) error {
-				_, version, name, _, _, err := descpb.GetDescriptorMetadata(descriptor)
+				_, version, name, _, err := descpb.GetDescriptorMetadata(descriptor)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2629,7 +2679,7 @@ func TestDropDescriptorRacesWithAcquisition(t *testing.T) {
 				return nil
 			},
 			TestingDescriptorRefreshedEvent: func(descriptor *descpb.Descriptor) {
-				_, version, name, _, _, err := descpb.GetDescriptorMetadata(descriptor)
+				_, version, name, _, err := descpb.GetDescriptorMetadata(descriptor)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2728,11 +2778,11 @@ func TestOfflineLeaseRefresh(t *testing.T) {
 	var mu syncutil.RWMutex
 
 	knobs := &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, req roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, req *kvpb.BatchRequest) *kvpb.Error {
 			mu.RLock()
 			checkRequest := req.Txn != nil && req.Txn.ID.Equal(txnID)
 			mu.RUnlock()
-			if _, ok := req.GetArg(roachpb.EndTxn); checkRequest && ok {
+			if _, ok := req.GetArg(kvpb.EndTxn); checkRequest && ok {
 				notify := make(chan struct{})
 				waitForRqstFilter <- notify
 				<-notify
@@ -2760,15 +2810,18 @@ CREATE TABLE d1.t2 (name int);
 
 	// Force the table descriptor into a offline state
 	cfg := s.ExecutorConfig().(sql.ExecutorConfig)
+	var tableID descpb.ID
 	require.NoError(t, sql.DescsTxn(ctx, &cfg, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
-		_, tableDesc, err := descriptors.GetMutableTableByName(ctx, txn, tree.NewTableNameWithSchema("d1", "public", "t1"), tree.ObjectLookupFlagsWithRequired())
+		tn := tree.NewTableNameWithSchema("d1", "public", "t1")
+		_, tableDesc, err := descs.PrefixAndMutableTable(ctx, descriptors.MutableByName(txn.KV()), tn)
 		if err != nil {
 			return err
 		}
+		tableID = tableDesc.GetID()
 		tableDesc.SetOffline("For unit test")
-		err = descriptors.WriteDesc(ctx, false, tableDesc, txn)
+		err = descriptors.WriteDesc(ctx, false, tableDesc, txn.KV())
 		if err != nil {
 			return err
 		}
@@ -2777,28 +2830,21 @@ CREATE TABLE d1.t2 (name int);
 
 	go func() {
 		err := sql.DescsTxn(ctx, &cfg, func(
-			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+			ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 		) error {
 			close(waitForRqstFilter)
 			mu.Lock()
 			waitForRqstFilter = make(chan chan struct{})
-			txnID = txn.ID()
+			txnID = txn.KV().ID()
 			mu.Unlock()
 
 			// Online the descriptor by making it public
-			_, tableDesc, err := descriptors.GetMutableTableByName(ctx, txn,
-				tree.NewTableNameWithSchema("d1", "public", "t1"),
-				tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
-					Required:       true,
-					RequireMutable: true,
-					IncludeOffline: true,
-					AvoidLeased:    true,
-				}})
+			tableDesc, err := descriptors.MutableByID(txn.KV()).Table(ctx, tableID)
 			if err != nil {
 				return err
 			}
 			tableDesc.SetPublic()
-			err = descriptors.WriteDesc(ctx, false, tableDesc, txn)
+			err = descriptors.WriteDesc(ctx, false, tableDesc, txn.KV())
 			if err != nil {
 				return err
 			}
@@ -2810,8 +2856,8 @@ CREATE TABLE d1.t2 (name int);
 			<-notify
 
 			// Select from an unrelated table
-			_, err = s.InternalExecutor().(sqlutil.InternalExecutor).ExecEx(ctx, "inline-exec", txn,
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			_, err = txn.ExecEx(ctx, "inline-exec", txn.KV(),
+				sessiondata.RootUserSessionDataOverride,
 				"insert into d1.t2 values (10);")
 			return err
 
@@ -2858,7 +2904,7 @@ func TestLeaseTxnDeadlineExtension(t *testing.T) {
 	// require the lease to be reacquired.
 	lease.LeaseDuration.Override(ctx, &params.SV, 0)
 	params.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, req roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, req *kvpb.BatchRequest) *kvpb.Error {
 			filterMu.Lock()
 			// Wait for a commit with the txnID, and only allows
 			// it to resume when the channel gets unblocked.
@@ -3048,7 +3094,7 @@ func TestLeaseBulkInsertWithImplicitTxn(t *testing.T) {
 		// The before execute hook will be to set up to pause
 		// the beforeExecuteStmt, which will then be resumed
 		// when the beforeExecuteResumeStmt statement is observed.
-		BeforeExecute: func(ctx context.Context, stmt string) {
+		BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
 			beforeExecute.Lock()
 			if stmt == beforeExecuteStmt {
 				tableID := descpb.ID(atomic.LoadUint64(&leaseTableID))
@@ -3178,7 +3224,7 @@ func TestAmbiguousResultIsRetried(t *testing.T) {
 
 	type filter = kvserverbase.ReplicaResponseFilter
 	var f atomic.Value
-	noop := filter(func(context.Context, roachpb.BatchRequest, *roachpb.BatchResponse) *roachpb.Error {
+	noop := filter(func(context.Context, *kvpb.BatchRequest, *kvpb.BatchResponse) *kvpb.Error {
 		return nil
 	})
 	f.Store(noop)
@@ -3186,7 +3232,7 @@ func TestAmbiguousResultIsRetried(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingResponseFilter: func(ctx context.Context, request roachpb.BatchRequest, response *roachpb.BatchResponse) *roachpb.Error {
+				TestingResponseFilter: func(ctx context.Context, request *kvpb.BatchRequest, response *kvpb.BatchResponse) *kvpb.Error {
 					return f.Load().(filter)(ctx, request, response)
 				},
 			},
@@ -3199,32 +3245,40 @@ func TestAmbiguousResultIsRetried(t *testing.T) {
 
 	tableID := sqlutils.QueryTableID(t, sqlDB, "defaultdb", "public", "foo")
 
-	indexPrefix := keys.SystemSQLCodec.IndexPrefix(keys.LeaseTableID, 1)
+	tablePrefix := keys.SystemSQLCodec.TablePrefix(keys.LeaseTableID)
 	var txnID atomic.Value
 	txnID.Store(uuid.UUID{})
 
 	testCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	errorsAfterEndTxn := make(chan chan *roachpb.Error)
-	f.Store(filter(func(ctx context.Context, request roachpb.BatchRequest, response *roachpb.BatchResponse) *roachpb.Error {
+	errorsAfterEndTxn := make(chan chan *kvpb.Error)
+	f.Store(filter(func(ctx context.Context, request *kvpb.BatchRequest, response *kvpb.BatchResponse) *kvpb.Error {
 		switch r := request.Requests[0].GetInner().(type) {
-		case *roachpb.ConditionalPutRequest:
-			if !bytes.HasPrefix(r.Key, indexPrefix) {
+		case *kvpb.ConditionalPutRequest:
+			if !bytes.HasPrefix(r.Key, tablePrefix) {
 				return nil
 			}
+			in, _, _, err := keys.DecodeTableIDIndexID(r.Key)
+			if err != nil {
+				return kvpb.NewError(errors.WithAssertionFailure(err))
+			}
 			var a tree.DatumAlloc
+			_, in, err = keyside.Decode(&a, types.Bytes, in, encoding.Ascending)
+			if !assert.NoError(t, err) {
+				return kvpb.NewError(err)
+			}
 			id, _, err := keyside.Decode(
-				&a, types.Int, bytes.TrimPrefix(r.Key, indexPrefix), encoding.Ascending,
+				&a, types.Int, in, encoding.Ascending,
 			)
 			assert.NoError(t, err)
 			if tree.MustBeDInt(id) == tree.DInt(tableID) {
 				txnID.Store(request.Txn.ID)
 			}
-		case *roachpb.EndTxnRequest:
+		case *kvpb.EndTxnRequest:
 			if request.Txn.ID != txnID.Load().(uuid.UUID) {
 				return nil
 			}
-			errCh := make(chan *roachpb.Error)
+			errCh := make(chan *kvpb.Error)
 			select {
 			case errorsAfterEndTxn <- errCh:
 			case <-testCtx.Done():
@@ -3243,7 +3297,7 @@ func TestAmbiguousResultIsRetried(t *testing.T) {
 		selectErr <- err
 	}()
 	unblock := <-errorsAfterEndTxn
-	unblock <- roachpb.NewError(roachpb.NewAmbiguousResultError(errors.New("boom")))
+	unblock <- kvpb.NewError(kvpb.NewAmbiguousResultError(errors.New("boom")))
 	// Make sure we see a retry, then let it succeed.
 	close(<-errorsAfterEndTxn)
 	// Allow anything further to proceed.

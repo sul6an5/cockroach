@@ -14,50 +14,57 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydrateddesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydrateddesccache"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
 // CollectionFactory is used to construct a new Collection.
 type CollectionFactory struct {
-	settings           *cluster.Settings
-	codec              keys.SQLCodec
-	leaseMgr           *lease.Manager
-	virtualSchemas     catalog.VirtualSchemas
-	hydrated           *hydrateddesc.Cache
-	systemDatabase     *catkv.SystemDatabaseCache
-	spanConfigSplitter spanconfig.Splitter
-	spanConfigLimiter  spanconfig.Limiter
-	defaultMonitor     *mon.BytesMonitor
-	ieFactoryWithTxn   InternalExecutorFactoryWithTxn
+	settings                             *cluster.Settings
+	codec                                keys.SQLCodec
+	leaseMgr                             *lease.Manager
+	virtualSchemas                       catalog.VirtualSchemas
+	hydrated                             *hydrateddesccache.Cache
+	systemDatabase                       *catkv.SystemDatabaseCache
+	spanConfigSplitter                   spanconfig.Splitter
+	spanConfigLimiter                    spanconfig.Limiter
+	defaultMonitor                       *mon.BytesMonitor
+	defaultDescriptorSessionDataProvider DescriptorSessionDataProvider
 }
 
-// InternalExecutorFactoryWithTxn is used to create an internal executor
-// with associated extra txn state information.
-// It should only be used as a field hanging off CollectionFactory.
-type InternalExecutorFactoryWithTxn interface {
-	MemoryMonitor() *mon.BytesMonitor
-
-	NewInternalExecutorWithTxn(
-		sd *sessiondata.SessionData,
-		sv *settings.Values,
-		txn *kv.Txn,
-		descCol *Collection,
-	) (sqlutil.InternalExecutor, InternalExecutorCommitTxnFunc)
+// GetClusterSettings returns the cluster setting from the collection factory.
+func (cf *CollectionFactory) GetClusterSettings() *cluster.Settings {
+	return cf.settings
 }
 
-// InternalExecutorCommitTxnFunc is to commit the txn associated with an
-// internal executor.
-type InternalExecutorCommitTxnFunc func(ctx context.Context) error
+type Txn interface {
+	isql.Txn
+	Descriptors() *Collection
+	Regions() RegionProvider
+}
+
+// DB is used to enable running multiple queries with an internal
+// executor in a transactional manner.
+type DB interface {
+	isql.DB
+
+	// DescsTxn is similar to DescsTxnWithExecutor but without an internal executor.
+	// It creates a descriptor collection that lives within the scope of the given
+	// function, and is a convenient method for running a transaction on
+	// them.
+	DescsTxn(
+		ctx context.Context,
+		f func(context.Context, Txn) error,
+		opts ...isql.TxnOption,
+	) error
+}
 
 // NewCollectionFactory constructs a new CollectionFactory which holds onto
 // the node-level dependencies needed to construct a Collection.
@@ -66,9 +73,10 @@ func NewCollectionFactory(
 	settings *cluster.Settings,
 	leaseMgr *lease.Manager,
 	virtualSchemas catalog.VirtualSchemas,
-	hydrated *hydrateddesc.Cache,
+	hydrated *hydrateddesccache.Cache,
 	spanConfigSplitter spanconfig.Splitter,
 	spanConfigLimiter spanconfig.Limiter,
+	defaultDescriptorSessionDataProvider DescriptorSessionDataProvider,
 ) *CollectionFactory {
 	return &CollectionFactory{
 		settings:           settings,
@@ -76,12 +84,13 @@ func NewCollectionFactory(
 		leaseMgr:           leaseMgr,
 		virtualSchemas:     virtualSchemas,
 		hydrated:           hydrated,
-		systemDatabase:     catkv.NewSystemDatabaseCache(leaseMgr.Codec(), settings),
+		systemDatabase:     leaseMgr.SystemDatabaseCache(),
 		spanConfigSplitter: spanConfigSplitter,
 		spanConfigLimiter:  spanConfigLimiter,
 		defaultMonitor: mon.NewUnlimitedMonitor(ctx, "CollectionFactoryDefaultUnlimitedMonitor",
 			mon.MemoryResource, nil /* curCount */, nil, /* maxHist */
 			0 /* noteworthy */, settings),
+		defaultDescriptorSessionDataProvider: defaultDescriptorSessionDataProvider,
 	}
 }
 
@@ -96,23 +105,68 @@ func NewBareBonesCollectionFactory(
 	}
 }
 
-// NewCollection constructs a new Collection.
-func (cf *CollectionFactory) NewCollection(
-	ctx context.Context, temporarySchemaProvider TemporarySchemaProvider, monitor *mon.BytesMonitor,
-) *Collection {
-	if monitor == nil {
-		// If an upstream monitor is not provided, the default, unlimited monitor will be used.
-		// All downstream resource allocation/releases on this default monitor will then be no-ops.
-		monitor = cf.defaultMonitor
-	}
-	return newCollection(ctx, cf.leaseMgr, cf.settings, cf.codec, cf.hydrated, cf.systemDatabase,
-		cf.virtualSchemas, temporarySchemaProvider, monitor)
+type constructorConfig struct {
+	dsdp    DescriptorSessionDataProvider
+	monitor *mon.BytesMonitor
 }
 
-// SetInternalExecutorWithTxn is to set the internal executor factory hanging
-// off the collection factory.
-func (cf *CollectionFactory) SetInternalExecutorWithTxn(
-	ieFactoryWithTxn InternalExecutorFactoryWithTxn,
-) {
-	cf.ieFactoryWithTxn = ieFactoryWithTxn
+// Option is how optional construction parameters are provided to the
+// CollectionFactory construction method.
+type Option func(b *constructorConfig)
+
+// WithDescriptorSessionDataProvider supplies a DescriptorSessionDataProvider
+// instance to the Collection constructor.
+func WithDescriptorSessionDataProvider(
+	dsdp DescriptorSessionDataProvider,
+) func(cfg *constructorConfig) {
+	return func(cfg *constructorConfig) {
+		cfg.dsdp = dsdp
+	}
+}
+
+// WithMonitor supplies a mon.BytesMonitor instance to the Collection
+// constructor.
+func WithMonitor(monitor *mon.BytesMonitor) func(b *constructorConfig) {
+	return func(cfg *constructorConfig) {
+		cfg.monitor = monitor
+	}
+}
+
+// NewCollection constructs a new Collection.
+// When no DescriptorSessionDataProvider is provided, the factory falls back to
+// the default instances which behaves as if the session data stack were empty.
+// Whe no mon.BytesMonitor is provided, the factory falls back to a default,
+// unlimited monitor for which all downstream resource allocation/releases are
+// no-ops.
+func (cf *CollectionFactory) NewCollection(ctx context.Context, options ...Option) *Collection {
+	cfg := constructorConfig{
+		dsdp:    cf.defaultDescriptorSessionDataProvider,
+		monitor: cf.defaultMonitor,
+	}
+	for _, opt := range options {
+		opt(&cfg)
+	}
+	v := cf.settings.Version.ActiveVersion(ctx)
+	return &Collection{
+		settings:                cf.settings,
+		version:                 v,
+		hydrated:                cf.hydrated,
+		virtual:                 makeVirtualDescriptors(cf.virtualSchemas),
+		leased:                  makeLeasedDescriptors(cf.leaseMgr),
+		uncommitted:             makeUncommittedDescriptors(cfg.monitor),
+		uncommittedComments:     makeUncommittedComments(),
+		uncommittedZoneConfigs:  makeUncommittedZoneConfigs(),
+		cr:                      catkv.NewCatalogReader(cf.codec, v, cf.systemDatabase, cfg.monitor),
+		temporarySchemaProvider: cfg.dsdp,
+		validationModeProvider:  cfg.dsdp,
+	}
+}
+
+// RegionProvider abstracts the lookup of regions. It is used to implement
+// crdb_internal.regions, which ultimately drives `SHOW REGIONS` and the
+// logic in the commands to manipulate multi-region features.
+type RegionProvider interface {
+	// GetRegions provides access to the set of regions available to the
+	// current tenant.
+	GetRegions(ctx context.Context) (*serverpb.RegionsResponse, error)
 }

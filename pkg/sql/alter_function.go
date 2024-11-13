@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -25,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type alterFunctionOptionsNode struct {
@@ -74,20 +74,57 @@ func (n *alterFunctionOptionsNode) startExec(params runParams) error {
 	if err := tree.ValidateFuncOptions(n.n.Options); err != nil {
 		return err
 	}
+
+	if err := validateVolatilityInOptions(n.n.Options, fnDesc); err != nil {
+		return err
+	}
+
 	for _, option := range n.n.Options {
 		// Note that language and function body cannot be altered, and it's blocked
 		// from parser level with "common_func_opt_item" syntax.
-		err := setFuncOption(params, fnDesc, option)
-		if err != nil {
+		if err := maybeValidateNewFuncVolatility(params, fnDesc, option); err != nil {
+			return err
+		}
+		if err := setFuncOption(params, fnDesc, option); err != nil {
 			return err
 		}
 	}
 
-	if err := funcdesc.CheckLeakProofVolatility(fnDesc); err != nil {
+	if err := params.p.writeFuncSchemaChange(params.ctx, fnDesc); err != nil {
 		return err
 	}
 
-	return params.p.writeFuncSchemaChange(params.ctx, fnDesc)
+	fnName, err := params.p.getQualifiedFunctionName(params.ctx, fnDesc)
+	if err != nil {
+		return err
+	}
+	event := eventpb.AlterFunctionOptions{
+		FunctionName: fnName.FQString(),
+	}
+	return params.p.logEvent(params.ctx, fnDesc.GetID(), &event)
+}
+
+func maybeValidateNewFuncVolatility(
+	params runParams, fnDesc catalog.FunctionDescriptor, option tree.FunctionOption,
+) error {
+	switch t := option.(type) {
+	case tree.FunctionVolatility:
+		f := NewReferenceProviderFactory(params.p)
+		ast, err := fnDesc.ToCreateExpr()
+		if err != nil {
+			return err
+		}
+		for i, o := range ast.Options {
+			if _, ok := o.(tree.FunctionVolatility); ok {
+				ast.Options[i] = t
+			}
+		}
+		if _, err := f.NewReferenceProvider(params.ctx, ast); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (n *alterFunctionOptionsNode) Next(params runParams) (bool, error) { return false, nil }
@@ -117,17 +154,19 @@ func (n *alterFunctionRenameNode) startExec(params runParams) error {
 	if err != nil {
 		return err
 	}
+	oldFnName, err := params.p.getQualifiedFunctionName(params.ctx, fnDesc)
+	if err != nil {
+		return err
+	}
 
-	scDesc, err := params.p.Descriptors().GetMutableSchemaByID(
-		params.ctx, params.p.txn, fnDesc.GetParentSchemaID(), tree.SchemaLookupFlags{Required: true},
-	)
+	scDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Schema(params.ctx, fnDesc.GetParentSchemaID())
 	if err != nil {
 		return err
 	}
 
 	maybeExistingFuncObj := fnDesc.ToFuncObj()
 	maybeExistingFuncObj.FuncName.ObjectName = n.n.NewName
-	existing, err := params.p.matchUDF(params.ctx, &maybeExistingFuncObj, false /* required */)
+	existing, err := params.p.matchUDF(params.ctx, maybeExistingFuncObj, false /* required */)
 	if err != nil {
 		return err
 	}
@@ -146,7 +185,19 @@ func (n *alterFunctionRenameNode) startExec(params runParams) error {
 		return err
 	}
 
-	return params.p.writeSchemaDescChange(params.ctx, scDesc, "alter function name")
+	if err := params.p.writeSchemaDescChange(params.ctx, scDesc, "alter function name"); err != nil {
+		return err
+	}
+
+	newFnName, err := params.p.getQualifiedFunctionName(params.ctx, fnDesc)
+	if err != nil {
+		return err
+	}
+	event := eventpb.RenameFunction{
+		FunctionName:    oldFnName.FQString(),
+		NewFunctionName: newFnName.FQString(),
+	}
+	return params.p.logEvent(params.ctx, fnDesc.GetID(), &event)
 }
 
 func (n *alterFunctionRenameNode) Next(params runParams) (bool, error) { return false, nil }
@@ -194,7 +245,19 @@ func (n *alterFunctionSetOwnerNode) startExec(params runParams) error {
 	}
 
 	fnDesc.GetPrivileges().SetOwner(newOwner)
-	return params.p.writeFuncSchemaChange(params.ctx, fnDesc)
+	if err := params.p.writeFuncSchemaChange(params.ctx, fnDesc); err != nil {
+		return err
+	}
+
+	fnName, err := params.p.getQualifiedFunctionName(params.ctx, fnDesc)
+	if err != nil {
+		return err
+	}
+	event := eventpb.AlterFunctionOwner{
+		FunctionName: fnName.FQString(),
+		Owner:        newOwner.Normalized(),
+	}
+	return params.p.logEvent(params.ctx, fnDesc.GetID(), &event)
 }
 
 func (n *alterFunctionSetOwnerNode) Next(params runParams) (bool, error) { return false, nil }
@@ -224,18 +287,17 @@ func (n *alterFunctionSetSchemaNode) startExec(params runParams) error {
 	if err != nil {
 		return err
 	}
-	// Functions cannot be resolved across db, so just use current db name to get
-	// the descriptor.
-	db, err := params.p.Descriptors().GetMutableDatabaseByName(
-		params.ctx, params.p.txn, params.p.CurrentDatabase(), tree.DatabaseLookupFlags{Required: true},
-	)
+	oldFnName, err := params.p.getQualifiedFunctionName(params.ctx, fnDesc)
 	if err != nil {
 		return err
 	}
-
-	sc, err := params.p.Descriptors().GetMutableSchemaByName(
-		params.ctx, params.p.txn, db, string(n.n.NewSchemaName), tree.SchemaLookupFlags{Required: true},
-	)
+	// Functions cannot be resolved across db, so just use current db name to get
+	// the descriptor.
+	db, err := params.p.Descriptors().MutableByName(params.p.txn).Database(params.ctx, params.p.CurrentDatabase())
+	if err != nil {
+		return err
+	}
+	sc, err := params.p.Descriptors().ByName(params.p.txn).Get().Schema(params.ctx, db, string(n.n.NewSchemaName))
 	if err != nil {
 		return err
 	}
@@ -256,17 +318,20 @@ func (n *alterFunctionSetSchemaNode) startExec(params runParams) error {
 		}
 	}
 
-	targetSc := sc.(*schemadesc.Mutable)
-	if targetSc.GetID() == fnDesc.GetParentSchemaID() {
+	if sc.GetID() == fnDesc.GetParentSchemaID() {
 		// No-op if moving to the same schema.
 		return nil
+	}
+	targetSc, err := params.p.Descriptors().MutableByID(params.p.txn).Schema(params.ctx, sc.GetID())
+	if err != nil {
+		return err
 	}
 
 	// Check if there is a conflicting function exists.
 	maybeExistingFuncObj := fnDesc.ToFuncObj()
 	maybeExistingFuncObj.FuncName.SchemaName = tree.Name(targetSc.GetName())
 	maybeExistingFuncObj.FuncName.ExplicitSchema = true
-	existing, err := params.p.matchUDF(params.ctx, &maybeExistingFuncObj, false /* required */)
+	existing, err := params.p.matchUDF(params.ctx, maybeExistingFuncObj, false /* required */)
 	if err != nil {
 		return err
 	}
@@ -277,9 +342,7 @@ func (n *alterFunctionSetSchemaNode) startExec(params runParams) error {
 		)
 	}
 
-	sourceSc, err := params.p.Descriptors().GetMutableSchemaByID(
-		params.ctx, params.p.txn, fnDesc.GetParentSchemaID(), tree.SchemaLookupFlags{Required: true},
-	)
+	sourceSc, err := params.p.Descriptors().MutableByID(params.p.txn).Schema(params.ctx, fnDesc.GetParentSchemaID())
 	if err != nil {
 		return err
 	}
@@ -293,7 +356,20 @@ func (n *alterFunctionSetSchemaNode) startExec(params runParams) error {
 		return err
 	}
 	fnDesc.SetParentSchemaID(targetSc.GetID())
-	return params.p.writeFuncSchemaChange(params.ctx, fnDesc)
+	if err := params.p.writeFuncSchemaChange(params.ctx, fnDesc); err != nil {
+		return err
+	}
+
+	newFnName, err := params.p.getQualifiedFunctionName(params.ctx, fnDesc)
+	if err != nil {
+		return err
+	}
+	event := eventpb.SetSchema{
+		DescriptorName:    oldFnName.FQString(),
+		NewDescriptorName: newFnName.FQString(),
+		DescriptorType:    string(fnDesc.DescriptorType()),
+	}
+	return params.p.logEvent(params.ctx, fnDesc.GetID(), &event)
 }
 
 func (n *alterFunctionSetSchemaNode) Next(params runParams) (bool, error) { return false, nil }
@@ -322,10 +398,7 @@ func (p *planner) mustGetMutableFunctionForAlter(
 	if err != nil {
 		return nil, err
 	}
-	fnID, err := funcdesc.UserDefinedFunctionOIDToID(ol.Oid)
-	if err != nil {
-		return nil, err
-	}
+	fnID := funcdesc.UserDefinedFunctionOIDToID(ol.Oid)
 	mut, err := p.checkPrivilegesForDropFunction(ctx, fnID)
 	if err != nil {
 		return nil, err
@@ -333,15 +406,15 @@ func (p *planner) mustGetMutableFunctionForAlter(
 	return mut, nil
 }
 
-func toSchemaOverloadSignature(fnDesc *funcdesc.Mutable) descpb.SchemaDescriptor_FunctionOverload {
-	ret := descpb.SchemaDescriptor_FunctionOverload{
+func toSchemaOverloadSignature(fnDesc *funcdesc.Mutable) descpb.SchemaDescriptor_FunctionSignature {
+	ret := descpb.SchemaDescriptor_FunctionSignature{
 		ID:         fnDesc.GetID(),
-		ArgTypes:   make([]*types.T, len(fnDesc.GetArgs())),
+		ArgTypes:   make([]*types.T, len(fnDesc.GetParams())),
 		ReturnType: fnDesc.ReturnType.Type,
 		ReturnSet:  fnDesc.ReturnType.ReturnSet,
 	}
-	for i := range fnDesc.Args {
-		ret.ArgTypes[i] = fnDesc.Args[i].Type
+	for i := range fnDesc.Params {
+		ret.ArgTypes[i] = fnDesc.Params[i].Type
 	}
 	return ret
 }

@@ -13,33 +13,11 @@
  */
 
 import _ from "lodash";
-import moment from "moment";
+import moment from "moment-timezone";
 
 import * as protos from "src/js/protos";
 import { FixLong } from "src/util/fixLong";
 import { propsToQueryString } from "src/util/query";
-import { cockroach } from "src/js/protos";
-import TakeTracingSnapshotRequest = cockroach.server.serverpb.TakeTracingSnapshotRequest;
-
-export type DatabasesRequestMessage =
-  protos.cockroach.server.serverpb.DatabasesRequest;
-export type DatabasesResponseMessage =
-  protos.cockroach.server.serverpb.DatabasesResponse;
-
-export type DatabaseDetailsRequestMessage =
-  protos.cockroach.server.serverpb.DatabaseDetailsRequest;
-export type DatabaseDetailsResponseMessage =
-  protos.cockroach.server.serverpb.DatabaseDetailsResponse;
-
-export type TableDetailsRequestMessage =
-  protos.cockroach.server.serverpb.TableDetailsRequest;
-export type TableDetailsResponseMessage =
-  protos.cockroach.server.serverpb.TableDetailsResponse;
-
-export type EventsRequestMessage =
-  protos.cockroach.server.serverpb.EventsRequest;
-export type EventsResponseMessage =
-  protos.cockroach.server.serverpb.EventsResponse;
 
 export type LocationsRequestMessage =
   protos.cockroach.server.serverpb.LocationsRequest;
@@ -192,28 +170,6 @@ export type MetricMetadataRequestMessage =
 export type MetricMetadataResponseMessage =
   protos.cockroach.server.serverpb.MetricMetadataResponse;
 
-export type StatementDiagnosticsReportsRequestMessage =
-  protos.cockroach.server.serverpb.StatementDiagnosticsReportsRequest;
-export type StatementDiagnosticsReportsResponseMessage =
-  protos.cockroach.server.serverpb.StatementDiagnosticsReportsResponse;
-
-export type CreateStatementDiagnosticsReportRequestMessage =
-  protos.cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
-export type CreateStatementDiagnosticsReportResponseMessage =
-  protos.cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse;
-
-export type CancelStatementDiagnosticsReportRequestMessage =
-  protos.cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest;
-export type CancelStatementDiagnosticsReportResponseMessage =
-  protos.cockroach.server.serverpb.CancelStatementDiagnosticsReportResponse;
-
-export type StatementDiagnosticsRequestMessage =
-  protos.cockroach.server.serverpb.StatementDiagnosticsRequest;
-export type StatementDiagnosticsResponseMessage =
-  protos.cockroach.server.serverpb.StatementDiagnosticsResponse;
-
-export type StatementsRequestMessage =
-  protos.cockroach.server.serverpb.StatementsRequest;
 export type StatementDetailsRequestMessage =
   protos.cockroach.server.serverpb.StatementDetailsRequest;
 
@@ -236,30 +192,16 @@ export type HotRangesRequestMessage =
   protos.cockroach.server.serverpb.HotRangesRequest;
 export type HotRangesV2ResponseMessage =
   protos.cockroach.server.serverpb.HotRangesResponseV2;
+
+export type KeyVisualizerSamplesRequestMessage =
+  protos.cockroach.server.serverpb.KeyVisSamplesRequest;
+export type KeyVisualizerSamplesResponseMessage =
+  protos.cockroach.server.serverpb.KeyVisSamplesResponse;
+
 export type ListTracingSnapshotsRequestMessage =
   protos.cockroach.server.serverpb.ListTracingSnapshotsRequest;
 export type ListTracingSnapshotsResponseMessage =
   protos.cockroach.server.serverpb.ListTracingSnapshotsResponse;
-
-export type TakeTracingSnapshotRequestMessage =
-  protos.cockroach.server.serverpb.TakeTracingSnapshotRequest;
-export type TakeTracingSnapshotResponseMessage =
-  protos.cockroach.server.serverpb.TakeTracingSnapshotResponse;
-
-export type GetTracingSnapshotRequestMessage =
-  protos.cockroach.server.serverpb.GetTracingSnapshotRequest;
-export type GetTracingSnapshotResponseMessage =
-  protos.cockroach.server.serverpb.GetTracingSnapshotResponse;
-
-export type GetTraceRequestMessage =
-  protos.cockroach.server.serverpb.GetTraceRequest;
-export type GetTraceResponseMessage =
-  protos.cockroach.server.serverpb.GetTraceResponse;
-
-export type SetTraceRecordingTypeRequestMessage =
-  protos.cockroach.server.serverpb.SetTraceRecordingTypeRequest;
-export type SetTraceRecordingTypeResponseMessage =
-  protos.cockroach.server.serverpb.SetTraceRecordingTypeResponse;
 
 // API constants
 
@@ -396,47 +338,6 @@ export type APIRequestFn<TReq, TResponse> = (
 const serverpb = protos.cockroach.server.serverpb;
 const tspb = protos.cockroach.ts.tspb;
 
-// getDatabaseList gets a list of all database names
-export function getDatabaseList(
-  _req: DatabasesRequestMessage,
-  timeout?: moment.Duration,
-): Promise<DatabasesResponseMessage> {
-  return timeoutFetch(
-    serverpb.DatabasesResponse,
-    `${API_PREFIX}/databases`,
-    null,
-    timeout,
-  );
-}
-
-// getDatabaseDetails gets details for a specific database
-export function getDatabaseDetails(
-  req: DatabaseDetailsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<DatabaseDetailsResponseMessage> {
-  const queryString = req.include_stats ? "?include_stats=true" : "";
-
-  return timeoutFetch(
-    serverpb.DatabaseDetailsResponse,
-    `${API_PREFIX}/databases/${req.database}${queryString}`,
-    null,
-    timeout,
-  );
-}
-
-// getTableDetails gets details for a specific table
-export function getTableDetails(
-  req: TableDetailsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<TableDetailsResponseMessage> {
-  return timeoutFetch(
-    serverpb.TableDetailsResponse,
-    `${API_PREFIX}/databases/${req.database}/tables/${req.table}`,
-    null,
-    timeout,
-  );
-}
-
 // getUIData gets UI data
 export function getUIData(
   req: GetUIDataRequestMessage,
@@ -463,20 +364,6 @@ export function setUIData(
     serverpb.SetUIDataResponse,
     `${API_PREFIX}/uidata`,
     req as any,
-    timeout,
-  );
-}
-
-// getEvents gets event data
-export function getEvents(
-  req: EventsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<EventsResponseMessage> {
-  const queryString = propsToQueryString(_.pick(req, ["type"]));
-  return timeoutFetch(
-    serverpb.EventsResponse,
-    `${API_PREFIX}/events?unredacted_events=true&${queryString}`,
-    null,
     timeout,
   );
 }
@@ -539,8 +426,7 @@ export function getHealth(
   );
 }
 
-export const jobsTimeoutErrorMessage =
-  "Unable to retrieve the Jobs table. To reduce the amount of data, try filtering the table.";
+export const jobsTimeoutErrorMessage = "Unable to retrieve the Jobs table.";
 
 export function getJobs(
   req: JobsRequestMessage,
@@ -593,9 +479,16 @@ export function getTableStats(
   req: TableStatsRequestMessage,
   timeout?: moment.Duration,
 ): Promise<TableStatsResponseMessage> {
+  const promiseErr = IsValidateUriName(req.database, req.table);
+  if (promiseErr) {
+    return promiseErr;
+  }
+
   return timeoutFetch(
     serverpb.TableStatsResponse,
-    `${API_PREFIX}/databases/${req.database}/tables/${req.table}/stats`,
+    `${API_PREFIX}/databases/${EncodeUriName(
+      req.database,
+    )}/tables/${EncodeUriName(req.table)}/stats`,
     null,
     timeout,
   );
@@ -606,9 +499,16 @@ export function getIndexStats(
   req: IndexStatsRequestMessage,
   timeout?: moment.Duration,
 ): Promise<IndexStatsResponseMessage> {
+  const promiseErr = IsValidateUriName(req.database, req.table);
+  if (promiseErr) {
+    return promiseErr;
+  }
+
   return timeoutFetch(
     serverpb.TableIndexStatsResponse,
-    `${STATUS_PREFIX}/databases/${req.database}/tables/${req.table}/indexstats`,
+    `${STATUS_PREFIX}/databases/${EncodeUriName(
+      req.database,
+    )}/tables/${EncodeUriName(req.table)}/indexstats`,
     null,
     timeout,
   );
@@ -817,24 +717,6 @@ export function getStores(
   );
 }
 
-// getCombinedStatements returns statements the cluster has recently executed, and some stats about them.
-export function getCombinedStatements(
-  req: StatementsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<StatementsResponseMessage> {
-  const queryStr = propsToQueryString({
-    combined: req.combined,
-    start: req.start.toInt(),
-    end: req.end.toInt(),
-  });
-  return timeoutFetch(
-    serverpb.StatementsResponse,
-    `${STATUS_PREFIX}/statements?${queryStr}`,
-    null,
-    timeout,
-  );
-}
-
 // getStatementDetails returns the statistics about the selected statement.
 export function getStatementDetails(
   req: StatementDetailsRequestMessage,
@@ -850,53 +732,6 @@ export function getStatementDetails(
   return timeoutFetch(
     serverpb.StatementDetailsResponse,
     `${STATUS_PREFIX}/stmtdetails/${req.fingerprint_id}?${queryStr}`,
-    null,
-    timeout,
-  );
-}
-
-export function getStatementDiagnosticsReports(
-  timeout?: moment.Duration,
-): Promise<StatementDiagnosticsReportsResponseMessage> {
-  return timeoutFetch(
-    serverpb.StatementDiagnosticsReportsResponse,
-    `${STATUS_PREFIX}/stmtdiagreports`,
-    null,
-    timeout,
-  );
-}
-
-export function createStatementDiagnosticsReport(
-  req: CreateStatementDiagnosticsReportRequestMessage,
-  timeout?: moment.Duration,
-): Promise<CreateStatementDiagnosticsReportResponseMessage> {
-  return timeoutFetch(
-    serverpb.CreateStatementDiagnosticsReportResponse,
-    `${STATUS_PREFIX}/stmtdiagreports`,
-    req as any,
-    timeout,
-  );
-}
-
-export function cancelStatementDiagnosticsReport(
-  req: CancelStatementDiagnosticsReportRequestMessage,
-  timeout?: moment.Duration,
-): Promise<CancelStatementDiagnosticsReportResponseMessage> {
-  return timeoutFetch(
-    serverpb.CancelStatementDiagnosticsReportResponse,
-    `${STATUS_PREFIX}/stmtdiagreports/cancel`,
-    req as any,
-    timeout,
-  );
-}
-
-export function getStatementDiagnostics(
-  req: StatementDiagnosticsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<StatementDiagnosticsResponseMessage> {
-  return timeoutFetch(
-    serverpb.StatementDiagnosticsResponse,
-    `${STATUS_PREFIX}/stmtdiag/${req.statement_diagnostics_id}`,
     null,
     timeout,
   );
@@ -987,74 +822,31 @@ export function getHotRanges(
   );
 }
 
-export function listTracingSnapshots(
+export function getKeyVisualizerSamples(
+  req: KeyVisualizerSamplesRequestMessage,
   timeout?: moment.Duration,
-): Promise<ListTracingSnapshotsResponseMessage> {
+): Promise<KeyVisualizerSamplesResponseMessage> {
   return timeoutFetch(
-    serverpb.ListTracingSnapshotsResponse,
-    `${API_PREFIX}/trace_snapshots`,
-    null,
-    timeout,
-  );
-}
-
-export function takeTracingSnapshot(
-  timeout?: moment.Duration,
-): Promise<TakeTracingSnapshotResponseMessage> {
-  const req = new TakeTracingSnapshotRequest();
-  return timeoutFetch(
-    serverpb.TakeTracingSnapshotResponse,
-    `${API_PREFIX}/trace_snapshots`,
+    serverpb.KeyVisSamplesResponse,
+    `${STATUS_PREFIX}/keyvissamples`,
     req as any,
     timeout,
   );
 }
 
-export function getTracingSnapshot(
-  req: GetTracingSnapshotRequestMessage,
-  timeout?: moment.Duration,
-): Promise<GetTracingSnapshotResponseMessage> {
-  return timeoutFetch(
-    serverpb.GetTracingSnapshotResponse,
-    `${API_PREFIX}/trace_snapshots/${req.snapshot_id}`,
-    null,
-    timeout,
-  );
+export function IsValidateUriName(...args: string[]): Promise<any> {
+  for (const name of args) {
+    if (name.includes("/")) {
+      return Promise.reject(
+        new Error(
+          `util/api: The entity '${name}' contains '/' which is not currently supported in the UI.`,
+        ),
+      );
+    }
+  }
+  return null;
 }
 
-export function getTraceForSnapshot(
-  req: GetTraceRequestMessage,
-  timeout?: moment.Duration,
-): Promise<GetTraceResponseMessage> {
-  return timeoutFetch(
-    serverpb.GetTraceResponse,
-    `${API_PREFIX}/traces`,
-    req as any,
-    timeout,
-  );
-}
-
-export function getLiveTrace(
-  req: GetTraceRequestMessage,
-  timeout?: moment.Duration,
-): Promise<GetTraceResponseMessage> {
-  return timeoutFetch(
-    serverpb.GetTraceResponse,
-    `${API_PREFIX}/traces`,
-    req as any,
-    timeout,
-  );
-}
-
-export function setTraceRecordingType(
-  req: SetTraceRecordingTypeRequestMessage,
-  timeout?: moment.Duration,
-): Promise<SetTraceRecordingTypeResponseMessage> {
-  return timeoutFetch(
-    serverpb.SetTraceRecordingTypeResponse,
-    // TODO(davidh): Consider making this endpoint just POST to `/traces/{trace_ID}`
-    `${API_PREFIX}/settracerecordingtype`,
-    req as any,
-    timeout,
-  );
+export function EncodeUriName(name: string): string {
+  return encodeURIComponent(name);
 }

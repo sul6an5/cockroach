@@ -126,8 +126,7 @@ type SQLTranslator interface {
 	// that don't exist.
 	// Additionally, if `generateSystemSpanConfigurations` is set to true,
 	// Translate will generate all the span configurations that apply to
-	// `spanconfig.SystemTargets`. The timestamp at which the translation is valid
-	// is also returned.
+	// `spanconfig.SystemTargets`.
 	//
 	// For every ID we first descend the zone configuration hierarchy with the
 	// ID as the root to accumulate IDs of all leaf objects. Leaf objects are
@@ -137,14 +136,17 @@ type SQLTranslator interface {
 	// for each one of these accumulated IDs, we generate <span, config> tuples
 	// by following up the inheritance chain to fully hydrate the span
 	// configuration. Translate also accounts for and negotiates subzone spans.
-	Translate(ctx context.Context, ids descpb.IDs,
-		generateSystemSpanConfigurations bool) ([]Record, hlc.Timestamp, error)
+	Translate(
+		ctx context.Context,
+		ids descpb.IDs,
+		generateSystemSpanConfigurations bool,
+	) ([]Record, error)
 }
 
 // FullTranslate translates the entire SQL zone configuration state to the span
 // configuration state. The timestamp at which such a translation is valid is
 // also returned.
-func FullTranslate(ctx context.Context, s SQLTranslator) ([]Record, hlc.Timestamp, error) {
+func FullTranslate(ctx context.Context, s SQLTranslator) ([]Record, error) {
 	// As RANGE DEFAULT is the root of all zone configurations (including other
 	// named zones for the system tenant), we can construct the entire span
 	// configuration state by starting from RANGE DEFAULT.
@@ -272,8 +274,8 @@ type StoreWriter interface {
 // StoreReader is the read-only portion of the Store interface. It doubles as an
 // adaptor interface for config.SystemConfig.
 type StoreReader interface {
-	NeedsSplit(ctx context.Context, start, end roachpb.RKey) bool
-	ComputeSplitKey(ctx context.Context, start, end roachpb.RKey) roachpb.RKey
+	NeedsSplit(ctx context.Context, start, end roachpb.RKey) (bool, error)
+	ComputeSplitKey(ctx context.Context, start, end roachpb.RKey) (roachpb.RKey, error)
 	GetSpanConfigForKey(ctx context.Context, key roachpb.RKey) (roachpb.SpanConfig, error)
 }
 
@@ -348,6 +350,19 @@ func Delta(
 
 	delta := uncommittedSplits - committedSplits
 	return delta, nil
+}
+
+// Reporter generates a conformance report over the given spans, i.e. whether
+// the backing ranges conform to the span configs that apply to them.
+//
+// NB: The standard implementation does not use a point-in-time snapshot of span
+// config state, but could be made to do so if needed. See commentary on the
+// spanconfigreporter.Reporter type for more details ("... we might not have a
+// point-in-time snapshot ...").
+type Reporter interface {
+	SpanConfigConformance(
+		ctx context.Context, spans []roachpb.Span,
+	) (roachpb.SpanConfigConformanceReport, error)
 }
 
 // SQLUpdate captures either a descriptor or a protected timestamp update.

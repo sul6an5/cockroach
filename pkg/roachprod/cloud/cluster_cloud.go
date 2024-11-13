@@ -178,7 +178,7 @@ func namesFromVM(v vm.VM) (userName string, clusterName string, _ error) {
 
 // ListCloud returns information about all instances (across all available
 // providers).
-func ListCloud(l *logger.Logger) (*Cloud, error) {
+func ListCloud(l *logger.Logger, options vm.ListOptions) (*Cloud, error) {
 	cloud := &Cloud{
 		Clusters: make(Clusters),
 	}
@@ -192,7 +192,7 @@ func ListCloud(l *logger.Logger) (*Cloud, error) {
 		provider := vm.Providers[providerName]
 		g.Go(func() error {
 			var err error
-			providerVMs[index], err = provider.List(l)
+			providerVMs[index], err = provider.List(l, options)
 			return err
 		})
 	}
@@ -274,21 +274,21 @@ func CreateCluster(
 }
 
 // DestroyCluster TODO(peter): document
-func DestroyCluster(c *Cluster) error {
+func DestroyCluster(l *logger.Logger, c *Cluster) error {
 	return vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
 		// Enable a fast-path for providers that can destroy a cluster in one shot.
 		if x, ok := p.(vm.DeleteCluster); ok {
-			return x.DeleteCluster(c.Name)
+			return x.DeleteCluster(l, c.Name)
 		}
-		return p.Delete(vms)
+		return p.Delete(l, vms)
 	})
 }
 
 // ExtendCluster TODO(peter): document
-func ExtendCluster(c *Cluster, extension time.Duration) error {
+func ExtendCluster(l *logger.Logger, c *Cluster, extension time.Duration) error {
 	// Round new lifetime to nearest second.
 	newLifetime := (c.Lifetime + extension).Round(time.Second)
 	return vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
-		return p.Extend(vms, newLifetime)
+		return p.Extend(l, vms, newLifetime)
 	})
 }

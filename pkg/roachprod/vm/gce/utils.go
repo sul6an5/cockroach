@@ -41,6 +41,8 @@ var Subdomain = func() string {
 const gceDiskStartupScriptTemplate = `#!/usr/bin/env bash
 # Script for setting up a GCE machine for roachprod use.
 
+set -x
+
 if [ -e /mnt/data1/.roachprod-initialized ]; then
   echo "Already initialized, exiting."
   exit 0
@@ -69,7 +71,7 @@ for d in $(ls /dev/nvme?n? /dev/disk/by-id/google-persistent-disk-[1-9]); do
   zpool list -v -P | grep ${d} > /dev/null
   if [ $? -ne 0 ]; then
 {{ else }}
-for d in $(ls /dev/disk/by-id/google-local-* /dev/disk/by-id/google-persistent-disk-[1-9]); do 
+for d in $(ls /dev/disk/by-id/google-local-* /dev/disk/by-id/google-persistent-disk-[1-9]); do
   if ! mount | grep ${d}; then
 {{ end }}
     disks+=("${d}")
@@ -78,6 +80,7 @@ for d in $(ls /dev/disk/by-id/google-local-* /dev/disk/by-id/google-persistent-d
     echo "Disk ${d} already mounted, skipping..."
   fi
 done
+
 
 if [ "${#disks[@]}" -eq "0" ]; then
   mountpoint="${mount_prefix}1"
@@ -99,6 +102,7 @@ elif [ "${#disks[@]}" -eq "1" ] || [ -n "$use_multiple_disks" ]; then
     mkfs.ext4 -q -F ${disk}
     mount -o ${mount_opts} ${disk} ${mountpoint}
     echo "${d} ${mountpoint} ext4 ${mount_opts} 1 1" | tee -a /etc/fstab
+    tune2fs -m 0 ${disk}
 {{ end }}
     chmod 777 ${mountpoint}
   done
@@ -115,6 +119,7 @@ else
   mkfs.ext4 -q -F ${raiddisk}
   mount -o ${mount_opts} ${raiddisk} ${mountpoint}
   echo "${raiddisk} ${mountpoint} ext4 ${mount_opts} 1 1" | tee -a /etc/fstab
+  tune2fs -m 0 ${raiddisk}
 {{ end }}
   chmod 777 ${mountpoint}
 fi
@@ -151,24 +156,6 @@ net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=60
 net.ipv4.tcp_keepalive_probes=5
 EOF
-
-# Enable core dumps
-cat <<EOF > /etc/security/limits.d/core_unlimited.conf
-* soft core unlimited
-* hard core unlimited
-root soft core unlimited
-root hard core unlimited
-EOF
-
-mkdir -p /mnt/data1/cores
-chmod a+w /mnt/data1/cores
-CORE_PATTERN="/mnt/data1/cores/core.%e.%p.%h.%t"
-echo "$CORE_PATTERN" > /proc/sys/kernel/core_pattern
-sed -i'~' 's/enabled=1/enabled=0/' /etc/default/apport
-sed -i'~' '/.*kernel\\.core_pattern.*/c\\' /etc/sysctl.conf
-echo "kernel.core_pattern=$CORE_PATTERN" >> /etc/sysctl.conf
-
-sysctl --system  # reload sysctl settings
 
 sudo apt-get update -q
 sudo apt-get install -qy chrony
@@ -211,6 +198,35 @@ for service in apport.service atd.service; do
   systemctl mask $service
 done
 
+# Enable core dumps, do this last, something above resets /proc/sys/kernel/core_pattern
+# to just "core".
+cat <<EOF > /etc/security/limits.d/core_unlimited.conf
+* soft core unlimited
+* hard core unlimited
+root soft core unlimited
+root hard core unlimited
+EOF
+
+mkdir -p /mnt/data1/cores
+chmod a+w /mnt/data1/cores
+cat <<'EOF' > /bin/gzip_core.sh
+#!/bin/sh
+exec /bin/gzip -f - > /mnt/data1/cores/core.$1.$2.$3.$4.gz
+EOF
+chmod +x /bin/gzip_core.sh
+
+CORE_PATTERN="|/bin/gzip_core.sh %e %p %h %t"
+echo "$CORE_PATTERN" > /proc/sys/kernel/core_pattern
+sed -i'~' 's/enabled=1/enabled=0/' /etc/default/apport
+sed -i'~' '/.*kernel\\.core_pattern.*/c\\' /etc/sysctl.conf
+echo "kernel.core_pattern=$CORE_PATTERN" >> /etc/sysctl.conf
+
+sysctl --system  # reload sysctl settings
+
+{{ if .EnableFIPS }}
+sudo ua enable fips --assume-yes
+{{ end }}
+
 sudo touch /mnt/data1/.roachprod-initialized
 `
 
@@ -221,18 +237,20 @@ sudo touch /mnt/data1/.roachprod-initialized
 // extraMountOpts, if not empty, is appended to the default mount options. It is
 // a comma-separated list of options for the "mount -o" flag.
 func writeStartupScript(
-	extraMountOpts string, fileSystem string, useMultiple bool,
+	extraMountOpts string, fileSystem string, useMultiple bool, enableFIPS bool,
 ) (string, error) {
 	type tmplParams struct {
 		ExtraMountOpts   string
 		UseMultipleDisks bool
 		Zfs              bool
+		EnableFIPS       bool
 	}
 
 	args := tmplParams{
 		ExtraMountOpts:   extraMountOpts,
 		UseMultipleDisks: useMultiple,
 		Zfs:              fileSystem == vm.Zfs,
+		EnableFIPS:       enableFIPS,
 	}
 
 	tmpfile, err := os.CreateTemp("", "gce-startup-script")
@@ -259,9 +277,11 @@ func SyncDNS(l *logger.Logger, vms vm.List) error {
 		return err
 	}
 	defer f.Close()
+
+	// Keep imported zone file in dry run mode.
 	defer func() {
 		if err := os.Remove(f.Name()); err != nil {
-			fmt.Fprintf(l.Stderr, "removing %s failed: %v", f.Name(), err)
+			l.Errorf("removing %s failed: %v", f.Name(), err)
 		}
 	}()
 
@@ -269,7 +289,7 @@ func SyncDNS(l *logger.Logger, vms vm.List) error {
 	for _, vm := range vms {
 		entry, err := vm.ZoneEntry()
 		if err != nil {
-			fmt.Fprintf(l.Stderr, "WARN: skipping: %s\n", err)
+			l.Printf("WARN: skipping: %s\n", err)
 			continue
 		}
 		zoneBuilder.WriteString(entry)
@@ -278,7 +298,7 @@ func SyncDNS(l *logger.Logger, vms vm.List) error {
 	f.Close()
 
 	args := []string{"--project", dnsProject, "dns", "record-sets", "import",
-		"-z", dnsZone, "--delete-all-existing", "--zone-file-format", f.Name()}
+		f.Name(), "-z", dnsZone, "--delete-all-existing", "--zone-file-format"}
 	cmd := exec.Command("gcloud", args...)
 	output, err := cmd.CombinedOutput()
 
@@ -288,7 +308,7 @@ func SyncDNS(l *logger.Logger, vms vm.List) error {
 // GetUserAuthorizedKeys retrieves reads a list of user public keys from the
 // gcloud cockroach-ephemeral project and returns them formatted for use in
 // an authorized_keys file.
-func GetUserAuthorizedKeys() (authorizedKeys []byte, err error) {
+func GetUserAuthorizedKeys(l *logger.Logger) (authorizedKeys []byte, err error) {
 	var outBuf bytes.Buffer
 	// The below command will return a stream of user:pubkey as text.
 	cmd := exec.Command("gcloud", "compute", "project-info", "describe",
@@ -296,6 +316,7 @@ func GetUserAuthorizedKeys() (authorizedKeys []byte, err error) {
 		"--format=value(commonInstanceMetadata.ssh-keys)")
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = &outBuf
+
 	if err := cmd.Run(); err != nil {
 		return nil, err
 	}

@@ -10,10 +10,7 @@
 
 package settings
 
-import (
-	"context"
-	"strings"
-)
+import "context"
 
 // Setting is the interface exposing the metadata for a cluster setting.
 //
@@ -34,19 +31,27 @@ type Setting interface {
 	// String returns the string representation of the setting's current value.
 	// It's used when materializing results for `SHOW CLUSTER SETTINGS` or `SHOW
 	// CLUSTER SETTING <setting-name>`.
+	//
+	// If this object implements a non-reportable setting that was retrieved for
+	// reporting (see LookupForReporting), String hides the actual value.
 	String(sv *Values) string
 
 	// Description contains a helpful text explaining what the specific cluster
 	// setting is for.
 	Description() string
 
-	// Visibility returns whether or not the setting is made publicly visible.
-	// Reserved settings are still accessible to users, but they don't get listed
-	// out when retrieving all settings.
+	// Visibility returns whether the setting is made publicly visible. Reserved
+	// settings are still accessible to users, but they don't get listed out when
+	// retrieving all settings.
 	Visibility() Visibility
 }
 
-// NonMaskedSetting is the exported interface of non-masked settings.
+// NonMaskedSetting is the exported interface of non-masked settings. A
+// non-masked setting provides access to the current value (even if the setting
+// is not reportable).
+//
+// A non-masked setting must not be used in the context of reporting values (see
+// LookupForReporting).
 type NonMaskedSetting interface {
 	Setting
 
@@ -137,10 +142,3 @@ const (
 	// In short: "Go ahead but be careful."
 	Public
 )
-
-// AdminOnly returns whether the setting can only be viewed and modified by
-// superusers. Otherwise, users with the MODIFYCLUSTERSETTING role privilege can
-// do so.
-func AdminOnly(name string) bool {
-	return !strings.HasPrefix(name, "sql.defaults.")
-}

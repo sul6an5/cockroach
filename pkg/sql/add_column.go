@@ -72,7 +72,7 @@ func (p *planner) addColumnImpl(
 	}
 	d = newDef
 
-	cdd, err := tabledesc.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext())
+	cdd, err := tabledesc.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext(), tree.ColumnDefaultExprInAddColumn)
 	if err != nil {
 		return err
 	}
@@ -139,7 +139,8 @@ func (p *planner) addColumnImpl(
 
 	if d.IsComputed() {
 		serializedExpr, _, err := schemaexpr.ValidateComputedColumnExpression(
-			params.ctx, n.tableDesc, d, tn, "computed column", params.p.SemaCtx(),
+			params.ctx, n.tableDesc, d, tn, tree.ComputedColumnExprContext(d.IsVirtual()), params.p.SemaCtx(),
+			params.ExecCfg().Settings.Version.ActiveVersion(params.ctx),
 		)
 		if err != nil {
 			return err
@@ -207,10 +208,9 @@ func (p *planner) addColumnImpl(
 	}
 
 	if col.Virtual && !col.Nullable {
-		colName := tree.Name(col.Name)
-		newCol, err := n.tableDesc.FindColumnWithName(colName)
+		newCol, err := catalog.MustFindColumnByName(n.tableDesc, col.Name)
 		if err != nil {
-			return errors.NewAssertionErrorWithWrappedErrf(err, "failed to find newly added column %v", colName)
+			return errors.NewAssertionErrorWithWrappedErrf(err, "failed to find newly added column %v", col.Name)
 		}
 		if err := addNotNullConstraintMutationForCol(n.tableDesc, newCol); err != nil {
 			return err
@@ -223,7 +223,7 @@ func (p *planner) addColumnImpl(
 func checkColumnDoesNotExist(
 	tableDesc catalog.TableDescriptor, name tree.Name,
 ) (isPublic bool, err error) {
-	col, _ := tableDesc.FindColumnWithName(name)
+	col := catalog.FindColumnByTreeName(tableDesc, name)
 	if col == nil {
 		return false, nil
 	}

@@ -31,11 +31,13 @@ const (
 // JSON format. Keys are the primary key columns in a record. Values are all
 // columns in a record.
 type confluentAvroEncoder struct {
-	schemaRegistry                     schemaRegistry
-	schemaPrefix                       string
-	updatedField, beforeField, keyOnly bool
-	virtualColumnVisibility            changefeedbase.VirtualColumnVisibility
-	targets                            changefeedbase.Targets
+	schemaRegistry            schemaRegistry
+	schemaPrefix              string
+	updatedField, beforeField bool
+	virtualColumnVisibility   changefeedbase.VirtualColumnVisibility
+	targets                   changefeedbase.Targets
+	envelopeType              changefeedbase.EnvelopeType
+	customKeyColumn           string
 
 	keyCache   *cache.UnorderedCache // [tableIDAndVersion]confluentRegisteredKeySchema
 	valueCache *cache.UnorderedCache // [tableIDAndVersionPair]confluentRegisteredEnvelopeSchema
@@ -73,37 +75,29 @@ var encoderCacheConfig = cache.Config{
 }
 
 func newConfluentAvroEncoder(
-	opts changefeedbase.EncodingOptions, targets changefeedbase.Targets,
+	opts changefeedbase.EncodingOptions,
+	targets changefeedbase.Targets,
+	p externalConnectionProvider,
+	sliMetrics *sliMetrics,
 ) (*confluentAvroEncoder, error) {
 	e := &confluentAvroEncoder{
 		schemaPrefix:            opts.AvroSchemaPrefix,
 		targets:                 targets,
 		virtualColumnVisibility: opts.VirtualColumns,
+		envelopeType:            opts.Envelope,
 	}
 
-	switch opts.Envelope {
-	case changefeedbase.OptEnvelopeKeyOnly:
-		e.keyOnly = true
-	case changefeedbase.OptEnvelopeWrapped:
-	default:
-		return nil, errors.Errorf(`%s=%s is not supported with %s=%s`,
-			changefeedbase.OptEnvelope, opts.Envelope, changefeedbase.OptFormat, changefeedbase.OptFormatAvro)
-	}
 	e.updatedField = opts.UpdatedTimestamps
-	if e.updatedField && e.keyOnly {
-		return nil, errors.Errorf(`%s is only usable with %s=%s`,
-			changefeedbase.OptUpdatedTimestamps, changefeedbase.OptEnvelope, changefeedbase.OptEnvelopeWrapped)
-	}
 	e.beforeField = opts.Diff
-	if e.beforeField && e.keyOnly {
-		return nil, errors.Errorf(`%s is only usable with %s=%s`,
-			changefeedbase.OptDiff, changefeedbase.OptEnvelope, changefeedbase.OptEnvelopeWrapped)
-	}
+	e.customKeyColumn = opts.CustomKeyColumn
 
+	// TODO: Implement this.
 	if opts.KeyInValue {
 		return nil, errors.Errorf(`%s is not supported with %s=%s`,
 			changefeedbase.OptKeyInValue, changefeedbase.OptFormat, changefeedbase.OptFormatAvro)
 	}
+
+	// TODO: Implement this.
 	if opts.TopicInValue {
 		return nil, errors.Errorf(`%s is not supported with %s=%s`,
 			changefeedbase.OptTopicInValue, changefeedbase.OptFormat, changefeedbase.OptFormatAvro)
@@ -113,7 +107,7 @@ func newConfluentAvroEncoder(
 			changefeedbase.OptConfluentSchemaRegistry, changefeedbase.OptFormat, changefeedbase.OptFormatAvro)
 	}
 
-	reg, err := newConfluentSchemaRegistry(opts.SchemaRegistryURI)
+	reg, err := newConfluentSchemaRegistry(opts.SchemaRegistryURI, p, sliMetrics)
 	if err != nil {
 		return nil, err
 	}
@@ -162,9 +156,20 @@ func (e *confluentAvroEncoder) EncodeKey(ctx context.Context, row cdcevent.Row) 
 		if err != nil {
 			return nil, err
 		}
-		registered.schema, err = primaryIndexToAvroSchema(row, tableName, e.schemaPrefix)
-		if err != nil {
-			return nil, err
+		if e.customKeyColumn == "" {
+			registered.schema, err = primaryIndexToAvroSchema(row, tableName, e.schemaPrefix)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			it, err := row.DatumNamed(e.customKeyColumn)
+			if err != nil {
+				return nil, err
+			}
+			registered.schema, err = newSchemaForRow(it, SQLNameToAvroName(tableName), e.schemaPrefix)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		// NB: This uses the kafka name escaper because it has to match the name
@@ -183,6 +188,13 @@ func (e *confluentAvroEncoder) EncodeKey(ctx context.Context, row cdcevent.Row) 
 		0, 0, 0, 0, // Placeholder for the ID.
 	}
 	binary.BigEndian.PutUint32(header[1:5], uint32(registered.registryID))
+	if e.customKeyColumn != "" {
+		it, err := row.DatumNamed(e.customKeyColumn)
+		if err != nil {
+			return nil, err
+		}
+		return registered.schema.BinaryFromRow(header, it)
+	}
 	return registered.schema.BinaryFromRow(header, row.ForEachKeyColumn())
 }
 
@@ -190,7 +202,7 @@ func (e *confluentAvroEncoder) EncodeKey(ctx context.Context, row cdcevent.Row) 
 func (e *confluentAvroEncoder) EncodeValue(
 	ctx context.Context, evCtx eventContext, updatedRow cdcevent.Row, prevRow cdcevent.Row,
 ) ([]byte, error) {
-	if e.keyOnly {
+	if e.envelopeType == changefeedbase.OptEnvelopeKeyOnly {
 		return nil, nil
 	}
 
@@ -217,7 +229,7 @@ func (e *confluentAvroEncoder) EncodeValue(
 			}
 		}
 	} else {
-		var beforeDataSchema *avroDataRecord
+		var beforeDataSchema, afterDataSchema, recordDataSchema *avroDataRecord
 		if e.beforeField && prevRow.IsInitialized() {
 			var err error
 			beforeDataSchema, err = tableToAvroSchema(prevRow, `before`, e.schemaPrefix)
@@ -226,17 +238,30 @@ func (e *confluentAvroEncoder) EncodeValue(
 			}
 		}
 
-		afterDataSchema, err := tableToAvroSchema(updatedRow, avroSchemaNoSuffix, e.schemaPrefix)
+		currentSchema, err := tableToAvroSchema(updatedRow, avroSchemaNoSuffix, e.schemaPrefix)
 		if err != nil {
 			return nil, err
 		}
 
-		opts := avroEnvelopeOpts{afterField: true, beforeField: e.beforeField, updatedField: e.updatedField}
+		var opts avroEnvelopeOpts
+
+		// In the wrapped envelope, row data goes in the "after" field. In the raw envelope,
+		// it goes in the "record" field. In the "key_only" envelope it's omitted.
+		// This means metadata can safely go at the top level as there are never arbitrary column names
+		// for it to conflict with.
+		if e.envelopeType == changefeedbase.OptEnvelopeWrapped {
+			opts = avroEnvelopeOpts{afterField: true, beforeField: e.beforeField, updatedField: e.updatedField}
+			afterDataSchema = currentSchema
+		} else {
+			opts = avroEnvelopeOpts{recordField: true, updatedField: e.updatedField}
+			recordDataSchema = currentSchema
+		}
+
 		name, err := e.rawTableName(updatedRow.Metadata)
 		if err != nil {
 			return nil, err
 		}
-		registered.schema, err = envelopeToAvroSchema(name, opts, beforeDataSchema, afterDataSchema, e.schemaPrefix)
+		registered.schema, err = envelopeToAvroSchema(name, opts, beforeDataSchema, afterDataSchema, recordDataSchema, e.schemaPrefix)
 
 		if err != nil {
 			return nil, err
@@ -265,7 +290,7 @@ func (e *confluentAvroEncoder) EncodeValue(
 		0, 0, 0, 0, // Placeholder for the ID.
 	}
 	binary.BigEndian.PutUint32(header[1:5], uint32(registered.registryID))
-	return registered.schema.BinaryFromRow(header, meta, prevRow, updatedRow)
+	return registered.schema.BinaryFromRow(header, meta, prevRow, updatedRow, updatedRow)
 }
 
 // EncodeResolvedTimestamp implements the Encoder interface.
@@ -276,7 +301,7 @@ func (e *confluentAvroEncoder) EncodeResolvedTimestamp(
 	if !ok {
 		opts := avroEnvelopeOpts{resolvedField: true}
 		var err error
-		registered.schema, err = envelopeToAvroSchema(topic, opts, nil /* before */, nil /* after */, e.schemaPrefix /* namespace */)
+		registered.schema, err = envelopeToAvroSchema(topic, opts, nil /* before */, nil /* after */, nil /* record */, e.schemaPrefix /* namespace */)
 		if err != nil {
 			return nil, err
 		}
@@ -304,7 +329,7 @@ func (e *confluentAvroEncoder) EncodeResolvedTimestamp(
 	}
 	binary.BigEndian.PutUint32(header[1:5], uint32(registered.registryID))
 	var nilRow cdcevent.Row
-	return registered.schema.BinaryFromRow(header, meta, nilRow, nilRow)
+	return registered.schema.BinaryFromRow(header, meta, nilRow, nilRow, nilRow)
 }
 
 func (e *confluentAvroEncoder) register(

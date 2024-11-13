@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	_ "github.com/cockroachdb/cockroach/pkg/util/uuid" // needed for recovery.proto
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 )
@@ -91,4 +92,73 @@ func (m *ReplicaRecoveryRecord) AsStructuredLog() eventpb.DebugRecoverReplica {
 		StartKey:          m.StartKey.AsRKey().String(),
 		EndKey:            m.EndKey.AsRKey().String(),
 	}
+}
+
+func (m *ClusterReplicaInfo) Merge(o ClusterReplicaInfo) error {
+	// When making a cluster id check, make sure that we can create empty
+	// cluster info and merge everything into it. i.e. merging into empty
+	// struct should not trip check failure.
+	if len(m.LocalInfo) > 0 || len(m.Descriptors) > 0 {
+		if m.ClusterID != o.ClusterID {
+			return errors.Newf("can't merge cluster info from different cluster: %s != %s", m.ClusterID,
+				o.ClusterID)
+		}
+		if !m.Version.Equal(o.Version) {
+			return errors.Newf("can't merge cluster info from different version: %s != %s", m.Version,
+				o.Version)
+		}
+	} else {
+		m.ClusterID = o.ClusterID
+		m.Version = o.Version
+	}
+	if len(o.Descriptors) > 0 {
+		if len(m.Descriptors) > 0 {
+			return errors.New("only single cluster replica info could contain descriptors")
+		}
+		m.Descriptors = append(m.Descriptors, o.Descriptors...)
+	}
+	type nsk struct {
+		n roachpb.NodeID
+		s roachpb.StoreID
+	}
+	existing := make(map[nsk]struct{})
+	for _, n := range m.LocalInfo {
+		for _, r := range n.Replicas {
+			existing[nsk{n: r.NodeID, s: r.StoreID}] = struct{}{}
+		}
+	}
+	for _, n := range o.LocalInfo {
+		for _, r := range n.Replicas {
+			if _, ok := existing[nsk{n: r.NodeID, s: r.StoreID}]; ok {
+				return errors.Newf("failed to merge cluster info, replicas from n%d/s%d are already present",
+					r.NodeID, r.StoreID)
+			}
+		}
+	}
+	m.LocalInfo = append(m.LocalInfo, o.LocalInfo...)
+	return nil
+}
+
+func (m *ClusterReplicaInfo) ReplicaCount() (size int) {
+	for _, i := range m.LocalInfo {
+		size += len(i.Replicas)
+	}
+	return size
+}
+
+func (a DeferredRecoveryActions) Empty() bool {
+	return len(a.DecommissionedNodeIDs) == 0
+}
+
+var rangeHealthTitle = map[int32]string{
+	0: "unknown",
+	1: "healthy",
+	2: "waiting for meta",
+	3: "loss of quorum",
+}
+
+// Name gives a better looking name for range health enum which is good for
+// including in CLI messages.
+func (x RangeHealth) Name() string {
+	return proto.EnumName(rangeHealthTitle, int32(x))
 }

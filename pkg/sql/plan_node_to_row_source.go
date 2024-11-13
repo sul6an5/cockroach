@@ -12,14 +12,18 @@ package sql
 
 import (
 	"context"
+	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/errors"
 )
 
@@ -44,74 +48,92 @@ type planNodeToRowSource struct {
 	row rowenc.EncDatumRow
 }
 
+var _ execinfra.LocalProcessor = &planNodeToRowSource{}
+var _ execreleasable.Releasable = &planNodeToRowSource{}
 var _ execopnode.OpNode = &planNodeToRowSource{}
 
-func makePlanNodeToRowSource(
-	source planNode, params runParams, fastPath bool,
-) (*planNodeToRowSource, error) {
-	var typs []*types.T
+var planNodeToRowSourcePool = sync.Pool{
+	New: func() interface{} {
+		return &planNodeToRowSource{}
+	},
+}
+
+func newPlanNodeToRowSource(
+	source planNode, params runParams, fastPath bool, firstNotWrapped planNode,
+) *planNodeToRowSource {
+	p := planNodeToRowSourcePool.Get().(*planNodeToRowSource)
+	*p = planNodeToRowSource{
+		ProcessorBase:   p.ProcessorBase,
+		fastPath:        fastPath,
+		node:            source,
+		params:          params,
+		firstNotWrapped: firstNotWrapped,
+		row:             p.row,
+	}
 	if fastPath {
 		// If our node is a "fast path node", it means that we're set up to
 		// just return a row count meaning we'll output a single row with a
 		// single INT column.
-		typs = []*types.T{types.Int}
+		p.outputTypes = []*types.T{types.Int}
 	} else {
-		typs = getTypesFromResultColumns(planColumns(source))
+		p.outputTypes = getTypesFromResultColumns(planColumns(source))
 	}
-	row := make(rowenc.EncDatumRow, len(typs))
-
-	return &planNodeToRowSource{
-		node:        source,
-		params:      params,
-		outputTypes: typs,
-		row:         row,
-		fastPath:    fastPath,
-	}, nil
+	if p.row != nil && cap(p.row) >= len(p.outputTypes) {
+		// In some cases we might have no output columns, so nil row would have
+		// sufficient width, yet nil row is a special value, so we can only
+		// reuse the old row if it's non-nil.
+		p.row = p.row[:len(p.outputTypes)]
+	} else {
+		p.row = make(rowenc.EncDatumRow, len(p.outputTypes))
+	}
+	return p
 }
-
-var _ execinfra.LocalProcessor = &planNodeToRowSource{}
 
 // MustBeStreaming implements the execinfra.Processor interface.
 func (p *planNodeToRowSource) MustBeStreaming() bool {
-	// hookFnNode is special because it might be blocked forever if we decide to
-	// buffer its output.
-	_, isHookFnNode := p.node.(*hookFnNode)
-	return isHookFnNode
+	switch p.node.(type) {
+	case *hookFnNode, *cdcValuesNode:
+		// hookFnNode is special because it might be blocked forever if we decide to
+		// buffer its output.
+		// cdcValuesNode is a node used by CDC that must stream data row-by-row, and
+		// it may also block forever if the input is buffered.
+		return true
+	default:
+		return false
+	}
 }
 
-// InitWithOutput implements the LocalProcessor interface.
-func (p *planNodeToRowSource) InitWithOutput(
-	flowCtx *execinfra.FlowCtx, post *execinfrapb.PostProcessSpec, output execinfra.RowReceiver,
+// Init implements the execinfra.LocalProcessor interface.
+func (p *planNodeToRowSource) Init(
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	post *execinfrapb.PostProcessSpec,
 ) error {
-	return p.InitWithEvalCtx(
+	if err := p.InitWithEvalCtx(
+		ctx,
 		p,
 		post,
 		p.outputTypes,
 		flowCtx,
 		// Note that we have already created a copy of the extendedEvalContext
 		// (which made a copy of the EvalContext) right before calling
-		// makePlanNodeToRowSource, so we can just use the eval context from the
+		// newPlanNodeToRowSource, so we can just use the eval context from the
 		// params.
 		p.params.EvalContext(),
-		0, /* processorID */
-		output,
+		processorID,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
-			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
-				var meta []execinfrapb.ProducerMetadata
-				if p.InternalClose() {
-					// Check if we're wrapping a mutation and emit the rows
-					// written metric if so.
-					if m, ok := p.node.(mutationPlanNode); ok {
-						metrics := execinfrapb.GetMetricsMeta()
-						metrics.RowsWritten = m.rowsWritten()
-						meta = []execinfrapb.ProducerMetadata{{Metrics: metrics}}
-					}
-				}
-				return meta
-			},
+			// Input to drain is added in SetInput.
+			TrailingMetaCallback: p.trailingMetaCallback,
 		},
-	)
+	); err != nil {
+		return err
+	}
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
+		p.ExecStatsForTrace = p.execStatsForTrace
+	}
+	return nil
 }
 
 // SetInput implements the LocalProcessor interface.
@@ -126,6 +148,9 @@ func (p *planNodeToRowSource) SetInput(ctx context.Context, input execinfra.RowS
 		return nil
 	}
 	p.input = input
+	// Adding the input to drain ensures that the input will be properly closed
+	// by this planNodeToRowSource. This is important since the
+	// rowSourceToPlanNode created below is not responsible for that.
 	p.AddInputToDrain(input)
 	// Search the plan we're wrapping for firstNotWrapped, which is the planNode
 	// that DistSQL planning resumed in. Replace that planNode with input,
@@ -133,7 +158,7 @@ func (p *planNodeToRowSource) SetInput(ctx context.Context, input execinfra.RowS
 	return walkPlan(ctx, p.node, planObserver{
 		replaceNode: func(ctx context.Context, nodeName string, plan planNode) (planNode, error) {
 			if plan == p.firstNotWrapped {
-				return makeRowSourceToPlanNode(input, p, planColumns(p.firstNotWrapped), p.firstNotWrapped), nil
+				return newRowSourceToPlanNode(input, p, planColumns(p.firstNotWrapped), p.firstNotWrapped), nil
 			}
 			return nil, nil
 		},
@@ -215,6 +240,52 @@ func (p *planNodeToRowSource) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerM
 // trailing metadata and expect us to forward it further.
 func (p *planNodeToRowSource) forwardMetadata(metadata *execinfrapb.ProducerMetadata) {
 	p.ProcessorBase.AppendTrailingMeta(*metadata)
+}
+
+func (p *planNodeToRowSource) trailingMetaCallback() []execinfrapb.ProducerMetadata {
+	var meta []execinfrapb.ProducerMetadata
+	if p.InternalClose() {
+		// Check if we're wrapping a mutation and emit the rows written metric
+		// if so.
+		if m, ok := p.node.(mutationPlanNode); ok {
+			metrics := execinfrapb.GetMetricsMeta()
+			metrics.RowsWritten = m.rowsWritten()
+			meta = []execinfrapb.ProducerMetadata{{Metrics: metrics}}
+		}
+	}
+	return meta
+}
+
+// execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
+func (p *planNodeToRowSource) execStatsForTrace() *execinfrapb.ComponentStats {
+	// Propagate RUs from IO requests.
+	// TODO(drewk): we should consider propagating other stats for planNode
+	// operators.
+	scanStats := execstats.GetScanStats(p.Ctx(), p.ExecStatsTrace)
+	if scanStats.ConsumedRU == 0 {
+		return nil
+	}
+	return &execinfrapb.ComponentStats{
+		Exec: execinfrapb.ExecStats{
+			ConsumedRU: optional.MakeUint(scanStats.ConsumedRU),
+		},
+	}
+}
+
+// Release releases this planNodeToRowSource back to the pool.
+func (p *planNodeToRowSource) Release() {
+	p.ProcessorBase.Reset()
+	// Deeply reset the row.
+	for i := range p.row {
+		p.row[i] = rowenc.EncDatum{}
+	}
+	// Note that we don't reuse the outputTypes slice because it is exposed to
+	// the outer physical planning code.
+	*p = planNodeToRowSource{
+		ProcessorBase: p.ProcessorBase,
+		row:           p.row[:0],
+	}
+	planNodeToRowSourcePool.Put(p)
 }
 
 // ChildCount is part of the execopnode.OpNode interface.

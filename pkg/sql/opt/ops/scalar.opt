@@ -43,6 +43,10 @@ define SubqueryPrivate {
     # will eventually be output. It is only used for ArrayFlatten expressions.
     RequestedCol ColumnID
 
+    # WithinUDF is set to true if the subquery exists inside a UDFExpr. It is
+    # only used for ArrayFlatten expressions.
+    WithinUDF bool
+
     # Cmp is only used for AnyOp.
     Cmp Operator
 
@@ -494,6 +498,14 @@ define BBoxIntersects {
     Right ScalarExpr
 }
 
+# TSMatches is the @@ operator when used with tsquery/tsvector operands.
+# It maps to tree.TSMatches.
+[Scalar, Bool, Comparison]
+define TSMatches {
+    Left ScalarExpr
+    Right ScalarExpr
+}
+
 # AnyScalar is the form of ANY which refers to an ANY operation on a
 # tuple or array, as opposed to Any which operates on a subquery.
 [Scalar, Bool]
@@ -792,6 +804,11 @@ define ColumnAccess {
 
 [Scalar, Aggregate]
 define ArrayAgg {
+    Input ScalarExpr
+}
+
+[Scalar, Aggregate]
+define ArrayCatAgg {
     Input ScalarExpr
 }
 
@@ -1219,8 +1236,9 @@ define NthValue {
 # function body, and a pointer to its type.
 [Scalar]
 define UDF {
-    # Input contains the scalar expressions given as input to the UDF.
-    Input ScalarListExpr
+    # Args contains the scalar expressions given as arguments to the UDF
+    # invocation.
+    Args ScalarListExpr
     _ UDFPrivate
 }
 
@@ -1233,14 +1251,17 @@ define UDFPrivate {
     # body.
     Body RelListExpr
 
-    # ArgCols is a list of columns that are references to arguments of the
-    # function. The i-th column in the list corresponds to the i-th argument of
-    # the function. During execution of the UDF, these columns are replaced with
-    # the constant value inputs to the function.
-    ArgCols ColList
+    # Params is the list of columns representing parameters of the function. The
+    # i-th column in the list corresponds to the i-th parameter of the function.
+    # During execution of the UDF, these columns are replaced with the arguments
+    # of the function invocation.
+    Params ColList
 
     # Typ is the return type of the function.
     Typ Type
+
+    # SetReturning is true if the UDF has a SETOF return type.
+    SetReturning bool
 
     # Volatility is the user-provided volatility of the function given during
     # CREATE FUNCTION.
@@ -1256,7 +1277,16 @@ define UDFPrivate {
     # CalledOnNullInput is true if the function should be called when any of its
     # inputs are NULL. If false, the function will not be evaluated in the
     # presence of NULL inputs, and will instead evaluate directly to NULL.
+    #
+    # Note that this field only affects evaluation of UDFs within project-set
+    # operators. Non-scalar UDFs are always in a project-set operator, while
+    # scalar UDFs can be if used as a data source (e.g. SELECT * FROM udf()).
     CalledOnNullInput bool
+
+    # MultiColDataSource is true if the function may return multiple columns. This
+    # is only the case if the UDF returns a RECORD type and is used as a data
+    # source.
+    MultiColDataSource bool
 }
 
 # KVOptions is a set of KVOptionItems that specify arbitrary keys and values

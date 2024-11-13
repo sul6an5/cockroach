@@ -11,10 +11,11 @@
 package storageutils
 
 import (
+	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 )
@@ -33,8 +34,8 @@ func (r raftCmdIDAndIndex) String() string {
 // from Raft replays.
 type ReplayProtectionFilterWrapper struct {
 	syncutil.Mutex
-	inFlight          singleflight.Group
-	processedCommands map[raftCmdIDAndIndex]*roachpb.Error
+	inFlight          *singleflight.Group
+	processedCommands map[raftCmdIDAndIndex]*kvpb.Error
 	filter            kvserverbase.ReplicaCommandFilter
 }
 
@@ -44,14 +45,15 @@ func WrapFilterForReplayProtection(
 	filter kvserverbase.ReplicaCommandFilter,
 ) kvserverbase.ReplicaCommandFilter {
 	wrapper := ReplayProtectionFilterWrapper{
-		processedCommands: make(map[raftCmdIDAndIndex]*roachpb.Error),
+		inFlight:          singleflight.NewGroup("replay-protection", "key"),
+		processedCommands: make(map[raftCmdIDAndIndex]*kvpb.Error),
 		filter:            filter,
 	}
 	return wrapper.run
 }
 
 // Errors are mutated on the Send path, so we must always return copies.
-func shallowCloneErrorWithTxn(pErr *roachpb.Error) *roachpb.Error {
+func shallowCloneErrorWithTxn(pErr *kvpb.Error) *kvpb.Error {
 	if pErr != nil {
 		pErrCopy := *pErr
 		pErrCopy.SetTxn(pErrCopy.GetTxn())
@@ -62,7 +64,7 @@ func shallowCloneErrorWithTxn(pErr *roachpb.Error) *roachpb.Error {
 }
 
 // run executes the wrapped filter.
-func (c *ReplayProtectionFilterWrapper) run(args kvserverbase.FilterArgs) *roachpb.Error {
+func (c *ReplayProtectionFilterWrapper) run(args kvserverbase.FilterArgs) *kvpb.Error {
 	if !args.InRaftCmd() {
 		return c.filter(args)
 	}
@@ -78,16 +80,24 @@ func (c *ReplayProtectionFilterWrapper) run(args kvserverbase.FilterArgs) *roach
 	// We use the singleflight.Group to coalesce replayed raft commands onto the
 	// same filter call. This allows concurrent access to the filter for
 	// different raft commands.
-	resC, _ := c.inFlight.DoChan(mapKey.String(), func() (interface{}, error) {
-		pErr := c.filter(args)
+	future, _ := c.inFlight.DoChan(args.Ctx, mapKey.String(),
+		singleflight.DoOpts{
+			Stop:               nil,
+			InheritCancelation: true,
+		},
+		func(ctx context.Context) (interface{}, error) {
+			pErr := c.filter(args)
 
-		c.Lock()
-		defer c.Unlock()
-		c.processedCommands[mapKey] = pErr
-		return pErr, nil
-	})
+			c.Lock()
+			defer c.Unlock()
+			c.processedCommands[mapKey] = pErr
+			return pErr, nil
+		})
 	c.Unlock()
 
-	res := <-resC
-	return shallowCloneErrorWithTxn(res.Val.(*roachpb.Error))
+	res := future.WaitForResult(args.Ctx)
+	if res.Err != nil {
+		return kvpb.NewError(res.Err)
+	}
+	return shallowCloneErrorWithTxn(res.Val.(*kvpb.Error))
 }

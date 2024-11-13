@@ -123,7 +123,7 @@ func (db *testDescriptorDB) FirstRange() (*roachpb.RangeDescriptor, error) {
 }
 
 func (db *testDescriptorDB) RangeLookup(
-	ctx context.Context, key roachpb.RKey, useReverseScan bool,
+	ctx context.Context, key roachpb.RKey, _ RangeLookupConsistency, useReverseScan bool,
 ) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error) {
 	// Notify the test of the lookup, if the test wants notifications.
 	if ch, ok := db.listeners[key.String()]; ok {
@@ -245,7 +245,6 @@ func staticSize(size int64) func() int64 {
 
 func initTestDescriptorDB(t *testing.T) *testDescriptorDB {
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
 	db := newTestDescriptorDB()
 	for i, char := range "abcdefghijklmnopqrstuvwx" {
 		// Create splits on each character:
@@ -259,7 +258,7 @@ func initTestDescriptorDB(t *testing.T) *testDescriptorDB {
 	}
 	// TODO(andrei): don't leak this Stopper. Someone needs to Stop() it.
 	db.stopper = stop.NewStopper()
-	db.cache = NewRangeCache(st, db, staticSize(2<<10), db.stopper, tr)
+	db.cache = NewRangeCache(st, db, staticSize(2<<10), db.stopper)
 	return db
 }
 
@@ -382,6 +381,19 @@ func TestRangeCacheAssumptions(t *testing.T) {
 	}
 }
 
+// requireTokenDoesNotHaveClosedTimestampPolicy is a helper to assert that the
+// ClosedTimestampPolicy method on the EvictionToken is going to return its
+// argument.
+func requireTokenDoesNotHaveClosedTimestampPolicy(t *testing.T, et EvictionToken) {
+	t.Helper()
+	for _, _default := range []roachpb.RangeClosedTimestampPolicy{
+		roachpb.LAG_BY_CLUSTER_SETTING,
+		roachpb.LEAD_FOR_GLOBAL_READS,
+	} {
+		require.Equal(t, _default, et.ClosedTimestampPolicy(_default))
+	}
+}
+
 // TestRangeCache is a simple test which verifies that metadata ranges
 // are being cached and retrieved properly. It sets up a fake backing
 // store for the cache, and measures how often that backing store is
@@ -396,7 +408,9 @@ func TestRangeCache(t *testing.T) {
 	// Totally uncached range.
 	//  Retrieves [meta(min),meta(g)) and [a,b).
 	//  Prefetches [meta(g),meta(m)), [meta(m),meta(s)), [b,c), and [c,d).
-	doLookup(ctx, db.cache, "aa")
+	_, token := doLookup(ctx, db.cache, "aa")
+	// Assert that the token does not have a closed timestamp policy.
+	requireTokenDoesNotHaveClosedTimestampPolicy(t, token)
 	db.assertLookupCountEq(t, 2, "aa")
 
 	// Descriptors for the following ranges should be cached.
@@ -482,10 +496,9 @@ func TestLookupByKeyMin(t *testing.T) {
 	ctx := context.Background()
 
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
-	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper, tr)
+	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper)
 	startToMeta2Desc := roachpb.RangeDescriptor{
 		StartKey: roachpb.RKeyMin,
 		EndKey:   keys.RangeMetaKey(roachpb.RKey("a")),
@@ -615,6 +628,11 @@ func TestRangeCacheContextCancellation(t *testing.T) {
 	// Cancel the leader and check that it gets an error.
 	cancel()
 	expectContextCancellation(t, errC1)
+	select {
+	case err := <-errC2:
+		t.Fatalf("unexpected err: %v", err)
+	case <-time.After(time.Millisecond):
+	}
 
 	// While lookups are still blocked, launch another one. This new request
 	// should join the flight just like c2.
@@ -890,7 +908,8 @@ func TestRangeCacheHandleDoubleSplit(t *testing.T) {
 					var desc *roachpb.RangeDescriptor
 					// Each request goes to a different key.
 					var err error
-					ctx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, db.cache.tracer, "test")
+					tracer := tracing.NewTracer()
+					ctx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tracer, "test")
 					defer getRecAndFinish()
 					tok, err := db.cache.lookupInternal(
 						ctx, key, oldToken, reverseScan)
@@ -1007,10 +1026,9 @@ func TestRangeCacheClearOverlapping(t *testing.T) {
 	}
 
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper, tr)
+	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper)
 	cache.addEntryLocked(&CacheEntry{desc: *defDesc})
 
 	// Now, add a new, overlapping set of descriptors.
@@ -1184,10 +1202,9 @@ func TestRangeCacheClearOlderOverlapping(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
 			st := cluster.MakeTestingClusterSettings()
-			tr := tracing.NewTracer()
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
-			cache := NewRangeCache(st, nil /* db */, staticSize(2<<10), stopper, tr)
+			cache := NewRangeCache(st, nil /* db */, staticSize(2<<10), stopper)
 			for _, d := range tc.cachedDescs {
 				cache.Insert(ctx, roachpb.RangeInfo{Desc: d})
 			}
@@ -1237,10 +1254,9 @@ func TestRangeCacheClearOverlappingMeta(t *testing.T) {
 	}
 
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper, tr)
+	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper)
 	cache.Insert(ctx,
 		roachpb.RangeInfo{Desc: firstDesc},
 		roachpb.RangeInfo{Desc: restDesc})
@@ -1276,10 +1292,9 @@ func TestGetCachedRangeDescriptorInverted(t *testing.T) {
 	}
 
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper, tr)
+	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper)
 	for _, rd := range testData {
 		cache.Insert(ctx, roachpb.RangeInfo{
 			Desc: rd,
@@ -1415,10 +1430,9 @@ func TestRangeCacheGeneration(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := cluster.MakeTestingClusterSettings()
-			tr := tracing.NewTracer()
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
-			cache := NewRangeCache(st, nil, staticSize(2<<10), stopper, tr)
+			cache := NewRangeCache(st, nil, staticSize(2<<10), stopper)
 			cache.Insert(ctx, roachpb.RangeInfo{Desc: *descAM2}, roachpb.RangeInfo{Desc: *descMZ4})
 			cache.Insert(ctx, roachpb.RangeInfo{Desc: *tc.insertDesc})
 
@@ -1482,30 +1496,34 @@ func TestRangeCacheEvictAndReplace(t *testing.T) {
 	startKey := desc1.StartKey
 
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper, tr)
+	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper)
 
-	ri := roachpb.RangeInfo{Desc: desc1}
+	ri := roachpb.RangeInfo{
+		Desc:                  desc1,
+		ClosedTimestampPolicy: UnknownClosedTimestampPolicy,
+	}
 	cache.Insert(ctx, ri)
-
+	const lag, lead = roachpb.LAG_BY_CLUSTER_SETTING, roachpb.LEAD_FOR_GLOBAL_READS
 	// Check that initially the cache has an empty lease and a default
 	// closed timestamp policy.
 	tok, err := cache.LookupWithEvictionToken(ctx, startKey, EvictionToken{}, false /* useReverseScan */)
 	require.NoError(t, err)
 	require.Equal(t, desc1, *tok.Desc())
 	require.Nil(t, tok.Leaseholder())
-	require.Equal(t, roachpb.LAG_BY_CLUSTER_SETTING, tok.ClosedTimestampPolicy())
+	requireTokenDoesNotHaveClosedTimestampPolicy(t, tok)
 
 	// EvictAndReplace() with a new descriptor.
 	ri.Desc = desc2
+	ri.ClosedTimestampPolicy = 0
 	tok.EvictAndReplace(ctx, ri)
 	tok, err = cache.LookupWithEvictionToken(ctx, startKey, tok, false /* useReverseScan */)
 	require.NoError(t, err)
 	require.Equal(t, desc2, *tok.Desc())
 	require.Nil(t, tok.Leaseholder())
-	require.Equal(t, roachpb.LAG_BY_CLUSTER_SETTING, tok.ClosedTimestampPolicy())
+	// Note that we now have a definitive closed timestamp policy.
+	require.Equal(t, lag, tok.ClosedTimestampPolicy(lead))
 
 	// EvictAndReplace() with a new lease.
 	ri.Lease = roachpb.Lease{
@@ -1519,10 +1537,10 @@ func TestRangeCacheEvictAndReplace(t *testing.T) {
 	require.NotNil(t, tok.Leaseholder())
 	require.Equal(t, rep1, *tok.Leaseholder())
 	require.Equal(t, roachpb.LeaseSequence(1), tok.LeaseSeq())
-	require.Equal(t, roachpb.LAG_BY_CLUSTER_SETTING, tok.ClosedTimestampPolicy())
+	require.Equal(t, lag, tok.ClosedTimestampPolicy(lead))
 
 	// EvictAndReplace() with a new closed timestamp policy.
-	ri.ClosedTimestampPolicy = roachpb.LEAD_FOR_GLOBAL_READS
+	ri.ClosedTimestampPolicy = lead
 	tok.EvictAndReplace(ctx, ri)
 	tok, err = cache.LookupWithEvictionToken(ctx, startKey, tok, false /* useReverseScan */)
 	require.NoError(t, err)
@@ -1530,7 +1548,7 @@ func TestRangeCacheEvictAndReplace(t *testing.T) {
 	require.NotNil(t, tok.Leaseholder())
 	require.Equal(t, rep1, *tok.Leaseholder())
 	require.Equal(t, roachpb.LeaseSequence(1), tok.LeaseSeq())
-	require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, tok.ClosedTimestampPolicy())
+	require.Equal(t, lead, tok.ClosedTimestampPolicy(lag))
 
 	// EvictAndReplace() with a speculative descriptor. Should update decriptor,
 	// remove lease, and retain closed timestamp policy.
@@ -1540,7 +1558,7 @@ func TestRangeCacheEvictAndReplace(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, desc3, *tok.Desc())
 	require.Nil(t, tok.Leaseholder())
-	require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, tok.ClosedTimestampPolicy())
+	require.Equal(t, lead, tok.ClosedTimestampPolicy(lag))
 }
 
 // TestRangeCacheSyncTokenAndMaybeUpdateCache tests
@@ -1614,11 +1632,10 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 	startKey := desc1.StartKey
 
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper, tr)
-
+	cache := NewRangeCache(st, nil, staticSize(2<<10), stopper)
+	const lag, lead = roachpb.LAG_BY_CLUSTER_SETTING, roachpb.LEAD_FOR_GLOBAL_READS
 	testCases := []struct {
 		name   string
 		testFn func(*testing.T, *RangeCache)
@@ -1629,7 +1646,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				cache.Insert(ctx, roachpb.RangeInfo{
 					Desc:                  desc1,
 					Lease:                 roachpb.Lease{},
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 
 				// Check that initially the cache has an empty lease. Then, we'll
@@ -1639,7 +1656,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, desc1, *tok.Desc())
 				require.Nil(t, tok.Leaseholder())
-				require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, tok.ClosedTimestampPolicy())
+				require.Equal(t, lead, tok.ClosedTimestampPolicy(lead))
 
 				l := &roachpb.Lease{
 					Replica:  rep1,
@@ -1650,12 +1667,12 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				require.True(t, updatedLeaseholder)
 				require.Equal(t, oldTok.Desc(), tok.Desc())
 				require.Equal(t, &l.Replica, tok.Leaseholder())
-				require.Equal(t, oldTok.ClosedTimestampPolicy(), tok.ClosedTimestampPolicy())
+				require.Equal(t, oldTok.ClosedTimestampPolicy(lag), tok.ClosedTimestampPolicy(lag))
 				ri := cache.GetCached(ctx, startKey, false /* inverted */)
 				require.NotNil(t, ri)
 				require.Equal(t, desc1, *ri.Desc())
 				require.Equal(t, rep1, ri.Lease().Replica)
-				require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, ri.ClosedTimestampPolicy())
+				require.Equal(t, lead, ri.ClosedTimestampPolicy())
 
 				// Ensure evicting the lease doesn't remove the closed timestamp
 				// policy/desc.
@@ -1663,12 +1680,12 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				tok.EvictLease(ctx)
 				require.Equal(t, oldTok.Desc(), tok.Desc())
 				require.Nil(t, tok.Leaseholder())
-				require.Equal(t, oldTok.ClosedTimestampPolicy(), tok.ClosedTimestampPolicy())
+				require.Equal(t, oldTok.ClosedTimestampPolicy(lag), tok.ClosedTimestampPolicy(lag))
 				ri = cache.GetCached(ctx, startKey, false /* inverted */)
 				require.NotNil(t, ri)
 				require.Equal(t, desc1, *ri.Desc())
 				require.True(t, ri.lease.Empty())
-				require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, ri.ClosedTimestampPolicy())
+				require.Equal(t, lead, ri.ClosedTimestampPolicy())
 			},
 		},
 		{
@@ -1680,7 +1697,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				cache.Insert(ctx, roachpb.RangeInfo{
 					Desc:                  desc1,
 					Lease:                 roachpb.Lease{},
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				tok, err := cache.LookupWithEvictionToken(
 					ctx, startKey, EvictionToken{}, false /* useReverseScan */)
@@ -1699,7 +1716,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				require.Equal(t, &desc2, tok.Desc())
 				require.Equal(t, &rep2, tok.Leaseholder())
 				require.Equal(t, tok.lease.Replica, rep2)
-				require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, tok.ClosedTimestampPolicy())
+				require.Equal(t, lead, tok.ClosedTimestampPolicy(lag))
 			},
 		},
 		{
@@ -1712,7 +1729,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				cache.Insert(ctx, roachpb.RangeInfo{
 					Desc:                  desc1,
 					Lease:                 roachpb.Lease{},
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				tok, err := cache.LookupWithEvictionToken(
 					ctx, startKey, EvictionToken{}, false /* useReverseScan */)
@@ -1726,7 +1743,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				cache.Insert(ctx, roachpb.RangeInfo{
 					Desc:                  desc3,
 					Lease:                 l,
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				updatedLeaseholder := tok.SyncTokenAndMaybeUpdateCache(ctx, &l, &desc2)
 				require.False(t, updatedLeaseholder)
@@ -1734,7 +1751,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				require.Equal(t, &desc3, tok.Desc())
 				require.Equal(t, &rep2, tok.Leaseholder())
 				require.Equal(t, tok.lease.Replica, rep2)
-				require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, tok.ClosedTimestampPolicy())
+				require.Equal(t, lead, tok.ClosedTimestampPolicy(lag))
 			},
 		},
 		{
@@ -1748,7 +1765,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 						Replica:  rep3,
 						Sequence: 4,
 					},
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				tok, err := cache.LookupWithEvictionToken(
 					ctx, startKey, EvictionToken{}, false, /* useReverseScan */
@@ -1763,7 +1780,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				require.Equal(t, &desc2, tok.Desc())
 				require.Equal(t, &rep3, tok.Leaseholder())
 				require.Equal(t, tok.lease.Replica, rep3)
-				require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, tok.ClosedTimestampPolicy())
+				require.Equal(t, lead, tok.ClosedTimestampPolicy(lag))
 			},
 		},
 		{
@@ -1777,7 +1794,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 						Replica:  rep3,
 						Sequence: 4,
 					},
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				tok, err := cache.LookupWithEvictionToken(
 					ctx, startKey, EvictionToken{}, false, /* useReverseScan */
@@ -1792,7 +1809,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				require.Equal(t, &desc2, tok.Desc())
 				require.Equal(t, &rep3, tok.Leaseholder())
 				require.Equal(t, tok.lease.Replica, rep3)
-				require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, tok.ClosedTimestampPolicy())
+				require.Equal(t, lead, tok.ClosedTimestampPolicy(lag))
 			},
 		},
 		{
@@ -1807,7 +1824,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 						Replica:  rep3,
 						Sequence: 4,
 					},
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				tok, err := cache.LookupWithEvictionToken(
 					ctx, startKey, EvictionToken{}, false, /* useReverseScan */
@@ -1821,7 +1838,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				require.NotNil(t, tok)
 				require.Equal(t, &desc3, tok.Desc())
 				require.Nil(t, tok.Leaseholder())
-				require.Equal(t, roachpb.LEAD_FOR_GLOBAL_READS, tok.ClosedTimestampPolicy())
+				require.Equal(t, lead, tok.ClosedTimestampPolicy(lag))
 			},
 		},
 		{
@@ -1838,7 +1855,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 						Replica:  rep3,
 						Sequence: 4,
 					},
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				tok, err := cache.LookupWithEvictionToken(
 					ctx, startKey, EvictionToken{}, false, /* useReverseScan */
@@ -1874,7 +1891,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 				cache.Insert(ctx, roachpb.RangeInfo{
 					Desc:                  desc2,
 					Lease:                 l,
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				tok, err := cache.LookupWithEvictionToken(
 					ctx, startKey, EvictionToken{}, false, /* useReverseScan */
@@ -1907,7 +1924,7 @@ func TestRangeCacheSyncTokenAndMaybeUpdateCache(t *testing.T) {
 						Replica:  rep3,
 						Sequence: 2,
 					},
-					ClosedTimestampPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
+					ClosedTimestampPolicy: lead,
 				})
 				tok, err := cache.LookupWithEvictionToken(
 					ctx, startKey, EvictionToken{}, false, /* useReverseScan */

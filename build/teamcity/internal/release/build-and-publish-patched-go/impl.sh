@@ -3,15 +3,12 @@
 set -xeuo pipefail
 
 # When updating to a new Go version, update all of these variables.
-GOVERS=1.19.1
+GOVERS=1.19.4
 GOLINK=https://go.dev/dl/go$GOVERS.src.tar.gz
-SRCSHASUM=27871baa490f3401414ad793fba49086f6c855b1c584385ed7771e1204c7e179
+SRCSHASUM=eda74db4ac494800a3e66ee784e495bfbb9b8e535df924a8b01b1a8028b7f368
 # We mirror the upstream freebsd because we don't have a cross-compiler targeting it.
 GOFREEBSDLINK=https://go.dev/dl/go$GOVERS.freebsd-amd64.tar.gz
-FREEBSDSHASUM=db5b8f232e12c655cc6cde6af1adf4d27d842541807802d747c86161e89efa0a
-# We mirror the upstream darwin/arm64 binary because we don't have code-signing yet.
-GODARWINARMLINK=https://go.dev/dl/go$GOVERS.darwin-arm64.tar.gz
-DARWINARMSHASUM=e46aecce83a9289be16ce4ba9b8478a5b89b8aa0230171d5c6adbc0c66640548
+FREEBSDSHASUM=84489ebb63f1757b79574d7345c647bd40bc6414cecb868c93e24476c2d2b9b6
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -33,8 +30,6 @@ update-alternatives --install /usr/bin/clang clang /usr/bin/clang-10 100 \
 
 curl -fsSL $GOFREEBSDLINK -o /artifacts/go$GOVERS.freebsd-amd64.tar.gz
 echo "$FREEBSDSHASUM  /artifacts/go$GOVERS.freebsd-amd64.tar.gz" | sha256sum -c -
-curl -fsSL $GODARWINARMLINK -o /artifacts/go$GOVERS.darwin-arm64.tar.gz
-echo "$DARWINARMSHASUM  /artifacts/go$GOVERS.darwin-arm64.tar.gz" | sha256sum -c -
 
 # libtapi is required for later versions of MacOSX.
 git clone https://github.com/tpoechtrager/apple-libtapi.git
@@ -67,7 +62,9 @@ cd /tmp/go$GOVERS/go
 git apply /bootstrap/diff.patch
 cd ..
 
-for CONFIG in linux_amd64 linux_arm64 darwin_amd64 windows_amd64; do
+CONFIGS="linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64"
+
+for CONFIG in $CONFIGS; do
     case $CONFIG in
         linux_amd64)
             CC_FOR_TARGET=/x-tools/x86_64-unknown-linux-gnu/bin/x86_64-unknown-linux-gnu-cc
@@ -80,6 +77,10 @@ for CONFIG in linux_amd64 linux_arm64 darwin_amd64 windows_amd64; do
         darwin_amd64)
             CC_FOR_TARGET=/x-tools/x86_64-apple-darwin21.2/bin/x86_64-apple-darwin21.2-cc
             CXX_FOR_TARGET=/x-tools/x86_64-apple-darwin21.2/bin/x86_64-apple-darwin21.2-c++
+            ;;
+        darwin_arm64)
+            CC_FOR_TARGET=/x-tools/x86_64-apple-darwin21.2/bin/aarch64-apple-darwin21.2-cc
+            CXX_FOR_TARGET=/x-tools/x86_64-apple-darwin21.2/bin/aarch64-apple-darwin21.2-c++
         ;;
         windows_amd64)
             CC_FOR_TARGET=/x-tools/x86_64-w64-mingw32/bin/x86_64-w64-mingw32-cc
@@ -99,6 +100,11 @@ for CONFIG in linux_amd64 linux_arm64 darwin_amd64 windows_amd64; do
     fi
     cd ../..
     rm -rf /tmp/go$GOVERS/go/pkg/${GOOS}_$GOARCH/cmd
+    for OTHER_CONFIG in $CONFIGS; do
+        if [ $CONFIG != $OTHER_CONFIG ]; then
+            rm -rf /tmp/go$GOVERS/go/pkg/$OTHER_CONFIG
+        fi
+    done
     if [ $CONFIG != linux_amd64 ]; then
         rm go/bin/go go/bin/gofmt
         mv go/bin/${GOOS}_$GOARCH/* go/bin

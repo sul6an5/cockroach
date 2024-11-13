@@ -17,18 +17,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -36,17 +39,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
 
-var _ sqlutil.InternalExecutor = &InternalExecutor{}
+var _ isql.Executor = &InternalExecutor{}
 
 // InternalExecutor can be used internally by code modules to execute SQL
 // statements without needing to open a SQL connection.
@@ -111,6 +115,8 @@ func (ie *InternalExecutor) WithSyntheticDescriptors(
 }
 
 // MakeInternalExecutor creates an InternalExecutor.
+// TODO (janexing): usage of it should be deprecated with `DescsTxnWithExecutor()`
+// or `Executor()`.
 func MakeInternalExecutor(
 	s *Server, memMetrics MemoryMetrics, monitor *mon.BytesMonitor,
 ) InternalExecutor {
@@ -119,55 +125,6 @@ func MakeInternalExecutor(
 		mon:        monitor,
 		memMetrics: memMetrics,
 	}
-}
-
-// newInternalExecutorWithTxn creates an Internal Executor with txn related
-// information, and also a function that can be called to commit the txn.
-// This function should only be used in the implementation of
-// descs.CollectionFactory's InternalExecutorFactoryWithTxn.
-// TODO (janexing): This function will be soon refactored after we change
-// the internal executor infrastructure with a single conn executor for all
-// sql statement executions within a txn.
-func newInternalExecutorWithTxn(
-	s *Server,
-	sd *sessiondata.SessionData,
-	txn *kv.Txn,
-	memMetrics MemoryMetrics,
-	monitor *mon.BytesMonitor,
-	descCol *descs.Collection,
-) (*InternalExecutor, descs.InternalExecutorCommitTxnFunc) {
-	schemaChangerState := &SchemaChangerState{
-		mode: sd.NewSchemaChangerMode,
-	}
-	ie := InternalExecutor{
-		s:          s,
-		mon:        monitor,
-		memMetrics: memMetrics,
-		extraTxnState: &extraTxnState{
-			txn:                    txn,
-			descCollection:         descCol,
-			jobs:                   new(jobsCollection),
-			schemaChangeJobRecords: make(map[descpb.ID]*jobs.Record),
-			schemaChangerState:     schemaChangerState,
-		},
-	}
-	ie.s.populateMinimalSessionData(sd)
-	ie.sessionDataStack = sessiondata.NewStack(sd)
-
-	commitTxnFunc := func(ctx context.Context) error {
-		defer func() {
-			ie.extraTxnState.jobs.reset()
-			ie.releaseSchemaChangeJobRecords()
-		}()
-		if err := ie.commitTxn(ctx); err != nil {
-			return err
-		}
-		return ie.s.cfg.JobRegistry.Run(
-			ctx, ie.s.cfg.InternalExecutor, *ie.extraTxnState.jobs,
-		)
-	}
-
-	return &ie, commitTxnFunc
 }
 
 // MakeInternalExecutorMemMonitor creates and starts memory monitor for an
@@ -193,7 +150,7 @@ func MakeInternalExecutorMemMonitor(
 // SetSessionData cannot be called concurrently with query execution.
 func (ie *InternalExecutor) SetSessionData(sessionData *sessiondata.SessionData) {
 	if sessionData != nil {
-		ie.s.populateMinimalSessionData(sessionData)
+		populateMinimalSessionData(sessionData)
 		ie.sessionDataStack = sessiondata.NewStack(sessionData)
 	}
 }
@@ -202,13 +159,14 @@ func (ie *InternalExecutor) runWithEx(
 	ctx context.Context,
 	txn *kv.Txn,
 	w ieResultWriter,
+	mode ieExecutionMode,
 	sd *sessiondata.SessionData,
 	stmtBuf *StmtBuf,
 	wg *sync.WaitGroup,
-	syncCallback func([]resWithPos),
+	syncCallback func([]*streamingCommandResult),
 	errCallback func(error),
 ) error {
-	ex, err := ie.initConnEx(ctx, txn, w, sd, stmtBuf, syncCallback)
+	ex, err := ie.initConnEx(ctx, txn, w, mode, sd, stmtBuf, syncCallback)
 	if err != nil {
 		return err
 	}
@@ -244,34 +202,22 @@ func (ie *InternalExecutor) initConnEx(
 	ctx context.Context,
 	txn *kv.Txn,
 	w ieResultWriter,
+	mode ieExecutionMode,
 	sd *sessiondata.SessionData,
 	stmtBuf *StmtBuf,
-	syncCallback func([]resWithPos),
+	syncCallback func([]*streamingCommandResult),
 ) (*connExecutor, error) {
 	clientComm := &internalClientComm{
-		w: w,
-		// init lastDelivered below the position of the first result (0).
-		lastDelivered: -1,
-		sync:          syncCallback,
+		w:    w,
+		mode: mode,
+		sync: syncCallback,
+		resetRowsAffected: func() {
+			var zero int
+			_ = w.addResult(ctx, ieIteratorResult{rowsAffected: &zero})
+		},
 	}
 
-	// When the connEx is serving an internal executor, it can inherit the
-	// application name from an outer session. This happens e.g. during ::regproc
-	// casts and built-in functions that use SQL internally. In that case, we do
-	// not want to record statistics against the outer application name directly;
-	// instead we want to use a separate bucket. However we will still want to
-	// have separate buckets for different applications so that we can measure
-	// their respective "pressure" on internal queries. Hence the choice here to
-	// add the delegate prefix to the current app name.
-	var appStatsBucketName string
-	if !strings.HasPrefix(sd.ApplicationName, catconstants.InternalAppNamePrefix) {
-		appStatsBucketName = catconstants.DelegatedAppNamePrefix + sd.ApplicationName
-	} else {
-		// If this is already an "internal app", don't put more prefix.
-		appStatsBucketName = sd.ApplicationName
-	}
-	applicationStats := ie.s.sqlStats.GetApplicationStats(appStatsBucketName)
-
+	applicationStats := ie.s.sqlStats.GetApplicationStats(sd.ApplicationName, true /* internal */)
 	sds := sessiondata.NewStack(sd)
 	sdMutIterator := ie.s.makeSessionDataMutatorIterator(sds, nil /* sessionDefaults */)
 	var ex *connExecutor
@@ -346,7 +292,6 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 		if ie.extraTxnState != nil {
 			ex.extraTxnState.descCollection = ie.extraTxnState.descCollection
 			ex.extraTxnState.fromOuterTxn = true
-			ex.extraTxnState.schemaChangeJobRecords = ie.extraTxnState.schemaChangeJobRecords
 			ex.extraTxnState.jobs = ie.extraTxnState.jobs
 			ex.extraTxnState.schemaChangerState = ie.extraTxnState.schemaChangerState
 			ex.extraTxnState.shouldResetSyntheticDescriptors = shouldResetSyntheticDescriptors
@@ -403,7 +348,7 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 		ex.QualityOfService())
 
 	// Modify the Collection to match the parent executor's Collection.
-	// This allows the InternalExecutor to see schema changes made by the
+	// This allows the Executor to see schema changes made by the
 	// parent executor.
 	if shouldResetSyntheticDescriptors {
 		ex.extraTxnState.descCollection.SetSyntheticDescriptors(ie.syntheticDescriptors)
@@ -413,10 +358,10 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 
 type ieIteratorResult struct {
 	// Exactly one of these 4 fields will be set.
-	row                   tree.Datums
-	rowsAffectedIncrement *int
-	cols                  colinfo.ResultColumns
-	err                   error
+	row          tree.Datums
+	rowsAffected *int
+	cols         colinfo.ResultColumns
+	err          error
 }
 
 type rowsIterator struct {
@@ -424,6 +369,8 @@ type rowsIterator struct {
 
 	rowsAffected int
 	resultCols   colinfo.ResultColumns
+
+	mode ieExecutionMode
 
 	// first, if non-nil, is the first object read from r. We block the return
 	// of the created rowsIterator in execInternal() until the producer writes
@@ -452,7 +399,7 @@ type rowsIterator struct {
 	sp *tracing.Span
 }
 
-var _ sqlutil.InternalRows = &rowsIterator{}
+var _ isql.Rows = &rowsIterator{}
 var _ eval.InternalRows = &rowsIterator{}
 
 func (r *rowsIterator) Next(ctx context.Context) (_ bool, retErr error) {
@@ -489,21 +436,21 @@ func (r *rowsIterator) Next(ctx context.Context) (_ bool, retErr error) {
 			r.lastRow = data.row
 			return true, nil
 		}
-		if data.rowsAffectedIncrement != nil {
-			r.rowsAffected += *data.rowsAffectedIncrement
+		if data.rowsAffected != nil {
+			r.rowsAffected = *data.rowsAffected
 			return r.Next(ctx)
 		}
 		if data.cols != nil {
-			// Ignore the result columns if they are already set on the
-			// iterator: it is possible for ROWS statement type to be executed
-			// in a 'rows affected' mode, in such case the correct columns are
-			// set manually when instantiating the iterator, but the result
-			// columns of the statement are also sent by SetColumns() (we need
-			// to keep the former).
-			if r.resultCols == nil {
-				r.resultCols = data.cols
+			if r.mode == rowsAffectedIEExecutionMode {
+				// In "rows affected" execution mode we simply ignore the column
+				// schema since we always return the number of rows affected
+				// (i.e. a single integer column).
+				return r.Next(ctx)
 			}
-			return r.Next(ctx)
+			// At this point we don't expect to see the columns - we should only
+			// return the rowsIterator to the caller of execInternal after the
+			// columns have been determined.
+			data.err = errors.AssertionFailedf("unexpectedly received non-nil cols in Next: %v", data)
 		}
 		if data.err == nil {
 			data.err = errors.AssertionFailedf("unexpectedly empty ieIteratorResult object")
@@ -560,6 +507,10 @@ func (r *rowsIterator) Close() error {
 
 func (r *rowsIterator) Types() colinfo.ResultColumns {
 	return r.resultCols
+}
+
+func (r *rowsIterator) HasResults() bool {
+	return r.first != nil && r.first.row != nil
 }
 
 // QueryBuffered executes the supplied SQL statement and returns the resulting
@@ -623,7 +574,7 @@ func (ie *InternalExecutor) queryInternalBuffered(
 	// We will run the query to completion, so we can use an async result
 	// channel.
 	rw := newAsyncIEResultChannel()
-	it, err := ie.execInternal(ctx, opName, rw, txn, sessionDataOverride, stmt, qargs...)
+	it, err := ie.execInternal(ctx, opName, rw, defaultIEExecutionMode, txn, sessionDataOverride, stmt, qargs...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -725,7 +676,11 @@ func (ie *InternalExecutor) ExecEx(
 	// We will run the query to completion, so we can use an async result
 	// channel.
 	rw := newAsyncIEResultChannel()
-	it, err := ie.execInternal(ctx, opName, rw, txn, session, stmt, qargs...)
+	// Since we only return the number of rows affected as given by the
+	// rowsIterator, we execute this stmt in "rows affected" mode allowing the
+	// internal executor to transparently retry.
+	const mode = rowsAffectedIEExecutionMode
+	it, err := ie.execInternal(ctx, opName, rw, mode, txn, session, stmt, qargs...)
 	if err != nil {
 		return 0, err
 	}
@@ -748,7 +703,7 @@ func (ie *InternalExecutor) ExecEx(
 // as root. Use QueryIteratorEx instead.
 func (ie *InternalExecutor) QueryIterator(
 	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
-) (sqlutil.InternalRows, error) {
+) (isql.Rows, error) {
 	return ie.QueryIteratorEx(ctx, opName, txn, ie.maybeRootSessionDataOverride(opName), stmt, qargs...)
 }
 
@@ -762,10 +717,26 @@ func (ie *InternalExecutor) QueryIteratorEx(
 	session sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
-) (sqlutil.InternalRows, error) {
+) (isql.Rows, error) {
 	return ie.execInternal(
-		ctx, opName, newSyncIEResultChannel(), txn, session, stmt, qargs...,
+		ctx, opName, newSyncIEResultChannel(), defaultIEExecutionMode, txn, session, stmt, qargs...,
 	)
+}
+
+// applyInternalExecutorSessionExceptions overrides values from
+// the session data that may have been set from a user-session but
+// which don't make sense to use in the InternalExecutor.
+func applyInternalExecutorSessionExceptions(sd *sessiondata.SessionData) {
+	// Even if session queries are told to error on non-home region accesses,
+	// internal queries spawned from the same context should never do so.
+	sd.LocalOnlySessionData.EnforceHomeRegion = false
+	// DisableBuffering is not supported by the InternalExecutor
+	// which uses streamingCommandResults.
+	sd.LocalOnlySessionData.AvoidBuffering = false
+	// At the moment, we disable the usage of the Streamer API in the internal
+	// executor to avoid possible concurrency with the "outer" query (which
+	// might be using the RootTxn).
+	sd.LocalOnlySessionData.StreamerEnabled = false
 }
 
 // applyOverrides overrides the respective fields from sd for all the fields set on o.
@@ -788,6 +759,8 @@ func applyOverrides(o sessiondata.InternalExecutorOverride, sd *sessiondata.Sess
 	if o.QualityOfService != nil {
 		sd.DefaultTxnQualityOfService = o.QualityOfService.ValidateInternal()
 	}
+	// We always override the injection knob based on the override struct.
+	sd.InjectRetryErrorsEnabled = o.InjectRetryErrorsEnabled
 }
 
 func (ie *InternalExecutor) maybeRootSessionDataOverride(
@@ -799,7 +772,7 @@ func (ie *InternalExecutor) maybeRootSessionDataOverride(
 			ApplicationName: catconstants.InternalAppNamePrefix + "-" + opName,
 		}
 	}
-	o := sessiondata.InternalExecutorOverride{}
+	o := sessiondata.NoSessionDataOverride
 	sd := ie.sessionDataStack.Top()
 	if sd.User().Undefined() {
 		o.User = username.RootUserName()
@@ -817,6 +790,98 @@ var rowsAffectedResultColumns = colinfo.ResultColumns{
 	},
 }
 
+// execInternal is the main entry point for executing a statement via the
+// InternalExecutor. From the high level it does the following:
+// - parses the statement as well as its arguments
+// - creates an "internal" connExecutor that runs in a separate goroutine
+// - pushes a few commands onto the StmtBuf of the connExecutor to be evaluated
+// - blocks until the first row of data is sent by the connExecutor
+// - returns the rowsIterator that can consume the result of the statement.
+//
+// Only a single statement is supported. If there are no query arguments, then
+// {ExecStmt, Sync} commands are pushed onto the StmtBuf, if there are some
+// query arguments, then {PrepareStmt, BindStmt, ExecPortal, Sync} are pushed.
+//
+// The coordination between the rowsIterator and the connExecutor is managed by
+// the internalClientComm as well as the ieResultChannel. The rowsIterator is
+// the reader of the ieResultChannel while the connExecutor is the writer. The
+// connExecutor goroutine exits (achieved by closing the StmtBuf) once the
+// result for the Sync command evaluation is closed.
+//
+// execInternal defines two callbacks that are passed into the connExecutor
+// machinery:
+// - syncCallback is called when the result for the Sync command evaluation is
+// closed. It is responsible for closing the StmtBuf (to allow the connExecutor
+// to exit its 'run' loop) as well iterating over the results to see whether an
+// error was encountered. Note that, unlike rows that are sent directly from the
+// streamingCommandResult (the writer) to the rowsIterator (the reader), errors
+// are buffered in the results - this is needed since the errors might be
+// updated by the connExecutor after they have been generated (e.g. replacing
+// context cancellation error with a nice "statement timed out" error).
+// - errCallback is called when the connExecutor's 'run' returns an error in
+// order to propagate the error to the rowsIterator.
+//
+// It's worth noting that rows as well some metadata (column schema as well as
+// "rows affected" number) are sent directly from the streamingCommandResult to
+// the rowsIterator, meaning that this communication doesn't go through the
+// internalClientComm.
+//
+// The returned rowsIterator can be synchronized with the connExecutor goroutine
+// if "synchronous" ieResultChannel is provided. In this case, only one
+// goroutine (among the rowsIterator and the connExecutor) is active at any
+// point in time since each read / write is blocked until the "send" / "receive"
+// happens on the ieResultChannel.
+//
+// It's also worth noting that execInternal doesn't return until the
+// connExecutor reaches the execution engine (i.e. until after the query
+// planning has been performed). This blocking behavior is still respected in
+// case a retry error occurs after the column schema is communicated, but before
+// the stmt reaches the execution engine. This is needed in order to avoid
+// concurrent access to the txn by the rowsIterator and the connExecutor
+// goroutines. In particular, this blocking allows us to avoid invalid
+// concurrent txn access when during the stmt evaluation the internal executor
+// needs to run "nested" internally-executed stmt  (see #62415 for an example).
+//
+// An additional responsibility of the internalClientComm is handling the retry
+// errors. If a retry error is encountered with an implicit txn (i.e. nil txn
+// is passed to execInternal), then we do our best to retry the execution
+// transparently; however, we can **not** do so in all cases, so sometimes the
+// retry error will be propagated to the user of the rowsIterator. In
+// particular, here is the summary of how retries are handled:
+// - If the retry error occurs after some rows have been sent from the
+//   streamingCommandResult to the rowsIterator, we have no choice but to return
+//   the retry error to the caller.
+//   - The only exception to this is when the stmt of "Rows" type was issued via
+//     ExecEx call. In such a scenario, we only need to report the number of
+//     "rows affected" that we obtain by counting all rows seen by the
+//     rowsIterator. With such a setup, we can transparently retry the execution
+//     of the corresponding command by simply resetting the counter when
+//     discarding the result of Sync command after the retry error occurs.
+// - If the retry error occurs after the "rows affected" metadata was sent for
+//   stmts of "RowsAffected" type, then we will always retry transparently. This
+//   is achieved by overriding the "rows affected" number, stored in the
+//   rowsIterator, with the latest information. With such setup, even if the
+//   stmt execution before the retry communicated its incorrect "rows affected"
+//   information, that info is overridden accordingly after the connExecutor
+//   re-executes the corresponding command.
+// - If the retry error occurs after the column schema is sent, then - similar
+//   to how we handle the "rows affected" metadata - we always transparently
+//   retry by keeping the latest information.
+//
+// Note that only implicit txns can be retried internally. If an explicit txn is
+// passed to execInternal, then the retry error is propagated to the
+// rowsIterator in the following manner (say we use {ExecStmt, Sync} commands):
+// - ExecStmt evaluation encounters a retry error
+// - the error is stored in internalClientComm.results[0] (since it's not
+//   propagated right away to the rowsIterator)
+// - the connExecutor's state machine rolls back the stmt
+// - the connExecutor then processes the Sync command, and when the
+//   corresponding result is closed, syncCallback is called
+// - in the syncCallback we iterate over two results and find the error in the
+//   zeroth result - the error is sent on the ieResultChannel
+// - the rowsIterator receives the error and returns it to the caller of
+//   execInternal.
+
 // execInternal executes a statement.
 //
 // sessionDataOverride can be used to control select fields in the executor's
@@ -826,37 +891,53 @@ func (ie *InternalExecutor) execInternal(
 	ctx context.Context,
 	opName string,
 	rw *ieResultChannel,
+	mode ieExecutionMode,
 	txn *kv.Txn,
 	sessionDataOverride sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
 ) (r *rowsIterator, retErr error) {
+	startup.AssertStartupRetry(ctx)
+
+	if err := ie.checkIfTxnIsConsistent(txn); err != nil {
+		return nil, err
+	}
+
 	ctx = logtags.AddTag(ctx, "intExec", opName)
 
 	var sd *sessiondata.SessionData
 	if ie.sessionDataStack != nil {
 		// TODO(andrei): Properly clone (deep copy) ie.sessionData.
 		sd = ie.sessionDataStack.Top().Clone()
-		// Even if session queries are told to error on non-home region accesses,
-		// internal queries spawned from the same context should never do so.
-		sd.LocalOnlySessionData.EnforceHomeRegion = false
 	} else {
-		sd = ie.s.newSessionData(SessionArgs{})
+		sd = newSessionData(SessionArgs{})
 	}
+
+	applyInternalExecutorSessionExceptions(sd)
 	applyOverrides(sessionDataOverride, sd)
 	sd.Internal = true
 	if sd.User().Undefined() {
 		return nil, errors.AssertionFailedf("no user specified for internal query")
 	}
-	if sd.ApplicationName == "" {
+	// When the connEx is serving an internal executor, it can inherit the
+	// application name from an outer session. This happens e.g. during ::regproc
+	// casts and built-in functions that use SQL internally. In that case, we do
+	// not want to record statistics against the outer application name directly;
+	// instead we want to use a separate bucket. However we will still want to
+	// have separate buckets for different applications so that we can measure
+	// their respective "pressure" on internal queries. Hence the choice here to
+	// add the delegate prefix to the current app name.
+	if sd.ApplicationName == "" || sd.ApplicationName == catconstants.InternalAppNamePrefix {
 		sd.ApplicationName = catconstants.InternalAppNamePrefix + "-" + opName
+	} else if !strings.HasPrefix(sd.ApplicationName, catconstants.InternalAppNamePrefix) {
+		// If this is already an "internal app", don't put more prefix.
+		sd.ApplicationName = catconstants.DelegatedAppNamePrefix + sd.ApplicationName
 	}
 	// If the caller has injected a mapping to temp schemas, install it, and
 	// leave it installed for the rest of the transaction.
 	if ie.extraTxnState != nil && sd.DatabaseIDToTempSchemaID != nil {
-		ie.extraTxnState.descCollection.SetTemporaryDescriptors(
-			descs.NewTemporarySchemaProvider(sessiondata.NewStack(sd)),
-		)
+		p := catsessiondata.NewDescriptorSessionDataStackProvider(sessiondata.NewStack(sd))
+		ie.extraTxnState.descCollection.SetDescriptorSessionDataProvider(p)
 	}
 
 	// The returned span is finished by this function in all error paths, but if
@@ -899,6 +980,9 @@ func (ie *InternalExecutor) execInternal(
 	if err != nil {
 		return nil, err
 	}
+	if err := ie.checkIfStmtIsAllowed(parsed.AST, txn); err != nil {
+		return nil, err
+	}
 	parseEnd := timeutil.Now()
 
 	// Transforms the args to datums. The datum types will be passed as type
@@ -908,11 +992,7 @@ func (ie *InternalExecutor) execInternal(
 		return nil, err
 	}
 
-	// resPos will be set to the position of the command that represents the
-	// statement we care about before that command is sent for execution.
-	var resPos CmdPos
-
-	syncCallback := func(results []resWithPos) {
+	syncCallback := func(results []*streamingCommandResult) {
 		// Close the stmtBuf so that the connExecutor exits its run() loop.
 		stmtBuf.Close()
 		for _, res := range results {
@@ -923,33 +1003,28 @@ func (ie *InternalExecutor) execInternal(
 				_ = rw.addResult(ctx, ieIteratorResult{err: res.Err()})
 				return
 			}
-			if res.pos == resPos {
-				return
-			}
 		}
-		_ = rw.addResult(ctx, ieIteratorResult{
-			err: errors.AssertionFailedf(
-				"missing result for pos: %d and no previous error", resPos,
-			),
-		})
 	}
 	// errCallback is called if an error is returned from the connExecutor's
 	// run() loop.
 	errCallback := func(err error) {
 		_ = rw.addResult(ctx, ieIteratorResult{err: err})
 	}
-	err = ie.runWithEx(ctx, txn, rw, sd, stmtBuf, &wg, syncCallback, errCallback)
+	err = ie.runWithEx(ctx, txn, rw, mode, sd, stmtBuf, &wg, syncCallback, errCallback)
 	if err != nil {
 		return nil, err
 	}
 
-	typeHints := make(tree.PlaceholderTypes, len(datums))
+	// We take max(len(s.Types), stmt.NumPlaceHolders) as the length of types.
+	numParams := len(datums)
+	if parsed.NumPlaceholders > numParams {
+		numParams = parsed.NumPlaceholders
+	}
+	typeHints := make(tree.PlaceholderTypes, numParams)
 	for i, d := range datums {
-		// Arg numbers start from 1.
 		typeHints[tree.PlaceholderIdx(i)] = d.ResolvedType()
 	}
 	if len(qargs) == 0 {
-		resPos = 0
 		if err := stmtBuf.Push(
 			ctx,
 			ExecStmt{
@@ -964,7 +1039,6 @@ func (ie *InternalExecutor) execInternal(
 			return nil, err
 		}
 	} else {
-		resPos = 2
 		if err := stmtBuf.Push(
 			ctx,
 			PrepareStmt{
@@ -997,6 +1071,7 @@ func (ie *InternalExecutor) execInternal(
 	}
 	r = &rowsIterator{
 		r:       rw,
+		mode:    mode,
 		stmtBuf: stmtBuf,
 		wg:      &wg,
 	}
@@ -1014,15 +1089,22 @@ func (ie *InternalExecutor) execInternal(
 			r.first = &first
 		}
 	}
-	if !r.done && r.first.cols != nil {
+	for !r.done && r.first.cols != nil {
 		// If the query is of ROWS statement type, the very first thing sent on
 		// the channel will be the column schema. This will occur before the
 		// query is given to the execution engine, so we actually need to get
 		// the next piece from the data channel.
 		//
+		// We also need to keep on looping until we get the first actual result
+		// with rows. In theory, it is possible for a stmt of ROWS type to
+		// encounter a retry error after sending the column schema but before
+		// going into the execution engine. In such a scenario we want to keep
+		// the latest column schema (in case there was a schema change
+		// in-between retries).
+		//
 		// Note that only statements of ROWS type should send the cols, but we
 		// choose to be defensive and don't assert that.
-		if r.resultCols == nil {
+		if parsed.AST.StatementReturnType() == tree.Rows {
 			r.resultCols = r.first.cols
 		}
 		var first ieIteratorResult
@@ -1034,15 +1116,10 @@ func (ie *InternalExecutor) execInternal(
 
 	// Note that if a context cancellation error has occurred, we still return
 	// the iterator and nil retErr so that the iterator is properly closed by
-	// the caller which will cleanup the connExecutor goroutine.
+	// the caller which will clean up the connExecutor goroutine.
+	// TODO(yuzefovich): reconsider this and return an error explicitly if
+	// r.lastErr is non-nil.
 	return r, nil
-}
-
-// ReleaseSchemaChangeJobRecords is to release the schema change job records.
-func (ie *InternalExecutor) releaseSchemaChangeJobRecords() {
-	for k := range ie.extraTxnState.schemaChangeJobRecords {
-		delete(ie.extraTxnState.schemaChangeJobRecords, k)
-	}
 }
 
 // commitTxn is to commit the txn bound to the internal executor.
@@ -1056,42 +1133,119 @@ func (ie *InternalExecutor) commitTxn(ctx context.Context) error {
 	if ie.sessionDataStack != nil {
 		sd = ie.sessionDataStack.Top().Clone()
 	} else {
-		sd = ie.s.newSessionData(SessionArgs{})
+		sd = newSessionData(SessionArgs{})
 	}
 
 	rw := newAsyncIEResultChannel()
 	stmtBuf := NewStmtBuf()
 
-	ex, err := ie.initConnEx(ctx, ie.extraTxnState.txn, rw, sd, stmtBuf, nil /* syncCallback */)
+	ex, err := ie.initConnEx(ctx, ie.extraTxnState.txn, rw, defaultIEExecutionMode, sd, stmtBuf, nil /* syncCallback */)
 	if err != nil {
 		return errors.Wrap(err, "cannot create conn executor to commit txn")
 	}
+	// TODO(janexing): is this correct?
+	ex.planner.txn = ie.extraTxnState.txn
+
 	defer ex.close(ctx, externalTxnClose)
+	if ie.extraTxnState.txn.IsCommitted() {
+		// TODO(ajwerner): assert that none of the other extraTxnState is
+		// occupied with state. Namely, we want to make sure that no jobs or
+		// schema changes occurred. If that had, it'd violate various invariants
+		// we'd like to uphold.
+		return nil
+	}
 	return ex.commitSQLTransactionInternal(ctx)
 }
 
+// checkIfStmtIsAllowed returns an error if the internal executor is not bound
+// with the outer-txn-related info but is used to run DDL statements within an
+// outer txn.
+// TODO (janexing): this will be deprecate soon since it's not a good idea
+// to have `extraTxnState` to store the info from a outer txn.
+func (ie *InternalExecutor) checkIfStmtIsAllowed(stmt tree.Statement, txn *kv.Txn) error {
+	if stmt == nil {
+		return nil
+	}
+	if tree.CanModifySchema(stmt) && txn != nil && ie.extraTxnState == nil {
+		return errors.New("DDL statement is disallowed if internal " +
+			"executor is not bound with txn metadata")
+	}
+	return nil
+}
+
+// checkIfTxnIsConsistent returns true if the given txn is not nil and is not
+// the same txn that is used to construct the internal executor.
+// TODO(janexing): this will be deprecated soon as we will only use
+// ie.extraTxnState.txn, and the txn argument in query functions will be
+// deprecated.
+func (ie *InternalExecutor) checkIfTxnIsConsistent(txn *kv.Txn) error {
+	if txn == nil && ie.extraTxnState != nil {
+		return errors.New("the current internal executor was contructed with " +
+			"a txn. To use an internal executor without a txn, call " +
+			"insql.DB.Executor()")
+	}
+
+	if txn != nil && ie.extraTxnState != nil && ie.extraTxnState.txn != txn {
+		return errors.New("txn is inconsistent with the one when " +
+			"constructing the internal executor")
+	}
+	return nil
+}
+
+// ieExecutionMode determines how the internal executor consumes the results of
+// the statement evaluation.
+type ieExecutionMode int
+
+const (
+	// defaultIEExecutionMode is the execution mode in which the results of the
+	// statement evaluation are consumed according to the statement's type.
+	defaultIEExecutionMode ieExecutionMode = iota
+	// rowsAffectedIEExecutionMode is the execution mode in which the internal
+	// executor is only interested in the number of rows affected, regardless of
+	// the statement's type.
+	//
+	// With this mode, if a stmt encounters a retry error, the internal executor
+	// will proceed to transparently reset the number of rows affected (if any
+	// have been seen by the rowsIterator) and retry the corresponding command.
+	// Such behavior makes sense given that in production code at most one
+	// command in the StmtBuf results in "rows affected".
+	rowsAffectedIEExecutionMode
+)
+
 // internalClientComm is an implementation of ClientComm used by the
-// InternalExecutor. Result rows are buffered in memory.
+// InternalExecutor. Result rows are streamed on the channel to the
+// ieResultWriter.
 type internalClientComm struct {
-	// results will contain the results of the commands executed by an
+	// results contains the results of the commands executed by the
 	// InternalExecutor.
-	results []resWithPos
+	//
+	// In production setting we expect either two (ExecStmt, Sync) or four
+	// (PrepareStmt, BindStmt, ExecPortal, Sync) commands pushed to the StmtBuf,
+	// after which point the internalClientComm is no longer used. We also take
+	// advantage of the invariant that only a single command is being evaluated
+	// at any point in time (i.e. any command is created, evaluated, and then
+	// closed / discarded, and only after that a new command can be processed).
+	results []*streamingCommandResult
 
 	// The results of the query execution will be written into w.
 	w ieResultWriter
 
-	lastDelivered CmdPos
+	// mode determines how the results of the query execution are consumed.
+	mode ieExecutionMode
 
-	// sync, if set, is called whenever a Sync is executed.
-	sync func([]resWithPos)
+	// resetRowsAffected is a callback that sends a single ieIteratorResult
+	// object to w in order to set the number of rows affected to zero. Only
+	// used in rowsAffectedIEExecutionMode when discarding a result (indicating
+	// that a command will be retried).
+	resetRowsAffected func()
+
+	// sync, if set, is called whenever a Sync is executed with all accumulated
+	// results since the last Sync.
+	sync func([]*streamingCommandResult)
 }
 
 var _ ClientComm = &internalClientComm{}
-
-type resWithPos struct {
-	*streamingCommandResult
-	pos CmdPos
-}
+var _ ClientLock = &internalClientComm{}
 
 // CreateStatementResult is part of the ClientComm interface.
 func (icc *internalClientComm) CreateStatementResult(
@@ -1104,54 +1258,70 @@ func (icc *internalClientComm) CreateStatementResult(
 	_ int,
 	_ string,
 	_ bool,
+	_ PortalPausablity,
 ) CommandResult {
-	return icc.createRes(pos, nil /* onClose */)
+	return icc.createRes(pos)
 }
 
-// createRes creates a result. onClose, if not nil, is called when the result is
-// closed.
-func (icc *internalClientComm) createRes(pos CmdPos, onClose func()) *streamingCommandResult {
+// createRes creates a result.
+func (icc *internalClientComm) createRes(pos CmdPos) *streamingCommandResult {
 	res := &streamingCommandResult{
-		w: icc.w,
-		closeCallback: func(res *streamingCommandResult, typ resCloseType) {
-			if typ == discarded {
-				return
-			}
-			icc.results = append(icc.results, resWithPos{streamingCommandResult: res, pos: pos})
-			if onClose != nil {
-				onClose()
+		pos: pos,
+		w:   icc.w,
+		discardCallback: func() {
+			// If this result is being discarded, then we can simply remove the
+			// last item from the slice. Such behavior is valid since we don't
+			// create a new result until the previous one is either closed or
+			// discarded (i.e. we are always processing the last entry in the
+			// results slice at the moment and all previous results have been
+			// "finalized").
+			icc.results = icc.results[:len(icc.results)-1]
+			if icc.mode == rowsAffectedIEExecutionMode {
+				icc.resetRowsAffected()
 			}
 		},
 	}
+	icc.results = append(icc.results, res)
 	return res
 }
 
 // CreatePrepareResult is part of the ClientComm interface.
 func (icc *internalClientComm) CreatePrepareResult(pos CmdPos) ParseResult {
-	return icc.createRes(pos, nil /* onClose */)
+	return icc.createRes(pos)
 }
 
 // CreateBindResult is part of the ClientComm interface.
 func (icc *internalClientComm) CreateBindResult(pos CmdPos) BindResult {
-	return icc.createRes(pos, nil /* onClose */)
+	return icc.createRes(pos)
 }
 
 // CreateSyncResult is part of the ClientComm interface.
 //
-// The returned SyncResult will call the sync callback when its closed.
+// The returned SyncResult will call the sync callback when it's closed.
 func (icc *internalClientComm) CreateSyncResult(pos CmdPos) SyncResult {
-	return icc.createRes(pos, func() {
-		results := make([]resWithPos, len(icc.results))
-		copy(results, icc.results)
-		icc.results = icc.results[:0]
-		icc.sync(results)
-		icc.lastDelivered = pos
-	} /* onClose */)
+	res := icc.createRes(pos)
+	if icc.sync != nil {
+		res.closeCallback = func() {
+			// sync might communicate with the reader, so we defensively mark
+			// this result as no longer being able to rewind. This shouldn't be
+			// that important though - we shouldn't be trying to rewind the Sync
+			// command anyway, so we're being conservative here.
+			icc.results[len(icc.results)-1].cannotRewind = true
+			icc.sync(icc.results)
+			icc.results = icc.results[:0]
+		}
+	}
+	return res
 }
 
 // LockCommunication is part of the ClientComm interface.
+//
+// The current implementation writes results from the same goroutine as the one
+// calling LockCommunication (main connExecutor's goroutine). Therefore, there's
+// nothing to "lock" - communication is naturally blocked as the command
+// processor won't write any more results.
 func (icc *internalClientComm) LockCommunication() ClientLock {
-	return (*noopClientLock)(icc)
+	return icc
 }
 
 // Flush is part of the ClientComm interface.
@@ -1161,7 +1331,7 @@ func (icc *internalClientComm) Flush(pos CmdPos) error {
 
 // CreateDescribeResult is part of the ClientComm interface.
 func (icc *internalClientComm) CreateDescribeResult(pos CmdPos) DescribeResult {
-	return icc.createRes(pos, nil /* onClose */)
+	return icc.createRes(pos)
 }
 
 // CreateDeleteResult is part of the ClientComm interface.
@@ -1185,7 +1355,12 @@ func (icc *internalClientComm) CreateEmptyQueryResult(pos CmdPos) EmptyQueryResu
 }
 
 // CreateCopyInResult is part of the ClientComm interface.
-func (icc *internalClientComm) CreateCopyInResult(pos CmdPos) CopyInResult {
+func (icc *internalClientComm) CreateCopyInResult(cmd CopyIn, pos CmdPos) CopyInResult {
+	panic("unimplemented")
+}
+
+// CreateCopyOutResult is part of the ClientComm interface.
+func (icc *internalClientComm) CreateCopyOutResult(cmd CopyOut, pos CmdPos) CopyOutResult {
 	panic("unimplemented")
 }
 
@@ -1194,92 +1369,164 @@ func (icc *internalClientComm) CreateDrainResult(pos CmdPos) DrainResult {
 	panic("unimplemented")
 }
 
-// noopClientLock is an implementation of ClientLock that says that no results
-// have been communicated to the client.
-type noopClientLock internalClientComm
-
 // Close is part of the ClientLock interface.
-func (ncl *noopClientLock) Close() {}
+func (icc *internalClientComm) Close() {}
 
 // ClientPos is part of the ClientLock interface.
-func (ncl *noopClientLock) ClientPos() CmdPos {
-	return ncl.lastDelivered
+func (icc *internalClientComm) ClientPos() CmdPos {
+	if icc.mode == rowsAffectedIEExecutionMode {
+		// With the "rows affected" mode, any command can be rewound since we
+		// assume that only a single command results in actual "rows affected",
+		// and in Discard we will reset the number to zero (if we were in
+		// process of evaluation that command when we encountered the retry
+		// error).
+		return -1
+	}
+	// Find the latest result that cannot be rewound.
+	lastDelivered := CmdPos(-1)
+	for _, r := range icc.results {
+		if r.cannotRewind {
+			lastDelivered = r.pos
+		}
+	}
+	return lastDelivered
 }
 
 // RTrim is part of the ClientLock interface.
-func (ncl *noopClientLock) RTrim(_ context.Context, pos CmdPos) {
-	var i int
-	var r resWithPos
-	for i, r = range ncl.results {
+func (icc *internalClientComm) RTrim(_ context.Context, pos CmdPos) {
+	for i, r := range icc.results {
 		if r.pos >= pos {
-			break
+			icc.results = icc.results[:i]
+			return
 		}
 	}
-	ncl.results = ncl.results[:i]
 }
 
 // extraTxnState is to store extra transaction state info that
 // will be passed to an internal executor when it's used under a txn context.
 // It should not be exported from the sql package.
 // TODO (janexing): we will deprecate this struct ASAP. It only exists as a
-// stop-gap before we implement InternalExecutor.ConnExecutor to run all
+// stop-gap before we implement Executor.ConnExecutor to run all
 // sql statements under a transaction. This struct is not ideal for an internal
 // executor in that it may lead to surprising bugs whereby we forget to add
 // fields here and keep them in sync.
 type extraTxnState struct {
-	txn                    *kv.Txn
-	descCollection         *descs.Collection
-	jobs                   *jobsCollection
-	schemaChangeJobRecords map[descpb.ID]*jobs.Record
-	schemaChangerState     *SchemaChangerState
+	txn                *kv.Txn
+	descCollection     *descs.Collection
+	jobs               *txnJobsCollection
+	schemaChangerState *SchemaChangerState
+
+	// regionsProvider is populated lazily.
+	regionsProvider *regions.Provider
 }
 
-// InternalExecutorFactory stored information needed to construct a new
+// InternalDB stored information needed to construct a new
 // internal executor.
-type InternalExecutorFactory struct {
+type InternalDB struct {
 	server     *Server
+	db         *kv.DB
+	cf         *descs.CollectionFactory
+	lm         *lease.Manager
 	memMetrics MemoryMetrics
 	monitor    *mon.BytesMonitor
 }
 
-// MemoryMonitor returns the monitor which should be used when constructing
-// things in the context of an internal executor created by this factory.
-func (ief *InternalExecutorFactory) MemoryMonitor() *mon.BytesMonitor {
-	return ief.monitor
+// NewShimInternalDB is used to bootstrap the server which needs access to
+// components which will ultimately have a handle to an InternalDB. Some of
+// those components may attempt to access the *kv.DB before the InternalDB
+// has been fully initialized. To get around this, we initially construct
+// an InternalDB with just a handle to a *kv.DB and then we'll fill in the
+// object during sql server construction.
+func NewShimInternalDB(db *kv.DB) *InternalDB {
+	return &InternalDB{db: db}
 }
 
-// NewInternalExecutorFactory returns a new internal executor factory.
-func NewInternalExecutorFactory(
-	s *Server, memMetrics MemoryMetrics, monitor *mon.BytesMonitor,
-) *InternalExecutorFactory {
-	return &InternalExecutorFactory{
+func (ief *InternalDB) CloneWithMemoryMonitor(
+	metrics MemoryMetrics, monitor *mon.BytesMonitor,
+) *InternalDB {
+	clone := *ief
+	clone.memMetrics = metrics
+	clone.monitor = monitor
+	return &clone
+}
+
+func (ief *InternalDB) KV() *kv.DB {
+	return ief.db
+}
+
+// NewInternalDB returns a new InternalDB.
+func NewInternalDB(s *Server, memMetrics MemoryMetrics, monitor *mon.BytesMonitor) *InternalDB {
+	return &InternalDB{
 		server:     s,
+		cf:         s.cfg.CollectionFactory,
+		db:         s.cfg.DB,
+		lm:         s.cfg.LeaseManager,
 		memMetrics: memMetrics,
 		monitor:    monitor,
 	}
 }
 
-var _ sqlutil.InternalExecutorFactory = &InternalExecutorFactory{}
-var _ descs.InternalExecutorFactoryWithTxn = &InternalExecutorFactory{}
+var _ isql.DB = &InternalDB{}
+
+type internalTxn struct {
+	internalExecutor
+	txn *kv.Txn
+}
+
+func (txn *internalTxn) Regions() descs.RegionProvider {
+	if txn.extraTxnState.regionsProvider == nil {
+		txn.extraTxnState.regionsProvider = regions.NewProvider(
+			txn.s.cfg.Codec,
+			txn.s.cfg.TenantStatusServer,
+			txn.txn,
+			txn.extraTxnState.descCollection,
+		)
+	}
+	return txn.extraTxnState.regionsProvider
+}
+
+func (txn *internalTxn) Descriptors() *descs.Collection {
+	return txn.extraTxnState.descCollection
+}
+
+func (txn *internalTxn) SessionData() *sessiondata.SessionData {
+	return txn.sessionDataStack.Top()
+}
+
+func (txn *internalTxn) KV() *kv.Txn { return txn.txn }
+
+func (txn *internalTxn) init(kvTxn *kv.Txn, ie InternalExecutor) {
+	txn.txn = kvTxn
+	txn.InternalExecutor = ie
+}
+
+type internalExecutor struct {
+	InternalExecutor
+}
 
 // NewInternalExecutor constructs a new internal executor.
-// TODO (janexing): this should be deprecated soon.
-func (ief *InternalExecutorFactory) NewInternalExecutor(
-	sd *sessiondata.SessionData,
-) sqlutil.InternalExecutor {
+// TODO (janexing): usage of it should be deprecated with `DescsTxnWithExecutor()`
+// or `Executor()`.
+func (ief *InternalDB) NewInternalExecutor(sd *sessiondata.SessionData) isql.Executor {
 	ie := MakeInternalExecutor(ief.server, ief.memMetrics, ief.monitor)
 	ie.SetSessionData(sd)
 	return &ie
 }
 
-// NewInternalExecutorWithTxn creates an internal executor with txn-related info,
-// such as descriptor collection and schema change job records, etc. It should
-// be called only after InternalExecutorFactory.NewInternalExecutor is already
-// called to construct the InternalExecutorFactory with required server info.
-// This function should only be used under CollectionFactory.TxnWithExecutor().
-func (ief *InternalExecutorFactory) NewInternalExecutorWithTxn(
+// internalExecutorCommitTxnFunc is to commit the txn associated with an
+// internal executor.
+type internalExecutorCommitTxnFunc func(ctx context.Context) error
+
+// newInternalExecutorWithTxn creates an internal executor with txn-related info,
+// such as descriptor collection and schema change job records, etc.
+// This function should only be used under
+// InternalDB.DescsTxnWithExecutor().
+// TODO (janexing): This function will be soon refactored after we change
+// the internal executor infrastructure with a single conn executor for all
+// sql statement executions within a txn.
+func (ief *InternalDB) newInternalExecutorWithTxn(
 	sd *sessiondata.SessionData, sv *settings.Values, txn *kv.Txn, descCol *descs.Collection,
-) (sqlutil.InternalExecutor, descs.InternalExecutorCommitTxnFunc) {
+) (InternalExecutor, internalExecutorCommitTxnFunc) {
 	// By default, if not given session data, we initialize a sessionData that
 	// would be the same as what would be created if root logged in.
 	// The sessionData's user can be override when calling the query
@@ -1288,26 +1535,233 @@ func (ief *InternalExecutorFactory) NewInternalExecutorWithTxn(
 	// than the actual user, a security boundary should be added to the error
 	// handling of internal executor.
 	if sd == nil {
-		sd = NewFakeSessionData(sv)
+		sd = NewFakeSessionData(sv, "" /* opName */)
 		sd.UserProto = username.RootUserName().EncodeProto()
 	}
-	ie, commitTxnFunc := newInternalExecutorWithTxn(
-		ief.server,
-		sd,
-		txn,
-		ief.memMetrics,
-		ief.monitor,
-		descCol,
-	)
+
+	schemaChangerState := &SchemaChangerState{
+		mode:   sd.NewSchemaChangerMode,
+		memAcc: ief.monitor.MakeBoundAccount(),
+	}
+	ie := InternalExecutor{
+		s:          ief.server,
+		mon:        ief.monitor,
+		memMetrics: ief.memMetrics,
+		extraTxnState: &extraTxnState{
+			txn:                txn,
+			descCollection:     descCol,
+			jobs:               newTxnJobsCollection(),
+			schemaChangerState: schemaChangerState,
+		},
+	}
+	populateMinimalSessionData(sd)
+	ie.sessionDataStack = sessiondata.NewStack(sd)
+
+	commitTxnFunc := func(ctx context.Context) error {
+		defer func() {
+			ie.extraTxnState.jobs.reset()
+			ie.extraTxnState.schemaChangerState.memAcc.Clear(ctx)
+		}()
+		if err := ie.commitTxn(ctx); err != nil {
+			return err
+		}
+		return ie.s.cfg.JobRegistry.Run(ctx, ie.extraTxnState.jobs.created)
+	}
 
 	return ie, commitTxnFunc
 }
 
-// RunWithoutTxn is to create an internal executor without binding to a txn,
-// and run the passed function with this internal executor.
-func (ief *InternalExecutorFactory) RunWithoutTxn(
-	ctx context.Context, run func(ctx context.Context, ie sqlutil.InternalExecutor) error,
+// Executor returns an Executor not bound with any txn.
+func (ief *InternalDB) Executor(opts ...isql.ExecutorOption) isql.Executor {
+	var cfg isql.ExecutorConfig
+	cfg.Init(opts...)
+	ie := MakeInternalExecutor(ief.server, ief.memMetrics, ief.monitor)
+	if sd := cfg.GetSessionData(); sd != nil {
+		ie.SetSessionData(sd)
+	}
+	return &ie
+}
+
+type kvTxnFunc = func(context.Context, *kv.Txn) error
+
+// DescsTxn enables callers to run transactions with explicit access to the
+// *descs.Collection which is bound to the isql.Txn in the Txn method.
+func (ief *InternalDB) DescsTxn(
+	ctx context.Context, f func(context.Context, descs.Txn) error, opts ...isql.TxnOption,
 ) error {
-	ie := ief.NewInternalExecutor(nil /* sessionData */)
-	return run(ctx, ie)
+	return ief.txn(
+		ctx,
+		func(ctx context.Context, txn *internalTxn) error { return f(ctx, txn) },
+		opts...,
+	)
+}
+
+// Txn is used to run queries with internal executor in a transactional
+// manner.
+func (ief *InternalDB) Txn(
+	ctx context.Context, f func(context.Context, isql.Txn) error, opts ...isql.TxnOption,
+) error {
+	wrapped := func(ctx context.Context, txn *internalTxn) error { return f(ctx, txn) }
+	return ief.txn(ctx, wrapped, opts...)
+}
+
+func (ief *InternalDB) txn(
+	ctx context.Context, f func(context.Context, *internalTxn) error, opts ...isql.TxnOption,
+) error {
+	var cfg isql.TxnConfig
+	cfg.Init(opts...)
+
+	db := ief.server.cfg.DB
+
+	// Wait for descriptors that were modified or dropped. If the descriptor
+	// was not dropped, wait for one version. Otherwise, wait for no versions.
+	waitForDescriptors := func(
+		modifiedDescriptors []lease.IDVersion,
+		deletedDescs catalog.DescriptorIDSet,
+	) error {
+		retryOpts := retry.Options{
+			InitialBackoff: time.Millisecond,
+			Multiplier:     1.5,
+			MaxBackoff:     time.Second,
+		}
+		lm := ief.server.cfg.LeaseManager
+		for _, ld := range modifiedDescriptors {
+			if deletedDescs.Contains(ld.ID) { // we'll wait below
+				continue
+			}
+			_, err := lm.WaitForOneVersion(ctx, ld.ID, retryOpts)
+			// If the descriptor has been deleted, just wait for leases to drain.
+			if errors.Is(err, catalog.ErrDescriptorNotFound) {
+				err = lm.WaitForNoVersion(ctx, ld.ID, retryOpts)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		for _, id := range deletedDescs.Ordered() {
+			if err := lm.WaitForNoVersion(ctx, id, retryOpts); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	run := db.Txn
+	if priority, hasPriority := cfg.GetAdmissionPriority(); hasPriority {
+		steppingMode := kv.SteppingDisabled
+		if cfg.GetSteppingEnabled() {
+			steppingMode = kv.SteppingEnabled
+		}
+		run = func(ctx context.Context, f kvTxnFunc) error {
+			return db.TxnWithAdmissionControl(
+				ctx, kvpb.AdmissionHeader_FROM_SQL, priority, steppingMode, f,
+			)
+		}
+	} else if cfg.GetSteppingEnabled() {
+		run = func(ctx context.Context, f kvTxnFunc) error {
+			return db.TxnWithSteppingEnabled(ctx, sessiondatapb.Normal, f)
+		}
+	}
+
+	cf := ief.server.cfg.CollectionFactory
+	for {
+		var withNewVersion []lease.IDVersion
+		var deletedDescs catalog.DescriptorIDSet
+		if err := run(ctx, func(ctx context.Context, kvTxn *kv.Txn) (err error) {
+			withNewVersion, deletedDescs = nil, catalog.DescriptorIDSet{}
+			descsCol := cf.NewCollection(ctx, descs.WithMonitor(ief.monitor))
+			defer descsCol.ReleaseAll(ctx)
+			ie, commitTxnFn := ief.newInternalExecutorWithTxn(
+				cfg.GetSessionData(),
+				&cf.GetClusterSettings().SV,
+				kvTxn,
+				descsCol,
+			)
+			txn := internalTxn{txn: kvTxn}
+			txn.InternalExecutor = ie
+			if err := f(ctx, &txn); err != nil {
+				return err
+			}
+			deletedDescs = descsCol.GetDeletedDescs()
+			withNewVersion, err = descsCol.GetOriginalPreviousIDVersionsForUncommitted()
+			if err != nil {
+				return err
+			}
+			return commitTxnFn(ctx)
+		}); descs.IsTwoVersionInvariantViolationError(err) {
+			continue
+		} else {
+			if err == nil {
+				err = waitForDescriptors(withNewVersion, deletedDescs)
+			}
+			return err
+		}
+	}
+}
+
+// SessionDataOverride is a function that can be used to override some
+// fields in the session data through all uses of a isql.DB.
+//
+// This override is applied first; then any additional overrides from
+// the sessiondata.InternalExecutorOverride passed to the "*Ex()"
+// methods of Executor are applied on top.
+//
+// This particular override mechanism is useful for packages that do
+// not use the "Ex*()" methods or to safeguard the same set of
+// overrides throughout all uses (prevents mistakes due to
+// inconsistent overrides in different places).
+type SessionDataOverride = func(sd *sessiondata.SessionData)
+
+type internalDBWithOverrides struct {
+	baseDB               isql.DB
+	sessionDataOverrides []SessionDataOverride
+}
+
+var _ isql.DB = (*internalDBWithOverrides)(nil)
+
+// NewInternalDBWithSessionDataOverrides creates a new DB that wraps
+// the given DB and customizes the session data. The customizations
+// passed here are applied *before* any other customizations via the
+// sessiondata.InternalExecutorOverride parameter to the "*Ex()"
+// methods of Executor.
+func NewInternalDBWithSessionDataOverrides(
+	baseDB isql.DB, sessionDataOverrides ...SessionDataOverride,
+) isql.DB {
+	return &internalDBWithOverrides{
+		baseDB:               baseDB,
+		sessionDataOverrides: sessionDataOverrides,
+	}
+}
+
+// KV is part of the isql.DB interface.
+func (db *internalDBWithOverrides) KV() *kv.DB {
+	return db.baseDB.KV()
+}
+
+// Txn is part of the isql.DB interface.
+func (db *internalDBWithOverrides) Txn(
+	ctx context.Context, fn func(context.Context, isql.Txn) error, opts ...isql.TxnOption,
+) error {
+	return db.baseDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		for _, o := range db.sessionDataOverrides {
+			o(txn.SessionData())
+		}
+		return fn(ctx, txn)
+	}, opts...)
+}
+
+// Executor is part of the isql.DB interface.
+func (db *internalDBWithOverrides) Executor(opts ...isql.ExecutorOption) isql.Executor {
+	var cfg isql.ExecutorConfig
+	cfg.Init(opts...)
+	sd := cfg.GetSessionData()
+	if sd == nil {
+		// newSessionData is the default value used by InternalExecutor
+		// when no session data is provided otherwise.
+		sd = newSessionData(SessionArgs{})
+	}
+	for _, o := range db.sessionDataOverrides {
+		o(sd)
+	}
+	return db.baseDB.Executor(isql.WithSessionData(sd))
 }

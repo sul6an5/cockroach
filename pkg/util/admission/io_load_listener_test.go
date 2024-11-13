@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/echotest"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/redact"
@@ -38,9 +38,12 @@ func TestIOLoadListener(t *testing.T) {
 	req := &testRequesterForIOLL{}
 	kvGranter := &testGranterWithIOTokens{}
 	var ioll *ioLoadListener
+	var cumFlushBytes int64
+	var cumFlushWork, cumFlushIdle time.Duration
+
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	datadriven.RunTest(t, testutils.TestDataPath(t, "io_load_listener"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "io_load_listener"),
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "init":
@@ -54,17 +57,21 @@ func TestIOLoadListener(t *testing.T) {
 				// test -- the channels provide synchronization and prevent this
 				// test code and the ioLoadListener from being concurrently
 				// active.
-				ioll.mu.Mutex = &syncutil.Mutex{}
-				ioll.mu.kvGranter = kvGranter
+				ioll.kvGranter = kvGranter
+
+				// Reset the cumulative data
+				cumFlushBytes = 0
+				cumFlushWork = time.Duration(0)
+				cumFlushIdle = time.Duration(0)
 				return ""
 
 			case "prep-admission-stats":
 				req.stats = storeAdmissionStats{
-					admittedCount:          0,
+					workCount:              0,
 					writeAccountedBytes:    0,
 					ingestedAccountedBytes: 0,
 				}
-				d.ScanArgs(t, "admitted", &req.stats.admittedCount)
+				d.ScanArgs(t, "admitted", &req.stats.workCount)
 				if d.HasArg("write-bytes") {
 					d.ScanArgs(t, "write-bytes", &req.stats.writeAccountedBytes)
 				}
@@ -112,13 +119,15 @@ func TestIOLoadListener(t *testing.T) {
 					d.ScanArgs(t, "flush-work-sec", &flushWorkSec)
 					d.ScanArgs(t, "flush-idle-sec", &flushIdleSec)
 				}
-				flushMetric := pebble.ThroughputMetric{
-					Bytes:        int64(flushBytes),
-					WorkDuration: time.Duration(flushWorkSec) * time.Second,
-					IdleDuration: time.Duration(flushIdleSec) * time.Second,
-				}
-				im := &pebble.InternalIntervalMetrics{}
-				im.Flush.WriteThroughput = flushMetric
+
+				cumFlushIdle += time.Duration(flushIdleSec) * time.Second
+				cumFlushWork += time.Duration(flushWorkSec) * time.Second
+				cumFlushBytes += int64(flushBytes)
+
+				metrics.Flush.WriteThroughput.Bytes = cumFlushBytes
+				metrics.Flush.WriteThroughput.IdleDuration = cumFlushIdle
+				metrics.Flush.WriteThroughput.WorkDuration = cumFlushWork
+
 				var writeStallCount int
 				if d.HasArg("write-stall-count") {
 					d.ScanArgs(t, "write-stall-count", &writeStallCount)
@@ -141,20 +150,20 @@ func TestIOLoadListener(t *testing.T) {
 				if d.HasArg("disk-bw-tokens-used") {
 					var regularTokensUsed, elasticTokensUsed int
 					d.ScanArgs(t, "disk-bw-tokens-used", &regularTokensUsed, &elasticTokensUsed)
-					kvGranter.diskBandwidthTokensUsed[regularWorkClass] = int64(regularTokensUsed)
-					kvGranter.diskBandwidthTokensUsed[elasticWorkClass] = int64(elasticTokensUsed)
+					kvGranter.diskBandwidthTokensUsed[admissionpb.RegularWorkClass] = int64(regularTokensUsed)
+					kvGranter.diskBandwidthTokensUsed[admissionpb.ElasticWorkClass] = int64(elasticTokensUsed)
 				} else {
-					kvGranter.diskBandwidthTokensUsed[regularWorkClass] = 0
-					kvGranter.diskBandwidthTokensUsed[elasticWorkClass] = 0
+					kvGranter.diskBandwidthTokensUsed[admissionpb.RegularWorkClass] = 0
+					kvGranter.diskBandwidthTokensUsed[admissionpb.ElasticWorkClass] = 0
 				}
 				var printOnlyFirstTick bool
 				if d.HasArg("print-only-first-tick") {
 					d.ScanArgs(t, "print-only-first-tick", &printOnlyFirstTick)
 				}
+
 				ioll.pebbleMetricsTick(ctx, StoreMetrics{
-					Metrics:                 &metrics,
-					WriteStallCount:         int64(writeStallCount),
-					InternalIntervalMetrics: im,
+					Metrics:         &metrics,
+					WriteStallCount: int64(writeStallCount),
 					DiskStats: DiskStats{
 						BytesRead:            uint64(bytesRead),
 						BytesWritten:         uint64(bytesWritten),
@@ -195,8 +204,7 @@ func TestIOLoadListenerOverflow(t *testing.T) {
 		settings:    st,
 		kvRequester: req,
 	}
-	ioll.mu.Mutex = &syncutil.Mutex{}
-	ioll.mu.kvGranter = kvGranter
+	ioll.kvGranter = kvGranter
 	// Bug 1: overflow when totalNumByteTokens is too large.
 	for i := int64(0); i < adjustmentInterval; i++ {
 		// Override the totalNumByteTokens manually to trigger the overflow bug.
@@ -212,10 +220,8 @@ func TestIOLoadListenerOverflow(t *testing.T) {
 		Sublevels: 100,
 		NumFiles:  10000,
 	}
-	ioll.pebbleMetricsTick(ctx,
-		StoreMetrics{Metrics: &m, InternalIntervalMetrics: &pebble.InternalIntervalMetrics{}})
-	ioll.pebbleMetricsTick(ctx,
-		StoreMetrics{Metrics: &m, InternalIntervalMetrics: &pebble.InternalIntervalMetrics{}})
+	ioll.pebbleMetricsTick(ctx, StoreMetrics{Metrics: &m})
+	ioll.pebbleMetricsTick(ctx, StoreMetrics{Metrics: &m})
 	ioll.allocateTokensTick()
 }
 
@@ -257,11 +263,11 @@ func TestAdjustTokensInnerAndLogging(t *testing.T) {
 	for _, tt := range tests {
 		buf.Printf("%s:\n", tt.name)
 		res := (*ioLoadListener)(nil).adjustTokensInner(
-			ctx, tt.prev, tt.l0Metrics, 12, &pebble.InternalIntervalMetrics{},
+			ctx, tt.prev, tt.l0Metrics, 12, pebble.ThroughputMetric{},
 			100, 10, 0.50)
 		buf.Printf("%s\n", res)
 	}
-	echotest.Require(t, string(redact.Sprint(buf)), filepath.Join(testutils.TestDataPath(t, "format_adjust_tokens_stats.txt")))
+	echotest.Require(t, string(redact.Sprint(buf)), filepath.Join(datapathutils.TestDataPath(t, "format_adjust_tokens_stats.txt")))
 }
 
 // TestBadIOLoadListenerStats tests that bad stats (non-monotonic cumulative
@@ -284,7 +290,7 @@ func TestBadIOLoadListenerStats(t *testing.T) {
 		d.BytesRead = rand.Uint64()
 		d.BytesWritten = rand.Uint64()
 		d.ProvisionedBandwidth = 1 << 20
-		req.stats.admittedCount = rand.Uint64()
+		req.stats.workCount = rand.Uint64()
 		req.stats.writeAccountedBytes = rand.Uint64()
 		req.stats.ingestedAccountedBytes = rand.Uint64()
 		req.stats.statsToIgnore.Bytes = rand.Uint64()
@@ -298,14 +304,12 @@ func TestBadIOLoadListenerStats(t *testing.T) {
 		perWorkTokenEstimator: makeStorePerWorkTokenEstimator(),
 		diskBandwidthLimiter:  makeDiskBandwidthLimiter(),
 	}
-	ioll.mu.Mutex = &syncutil.Mutex{}
-	ioll.mu.kvGranter = kvGranter
+	ioll.kvGranter = kvGranter
 	for i := 0; i < 100; i++ {
 		randomValues()
 		ioll.pebbleMetricsTick(ctx, StoreMetrics{
-			Metrics:                 &m,
-			InternalIntervalMetrics: &pebble.InternalIntervalMetrics{},
-			DiskStats:               d,
+			Metrics:   &m,
+			DiskStats: d,
 		})
 		for j := 0; j < ticksInAdjustmentInterval; j++ {
 			ioll.allocateTokensTick()
@@ -330,7 +334,7 @@ var _ storeRequester = &testRequesterForIOLL{}
 
 func (r *testRequesterForIOLL) close() {}
 
-func (r *testRequesterForIOLL) getRequesters() [numWorkClasses]requester {
+func (r *testRequesterForIOLL) getRequesters() [admissionpb.NumWorkClasses]requester {
 	panic("unimplemented")
 }
 
@@ -345,29 +349,28 @@ func (r *testRequesterForIOLL) setStoreRequestEstimates(estimates storeRequestEs
 type testGranterWithIOTokens struct {
 	buf                     strings.Builder
 	allTokensUsed           bool
-	diskBandwidthTokensUsed [numWorkClasses]int64
+	diskBandwidthTokensUsed [admissionpb.NumWorkClasses]int64
 }
 
 var _ granterWithIOTokens = &testGranterWithIOTokens{}
 
-func (g *testGranterWithIOTokens) setAvailableIOTokensLocked(tokens int64) (tokensUsed int64) {
-	fmt.Fprintf(&g.buf, "setAvailableIOTokens: %s", tokensForTokenTickDurationToString(tokens))
+func (g *testGranterWithIOTokens) setAvailableTokens(
+	ioTokens int64, elasticDiskBandwidthTokens int64,
+) (tokensUsed int64) {
+	fmt.Fprintf(&g.buf, "setAvailableTokens: io-tokens=%s elastic-disk-bw-tokens=%s",
+		tokensForTokenTickDurationToString(ioTokens),
+		tokensForTokenTickDurationToString(elasticDiskBandwidthTokens))
 	if g.allTokensUsed {
-		return tokens * 2
+		return ioTokens * 2
 	}
 	return 0
 }
 
-func (g *testGranterWithIOTokens) setAvailableElasticDiskBandwidthTokensLocked(tokens int64) {
-	fmt.Fprintf(&g.buf, " setAvailableElasticDiskTokens: %s",
-		tokensForTokenTickDurationToString(tokens))
-}
-
-func (g *testGranterWithIOTokens) getDiskTokensUsedAndResetLocked() [numWorkClasses]int64 {
+func (g *testGranterWithIOTokens) getDiskTokensUsedAndReset() [admissionpb.NumWorkClasses]int64 {
 	return g.diskBandwidthTokensUsed
 }
 
-func (g *testGranterWithIOTokens) setAdmittedDoneModelsLocked(
+func (g *testGranterWithIOTokens) setAdmittedDoneModels(
 	l0WriteLM tokensLinearModel, l0IngestLM tokensLinearModel, ingestLM tokensLinearModel,
 ) {
 	fmt.Fprintf(&g.buf, "setAdmittedDoneModelsLocked: l0-write-lm: ")
@@ -394,20 +397,19 @@ type testGranterNonNegativeTokens struct {
 
 var _ granterWithIOTokens = &testGranterNonNegativeTokens{}
 
-func (g *testGranterNonNegativeTokens) setAvailableIOTokensLocked(tokens int64) (tokensUsed int64) {
-	require.LessOrEqual(g.t, int64(0), tokens)
+func (g *testGranterNonNegativeTokens) setAvailableTokens(
+	ioTokens int64, elasticDiskBandwidthTokens int64,
+) (tokensUsed int64) {
+	require.LessOrEqual(g.t, int64(0), ioTokens)
+	require.LessOrEqual(g.t, int64(0), elasticDiskBandwidthTokens)
 	return 0
 }
 
-func (g *testGranterNonNegativeTokens) setAvailableElasticDiskBandwidthTokensLocked(tokens int64) {
-	require.LessOrEqual(g.t, int64(0), tokens)
+func (g *testGranterNonNegativeTokens) getDiskTokensUsedAndReset() [admissionpb.NumWorkClasses]int64 {
+	return [admissionpb.NumWorkClasses]int64{}
 }
 
-func (g *testGranterNonNegativeTokens) getDiskTokensUsedAndResetLocked() [numWorkClasses]int64 {
-	return [numWorkClasses]int64{}
-}
-
-func (g *testGranterNonNegativeTokens) setAdmittedDoneModelsLocked(
+func (g *testGranterNonNegativeTokens) setAdmittedDoneModels(
 	l0WriteLM tokensLinearModel, l0IngestLM tokensLinearModel, ingestLM tokensLinearModel,
 ) {
 	require.LessOrEqual(g.t, 0.5, l0WriteLM.multiplier)

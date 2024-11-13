@@ -79,7 +79,7 @@ LEFT JOIN %[1]s.pg_catalog.pg_roles AS rl on (pc.relowner = rl.oid)
 JOIN %[1]s.pg_catalog.pg_namespace AS ns ON (ns.oid = pc.relnamespace)
 %[4]s
 %[6]s
-LEFT JOIN crdb_internal.tables AS ct ON (pc.oid::int8 = ct.table_id)
+LEFT JOIN crdb_internal.tables AS ct ON (pc.oid::int8 = ct.table_id AND ct.database_name = %[7]s AND ct.drop_time IS NULL)
 WHERE pc.relkind IN ('r', 'v', 'S', 'm') %[2]s
 ORDER BY schema_name, table_name
 `
@@ -96,11 +96,12 @@ ORDER BY schema_name, table_name
 	var comment string
 	if n.WithComment {
 		descJoin = fmt.Sprintf(
-			`LEFT JOIN %s.pg_catalog.pg_description AS pd ON (pc.oid = pd.objoid AND pd.objsubid = 0)`,
-			&name.CatalogName,
+			`LEFT JOIN %[1]s.pg_catalog.pg_description AS pd ON (pc.oid = pd.objoid AND pd.objsubid = 0 AND pd.classoid = %[2]d)`,
+			&name.CatalogName, catconstants.PgCatalogClassTableID,
 		)
 		comment = `, COALESCE(pd.description, '') AS comment`
 	}
+
 	query := fmt.Sprintf(
 		getTablesQuery,
 		&name.CatalogName,
@@ -109,6 +110,7 @@ ORDER BY schema_name, table_name
 		descJoin,
 		estimatedRowCount,
 		estimatedRowCountJoin,
+		lexbase.EscapeSQLString(string(name.CatalogName)),
 	)
-	return parse(query)
+	return d.parse(query)
 }

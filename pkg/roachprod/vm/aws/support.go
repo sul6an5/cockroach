@@ -12,15 +12,14 @@ package aws
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
 	"text/template"
 
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -37,6 +36,12 @@ const awsStartupScriptTemplate = `#!/usr/bin/env bash
 # Script for setting up a AWS machine for roachprod use.
 
 set -x
+
+if [ -e /mnt/data1/.roachprod-initialized ]; then
+  echo "Already initialized, exiting."
+  exit 0
+fi
+
 sudo apt-get update
 sudo apt-get install -qy --no-install-recommends mdadm
 
@@ -76,6 +81,7 @@ elif [ "${#disks[@]}" -eq "1" ] || [ -n "$use_multiple_disks" ]; then
     mount -o ${mount_opts} ${disk} ${mountpoint}
     chmod 777 ${mountpoint}
     echo "${disk} ${mountpoint} ext4 ${mount_opts} 1 1" | tee -a /etc/fstab
+    tune2fs -m 0 ${disk}
   done
 else
   mountpoint="${mount_prefix}1"
@@ -87,7 +93,12 @@ else
   mount -o ${mount_opts} ${raiddisk} ${mountpoint}
   chmod 777 ${mountpoint}
   echo "${raiddisk} ${mountpoint} ext4 ${mount_opts} 1 1" | tee -a /etc/fstab
+  tune2fs -m 0 ${raiddisk}
 fi
+
+# Print the block device and FS usage output. This is useful for debugging.
+lsblk
+df -h
 
 sudo apt-get install -qy chrony
 
@@ -147,6 +158,14 @@ echo "kernel.core_pattern=$CORE_PATTERN" >> /etc/sysctl.conf
 
 sysctl --system  # reload sysctl settings
 
+# set hostname according to the name used by roachprod. There's host
+# validation logic that relies on this -- see comment on cluster_synced.go
+sudo hostnamectl set-hostname {{.VMName}}
+
+{{ if .EnableFIPS }}
+sudo ua enable fips --assume-yes
+{{ end }}
+
 sudo touch /mnt/data1/.roachprod-initialized
 `
 
@@ -156,13 +175,22 @@ sudo touch /mnt/data1/.roachprod-initialized
 //
 // extraMountOpts, if not empty, is appended to the default mount options. It is
 // a comma-separated list of options for the "mount -o" flag.
-func writeStartupScript(extraMountOpts string, useMultiple bool) (string, error) {
+func writeStartupScript(
+	name string, extraMountOpts string, useMultiple bool, enableFips bool,
+) (string, error) {
 	type tmplParams struct {
+		VMName           string
 		ExtraMountOpts   string
 		UseMultipleDisks bool
+		EnableFIPS       bool
 	}
 
-	args := tmplParams{ExtraMountOpts: extraMountOpts, UseMultipleDisks: useMultiple}
+	args := tmplParams{
+		VMName:           name,
+		ExtraMountOpts:   extraMountOpts,
+		UseMultipleDisks: useMultiple,
+		EnableFIPS:       enableFips,
+	}
 
 	tmpfile, err := os.CreateTemp("", "aws-startup-script")
 	if err != nil {
@@ -178,7 +206,7 @@ func writeStartupScript(extraMountOpts string, useMultiple bool) (string, error)
 }
 
 // runCommand is used to invoke an AWS command.
-func (p *Provider) runCommand(args []string) ([]byte, error) {
+func (p *Provider) runCommand(l *logger.Logger, args []string) ([]byte, error) {
 
 	if p.Profile != "" {
 		args = append(args[:len(args):len(args)], "--profile", p.Profile)
@@ -189,7 +217,7 @@ func (p *Provider) runCommand(args []string) ([]byte, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		if exitErr := (*exec.ExitError)(nil); errors.As(err, &exitErr) {
-			log.Infof(context.Background(), "%s", string(exitErr.Stderr))
+			l.Printf("%s", string(exitErr.Stderr))
 		}
 		return nil, errors.Wrapf(err, "failed to run: aws %s: stderr: %v",
 			strings.Join(args, " "), stderrBuf.String())
@@ -198,10 +226,10 @@ func (p *Provider) runCommand(args []string) ([]byte, error) {
 }
 
 // runJSONCommand invokes an aws command and parses the json output.
-func (p *Provider) runJSONCommand(args []string, parsed interface{}) error {
+func (p *Provider) runJSONCommand(l *logger.Logger, args []string, parsed interface{}) error {
 	// Force json output in case the user has overridden the default behavior.
 	args = append(args[:len(args):len(args)], "--output", "json")
-	rawJSON, err := p.runCommand(args)
+	rawJSON, err := p.runCommand(l, args)
 	if err != nil {
 		return err
 	}

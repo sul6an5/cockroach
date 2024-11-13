@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild/internal/scbuildstmt"
@@ -28,6 +29,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/redact"
 )
@@ -69,14 +72,24 @@ type Dependencies interface {
 	// partitioning descriptors for indexes.
 	IndexPartitioningCCLCallback() CreatePartitioningCCLCallback
 
-	// DescriptorCommentCache returns a CommentCache
+	// DescriptorCommentGetter returns a CommentCache
 	// Implementation.
-	DescriptorCommentCache() CommentCache
+	DescriptorCommentGetter() CommentGetter
 
 	// ZoneConfigGetter returns a zone config reader.
 	ZoneConfigGetter() ZoneConfigGetter
 
+	// ClientNoticeSender returns a eval.ClientNoticeSender.
 	ClientNoticeSender() eval.ClientNoticeSender
+
+	// EventLogger returns an EventLogger.
+	EventLogger() EventLogger
+
+	// DescIDGenerator returns a DescIDGenerator.
+	DescIDGenerator() eval.DescIDGenerator
+
+	// ReferenceProviderFactory returns a ReferenceProviderFactory.
+	ReferenceProviderFactory() ReferenceProviderFactory
 }
 
 // CreatePartitioningCCLCallback is the type of the CCL callback for creating
@@ -113,6 +126,11 @@ type CatalogReader interface {
 	// MayResolveSchema looks up a schema by name.
 	MayResolveSchema(ctx context.Context, name tree.ObjectNamePrefix) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
 
+	// MustResolvePrefix looks up a database and schema given the prefix at best
+	// effort, meaning the prefix may not have explicit catalog and schema name.
+	// It fails if the db or schema represented by the prefix does not exist.
+	MustResolvePrefix(ctx context.Context, name tree.ObjectNamePrefix) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
+
 	// MayResolveTable looks up a table by name.
 	MayResolveTable(ctx context.Context, name tree.UnresolvedObjectName) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor)
 
@@ -133,17 +151,14 @@ type CatalogReader interface {
 		found bool, prefix catalog.ResolvedObjectPrefix, tbl catalog.TableDescriptor, idx catalog.Index,
 	)
 
-	// ReadObjectNamesAndIDs looks up the namespace entries for a schema.
-	ReadObjectNamesAndIDs(ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor) (tree.TableNames, descpb.IDs)
+	// GetAllSchemasInDatabase gets all schemas in a database.
+	GetAllSchemasInDatabase(ctx context.Context, database catalog.DatabaseDescriptor) nstree.Catalog
+
+	// GetAllObjectsInSchema gets all non-dropped objects in a schema.
+	GetAllObjectsInSchema(ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor) nstree.Catalog
 
 	// MustReadDescriptor looks up a descriptor by ID.
 	MustReadDescriptor(ctx context.Context, id descpb.ID) catalog.Descriptor
-
-	// MustGetSchemasForDatabase gets schemas associated with
-	// a database.
-	MustGetSchemasForDatabase(
-		ctx context.Context, database catalog.DatabaseDescriptor,
-	) map[descpb.ID]string
 }
 
 // TableReader implements functions for inspecting tables during the build phase,
@@ -158,7 +173,7 @@ type AuthorizationAccessor interface {
 	// CheckPrivilege verifies that the current user has `privilege` on
 	// `descriptor`.
 	CheckPrivilege(
-		ctx context.Context, privilegeObject catalog.PrivilegeObject, privilege privilege.Kind,
+		ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind,
 	) error
 
 	// HasAdminRole verifies if a user has an admin role.
@@ -166,16 +181,22 @@ type AuthorizationAccessor interface {
 
 	// HasOwnership returns true iff the role, or any role the role is a member
 	// of, has ownership privilege of the desc.
-	HasOwnership(ctx context.Context, privilegeObject catalog.PrivilegeObject) (bool, error)
+	HasOwnership(ctx context.Context, privilegeObject privilege.Object) (bool, error)
 
 	// CheckPrivilegeForUser verifies that the user has `privilege` on `descriptor`.
 	CheckPrivilegeForUser(
-		ctx context.Context, privilegeObject catalog.PrivilegeObject, privilege privilege.Kind, user username.SQLUsername,
+		ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind, user username.SQLUsername,
 	) error
 
 	// MemberOfWithAdminOption looks up all the roles 'member' belongs to (direct
 	// and indirect) and returns a map of "role" -> "isAdmin".
 	MemberOfWithAdminOption(ctx context.Context, member username.SQLUsername) (map[username.SQLUsername]bool, error)
+
+	// HasPrivilege checks if the user has `privilege` on `descriptor`.
+	HasPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind, user username.SQLUsername) (bool, error)
+
+	// HasAnyPrivilege returns true if user has any privileges at all.
+	HasAnyPrivilege(ctx context.Context, privilegeObject privilege.Object) (bool, error)
 }
 
 // AstFormatter provides interfaces for formatting AST nodes.
@@ -185,18 +206,11 @@ type AstFormatter interface {
 	FormatAstAsRedactableString(statement tree.Statement, annotations *tree.Annotations) redact.RedactableString
 }
 
-// CommentCache represent an interface to fetch and cache comments for
-// descriptors.
-type CommentCache interface {
-	scdecomp.CommentGetter
-
-	// LoadCommentsForObjects explicitly loads commentCache into the cache give a list
-	// of object id of a descriptor type.
-	LoadCommentsForObjects(ctx context.Context, objIDs []descpb.ID) error
-}
-
-// ZoneConfigGetter see scdecomp.ZoneConfigGetter
+// ZoneConfigGetter see scdecomp.ZoneConfigGetter.
 type ZoneConfigGetter scdecomp.ZoneConfigGetter
+
+// CommentGetter see scdecomp.CommentGetter.
+type CommentGetter scdecomp.CommentGetter
 
 // SchemaResolverFactory is used to construct a new schema resolver with
 // injected dependencies.
@@ -206,3 +220,27 @@ type SchemaResolverFactory func(
 	txn *kv.Txn,
 	authAccessor AuthorizationAccessor,
 ) resolver.SchemaResolver
+
+// EventLogger contains the dependencies required for logging schema change
+// events.
+type EventLogger interface {
+
+	// LogEvent writes an event into the event log which signals the start of a
+	// schema change.
+	LogEvent(
+		ctx context.Context, details eventpb.CommonSQLEventDetails, event logpb.EventPayload,
+	) error
+}
+
+// ReferenceProvider provides all referenced objects with in current DDL
+// statement. For example, CREATE VIEW and CREATE FUNCTION both could reference
+// other objects, and cross-references need to probably tracked.
+type ReferenceProvider interface {
+	scbuildstmt.ReferenceProvider
+}
+
+// ReferenceProviderFactory is used to construct a new ReferenceProvider which
+// provide all dependencies required by the statement.
+type ReferenceProviderFactory interface {
+	NewReferenceProvider(ctx context.Context, stmt tree.Statement) (ReferenceProvider, error)
+}

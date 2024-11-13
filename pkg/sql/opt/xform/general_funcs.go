@@ -15,6 +15,7 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/idxconstraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -308,6 +309,226 @@ func (c *CustomFuncs) computedColFilters(
 	return computedColFilters
 }
 
+// combineComputedColFilters is a generalized version of computedColFilters,
+// which seeks to combine single-key filters with derived single-key filters on
+// computed columns by ANDing spans in a given FiltersItem with any other spans
+// which could be computed from the span key values.
+// Keys cannot be saved for the filters as a whole, for later processing,
+// because a given combination of keys is only applicable with the scope of that
+// predicate. For example:
+//
+//	CREATE TABLE t1 (
+//	a INT,
+//	b INT,
+//	c INT AS (a+b) VIRTUAL,
+//	INDEX idx1 (c ASC, b ASC, a ASC));
+//
+// SELECT * FROM t1 WHERE (a,b) IN ((3,4), (5,6));
+//
+// Here we derive:
+//
+//	(a IS 3 AND b IS 4 AND c IS 7) OR
+//	(a IS 5 AND b IS 6 AND c IS 11)
+//
+// The `c IS 7` term is only applicable when a is 3 and b is 4, so those two
+// terms must be combined with the `c IS 7` term in the same conjunction for the
+// result to be semantically equivalent to the original query.
+// Here is the plan built in this case:
+//
+//	scan t1@idx1
+//	├── columns: a:1!null b:2!null c:3!null
+//	├── constraint: /3/2/1
+//	│    ├── [/7/4/3 - /7/4/3]
+//	│    └── [/11/6/5 - /11/6/5]
+//	├── cardinality: [0 - 2]
+//	├── key: (1,2)
+//	└── fd: (1,2)-->(3)
+//
+// Note that new predicates are derived from constraint spans, not predicates,
+// so a predicate such as (a,b) IN ((null,4), (5,6)) will not derive anything
+// because the null is not placed in a span, and also IN predicates with nulls
+// are not marked as tight, and this function does not process non-tight
+// constraints.
+//
+// Note that `computedColFilters` can't be replaced because it can handle cases
+// which `combineComputedColFilters` doesn't, for example a computed column
+// which is built from constants found in separate `FiltersItem`s.
+//
+// Also note, this function handles IN list predicates but could be extended to
+// handle ORed predicates too (see TODO below).
+func (c *CustomFuncs) combineComputedColFilters(
+	scanPrivate *memo.ScanPrivate, requiredFilters memo.FiltersExpr, optionalFilters memo.FiltersExpr,
+) memo.FiltersExpr {
+	tabMeta := c.e.mem.Metadata().TableMeta(scanPrivate.Table)
+	if len(tabMeta.ComputedCols) == 0 {
+		return nil
+	}
+	if !c.e.evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation {
+		return nil
+	}
+	tab := c.e.mem.Metadata().Table(scanPrivate.Table)
+	numFilters := len(requiredFilters) + len(optionalFilters)
+	filters := make(memo.FiltersExpr, 0, numFilters)
+	filters = append(filters, requiredFilters...)
+	filters = append(filters, optionalFilters...)
+
+	var combinedComputedColFilters memo.FiltersExpr
+	for i := range filters {
+		props := filters[i].ScalarProps()
+		if !props.TightConstraints {
+			continue
+		}
+		// Handle only tight constraint sets for now, which is the IN list case.
+		// TODO(msirek): Handle OR'ed terms. These may be split across multiple
+		//    Constraints instead of combined into multiple spans within a
+		//    constraint, e.g. (a = 3 AND b = 4) OR (a = 5 AND b = 6)
+		//    is represented with 2 constraints, each having 2 spans:
+		//      /1: [/3 - /3] [/5 - /5]
+		//      /2: [/4 - /4] [/6 - /6]
+		//    Span 1 of Constraint 1 should be combined with Span 1 of Constraint 2,
+		//    etc...
+		for j, n := 0, props.Constraints.Length(); j < n; j++ {
+			var orOp opt.ScalarExpr
+			cons := props.Constraints.Constraint(j)
+			if !cons.Columns.ColSet().Intersects(tabMeta.ColsInComputedColsExpressions) {
+				// If this constraint doesn't involve any columns used to construct a
+				// computed column value, skip it.
+				continue
+			}
+
+			for k := 0; k < cons.Spans.Count(); k++ {
+				filterAdded := false
+				span := cons.Spans.Get(k)
+				if !span.HasSingleKey(c.e.evalCtx) {
+					// If we don't have a single value, or combination of single values
+					// to use in folding the computed column expression, don't use this
+					// constraint.
+					continue
+				}
+				// Build the initial conjunction from the constraint.
+				initialConjunction, constFilterCols, ok :=
+					c.buildConjunctionFromConstraint(cons, span, tab, scanPrivate)
+				if !ok {
+					continue
+				}
+				var newOp opt.ScalarExpr
+				newOp, filterAdded =
+					c.buildConjunctionOfEqualityPredsOnComputedAndNonComputedCols(
+						initialConjunction, tabMeta, constFilterCols, cons, scanPrivate,
+					)
+				// Only build a new disjunct if terms were derived for this span.
+				if filterAdded {
+					if orOp == nil {
+						// The case of the first span or only one span.
+						orOp = newOp
+					} else {
+						// The spans in a constraint represent a disjunction, so OR them
+						// together.
+						orOp = c.e.f.ConstructOr(orOp, newOp)
+					}
+				} else {
+					// If we failed to build any of the disjuncts, give up on this
+					// Constraint.
+					orOp = nil
+					break
+				}
+			}
+			if orOp != nil {
+				// Multiple independent tight constraints represent a conjunction, so
+				// AND them together.
+				combinedComputedColFilters =
+					append(combinedComputedColFilters, c.e.f.ConstructFiltersItem(orOp))
+			}
+		}
+	}
+	return combinedComputedColFilters
+}
+
+// buildConjunctionFromConstraint converts a constraint on one or more columns
+// into a scalar expression predicate in the form:
+// (constraint_col1 IS span1) AND (constraint_col2 IS span2) AND ...
+func (c *CustomFuncs) buildConjunctionFromConstraint(
+	cons *constraint.Constraint, span *constraint.Span, tab cat.Table, scanPrivate *memo.ScanPrivate,
+) (conjunction opt.ScalarExpr, constFilterCols constColsMap, ok bool) {
+	for m := 0; m < cons.Columns.Count(); m++ {
+		// Skip columns that aren't referenced in the scan.
+		colID := cons.Columns.Get(m).ID()
+		if !scanPrivate.Cols.Contains(colID) {
+			continue
+		}
+		colTyp := tab.Column(scanPrivate.Table.ColumnOrdinal(colID)).DatumType()
+		datum := span.StartKey().Value(m)
+		originalConstVal := c.e.f.ConstructConstVal(datum, colTyp)
+		// Mark the value in the map for use by `tryFoldComputedCol`.
+		if constFilterCols == nil {
+			constFilterCols = make(constColsMap)
+		}
+		constFilterCols[colID] = originalConstVal
+		// Note: Nulls could be handled here, but there is currently no supported
+		// test case for this situation, so it is explicitly disallowed for now.
+		if _, isNullExpr := originalConstVal.(*memo.NullExpr); isNullExpr {
+			return nil, nil, false
+		}
+		// Use IS NOT DISTINCT FROM to handle nulls.
+		originalEqOp := c.e.f.ConstructIs(c.e.f.ConstructVariable(colID), originalConstVal)
+		if conjunction == nil {
+			conjunction = originalEqOp
+		} else {
+			// Build a conjunction representing this span.
+			conjunction = c.e.f.ConstructAnd(conjunction, originalEqOp)
+		}
+	}
+	ok = conjunction != nil
+	if !ok {
+		if len(constFilterCols) != 0 {
+			// Help the garbage collector.
+			for k := range constFilterCols {
+				delete(constFilterCols, k)
+			}
+		}
+		return nil, nil, false
+	}
+	return conjunction, constFilterCols, true
+}
+
+// buildConjunctionOfEqualityPredsOnComputedAndNonComputedCols takes an
+// initialConjunction of IS equality predicates on non-computed columns and attempts
+// to build a new conjunction of IS equality predicates on computed columns by
+// folding the computed column expressions using the constant values stored in
+// the constFilterCols map. If successful, ok=true is returned along with
+// initialConjunction ANDed with the predicates on computed columns.
+func (c *CustomFuncs) buildConjunctionOfEqualityPredsOnComputedAndNonComputedCols(
+	initialConjunction opt.ScalarExpr,
+	tabMeta *opt.TableMeta,
+	constFilterCols constColsMap,
+	cons *constraint.Constraint,
+	scanPrivate *memo.ScanPrivate,
+) (computedColPlusOriginalColEqualityConjunction opt.ScalarExpr, ok bool) {
+	computedColPlusOriginalColEqualityConjunction = initialConjunction
+	for computedColID := range tabMeta.ComputedCols {
+		if c.tryFoldComputedCol(tabMeta, computedColID, constFilterCols) {
+			constVal := constFilterCols[computedColID]
+			// Use IS NOT DISTINCT FROM to handle nulls.
+			eqOp := c.e.f.ConstructIs(c.e.f.ConstructVariable(computedColID), constVal)
+			computedColPlusOriginalColEqualityConjunction =
+				c.e.f.ConstructAnd(computedColPlusOriginalColEqualityConjunction, eqOp)
+			ok = true
+		}
+	}
+	for m := 0; m < cons.Columns.Count(); m++ {
+		colID := cons.Columns.Get(m).ID()
+		if !scanPrivate.Cols.Contains(colID) {
+			// This column wasn't added to the map, so no need to delete it
+			// from the map.
+			continue
+		}
+	}
+	if !ok {
+		return nil, false
+	}
+	return computedColPlusOriginalColEqualityConjunction, true
+}
+
 // constColsMap maps columns to constant values that we can infer from query
 // filters.
 //
@@ -500,10 +721,10 @@ func (c *CustomFuncs) splitScanIntoUnionScansOrSelects(
 		// We will construct at most maxScanCount new Scans.
 		scanCount = maxScanCount
 	}
-	rowCount := scan.Relational().Stats.RowCount
+	rowCount := scan.Relational().Statistics().RowCount
 	if limit > 0 {
 		nLogN := rowCount * math.Log2(rowCount)
-		if scan.Relational().Stats.Available &&
+		if scan.Relational().Statistics().Available &&
 			float64(scanCount*randIOCostFactor+limit*seqIOCostFactor) >= nLogN {
 			// Splitting the Scan may not be worth the overhead. Creating a sequence of
 			// Scans and Unions is expensive, so we only want to create the plan if it
@@ -545,6 +766,7 @@ func (c *CustomFuncs) splitScanIntoUnionScansOrSelects(
 	// UnionAll tree.
 	var noLimitSpans constraint.Spans
 	var last memo.RelExpr
+	spColList := sp.Cols.ToList()
 	queue := list.New()
 	for i, n := 0, spans.Count(); i < n; i++ {
 		if i >= budgetExceededIndex {
@@ -561,23 +783,35 @@ func (c *CustomFuncs) splitScanIntoUnionScansOrSelects(
 		}
 		for j, m := 0, singleKeySpans.Count(); j < m; j++ {
 			// Construct a new Scan for each span.
+			// Note: newHardLimit will be 0 (i.e., no limit) if there are
+			// filters to be applied in a Select.
 			newScanPrivate := c.makeNewScanPrivate(
 				sp,
 				cons.Columns,
 				newHardLimit,
 				singleKeySpans.Get(j),
 			)
-			newScanOrSelect := c.e.f.ConstructScan(newScanPrivate)
+			newScanOrLimitedSelect := c.e.f.ConstructScan(newScanPrivate)
 			if !filters.IsTrue() {
-				newScanOrSelect = c.wrapScanInLimitedSelect(
-					newScanOrSelect,
-					sp,
-					newScanPrivate,
-					filters,
-					limit,
+				// If there are filters, apply them and a limit. The limit is
+				// not needed if there are no filters because the scan's hard
+				// limit will be set (see newHardLimit).
+				//
+				// TODO(mgartner/msirek): Converting ColSets to ColLists here is
+				// only safe because column IDs are always allocated in a
+				// consistent, ascending order for each duplicated table in the
+				// metadata. If column ID allocation changes, this could break.
+				newColList := newScanPrivate.Cols.ToList()
+				newScanOrLimitedSelect = c.e.f.ConstructLimit(
+					c.e.f.ConstructSelect(
+						newScanOrLimitedSelect,
+						c.RemapScanColsInFilter(filters, sp, newScanPrivate),
+					),
+					c.IntConst(tree.NewDInt(tree.DInt(limit))),
+					ordering.RemapColumns(spColList, newColList),
 				)
 			}
-			queue.PushBack(newScanOrSelect)
+			queue.PushBack(newScanOrLimitedSelect)
 		}
 	}
 
@@ -652,15 +886,21 @@ func (c *CustomFuncs) splitScanIntoUnionScansOrSelects(
 		Columns: cons.Columns.RemapColumns(sp.Table, newScanPrivate.Table),
 		Spans:   noLimitSpans,
 	})
+	// TODO(mgartner): We should be able to add a LIMIT above the Scan or Select
+	// below, as long as we remap the original ordering columns. This could
+	// allow a top-k to be planned instead of a sort.
 	newScanOrSelect := c.e.f.ConstructScan(newScanPrivate)
 	if !filters.IsTrue() {
-		newScanOrSelect = c.wrapScanInLimitedSelect(newScanOrSelect, sp, newScanPrivate, filters, limit)
+		newScanOrSelect = c.e.f.ConstructSelect(
+			newScanOrSelect,
+			c.RemapScanColsInFilter(filters, sp, newScanPrivate),
+		)
 	}
 	// TODO(mgartner/msirek): Converting ColSets to ColLists here is only safe
 	// because column IDs are always allocated in a consistent, ascending order
 	// for each duplicated table in the metadata. If column ID allocation
 	// changes, this could break.
-	return makeNewUnion(last, newScanOrSelect, sp.Cols.ToList()), true
+	return makeNewUnion(last, newScanOrSelect, spColList), true
 }
 
 // numAllowedValues returns the number of allowed values for a column with a
@@ -682,7 +922,7 @@ func (c *CustomFuncs) numAllowedValues(
 	filters := *constraints.(*memo.FiltersExpr)
 	// For each ANDed check constraint...
 	for i := 0; i < len(filters); i++ {
-		filter := filters[i]
+		filter := &filters[i]
 		// This must be some type of comparison operation, or an OR or AND
 		// expression. These operations have at least 2 children.
 		if filter.Condition.ChildCount() < 2 {
@@ -709,29 +949,6 @@ func (c *CustomFuncs) numAllowedValues(
 		}
 	}
 	return 0, false
-}
-
-// wrapScanInLimitedSelect wraps "scan" in a SelectExpr with filters mapped from
-// the originalScanPrivate columns to the columns in scan. If limit is non-zero,
-// the SelectExpr is wrapped in a LimitExpr with that limit.
-func (c *CustomFuncs) wrapScanInLimitedSelect(
-	scan memo.RelExpr,
-	originalScanPrivate, newScanPrivate *memo.ScanPrivate,
-	filters memo.FiltersExpr,
-	limit int,
-) (limitedSelect memo.RelExpr) {
-	limitedSelect = c.e.f.ConstructSelect(
-		scan,
-		c.RemapScanColsInFilter(filters, originalScanPrivate, newScanPrivate),
-	)
-	if limit != 0 {
-		limitedSelect = c.e.f.ConstructLimit(
-			limitedSelect,
-			c.IntConst(tree.NewDInt(tree.DInt(limit))),
-			c.EmptyOrdering(),
-		)
-	}
-	return limitedSelect
 }
 
 // indexHasOrderingSequence returns whether the Scan can provide a given

@@ -8,16 +8,15 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React, { ReactNode } from "react";
+import React, { ReactNode, useContext } from "react";
 import { Col, Row, Tabs } from "antd";
 import "antd/lib/col/style";
 import "antd/lib/row/style";
 import "antd/lib/tabs/style";
-import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
-import { Text, InlineAlert } from "@cockroachlabs/ui-components";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import { InlineAlert, Text } from "@cockroachlabs/ui-components";
 import { ArrowLeft } from "@cockroachlabs/icons";
-import { Location } from "history";
-import _, { isNil } from "lodash";
+import { isNil } from "lodash";
 import Long from "long";
 import { Helmet } from "react-helmet";
 import { Link, RouteComponentProps } from "react-router-dom";
@@ -28,14 +27,15 @@ import { AxisUnits } from "../graphs";
 import { AlignedData, Options } from "uplot";
 
 import {
-  intersperse,
-  unique,
-  queryByName,
   appAttr,
   appNamesAttr,
+  FixFingerprintHexValue,
+  DATE_FORMAT_24_TZ,
+  intersperse,
+  queryByName,
   RenderCount,
   TimestampToMoment,
-  DATE_FORMAT_24_UTC,
+  unique,
 } from "src/util";
 import { getValidErrorsList, Loading } from "src/loading";
 import { Button } from "src/button";
@@ -43,11 +43,11 @@ import { SqlBox, SqlBoxSize } from "src/sql";
 import { PlanDetails } from "./planDetails";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 import { DiagnosticsView } from "./diagnostics/diagnosticsView";
+import insightTableStyles from "../insightsTable/insightsTable.module.scss";
 import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
 import timeScaleStyles from "src/timeScaleDropdown/timeScale.module.scss";
 import styles from "./statementDetails.module.scss";
 import { commonStyles } from "src/common";
-import { NodeSummaryStats } from "../nodes";
 import { UIConfigState } from "../store";
 import { StatementDetailsRequest } from "src/api/statementsApi";
 import {
@@ -55,53 +55,69 @@ import {
   TimeScale,
   timeScale1hMinOptions,
   TimeScaleDropdown,
-  timeScaleToString,
   toRoundedDateRange,
 } from "../timeScaleDropdown";
-import SQLActivityError from "../sqlActivity/errorComponent";
+import LoadingError from "../sqlActivity/errorComponent";
 import {
   ActivateDiagnosticsModalRef,
   ActivateStatementDiagnosticsModal,
 } from "../statementsDiagnostics";
 import {
+  generateContentionTimeseries,
   generateExecCountTimeseries,
   generateExecRetriesTimeseries,
   generateExecuteAndPlanningTimeseries,
   generateRowsProcessedTimeseries,
-  generateContentionTimeseries,
+  generateCPUTimeseries,
 } from "./timeseriesUtils";
 import { Delayed } from "../delayed";
-import moment from "moment";
-type IDuration = google.protobuf.IDuration;
+import moment from "moment-timezone";
+import {
+  InsertStmtDiagnosticRequest,
+  InsightRecommendation,
+  StatementDiagnosticsReport,
+  StmtInsightsReq,
+} from "../api";
+import {
+  getStmtInsightRecommendations,
+  InsightType,
+  StmtInsightEvent,
+} from "../insights";
+import {
+  InsightsSortedTable,
+  makeInsightsColumns,
+} from "../insightsTable/insightsTable";
+import { CockroachCloudContext } from "../contexts";
+import { filterByTimeScale } from "./diagnostics/diagnosticsUtils";
+import { FormattedTimescale } from "../timeScaleDropdown/formattedTimeScale";
+import { Timestamp } from "../timestamp";
+
 type StatementDetailsResponse =
   cockroach.server.serverpb.StatementDetailsResponse;
-type IStatementDiagnosticsReport =
-  cockroach.server.serverpb.IStatementDiagnosticsReport;
 
 const { TabPane } = Tabs;
-
-export interface Fraction {
-  numerator: number;
-  denominator: number;
-}
 
 export type StatementDetailsProps = StatementDetailsOwnProps &
   RouteComponentProps<{ implicitTxn: string; statement: string }>;
 
 export interface StatementDetailsState {
   currentTab?: string;
-}
+  cardWidth: number;
 
-export type NodesSummary = {
-  nodeStatuses: cockroach.server.status.statuspb.INodeStatus[];
-  nodeIDs: string[];
-  nodeStatusByID: Dictionary<cockroach.server.status.statuspb.INodeStatus>;
-  nodeSums: NodeSummaryStats;
-  nodeDisplayNameByID: Dictionary<string>;
-  livenessStatusByNodeID: Dictionary<cockroach.kv.kvserver.liveness.livenesspb.NodeLivenessStatus>;
-  livenessByNodeID: Dictionary<cockroach.kv.kvserver.liveness.livenesspb.ILiveness>;
-  storeIDsByNodeID: Dictionary<string[]>;
-};
+  /**
+   * The latest non-null query text associated with the statement fingerprint in the URL.
+   * We save this to preserve this data when the time frame changes such that there is no
+   * longer data for this statement fingerprint in the selected time frame.
+   */
+  query: string;
+
+  /**
+   * The latest non-null formatted query associated with the statement fingerprint in the URL.
+   * We save this to preserve data when the time frame changes such that there is no longer
+   * data for this statement fingerprint in the selected time frame.
+   */
+  formattedQuery: string;
+}
 
 export interface StatementDetailsDispatchProps {
   refreshStatementDetails: (req: StatementDetailsRequest) => void;
@@ -109,41 +125,38 @@ export interface StatementDetailsDispatchProps {
   refreshUserSQLRoles: () => void;
   refreshNodes: () => void;
   refreshNodesLiveness: () => void;
+  refreshStatementFingerprintInsights: (req: StmtInsightsReq) => void;
   createStatementDiagnosticsReport: (
-    statementFingerprint: string,
-    minExecLatency: IDuration,
-    expiresAfter: IDuration,
+    insertStmtDiagnosticsRequest: InsertStmtDiagnosticRequest,
   ) => void;
   dismissStatementDiagnosticsAlertMessage?: () => void;
   onTabChanged?: (tabName: string) => void;
   onTimeScaleChange: (ts: TimeScale) => void;
   onDiagnosticsModalOpen?: (statementFingerprint: string) => void;
   onDiagnosticBundleDownload?: (statementFingerprint?: string) => void;
-  onDiagnosticCancelRequest?: (report: IStatementDiagnosticsReport) => void;
+  onDiagnosticCancelRequest?: (report: StatementDiagnosticsReport) => void;
   onSortingChange?: (
     name: string,
     columnTitle: string,
     ascending: boolean,
   ) => void;
   onBackToStatementsClick?: () => void;
-  onStatementDetailsQueryChange: (query: string) => void;
-  onStatementDetailsFormattedQueryChange: (formattedQuery: string) => void;
 }
 
 export interface StatementDetailsStateProps {
   statementFingerprintID: string;
   statementDetails: StatementDetailsResponse;
   isLoading: boolean;
-  latestQuery: string;
-  latestFormattedQuery: string;
   statementsError: Error | null;
+  lastUpdated: moment.Moment | null;
   timeScale: TimeScale;
-  nodeNames: { [nodeId: string]: string };
   nodeRegions: { [nodeId: string]: string };
-  diagnosticsReports: cockroach.server.serverpb.IStatementDiagnosticsReport[];
+  diagnosticsReports: StatementDiagnosticsReport[];
   uiConfig?: UIConfigState["pages"]["statementDetails"];
   isTenant?: UIConfigState["isTenant"];
   hasViewActivityRedactedRole?: UIConfigState["hasViewActivityRedactedRole"];
+  hasAdminRole?: UIConfigState["hasAdminRole"];
+  statementFingerprintInsights?: StmtInsightEvent[];
 }
 
 export type StatementDetailsOwnProps = StatementDetailsDispatchProps &
@@ -152,16 +165,15 @@ export type StatementDetailsOwnProps = StatementDetailsDispatchProps &
 const cx = classNames.bind(styles);
 const summaryCardStylesCx = classNames.bind(summaryCardStyles);
 const timeScaleStylesCx = classNames.bind(timeScaleStyles);
+const insightsTableCx = classNames.bind(insightTableStyles);
 
-function getStatementDetailsRequest(
-  timeScale: TimeScale,
-  statementFingerprintID: string,
-  location: Location,
+function getStatementDetailsRequestFromProps(
+  props: StatementDetailsProps,
 ): cockroach.server.serverpb.StatementDetailsRequest {
-  const [start, end] = toRoundedDateRange(timeScale);
+  const [start, end] = toRoundedDateRange(props.timeScale);
   return new cockroach.server.serverpb.StatementDetailsRequest({
-    fingerprint_id: statementFingerprintID,
-    app_names: queryByName(location, appNamesAttr)?.split(","),
+    fingerprint_id: props.statementFingerprintID,
+    app_names: queryByName(props.location, appNamesAttr)?.split(","),
     start: Long.fromNumber(start.unix()),
     end: Long.fromNumber(end.unix()),
   });
@@ -206,11 +218,16 @@ export class StatementDetails extends React.Component<
   StatementDetailsState
 > {
   activateDiagnosticsRef: React.RefObject<ActivateDiagnosticsModalRef>;
+
   constructor(props: StatementDetailsProps) {
     super(props);
     const searchParams = new URLSearchParams(props.history.location.search);
     this.state = {
       currentTab: searchParams.get("tab") || "overview",
+      cardWidth: 700,
+      query: this.props.statementDetails?.statement?.metadata?.query,
+      formattedQuery:
+        this.props.statementDetails?.statement?.metadata?.formatted_query,
     };
     this.activateDiagnosticsRef = React.createRef();
 
@@ -219,41 +236,68 @@ export class StatementDetails extends React.Component<
     // where the value 10/30 min is selected on the Metrics page.
     const ts = getValidOption(this.props.timeScale, timeScale1hMinOptions);
     if (ts !== this.props.timeScale) {
-      this.props.onTimeScaleChange(ts);
+      this.changeTimeScale(ts);
     }
   }
-
-  static defaultProps: Partial<StatementDetailsProps> = {
-    onDiagnosticBundleDownload: _.noop,
-    uiConfig: {
-      showStatementDiagnosticsLink: true,
-    },
-    isTenant: false,
-    hasViewActivityRedactedRole: false,
-  };
 
   hasDiagnosticReports = (): boolean =>
     this.props.diagnosticsReports.length > 0;
 
-  refreshStatementDetails = (
-    timeScale: TimeScale,
-    statementFingerprintID: string,
-    location: Location,
-  ): void => {
-    const req = getStatementDetailsRequest(
-      timeScale,
-      statementFingerprintID,
-      location,
-    );
+  changeTimeScale = (ts: TimeScale): void => {
+    if (this.props.onTimeScaleChange) {
+      this.props.onTimeScaleChange(ts);
+    }
+  };
+
+  refreshStatementDetails = (): void => {
+    const req = getStatementDetailsRequestFromProps(this.props);
     this.props.refreshStatementDetails(req);
+    this.refreshStatementInsights();
+  };
+
+  refreshStatementInsights = (): void => {
+    const [startTime, endTime] = toRoundedDateRange(this.props.timeScale);
+    const id = BigInt(this.props.statementFingerprintID).toString(16);
+    const req: StmtInsightsReq = {
+      start: startTime,
+      end: endTime,
+      stmtFingerprintId: id,
+    };
+    this.props.refreshStatementFingerprintInsights(req);
+  };
+
+  handleResize = (): void => {
+    // Use the same size as the summary card and remove a space for margin (22).
+    const cardWidth = document.getElementById("first-card")
+      ? document.getElementById("first-card")?.offsetWidth - 22
+      : 700;
+    if (cardWidth !== this.state.cardWidth) {
+      this.setState({
+        cardWidth: cardWidth,
+      });
+    }
   };
 
   componentDidMount(): void {
-    this.refreshStatementDetails(
-      this.props.timeScale,
-      this.props.statementFingerprintID,
-      this.props.location,
-    );
+    this.refreshStatementDetails();
+
+    window.addEventListener("resize", this.handleResize);
+    this.handleResize();
+    // For the first data fetch for this page, we refresh if there are:
+    // - Last updated is null (no statement details fetched previously)
+    // - The time interval is not custom, i.e. we have a moving window
+    // in which case we poll every 5 minutes. For the first fetch we will
+    // calculate the next time to refresh based on when the data was last
+    // updated.
+    if (this.props.timeScale.key !== "Custom" || !this.props.lastUpdated) {
+      const now = moment();
+      const nextRefresh =
+        this.props.lastUpdated?.clone().add(5, "minutes") || now;
+      setTimeout(
+        this.refreshStatementDetails,
+        Math.max(0, nextRefresh.diff(now, "milliseconds")),
+      );
+    }
     this.props.refreshUserSQLRoles();
     if (!this.props.isTenant) {
       this.props.refreshNodes();
@@ -265,16 +309,13 @@ export class StatementDetails extends React.Component<
   }
 
   componentDidUpdate(prevProps: StatementDetailsProps): void {
+    this.handleResize();
     if (
-      prevProps.timeScale != this.props.timeScale ||
-      prevProps.statementFingerprintID != this.props.statementFingerprintID ||
-      prevProps.location != this.props.location
+      prevProps.timeScale !== this.props.timeScale ||
+      prevProps.statementFingerprintID !== this.props.statementFingerprintID ||
+      prevProps.location !== this.props.location
     ) {
-      this.refreshStatementDetails(
-        this.props.timeScale,
-        this.props.statementFingerprintID,
-        this.props.location,
-      );
+      this.refreshStatementDetails();
     }
 
     if (!this.props.isTenant) {
@@ -285,30 +326,22 @@ export class StatementDetails extends React.Component<
       }
     }
 
-    // If new, non-empty-string query text is available (derived from the statement details response),
-    // cache the query text.
+    // If a new, non-empty-string query text is available
+    // (derived from the statement details response), save the query text.
+    const newQuery =
+      this.props.statementDetails?.statement?.metadata?.query ||
+      this.state.query;
+    const newFormattedQuery =
+      this.props.statementDetails?.statement?.metadata?.formatted_query ||
+      this.state.formattedQuery;
     if (
-      this.props.statementDetails &&
-      this.props.statementDetails.statement.metadata.query != "" &&
-      this.props.latestQuery !=
-        this.props.statementDetails.statement.metadata.query
+      newQuery !== this.state.query ||
+      newFormattedQuery !== this.state.formattedQuery
     ) {
-      this.props.onStatementDetailsQueryChange(
-        this.props.statementDetails.statement.metadata.query,
-      );
-    }
-
-    // If a new, non-empty-string formatted query text is available (derived from the statement details response),
-    // cache the query text.
-    if (
-      this.props.statementDetails &&
-      this.props.statementDetails.statement.metadata.formatted_query != "" &&
-      this.props.latestFormattedQuery !=
-        this.props.statementDetails.statement.metadata.formatted_query
-    ) {
-      this.props.onStatementDetailsFormattedQueryChange(
-        this.props.statementDetails.statement.metadata.formatted_query,
-      );
+      this.setState({
+        query: newQuery,
+        formattedQuery: newFormattedQuery,
+      });
     }
 
     // If the statementFingerprintID (derived from the URL) changes, invalidate the cached query texts.
@@ -316,8 +349,7 @@ export class StatementDetails extends React.Component<
     // The new query text and the formatted query text would be an empty string, and we need to invalidate the old
     // query text and formatted query text.
     if (this.props.statementFingerprintID != prevProps.statementFingerprintID) {
-      this.props.onStatementDetailsQueryChange("");
-      this.props.onStatementDetailsFormattedQueryChange("");
+      this.setState({ query: null, formattedQuery: null });
     }
   }
 
@@ -390,7 +422,7 @@ export class StatementDetails extends React.Component<
             error={error}
             render={this.renderTabs}
             renderError={() =>
-              SQLActivityError({
+              LoadingError({
                 statsType: "statements",
               })
             }
@@ -414,7 +446,6 @@ export class StatementDetails extends React.Component<
       .includes("timeout");
     const hasData =
       Number(this.props.statementDetails?.statement?.stats?.count) > 0;
-    const period = timeScaleToString(this.props.timeScale);
 
     return (
       <Tabs
@@ -424,16 +455,21 @@ export class StatementDetails extends React.Component<
         activeKey={currentTab}
       >
         <TabPane tab="Overview" key="overview">
-          {this.renderOverviewTabContent(hasTimeout, hasData, period)}
+          {this.renderOverviewTabContent(hasTimeout, hasData)}
         </TabPane>
         <TabPane tab="Explain Plans" key="explain-plan">
-          {this.renderExplainPlanTabContent(hasTimeout, hasData, period)}
+          {this.renderExplainPlanTabContent(hasTimeout, hasData)}
         </TabPane>
         {!this.props.isTenant && !this.props.hasViewActivityRedactedRole && (
           <TabPane
             tab={`Diagnostics${
               this.hasDiagnosticReports()
-                ? ` (${this.props.diagnosticsReports.length})`
+                ? ` (${
+                    filterByTimeScale(
+                      this.props.diagnosticsReports,
+                      this.props.timeScale,
+                    ).length
+                  })`
                 : ""
             }`}
             key="diagnostics"
@@ -446,9 +482,20 @@ export class StatementDetails extends React.Component<
   };
 
   renderNoDataTabContent = (): React.ReactElement => (
-    <section className={cx("section")}>
-      <InlineAlert intent="info" title="No data available." />
-    </section>
+    <>
+      <PageConfig>
+        <PageConfigItem>
+          <TimeScaleDropdown
+            options={timeScale1hMinOptions}
+            currentScale={this.props.timeScale}
+            setTimeScale={this.props.onTimeScaleChange}
+          />
+        </PageConfigItem>
+      </PageConfig>
+      <section className={cx("section")}>
+        <InlineAlert intent="info" title="No data available." />
+      </section>
+    </>
   );
 
   renderNoDataWithTimeScaleAndSqlBoxTabContent = (
@@ -465,12 +512,13 @@ export class StatementDetails extends React.Component<
         </PageConfigItem>
       </PageConfig>
       <section className={cx("section")}>
-        {this.props.latestFormattedQuery && (
+        {this.state.formattedQuery && (
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
               <SqlBox
-                value={this.props.latestFormattedQuery}
+                value={this.state.formattedQuery}
                 size={SqlBoxSize.custom}
+                format={true}
               />
             </Col>
           </Row>
@@ -478,7 +526,7 @@ export class StatementDetails extends React.Component<
         {hasTimeout && (
           <InlineAlert
             intent="danger"
-            title={SQLActivityError({
+            title={LoadingError({
               statsType: "statements",
               timeout: true,
             })}
@@ -497,16 +545,17 @@ export class StatementDetails extends React.Component<
   renderOverviewTabContent = (
     hasTimeout: boolean,
     hasData: boolean,
-    period: string,
   ): React.ReactElement => {
     if (!hasData) {
       return this.renderNoDataWithTimeScaleAndSqlBoxTabContent(hasTimeout);
     }
-    const { nodeRegions, isTenant } = this.props;
+    const { cardWidth } = this.state;
+    const { nodeRegions, isTenant, statementFingerprintInsights } = this.props;
     const { stats } = this.props.statementDetails.statement;
     const {
       app_names,
       databases,
+      fingerprint_id,
       failed_count,
       full_scan_count,
       vec_count,
@@ -520,12 +569,17 @@ export class StatementDetails extends React.Component<
       (stats.nodes || []).map(node => node.toString()),
     ).sort();
     const regions = unique(
-      (stats.nodes || []).map(node => nodeRegions[node.toString()]),
+      isTenant
+        ? stats.regions || []
+        : nodes.map(node => nodeRegions[node]).filter(r => r), // Remove undefined / unknown regions.
     ).sort();
 
-    const lastExec =
-      stats.last_exec_timestamp &&
-      TimestampToMoment(stats.last_exec_timestamp).format(DATE_FORMAT_24_UTC);
+    const lastExec = stats.last_exec_timestamp && (
+      <Timestamp
+        time={TimestampToMoment(stats.last_exec_timestamp)}
+        format={DATE_FORMAT_24_TZ}
+      />
+    );
 
     const statementSampled = stats.exec_stats.count > Long.fromNumber(0);
     const unavailableTooltip = !statementSampled && (
@@ -555,8 +609,13 @@ export class StatementDetails extends React.Component<
       generateExecuteAndPlanningTimeseries(statsPerAggregatedTs);
     const executionAndPlanningOps: Partial<Options> = {
       axes: [{}, { label: "Time Spent" }],
-      series: [{}, { label: "Execution" }, { label: "Planning" }],
-      width: 735,
+      series: [
+        {},
+        { label: "Execution" },
+        { label: "Planning" },
+        { label: "Idle" },
+      ],
+      width: cardWidth,
     };
 
     const rowsProcessedTimeseries: AlignedData =
@@ -564,7 +623,7 @@ export class StatementDetails extends React.Component<
     const rowsProcessedOps: Partial<Options> = {
       axes: [{}, { label: "Rows" }],
       series: [{}, { label: "Rows Read" }, { label: "Rows Written" }],
-      width: 735,
+      width: cardWidth,
     };
 
     const execRetriesTimeseries: AlignedData =
@@ -573,7 +632,7 @@ export class StatementDetails extends React.Component<
       axes: [{}, { label: "Retries" }],
       series: [{}, { label: "Retries" }],
       legend: { show: false },
-      width: 735,
+      width: cardWidth,
     };
 
     const execCountTimeseries: AlignedData =
@@ -582,7 +641,7 @@ export class StatementDetails extends React.Component<
       axes: [{}, { label: "Execution Counts" }],
       series: [{}, { label: "Execution Counts" }],
       legend: { show: false },
-      width: 735,
+      width: cardWidth,
     };
 
     const contentionTimeseries: AlignedData =
@@ -591,8 +650,38 @@ export class StatementDetails extends React.Component<
       axes: [{}, { label: "Contention" }],
       series: [{}, { label: "Contention" }],
       legend: { show: false },
-      width: 735,
+      width: cardWidth,
     };
+
+    const cpuTimeseries: AlignedData =
+      generateCPUTimeseries(statsPerAggregatedTs);
+    const cpuOps: Partial<Options> = {
+      axes: [{}, { label: "CPU Time" }],
+      series: [{}, { label: "CPU Time" }],
+      legend: { show: false },
+      width: cardWidth,
+    };
+
+    const isCockroachCloud = useContext(CockroachCloudContext);
+    const insightsColumns = makeInsightsColumns(
+      isCockroachCloud,
+      this.props.hasAdminRole,
+      true,
+      true,
+    );
+    const tableData: InsightRecommendation[] = [];
+    if (statementFingerprintInsights) {
+      const tableDataTypes = new Set<InsightType>();
+      statementFingerprintInsights.forEach(insight => {
+        const rec = getStmtInsightRecommendations(insight);
+        rec.forEach(entry => {
+          if (!tableDataTypes.has(entry.type)) {
+            tableData.push(entry);
+            tableDataTypes.add(entry.type);
+          }
+        });
+      });
+    }
 
     return (
       <>
@@ -607,42 +696,47 @@ export class StatementDetails extends React.Component<
         </PageConfig>
         <p className={timeScaleStylesCx("time-label", "label-margin")}>
           Showing aggregated stats from{" "}
-          <span className={timeScaleStylesCx("bold")}>{period}</span>
+          <span className={timeScaleStylesCx("bold")}>
+            <FormattedTimescale ts={this.props.timeScale} />
+          </span>
         </p>
         <section className={cx("section")}>
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
               <SqlBox
-                value={this.props.latestFormattedQuery}
+                value={this.state.formattedQuery}
                 size={SqlBoxSize.custom}
+                format={true}
               />
             </Col>
           </Row>
-          <Row gutter={24}>
+          <Row gutter={24} className={cx("margin-left-neg")}>
             <Col className="gutter-row" span={12}>
-              <SummaryCard className={cx("summary-card")}>
+              <SummaryCard id="first-card" className={cx("summary-card")}>
                 {!isTenant && (
-                  <>
-                    <SummaryCardItem
-                      label="Nodes"
-                      value={intersperse<ReactNode>(
-                        nodes.map(n => <NodeLink node={n} key={n} />),
-                        ", ",
-                      )}
-                    />
-                    <SummaryCardItem
-                      label="Regions"
-                      value={intersperse<ReactNode>(regions, ", ")}
-                    />
-                  </>
+                  <SummaryCardItem
+                    label="Nodes"
+                    value={intersperse<ReactNode>(
+                      nodes.map(n => <NodeLink node={n} key={n} />),
+                      ", ",
+                    )}
+                  />
                 )}
+                <SummaryCardItem
+                  label="Regions"
+                  value={intersperse<ReactNode>(regions, ", ")}
+                />
                 <SummaryCardItem label="Database" value={db} />
                 <SummaryCardItem
-                  label="App"
+                  label="Application Name"
                   value={intersperse<ReactNode>(
                     app_names.map(a => <AppLink app={a} key={a} />),
                     ", ",
                   )}
+                />
+                <SummaryCardItem
+                  label="Fingerprint ID"
+                  value={FixFingerprintHexValue(fingerprint_id)}
                 />
               </SummaryCard>
             </Col>
@@ -668,11 +762,27 @@ export class StatementDetails extends React.Component<
               </SummaryCard>
             </Col>
           </Row>
+          {tableData?.length > 0 && (
+            <>
+              <p
+                className={summaryCardStylesCx("summary--card__divider--large")}
+              />
+              <Row gutter={24}>
+                <Col className="gutter-row" span={24}>
+                  <InsightsSortedTable
+                    columns={insightsColumns}
+                    data={tableData}
+                    tableWrapperClassName={insightsTableCx("sorted-table")}
+                  />
+                </Col>
+              </Row>
+            </>
+          )}
           <p className={summaryCardStylesCx("summary--card__divider--large")} />
           <Row gutter={24}>
             <Col className="gutter-row" span={12}>
               <BarGraphTimeSeries
-                title="Statement Execution and Planning Time"
+                title="Statement Times"
                 alignedData={executionAndPlanningTimeseries}
                 uPlotOptions={executionAndPlanningOps}
                 yAxisUnits={AxisUnits.Duration}
@@ -708,9 +818,18 @@ export class StatementDetails extends React.Component<
           <Row gutter={24}>
             <Col className="gutter-row" span={12}>
               <BarGraphTimeSeries
-                title={`Contention${noSamples}`}
+                title={`Contention Time${noSamples}`}
                 alignedData={contentionTimeseries}
                 uPlotOptions={contentionOps}
+                tooltip={unavailableTooltip}
+                yAxisUnits={AxisUnits.Duration}
+              />
+            </Col>
+            <Col className="gutter-row" span={12}>
+              <BarGraphTimeSeries
+                title={`CPU Time${noSamples}`}
+                alignedData={cpuTimeseries}
+                uPlotOptions={cpuOps}
                 tooltip={unavailableTooltip}
                 yAxisUnits={AxisUnits.Duration}
               />
@@ -724,7 +843,6 @@ export class StatementDetails extends React.Component<
   renderExplainPlanTabContent = (
     hasTimeout: boolean,
     hasData: boolean,
-    period: string,
   ): React.ReactElement => {
     if (!hasData) {
       return this.renderNoDataWithTimeScaleAndSqlBoxTabContent(hasTimeout);
@@ -738,24 +856,31 @@ export class StatementDetails extends React.Component<
             <TimeScaleDropdown
               options={timeScale1hMinOptions}
               currentScale={this.props.timeScale}
-              setTimeScale={this.props.onTimeScaleChange}
+              setTimeScale={this.changeTimeScale}
             />
           </PageConfigItem>
         </PageConfig>
         <p className={timeScaleStylesCx("time-label", "label-margin")}>
           Showing explain plans from{" "}
-          <span className={timeScaleStylesCx("bold")}>{period}</span>
+          <span className={timeScaleStylesCx("bold")}>
+            <FormattedTimescale ts={this.props.timeScale} />
+          </span>
         </p>
         <section className={cx("section")}>
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
-              <SqlBox value={formatted_query} size={SqlBoxSize.custom} />
+              <SqlBox
+                value={formatted_query}
+                size={SqlBoxSize.custom}
+                format={true}
+              />
             </Col>
           </Row>
           <p className={summaryCardStylesCx("summary--card__divider")} />
           <PlanDetails
             statementFingerprintID={this.props.statementFingerprintID}
             plans={statement_statistics_per_plan_hash}
+            hasAdminRole={this.props.hasAdminRole}
           />
         </section>
       </>
@@ -763,23 +888,31 @@ export class StatementDetails extends React.Component<
   };
 
   renderDiagnosticsTabContent = (hasData: boolean): React.ReactElement => {
-    if (!hasData && !this.props.latestQuery) {
+    if (!hasData && !this.state.query) {
       return this.renderNoDataTabContent();
     }
 
+    const fingerprint =
+      this.props.statementDetails?.statement?.metadata?.query.length === 0
+        ? this.state.formattedQuery
+        : this.props.statementDetails?.statement?.metadata?.query;
     return (
       <DiagnosticsView
         activateDiagnosticsRef={this.activateDiagnosticsRef}
         diagnosticsReports={this.props.diagnosticsReports}
         dismissAlertMessage={this.props.dismissStatementDiagnosticsAlertMessage}
         hasData={this.hasDiagnosticReports()}
-        statementFingerprint={this.props.latestQuery}
+        statementFingerprint={fingerprint}
         onDownloadDiagnosticBundleClick={this.props.onDiagnosticBundleDownload}
-        onDiagnosticCancelRequestClick={this.props.onDiagnosticCancelRequest}
+        onDiagnosticCancelRequestClick={report =>
+          this.props.onDiagnosticCancelRequest(report)
+        }
         showDiagnosticsViewLink={
-          this.props.uiConfig.showStatementDiagnosticsLink
+          this.props.uiConfig?.showStatementDiagnosticsLink
         }
         onSortingChange={this.props.onSortingChange}
+        currentScale={this.props.timeScale}
+        onChangeTimeScale={this.props.onTimeScaleChange}
       />
     );
   };

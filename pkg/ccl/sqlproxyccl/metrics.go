@@ -11,7 +11,6 @@ package sqlproxyccl
 import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/errors"
 )
 
 // metrics contains pointers to the metrics for monitoring proxy operations.
@@ -22,33 +21,46 @@ type metrics struct {
 	ClientDisconnectCount  *metric.Counter
 	CurConnCount           *metric.Gauge
 	RoutingErrCount        *metric.Counter
+	AcceptedConnCount      *metric.Counter
 	RefusedConnCount       *metric.Counter
 	SuccessfulConnCount    *metric.Counter
-	ConnectionLatency      *metric.Histogram
+	ConnectionLatency      metric.IHistogram
 	AuthFailedCount        *metric.Counter
 	ExpiredClientConnCount *metric.Counter
 
-	DialTenantLatency *metric.Histogram
+	DialTenantLatency metric.IHistogram
 	DialTenantRetries *metric.Counter
 
 	ConnMigrationSuccessCount                *metric.Counter
 	ConnMigrationErrorFatalCount             *metric.Counter
 	ConnMigrationErrorRecoverableCount       *metric.Counter
 	ConnMigrationAttemptedCount              *metric.Counter
-	ConnMigrationAttemptedLatency            *metric.Histogram
-	ConnMigrationTransferResponseMessageSize *metric.Histogram
+	ConnMigrationAttemptedLatency            metric.IHistogram
+	ConnMigrationTransferResponseMessageSize metric.IHistogram
 
 	QueryCancelReceivedPGWire *metric.Counter
 	QueryCancelReceivedHTTP   *metric.Counter
 	QueryCancelForwarded      *metric.Counter
 	QueryCancelIgnored        *metric.Counter
 	QueryCancelSuccessful     *metric.Counter
+
+	AccessControlFileErrorCount *metric.Gauge
 }
 
 // MetricStruct implements the metrics.Struct interface.
 func (metrics) MetricStruct() {}
 
 var _ metric.Struct = metrics{}
+
+const (
+	// maxExpectedTransferResponseMessageSize corresponds to maximum expected
+	// response message size for the SHOW TRANSFER STATE query. We choose 16MB
+	// here to match the defaultMaxReadBufferSize used for ingesting SQL
+	// statements in the SQL server (see pkg/sql/pgwire/pgwirebase/encoding.go).
+	//
+	// This will be used to tune sql.session_transfer.max_session_size.
+	maxExpectedTransferResponseMessageSize = 1 << 24 // 16MB
+)
 
 var (
 	metaCurConnCount = metric.Metadata{
@@ -91,6 +103,12 @@ var (
 		Name:        "proxy.err.client_disconnect",
 		Help:        "Number of disconnects initiated by clients",
 		Measurement: "Client Disconnects",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaAcceptedConnCount = metric.Metadata{
+		Name:        "proxy.sql.accepted_conns",
+		Help:        "Number of accepted connections",
+		Measurement: "Accepted connections",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaRefusedConnCount = metric.Metadata{
@@ -200,6 +218,12 @@ var (
 		Measurement: "Query Cancel Requests",
 		Unit:        metric.Unit_COUNT,
 	}
+	accessControlFileErrorCount = metric.Metadata{
+		Name:        "proxy.access_control.errors",
+		Help:        "Numbers of access control list files that are currently having errors",
+		Measurement: "Access Control File Errors",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // makeProxyMetrics instantiates the metrics holder for proxy monitoring.
@@ -212,20 +236,23 @@ func makeProxyMetrics() metrics {
 		ClientDisconnectCount:  metric.NewCounter(metaClientDisconnectCount),
 		CurConnCount:           metric.NewGauge(metaCurConnCount),
 		RoutingErrCount:        metric.NewCounter(metaRoutingErrCount),
+		AcceptedConnCount:      metric.NewCounter(metaAcceptedConnCount),
 		RefusedConnCount:       metric.NewCounter(metaRefusedConnCount),
 		SuccessfulConnCount:    metric.NewCounter(metaSuccessfulConnCount),
-		ConnectionLatency: metric.NewHistogram(
-			metaConnMigrationAttemptedCount,
-			base.DefaultHistogramWindowInterval(),
-			metric.NetworkLatencyBuckets,
-		),
+		ConnectionLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaConnMigrationAttemptedCount,
+			Duration: base.DefaultHistogramWindowInterval(),
+			Buckets:  metric.NetworkLatencyBuckets,
+		}),
 		AuthFailedCount:        metric.NewCounter(metaAuthFailedCount),
 		ExpiredClientConnCount: metric.NewCounter(metaExpiredClientConnCount),
 		// Connector metrics.
-		DialTenantLatency: metric.NewHistogram(
-			metaDialTenantLatency,
-			base.DefaultHistogramWindowInterval(),
-			metric.NetworkLatencyBuckets,
+		DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaDialTenantLatency,
+			Duration: base.DefaultHistogramWindowInterval(),
+			Buckets:  metric.NetworkLatencyBuckets},
 		),
 		DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		// Connection migration metrics.
@@ -233,21 +260,26 @@ func makeProxyMetrics() metrics {
 		ConnMigrationErrorFatalCount:       metric.NewCounter(metaConnMigrationErrorFatalCount),
 		ConnMigrationErrorRecoverableCount: metric.NewCounter(metaConnMigrationErrorRecoverableCount),
 		ConnMigrationAttemptedCount:        metric.NewCounter(metaConnMigrationAttemptedCount),
-		ConnMigrationAttemptedLatency: metric.NewHistogram(
-			metaConnMigrationAttemptedLatency,
-			base.DefaultHistogramWindowInterval(),
-			metric.NetworkLatencyBuckets,
-		),
-		ConnMigrationTransferResponseMessageSize: metric.NewHistogram(
-			metaConnMigrationTransferResponseMessageSize,
-			base.DefaultHistogramWindowInterval(),
-			metric.DataSize16MBBuckets,
-		),
+		ConnMigrationAttemptedLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaConnMigrationAttemptedLatency,
+			Duration: base.DefaultHistogramWindowInterval(),
+			Buckets:  metric.NetworkLatencyBuckets,
+		}),
+		ConnMigrationTransferResponseMessageSize: metric.NewHistogram(metric.HistogramOptions{
+			Metadata: metaConnMigrationTransferResponseMessageSize,
+			Duration: base.DefaultHistogramWindowInterval(),
+			Buckets:  metric.DataSize16MBBuckets,
+			MaxVal:   maxExpectedTransferResponseMessageSize,
+			SigFigs:  1,
+		}),
 		QueryCancelReceivedPGWire: metric.NewCounter(metaQueryCancelReceivedPGWire),
 		QueryCancelReceivedHTTP:   metric.NewCounter(metaQueryCancelReceivedHTTP),
 		QueryCancelIgnored:        metric.NewCounter(metaQueryCancelIgnored),
 		QueryCancelForwarded:      metric.NewCounter(metaQueryCancelForwarded),
 		QueryCancelSuccessful:     metric.NewCounter(metaQueryCancelSuccessful),
+
+		AccessControlFileErrorCount: metric.NewGauge(accessControlFileErrorCount),
 	}
 }
 
@@ -257,25 +289,22 @@ func (metrics *metrics) updateForError(err error) {
 	if err == nil {
 		return
 	}
-	codeErr := (*codeError)(nil)
-	if errors.As(err, &codeErr) {
-		switch codeErr.code {
-		case codeExpiredClientConnection:
-			metrics.ExpiredClientConnCount.Inc(1)
-		case codeBackendDisconnected, codeBackendReadFailed, codeBackendWriteFailed:
-			metrics.BackendDisconnectCount.Inc(1)
-		case codeClientDisconnected, codeClientWriteFailed, codeClientReadFailed:
-			metrics.ClientDisconnectCount.Inc(1)
-		case codeProxyRefusedConnection:
-			metrics.RefusedConnCount.Inc(1)
-			metrics.BackendDownCount.Inc(1)
-		case codeParamsRoutingFailed, codeUnavailable:
-			metrics.RoutingErrCount.Inc(1)
-			metrics.BackendDownCount.Inc(1)
-		case codeBackendDown:
-			metrics.BackendDownCount.Inc(1)
-		case codeAuthFailed:
-			metrics.AuthFailedCount.Inc(1)
-		}
+	switch getErrorCode(err) {
+	case codeExpiredClientConnection:
+		metrics.ExpiredClientConnCount.Inc(1)
+	case codeBackendDisconnected, codeBackendReadFailed, codeBackendWriteFailed:
+		metrics.BackendDisconnectCount.Inc(1)
+	case codeClientDisconnected, codeClientWriteFailed, codeClientReadFailed:
+		metrics.ClientDisconnectCount.Inc(1)
+	case codeProxyRefusedConnection:
+		metrics.RefusedConnCount.Inc(1)
+		metrics.BackendDownCount.Inc(1)
+	case codeParamsRoutingFailed, codeUnavailable:
+		metrics.RoutingErrCount.Inc(1)
+		metrics.BackendDownCount.Inc(1)
+	case codeBackendDown:
+		metrics.BackendDownCount.Inc(1)
+	case codeAuthFailed:
+		metrics.AuthFailedCount.Inc(1)
 	}
 }

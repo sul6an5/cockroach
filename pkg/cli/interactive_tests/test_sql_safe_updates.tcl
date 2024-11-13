@@ -9,10 +9,12 @@ send "PS1=':''/# '\r"
 eexpect ":/# "
 
 start_test "Check that dangerous statements are properly rejected when running interactively with terminal output."
-send "$argv sql\r"
+send "$argv sql --no-line-editor\r"
 eexpect root@
-send "create database d;\rcreate table d.t(x int);\r"
+send "create database d;\r"
 eexpect "CREATE"
+eexpect root@
+send "create table d.t(x int);\r"
 eexpect "CREATE"
 eexpect root@
 

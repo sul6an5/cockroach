@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
@@ -83,13 +84,13 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 		},
 		changePrivilege: func(
 			privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername,
-		) (changed bool) {
+		) (changed bool, retErr error) {
 			// Grant the desired privileges to grantee, and return true
 			// if privileges have actually been changed due to this `GRANT``.
 			granteePrivsBeforeGrant := *(privDesc.FindOrCreateUser(grantee))
 			privDesc.Grant(grantee, privileges, n.WithGrantOption)
 			granteePrivsAfterGrant := *(privDesc.FindOrCreateUser(grantee))
-			return granteePrivsBeforeGrant != granteePrivsAfterGrant
+			return granteePrivsBeforeGrant != granteePrivsAfterGrant, nil
 		},
 	}, nil
 }
@@ -142,19 +143,21 @@ func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) 
 		},
 		changePrivilege: func(
 			privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername,
-		) (changed bool) {
+		) (changed bool, retErr error) {
 			granteePrivs, ok := privDesc.FindUser(grantee)
 			if !ok {
-				return false
+				return false, nil
 			}
 			granteePrivsBeforeGrant := *granteePrivs // Make a copy of the grantee's privileges before revoke.
-			privDesc.Revoke(grantee, privileges, grantOn, n.GrantOptionFor)
+			if err := privDesc.Revoke(grantee, privileges, grantOn, n.GrantOptionFor); err != nil {
+				return false, err
+			}
 			granteePrivs, ok = privDesc.FindUser(grantee)
 			// Revoke results in any privilege changes if
 			//   1. grantee's entry is removed from the privilege descriptor, or
 			//   2. grantee's entry is changed in its content.
 			privsChanges := !ok || granteePrivsBeforeGrant != *granteePrivs
-			return privsChanges
+			return privsChanges, nil
 		},
 	}, nil
 }
@@ -170,7 +173,7 @@ type changePrivilegesNode struct {
 
 type changeDescriptorBackedPrivilegesNode struct {
 	changePrivilegesNode
-	changePrivilege func(*catpb.PrivilegeDescriptor, privilege.List, username.SQLUsername) (changed bool)
+	changePrivilege func(*catpb.PrivilegeDescriptor, privilege.List, username.SQLUsername) (changed bool, retErr error)
 }
 
 type changeNonDescriptorBackedPrivilegesNode struct {
@@ -272,15 +275,28 @@ func (n *changeDescriptorBackedPrivilegesNode) startExec(params runParams) error
 				}
 			}
 
-			err := p.CheckGrantOptionsForUser(ctx, descriptor.GetPrivileges(), descriptor, n.desiredprivs, p.User(), n.isGrant)
+			err := p.MustCheckGrantOptionsForUser(ctx, descriptor.GetPrivileges(), descriptor, n.desiredprivs, p.User(), n.isGrant)
 			if err != nil {
 				return err
 			}
 
 			privileges := descriptor.GetPrivileges()
 			for _, grantee := range n.grantees {
-				changed := n.changePrivilege(privileges, n.desiredprivs, grantee)
+				changed, err := n.changePrivilege(privileges, n.desiredprivs, grantee)
+				if err != nil {
+					return err
+				}
 				descPrivsChanged = descPrivsChanged || changed
+				if !n.isGrant && grantee == privileges.Owner() {
+					params.p.BufferClientNotice(
+						ctx,
+						pgnotice.Newf(
+							"%s is the owner of %s and still has all privileges implicitly",
+							privileges.Owner(),
+							descriptor.GetName(),
+						),
+					)
+				}
 			}
 
 			if len(sequencePrivilegesNoOp) > 0 {
@@ -327,10 +343,7 @@ func (n *changeDescriptorBackedPrivilegesNode) startExec(params runParams) error
 			if err := p.writeDatabaseChangeToBatch(ctx, d, b); err != nil {
 				return err
 			}
-			if err := p.createNonDropDatabaseChangeJob(ctx, d.ID,
-				fmt.Sprintf("updating privileges for database %d", d.ID)); err != nil {
-				return err
-			}
+			p.createNonDropDatabaseChangeJob(ctx, d.ID, fmt.Sprintf("updating privileges for database %d", d.ID))
 			for _, grantee := range n.grantees {
 				privs := eventDetails // copy the granted/revoked privilege list.
 				privs.Grantee = grantee.Normalized()
@@ -419,7 +432,6 @@ func (n *changeDescriptorBackedPrivilegesNode) startExec(params runParams) error
 					FuncName:                       d.Name, // FIXME
 				})
 			}
-			// TODO(chengxiong): add eventlog for function privilege changes.
 		}
 	}
 
@@ -530,57 +542,66 @@ func (p *planner) getTablePatternsComposition(
 	if targets.Tables.SequenceOnly {
 		return sequenceOnly, nil
 	}
+	var allObjectIDs []descpb.ID
 	for _, tableTarget := range targets.Tables.TablePatterns {
 		tableGlob, err := tableTarget.NormalizeTablePattern()
 		if err != nil {
 			return unknownComposition, err
 		}
-		_, objectIDs, err := expandTableGlob(ctx, p, tableGlob)
+		_, objectIDs, err := p.ExpandTableGlob(ctx, tableGlob)
 		if err != nil {
 			return unknownComposition, err
 		}
+		allObjectIDs = append(allObjectIDs, objectIDs...)
+	}
 
-		// Check if the table is a virtual table.
-		var virtualTableIDs descpb.IDs
-		var nonVirtualTableIDs descpb.IDs
-		for _, objectID := range objectIDs {
-			isVirtual := false
-			for _, vs := range virtualSchemas {
-				if _, ok := vs.tableDefs[objectID]; ok {
-					isVirtual = true
-					break
-				}
+	if len(allObjectIDs) == 0 {
+		return unknownComposition, nil
+	}
+
+	// Check if the table is a virtual table.
+	var virtualIDs descpb.IDs
+	var nonVirtualIDs descpb.IDs
+	for _, objectID := range allObjectIDs {
+		isVirtual := false
+		for _, vs := range virtualSchemas {
+			if _, ok := vs.tableDefs[objectID]; ok {
+				isVirtual = true
+				break
 			}
+		}
 
-			if isVirtual {
-				virtualTableIDs = append(nonVirtualTableIDs, objectID)
-			} else {
-				nonVirtualTableIDs = append(virtualTableIDs, objectID)
+		if isVirtual {
+			virtualIDs = append(nonVirtualIDs, objectID)
+		} else {
+			nonVirtualIDs = append(virtualIDs, objectID)
+		}
+	}
+	haveVirtualTables := virtualIDs.Len() > 0
+	haveNonVirtualTables := nonVirtualIDs.Len() > 0
+	if haveVirtualTables && haveNonVirtualTables {
+		return unknownComposition, pgerror.Newf(
+			pgcode.FeatureNotSupported, "cannot mix grants between virtual and non-virtual tables",
+		)
+	}
+	if !haveNonVirtualTables {
+		return virtualTablesOnly, nil
+	}
+	// Note that part of the reason the code is structured this way is that
+	// resolving mutable descriptors for virtual table IDs results in an error.
+	muts, err := p.Descriptors().MutableByID(p.txn).Descs(ctx, nonVirtualIDs)
+	if err != nil {
+		return unknownComposition, err
+	}
+
+	for _, mut := range muts {
+		if mut != nil && mut.DescriptorType() == catalog.Table {
+			tableDesc, err := catalog.AsTableDescriptor(mut)
+			if err != nil {
+				return unknownComposition, err
 			}
-		}
-
-		if len(nonVirtualTableIDs) != 0 && len(virtualTableIDs) != 0 {
-			return unknownComposition, errors.Newf("cannot mix grants between virtual and non-virtual tables")
-		}
-
-		if len(nonVirtualTableIDs) == 0 {
-			return virtualTablesOnly, nil
-		}
-
-		muts, err := p.Descriptors().GetMutableDescriptorsByID(ctx, p.txn, nonVirtualTableIDs...)
-		if err != nil {
-			return unknownComposition, err
-		}
-
-		for _, mut := range muts {
-			if mut != nil && mut.DescriptorType() == catalog.Table {
-				tableDesc, err := catalog.AsTableDescriptor(mut)
-				if err != nil {
-					return unknownComposition, err
-				}
-				if !tableDesc.IsSequence() {
-					return containsTable, nil
-				}
+			if !tableDesc.IsSequence() {
+				return containsTable, nil
 			}
 		}
 	}
@@ -601,8 +622,7 @@ func (p *planner) validateRoles(
 	}
 	for i, grantee := range roles {
 		if _, ok := users[grantee]; !ok {
-			sqlName := tree.Name(roles[i].Normalized())
-			return errors.Errorf("user or role %s does not exist", &sqlName)
+			return sqlerrors.NewUndefinedUserError(roles[i])
 		}
 	}
 

@@ -43,6 +43,9 @@ type OrderedSynchronizer struct {
 	ordering              colinfo.ColumnOrdering
 	typs                  []*types.T
 	canonicalTypeFamilies []types.Family
+	// tuplesToMerge (when positive) tracks the number of tuples that are still
+	// to be merged by synchronizer.
+	tuplesToMerge int64
 
 	// inputBatches stores the current batch for each input.
 	inputBatches []coldata.Batch
@@ -80,20 +83,24 @@ func (o *OrderedSynchronizer) Child(nth int, verbose bool) execopnode.OpNode {
 
 // NewOrderedSynchronizer creates a new OrderedSynchronizer.
 // - memoryLimit will limit the size of batches produced by the synchronizer.
+// - tuplesToMerge, if positive, indicates the total number of tuples that will
+// be emitted by all inputs, use 0 if unknown.
 func NewOrderedSynchronizer(
 	allocator *colmem.Allocator,
 	memoryLimit int64,
 	inputs []colexecargs.OpWithMetaInfo,
 	typs []*types.T,
 	ordering colinfo.ColumnOrdering,
+	tuplesToMerge int64,
 ) *OrderedSynchronizer {
 	os := &OrderedSynchronizer{
 		inputs:                inputs,
 		ordering:              ordering,
 		typs:                  typs,
 		canonicalTypeFamilies: typeconv.ToCanonicalTypeFamilies(typs),
+		tuplesToMerge:         tuplesToMerge,
 	}
-	os.accountingHelper.Init(allocator, memoryLimit, typs)
+	os.accountingHelper.Init(allocator, memoryLimit, typs, false /* alwaysReallocate */)
 	return os
 }
 
@@ -256,13 +263,16 @@ func (o *OrderedSynchronizer) Next() coldata.Batch {
 	}
 
 	o.output.SetLength(outputIdx)
+	// Note that it's ok if this number becomes negative - the accounting helper
+	// will ignore it.
+	o.tuplesToMerge -= int64(outputIdx)
 	return o.output
 }
 
 func (o *OrderedSynchronizer) resetOutput() {
 	var reallocated bool
 	o.output, reallocated = o.accountingHelper.ResetMaybeReallocate(
-		o.typs, o.output, 0, /* tuplesToBeSet */
+		o.typs, o.output, int(o.tuplesToMerge), /* tuplesToBeSet */
 	)
 	if reallocated {
 		o.outVecs.SetBatch(o.output)
@@ -305,22 +315,12 @@ func (o *OrderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetadata {
 }
 
 func (o *OrderedSynchronizer) Close(context.Context) error {
-	// Note that we're using the context of the synchronizer rather than the
-	// argument of Close() because the synchronizer derives its own tracing
-	// span.
-	ctx := o.EnsureCtx()
 	o.accountingHelper.Release()
-	var lastErr error
-	for _, input := range o.inputs {
-		if err := input.ToClose.Close(ctx); err != nil {
-			lastErr = err
-		}
-	}
 	if o.span != nil {
 		o.span.Finish()
 	}
 	*o = OrderedSynchronizer{}
-	return lastErr
+	return nil
 }
 
 func (o *OrderedSynchronizer) compareRow(batchIdx1 int, batchIdx2 int) int {

@@ -14,6 +14,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -66,22 +67,22 @@ func TestRefreshError(t *testing.T) {
 		if resolveIntent {
 			intent := roachpb.MakeLockUpdate(txn, roachpb.Span{Key: k})
 			intent.Status = roachpb.COMMITTED
-			if _, err := storage.MVCCResolveWriteIntent(ctx, db, nil, intent); err != nil {
+			if _, _, _, err := storage.MVCCResolveWriteIntent(ctx, db, nil, intent, storage.MVCCResolveWriteIntentOptions{}); err != nil {
 				t.Fatal(err)
 			}
 		}
 
 		// We are trying to refresh from time 1 to 3, but the key was written at
 		// time 2, therefore the refresh should fail.
-		var resp roachpb.RefreshResponse
+		var resp kvpb.RefreshResponse
 		_, err := Refresh(ctx, db, CommandArgs{
-			Args: &roachpb.RefreshRequest{
-				RequestHeader: roachpb.RequestHeader{
+			Args: &kvpb.RefreshRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key: k,
 				},
 				RefreshFrom: ts1,
 			},
-			Header: roachpb.Header{
+			Header: kvpb.Header{
 				Txn: &roachpb.Transaction{
 					TxnMeta: enginepb.TxnMeta{
 						WriteTimestamp: ts3,
@@ -91,7 +92,7 @@ func TestRefreshError(t *testing.T) {
 				Timestamp: ts3,
 			},
 		}, &resp)
-		require.IsType(t, &roachpb.RefreshFailedError{}, err)
+		require.IsType(t, &kvpb.RefreshFailedError{}, err)
 		if resolveIntent {
 			require.Equal(t, "encountered recently written committed value \"resolved_key\" @0.000000002,0",
 				err.Error())
@@ -133,15 +134,15 @@ func TestRefreshTimestampBounds(t *testing.T) {
 		// RefreshTo is exclusive, so expect no error on collision.
 		{ts2, ts3, false},
 	} {
-		var resp roachpb.RefreshResponse
+		var resp kvpb.RefreshResponse
 		_, err := Refresh(ctx, db, CommandArgs{
-			Args: &roachpb.RefreshRequest{
-				RequestHeader: roachpb.RequestHeader{
+			Args: &kvpb.RefreshRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key: k,
 				},
 				RefreshFrom: tc.from,
 			},
-			Header: roachpb.Header{
+			Header: kvpb.Header{
 				Txn: &roachpb.Transaction{
 					TxnMeta: enginepb.TxnMeta{
 						WriteTimestamp: tc.to,

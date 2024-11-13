@@ -77,6 +77,13 @@ func (k MVCCKey) Clone() MVCCKey {
 	return k
 }
 
+// CloneInto copies the key into the provided destination MVCCKey, reusing and
+// overwriting its key slice.
+func (k MVCCKey) CloneInto(dst *MVCCKey) {
+	dst.Key = append(dst.Key[:0], k.Key...)
+	dst.Timestamp = k.Timestamp
+}
+
 // Compare returns -1 if this key is less than the given key, 0 if they're
 // equal, or 1 if this is greater. Comparison is by key,timestamp, where larger
 // timestamps sort before smaller ones except empty ones which sort first (like
@@ -248,6 +255,23 @@ func encodeMVCCTimestampSuffixToBuf(buf []byte, ts hlc.Timestamp) []byte {
 	}
 	encodeMVCCTimestampToBuf(buf, ts)
 	buf[tsLen] = byte(suffixLen)
+	return buf
+}
+
+// EncodeMVCCTimestampToBuf encodes an MVCC timestamp into its Pebble
+// representation, excluding the length suffix and sentinel byte, reusing the
+// given byte slice if it has sufficient capacity.
+func EncodeMVCCTimestampToBuf(buf []byte, ts hlc.Timestamp) []byte {
+	tsLen := encodedMVCCTimestampLength(ts)
+	if tsLen == 0 {
+		return buf[:0]
+	}
+	if cap(buf) < tsLen {
+		buf = make([]byte, tsLen)
+	} else {
+		buf = buf[:tsLen]
+	}
+	encodeMVCCTimestampToBuf(buf, ts)
 	return buf
 }
 
@@ -488,6 +512,13 @@ type MVCCRangeKeyVersion struct {
 	Value     []byte
 }
 
+// CloneInto copies the version into the provided destination
+// MVCCRangeKeyVersion, reusing and overwriting its value slice.
+func (v MVCCRangeKeyVersion) CloneInto(dst *MVCCRangeKeyVersion) {
+	dst.Timestamp = v.Timestamp
+	dst.Value = append(dst.Value[:0], v.Value...)
+}
+
 // AsRangeKey returns an MVCCRangeKey for the given version. Byte slices
 // are shared with the stack.
 func (s MVCCRangeKeyStack) AsRangeKey(v MVCCRangeKeyVersion) MVCCRangeKey {
@@ -570,6 +601,8 @@ func (s MVCCRangeKeyStack) CloneInto(c *MVCCRangeKeyStack) {
 }
 
 // Covers returns true if any range key in the stack covers the given point key.
+// A timestamp of 0 (i.e. an intent) is considered to be above all timestamps,
+// and thus not covered by any range key.
 func (s MVCCRangeKeyStack) Covers(k MVCCKey) bool {
 	return s.Versions.Covers(k.Timestamp) && s.Bounds.ContainsKey(k.Key)
 }
@@ -681,8 +714,10 @@ func (v MVCCRangeKeyVersions) CloneInto(c *MVCCRangeKeyVersions) {
 }
 
 // Covers returns true if any version in the stack is above the given timestamp.
+// A timestamp of 0 (i.e. an intent) is considered to be above all timestamps,
+// and thus not covered by any range key.
 func (v MVCCRangeKeyVersions) Covers(ts hlc.Timestamp) bool {
-	return !v.IsEmpty() && ts.LessEq(v[0].Timestamp)
+	return !v.IsEmpty() && !ts.IsEmpty() && ts.LessEq(v[0].Timestamp)
 }
 
 // Equal returns whether versions in the specified MVCCRangeKeyVersions match

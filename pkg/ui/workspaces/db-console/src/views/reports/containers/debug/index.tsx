@@ -23,15 +23,15 @@ import {
   Panel,
 } from "src/views/shared/components/panelSection";
 import "./debug.styl";
-import { connect } from "react-redux";
-import { AdminUIState } from "src/redux/state";
-import { nodeIDsSelector } from "src/redux/nodes";
+import { connect, useSelector } from "react-redux";
+import { AdminUIState, featureFlagSelector } from "src/redux/state";
+import { nodeIDsStringifiedSelector } from "src/redux/nodes";
 import { refreshNodes, refreshUserSQLRoles } from "src/redux/apiReducers";
 import { selectHasViewActivityRedactedRole } from "src/redux/user";
+import { getCookieValue, setCookie } from "src/redux/cookies";
+import { InlineAlert } from "src/components";
 
 const COMMUNITY_URL = "https://www.cockroachlabs.com/community/";
-
-const NODE_ID = getDataFromServer().NodeID;
 
 export function DebugTableLink(props: {
   name: string;
@@ -43,7 +43,12 @@ export function DebugTableLink(props: {
     si?: string;
     labels?: string;
   };
+  disabled?: boolean;
 }) {
+  if (props.disabled) {
+    return null;
+  }
+
   const params = new URLSearchParams(props.params);
   const urlWithParams = props.params
     ? `${props.url}?${params.toString()}`
@@ -62,7 +67,14 @@ export function DebugTableLink(props: {
   );
 }
 
-function DebugTableRow(props: { title: string; children?: React.ReactNode }) {
+function DebugTableRow(props: {
+  title: string;
+  children?: React.ReactNode;
+  disabled?: boolean;
+}) {
+  if (props.disabled) {
+    return null;
+  }
   return (
     <tr className="debug-table__row">
       <th className="debug-table__cell debug-table__cell--header">
@@ -91,7 +103,15 @@ function DebugTable(props: {
   );
 }
 
-function DebugPanelLink(props: { name: string; url: string; note: string }) {
+function DebugPanelLink(props: {
+  name: string;
+  url: string;
+  note: string;
+  disabled?: boolean;
+}) {
+  if (props.disabled) {
+    return null;
+  }
   return (
     <PanelPair>
       <Panel>
@@ -133,7 +153,11 @@ function NodeIDSelector(props: {
       }}
     >
       {nodeIDs.map(n => {
-        return <option value={n}>{n}</option>;
+        return (
+          <option value={n} key={n}>
+            {n}
+          </option>
+        );
       })}
     </select>
   );
@@ -142,7 +166,7 @@ function NodeIDSelector(props: {
 const NodeIDSelectorConnected = connect(
   (state: AdminUIState) => {
     return {
-      nodeIDs: nodeIDsSelector(state),
+      nodeIDs: nodeIDsStringifiedSelector(state),
     };
   },
   {
@@ -164,28 +188,15 @@ const ProxyToNodeSelector = (props: ProxyToNodeSelectorProps) => {
 
   // currentNodeIDCookie will either be empty or contain two elements
   // with the cookie name and value we're looking for
-  const currentNodeIDCookie: string[] = document.cookie
-    .split(";")
-    .map(cookieString => {
-      return cookieString.split("=").map(kv => {
-        return kv.trim();
-      });
-    })
-    .find(cookie => {
-      return cookie[0] === remoteNodeIDCookieName;
-    });
+  const currentNodeIDCookie: string = getCookieValue(remoteNodeIDCookieName);
   const setNodeIDCookie = (nodeID: string) => {
-    document.cookie = `${remoteNodeIDCookieName}=${nodeID};path=/`;
+    setCookie(remoteNodeIDCookieName, nodeID);
     location.reload();
   };
   let currentNodeID = props.nodeID;
   let proxyEnabled = false;
-  if (
-    currentNodeIDCookie &&
-    currentNodeIDCookie.length == 2 &&
-    currentNodeIDCookie[1] !== ""
-  ) {
-    currentNodeID = currentNodeIDCookie[1];
+  if (currentNodeIDCookie) {
+    currentNodeID = currentNodeIDCookie;
     if (currentNodeID !== "local" && currentNodeID !== "") {
       proxyEnabled = true;
     }
@@ -242,11 +253,28 @@ const StatementDiagnosticsConnected = connect(
 )(StatementDiagnosticsSelector);
 
 export default function Debug() {
-  const [nodeID, setNodeID] = useState<string>(NODE_ID);
+  const [nodeID, setNodeID] = useState<string>(getDataFromServer().NodeID);
+
+  const { disable_kv_level_advanced_debug } = useSelector(featureFlagSelector);
+
   return (
     <div className="section">
       <Helmet title="Debug" />
-      <h3 className="base-heading">Advanced Debugging</h3>
+      <h3 className="base-heading">Advanced Debug</h3>
+      {disable_kv_level_advanced_debug && (
+        <section className="section">
+          <InlineAlert
+            title="Some advanced debug options are not available on secondary tenants."
+            intent="warning"
+            message={
+              <span>
+                To access additional advanced debug options, please login using
+                system tenant credentials.
+              </span>
+            }
+          />
+        </section>
+      )}
       <div className="debug-header">
         <InfoBox>
           <p>
@@ -276,11 +304,13 @@ export default function Debug() {
           name="Problem Ranges"
           url="#/reports/problemranges"
           note="View ranges in your cluster that are unavailable, underreplicated, slow, or have other problems."
+          disabled={disable_kv_level_advanced_debug}
         />
         <DebugPanelLink
           name="Data Distribution and Zone Configs"
           url="#/data-distribution"
           note="View the distribution of table data across nodes and verify zone configuration."
+          disabled={disable_kv_level_advanced_debug}
         />
         <StatementDiagnosticsConnected />
         <PanelTitle>Configuration</PanelTitle>
@@ -314,7 +344,10 @@ export default function Debug() {
             note="#/reports/nodes/history"
           />
         </DebugTableRow>
-        <DebugTableRow title="Stores">
+        <DebugTableRow
+          title="Stores"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink
             name="Stores on this node"
             url="#/reports/stores/local"
@@ -341,7 +374,10 @@ export default function Debug() {
             note="#/reports/certificates/[node_id]"
           />
         </DebugTableRow>
-        <DebugTableRow title="Problem Ranges">
+        <DebugTableRow
+          title="Problem Ranges"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink
             name="Problem Ranges on a specific node"
             url="#/reports/problemranges/local"
@@ -354,10 +390,26 @@ export default function Debug() {
             url="#/reports/range/1"
             note="#/reports/range/[range_id]"
           />
-          <DebugTableLink name="Raft Messages" url="#/raft/messages/all" />
-          <DebugTableLink name="Raft for all ranges" url="#/raft/ranges" />
+          <DebugTableLink
+            name="Raft Messages"
+            url="#/raft/messages/all"
+            disabled={disable_kv_level_advanced_debug}
+          />
+          <DebugTableLink
+            name="Raft for all ranges"
+            url="#/raft/ranges"
+            disabled={disable_kv_level_advanced_debug}
+          />
+          <DebugTableLink
+            name="Key Visualizer"
+            url="#/keyvisualizer"
+            disabled={disable_kv_level_advanced_debug}
+          />
         </DebugTableRow>
-        <DebugTableRow title="Closed timestamps">
+        <DebugTableRow
+          title="Closed timestamps"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink
             name="Sender on this node"
             url="debug/closedts-sender"
@@ -417,9 +469,21 @@ export default function Debug() {
       </DebugTable>
       <DebugTable heading="Tracing and Profiling Endpoints (local node only)">
         <DebugTableRow title="Tracing">
-          <DebugTableLink name="Active operations" url="#/debug/tracez" />
-          <DebugTableLink name="Requests" url="debug/requests" />
-          <DebugTableLink name="Events" url="debug/events" />
+          <DebugTableLink
+            name="Active operations"
+            url="#/debug/tracez"
+            disabled={disable_kv_level_advanced_debug}
+          />
+          <DebugTableLink
+            name="Requests"
+            url="debug/requests"
+            disabled={disable_kv_level_advanced_debug}
+          />
+          <DebugTableLink
+            name="Events"
+            url="debug/events"
+            disabled={disable_kv_level_advanced_debug}
+          />
           <DebugTableLink
             name="Logs (JSON)"
             url="debug/logspy?count=100&amp;duration=10s&amp;grep=.&flatten=0"
@@ -441,7 +505,10 @@ export default function Debug() {
             note="debug/vmodule?duration=[duration]&amp;vmodule=[vmodule]"
           />
         </DebugTableRow>
-        <DebugTableRow title="Enqueue Range">
+        <DebugTableRow
+          title="Enqueue Range"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink
             name="Run a range through an internal queue"
             url="#/debug/enqueue_range"
@@ -488,9 +555,13 @@ export default function Debug() {
         <DebugTableRow title="Metrics">
           <DebugTableLink name="Variables" url="debug/metrics" />
           <DebugTableLink name="Prometheus" url="_status/vars" />
+          <DebugTableLink name="Load" url="_status/load" />
           <DebugTableLink name="Rules" url="api/v2/rules/" />
         </DebugTableRow>
-        <DebugTableRow title="Node Status">
+        <DebugTableRow
+          title="Node Status"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink
             name="All Nodes"
             url="_status/nodes"
@@ -512,9 +583,13 @@ export default function Debug() {
             name="Single node's ranges"
             url="#/debug/hotranges/local"
             note="#/debug/hotranges/[node_id]"
+            disabled={disable_kv_level_advanced_debug}
           />
         </DebugTableRow>
-        <DebugTableRow title="Hot Ranges (legacy)">
+        <DebugTableRow
+          title="Hot Ranges (legacy)"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink
             name="All Nodes"
             url="_status/hotranges"
@@ -526,7 +601,10 @@ export default function Debug() {
             note="_status/hotranges?node_id=[node_id]"
           />
         </DebugTableRow>
-        <DebugTableRow title="Single Node Specific">
+        <DebugTableRow
+          title="Single Node Specific"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink
             name="Stores"
             url="_status/stores/local"
@@ -567,7 +645,10 @@ export default function Debug() {
           <DebugTableLink name="Local Sessions" url="_status/local_sessions" />
           <DebugTableLink name="All Sessions" url="_status/sessions" />
         </DebugTableRow>
-        <DebugTableRow title="Cluster Wide">
+        <DebugTableRow
+          title="Cluster Wide"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink name="Raft" url="_status/raft" />
           <DebugTableLink
             name="Range"
@@ -581,7 +662,10 @@ export default function Debug() {
             note="_admin/v1/rangelog/[range_id]?limit=100"
           />
         </DebugTableRow>
-        <DebugTableRow title="Allocator">
+        <DebugTableRow
+          title="Allocator"
+          disabled={disable_kv_level_advanced_debug}
+        >
           <DebugTableLink
             name="Simulated Allocator Runs on a Specific Node"
             url="_status/allocator/node/local"

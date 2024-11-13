@@ -15,7 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
@@ -30,7 +29,7 @@ func DropSchema(b BuildCtx, n *tree.DropSchema) {
 	for _, name := range n.Names {
 		elts := b.ResolveSchema(name, ResolveParams{
 			IsExistenceOptional: n.IfExists,
-			RequiredPrivilege:   privilege.DROP,
+			RequireOwnership:    true,
 		})
 		_, _, sc := scpb.FindSchema(elts)
 		if sc == nil {
@@ -49,6 +48,7 @@ func DropSchema(b BuildCtx, n *tree.DropSchema) {
 		} else if dropRestrictDescriptor(b, sc.SchemaID) {
 			toCheckBackrefs = append(toCheckBackrefs, sc.SchemaID)
 		}
+		b.LogEventForExistingTarget(sc)
 		b.IncrementSubWorkID()
 		b.IncrementSchemaChangeDropCounter("schema")
 		b.IncrementUserDefinedSchemaCounter(sqltelemetry.UserDefinedSchemaDrop)
@@ -58,8 +58,8 @@ func DropSchema(b BuildCtx, n *tree.DropSchema) {
 		if n.DropBehavior == tree.DropCascade {
 			// Special case to handle dropped types which aren't supported in CASCADE.
 			var objectIDs, typeIDs catalog.DescriptorIDSet
-			scpb.ForEachObjectParent(b.BackReferences(schemaID), func(_ scpb.Status, _ scpb.TargetStatus, op *scpb.ObjectParent) {
-				objectIDs.Add(op.ObjectID)
+			scpb.ForEachSchemaChild(b.BackReferences(schemaID), func(_ scpb.Status, _ scpb.TargetStatus, op *scpb.SchemaChild) {
+				objectIDs.Add(op.ChildObjectID)
 			})
 			objectIDs.ForEach(func(id descpb.ID) {
 				elts := b.QueryByID(id)

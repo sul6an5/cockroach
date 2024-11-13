@@ -13,6 +13,7 @@ package sql_test
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -28,7 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -332,16 +336,16 @@ func TestExplainMVCCSteps(t *testing.T) {
 	skip.UnderMetamorphic(t,
 		"this test expects a precise number of scan requests, which is not upheld "+
 			"in the metamorphic configuration that edits the kv batch size.")
-
 	ctx := context.Background()
 	srv, godb, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
 	defer srv.Stopper().Stop(ctx)
 	r := sqlutils.MakeSQLRunner(godb)
+
 	r.Exec(t, "CREATE TABLE ab (a PRIMARY KEY, b) AS SELECT g, g FROM generate_series(1,1000) g(g)")
 	r.Exec(t, "CREATE TABLE bc (b PRIMARY KEY, c) AS SELECT g, g FROM generate_series(1,1000) g(g)")
 
 	scanQuery := "SELECT count(*) FROM ab"
-	expectedSteps, expectedSeeks := 1000, 2
+	expectedSteps, expectedSeeks := 1000, 1
 	foundSteps, foundSeeks := getMVCCStats(t, r, scanQuery)
 
 	assert.Equal(t, expectedSteps, foundSteps)
@@ -352,7 +356,7 @@ func TestExplainMVCCSteps(t *testing.T) {
 	// Update all rows.
 	r.Exec(t, "UPDATE ab SET b=b+1 WHERE true")
 
-	expectedSteps, expectedSeeks = 2000, 2
+	expectedSteps, expectedSeeks = 1000, 1
 	foundSteps, foundSeeks = getMVCCStats(t, r, scanQuery)
 
 	assert.Equal(t, expectedSteps, foundSteps)
@@ -468,4 +472,59 @@ func TestExplainAnalyzeWarnings(t *testing.T) {
 		}
 		assert.Equal(t, tc.expectWarning, warningFound, fmt.Sprintf("failed for estimated row count %d", tc.estimatedRowCount))
 	}
+}
+
+// TestExplainRedact tests that variants of EXPLAIN (REDACT) do not leak PII.
+func TestExplainRedact(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const numStatements = 10
+
+	ctx := context.Background()
+	rng, seed := randutil.NewTestRand()
+	t.Log("seed:", seed)
+
+	params, _ := tests.CreateTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	defer sqlDB.Close()
+
+	query := func(sql string) (*gosql.Rows, error) {
+		return sqlDB.QueryContext(ctx, sql)
+	}
+
+	// To check for PII leaks, we inject a single unlikely string into some of the
+	// query constants produced by SQLSmith, and then search the redacted EXPLAIN
+	// output for this string.
+	pii := "pterodactyl"
+	containsPII := func(explain, output string) error {
+		lowerOutput := strings.ToLower(output)
+		if strings.Contains(lowerOutput, pii) {
+			return errors.Newf(
+				"EXPLAIN output contained PII (%q):\n%s\noutput:\n%s\n", pii, explain, output,
+			)
+		}
+		return nil
+	}
+
+	// Set up smither to generate random DML statements.
+	setup := sqlsmith.Setups["seed"](rng)
+	setup = append(setup, "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = off;")
+	setup = append(setup, "ANALYZE seed;")
+	setup = append(setup, "SET statement_timeout = '5s';")
+	t.Log(strings.Join(setup, "\n"))
+	db := sqlutils.MakeSQLRunner(sqlDB)
+	db.ExecMultiple(t, setup...)
+
+	smith, err := sqlsmith.NewSmither(sqlDB, rng,
+		sqlsmith.PrefixStringConsts(pii),
+		sqlsmith.DisableDDLs(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer smith.Close()
+
+	tests.GenerateAndCheckRedactedExplainsForPII(t, smith, numStatements, query, containsPII)
 }

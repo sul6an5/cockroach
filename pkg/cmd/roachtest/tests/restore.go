@@ -13,467 +13,791 @@ package tests
 import (
 	"bytes"
 	"context"
-	gosql "database/sql"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"path/filepath"
-	"sort"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
-	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
 )
 
-// HealthChecker runs a regular check that verifies that a specified subset
-// of (CockroachDB) nodes look "very healthy". That is, there are no stuck
-// proposals, liveness problems, or whatever else might get added in the
-// future.
-type HealthChecker struct {
-	t      test.Test
-	c      cluster.Cluster
-	nodes  option.NodeListOption
-	doneCh chan struct{}
-}
-
-// NewHealthChecker returns a populated HealthChecker.
-func NewHealthChecker(t test.Test, c cluster.Cluster, nodes option.NodeListOption) *HealthChecker {
-	return &HealthChecker{
-		t:      t,
-		c:      c,
-		nodes:  nodes,
-		doneCh: make(chan struct{}),
-	}
-}
-
-// Done signals the HealthChecker's Runner to shut down.
-func (hc *HealthChecker) Done() {
-	close(hc.doneCh)
-}
-
-type gossipAlert struct {
-	NodeID, StoreID       int
-	Category, Description string
-	Value                 float64
-}
-
-type gossipAlerts []gossipAlert
-
-func (g gossipAlerts) String() string {
-	var buf bytes.Buffer
-	tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
-
-	for _, a := range g {
-		fmt.Fprintf(tw, "n%d/s%d\t%.2f\t%s\t%s\n", a.NodeID, a.StoreID, a.Value, a.Category, a.Description)
-	}
-	_ = tw.Flush()
-	return buf.String()
-}
-
-// Runner makes sure the gossip_alerts table is empty at all times.
-//
-// TODO(tschottdorf): actually let this fail the test instead of logging complaints.
-func (hc *HealthChecker) Runner(ctx context.Context) (err error) {
-	logger, err := hc.t.L().ChildLogger("health")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		logger.Printf("health check terminated with %v\n", err)
-	}()
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-hc.doneCh:
-			return nil
-		case <-ticker.C:
-		}
-
-		tBegin := timeutil.Now()
-
-		nodeIdx := 1 + rand.Intn(len(hc.nodes))
-		db, err := hc.c.ConnE(ctx, hc.t.L(), nodeIdx)
-		if err != nil {
-			return err
-		}
-		// TODO(tschottdorf): remove replicate queue failures when the cluster first starts.
-		// Ditto queue.raftsnapshot.process.failure.
-		_, err = db.Exec(`USE system`)
-		if err != nil {
-			return err
-		}
-		rows, err := db.QueryContext(ctx, `SELECT * FROM crdb_internal.gossip_alerts ORDER BY node_id ASC, store_id ASC `)
-		_ = db.Close()
-		if err != nil {
-			return err
-		}
-		var rr gossipAlerts
-		for rows.Next() {
-			a := gossipAlert{StoreID: -1}
-			var storeID gosql.NullInt64
-			if err := rows.Scan(&a.NodeID, &storeID, &a.Category, &a.Description, &a.Value); err != nil {
-				return err
-			}
-			if storeID.Valid {
-				a.StoreID = int(storeID.Int64)
-			}
-			rr = append(rr, a)
-		}
-		if len(rr) > 0 {
-			logger.Printf(rr.String() + "\n")
-			// TODO(tschottdorf): see method comment.
-			// return errors.New(rr.String())
-		}
-
-		if elapsed := timeutil.Since(tBegin); elapsed > 10*time.Second {
-			err := errors.Errorf("health check against node %d took %s", nodeIdx, elapsed)
-			logger.Printf("%+v", err)
-			// TODO(tschottdorf): see method comment.
-			// return err
-		}
-	}
-}
-
-// DiskUsageLogger regularly logs the disk spaced used by the nodes in the cluster.
-type DiskUsageLogger struct {
-	t      test.Test
-	c      cluster.Cluster
-	doneCh chan struct{}
-}
-
-// NewDiskUsageLogger populates a DiskUsageLogger.
-func NewDiskUsageLogger(t test.Test, c cluster.Cluster) *DiskUsageLogger {
-	return &DiskUsageLogger{
-		t:      t,
-		c:      c,
-		doneCh: make(chan struct{}),
-	}
-}
-
-// Done instructs the Runner to terminate.
-func (dul *DiskUsageLogger) Done() {
-	close(dul.doneCh)
-}
-
-// Runner runs in a loop until Done() is called and prints the cluster-wide per
-// node disk usage in descending order.
-func (dul *DiskUsageLogger) Runner(ctx context.Context) error {
-	l, err := dul.t.L().ChildLogger("diskusage")
-	if err != nil {
-		return err
-	}
-	quietLogger, err := dul.t.L().ChildLogger("diskusage-exec", logger.QuietStdout, logger.QuietStderr)
-	if err != nil {
-		return err
-	}
-
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-dul.doneCh:
-			return nil
-		case <-ticker.C:
-		}
-
-		type usage struct {
-			nodeNum int
-			bytes   int
-		}
-
-		var bytesUsed []usage
-		for i := 1; i <= dul.c.Spec().NodeCount; i++ {
-			cur, err := getDiskUsageInBytes(ctx, dul.c, quietLogger, i)
-			if err != nil {
-				// This can trigger spuriously as compactions remove files out from under `du`.
-				l.Printf("%s", errors.Wrapf(err, "node #%d", i))
-				cur = -1
-			}
-			bytesUsed = append(bytesUsed, usage{
-				nodeNum: i,
-				bytes:   cur,
-			})
-		}
-		sort.Slice(bytesUsed, func(i, j int) bool { return bytesUsed[i].bytes > bytesUsed[j].bytes }) // descending
-
-		var s []string
-		for _, usage := range bytesUsed {
-			s = append(s, fmt.Sprintf("n#%d: %s", usage.nodeNum, humanizeutil.IBytes(int64(usage.bytes))))
-		}
-
-		l.Printf("%s\n", strings.Join(s, ", "))
-	}
-}
 func registerRestoreNodeShutdown(r registry.Registry) {
-	makeRestoreStarter := func(ctx context.Context, t test.Test, c cluster.Cluster, gatewayNode int) jobStarter {
+	sp := restoreSpecs{
+		hardware: makeHardwareSpecs(hardwareSpecs{}),
+		backup: makeBackupSpecs(
+			backupSpecs{workload: tpceRestore{customers: 1000},
+				version: "v22.2.1"}),
+		timeout:     1 * time.Hour,
+		fingerprint: 8445446819555404274,
+	}
+
+	makeRestoreStarter := func(ctx context.Context, t test.Test, c cluster.Cluster,
+		gatewayNode int, rd restoreDriver) jobStarter {
 		return func(c cluster.Cluster, t test.Test) (string, error) {
-			t.L().Printf("connecting to gateway")
-			gatewayDB := c.Conn(ctx, t.L(), gatewayNode)
-			defer gatewayDB.Close()
-
-			t.L().Printf("creating bank database")
-			if _, err := gatewayDB.Exec("CREATE DATABASE bank"); err != nil {
-				return "", err
-			}
-
-			errCh := make(chan error, 1)
-			go func() {
-				defer close(errCh)
-
-				// 10 GiB restore.
-				restoreQuery := `RESTORE bank.bank FROM
-					'gs://cockroach-fixtures/workload/bank/version=1.0.0,payload-bytes=100,ranges=10,rows=10000000,seed=1/bank?AUTH=implicit'`
-
-				t.L().Printf("starting to run the restore job")
-				if _, err := gatewayDB.Exec(restoreQuery); err != nil {
-					errCh <- err
-				}
-				t.L().Printf("done running restore job")
-			}()
-
-			// Wait for the job.
-			retryOpts := retry.Options{
-				MaxRetries:     50,
-				InitialBackoff: 1 * time.Second,
-				MaxBackoff:     5 * time.Second,
-			}
-			for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-				var jobCount int
-				if err := gatewayDB.QueryRowContext(ctx, "SELECT count(*) FROM [SHOW JOBS] WHERE job_type = 'RESTORE'").Scan(&jobCount); err != nil {
-					return "", err
-				}
-
-				select {
-				case err := <-errCh:
-					// We got an error when starting the job.
-					return "", err
-				default:
-				}
-
-				if jobCount == 0 {
-					t.L().Printf("waiting for restore job")
-				} else if jobCount == 1 {
-					t.L().Printf("found restore job")
-					break
-				} else {
-					t.L().Printf("found multiple restore jobs -- erroring")
-					return "", errors.New("unexpectedly found multiple restore jobs")
-				}
-			}
-
-			var jobID string
-			if err := gatewayDB.QueryRowContext(ctx, "SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'RESTORE'").Scan(&jobID); err != nil {
-				return "", errors.Wrap(err, "querying the job ID")
-			}
-			return jobID, nil
+			jobID, err := rd.runDetached(ctx, "DATABASE tpce", gatewayNode)
+			return fmt.Sprintf("%d", jobID), err
 		}
 	}
 
 	r.Add(registry.TestSpec{
 		Name:    "restore/nodeShutdown/worker",
-		Owner:   registry.OwnerBulkIO,
-		Cluster: r.MakeClusterSpec(4),
+		Owner:   registry.OwnerDisasterRecovery,
+		Cluster: sp.hardware.makeClusterSpecs(r, sp.backup.cloud),
+		Timeout: sp.timeout,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			gatewayNode := 2
 			nodeToShutdown := 3
-			c.Put(ctx, t.Cockroach(), "./cockroach")
-			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
-			jobSurvivesNodeShutdown(ctx, t, c, nodeToShutdown, makeRestoreStarter(ctx, t, c, gatewayNode))
+			rd := makeRestoreDriver(t, c, sp)
+			rd.prepareCluster(ctx)
+			jobSurvivesNodeShutdown(ctx, t, c, nodeToShutdown, makeRestoreStarter(ctx, t, c,
+				gatewayNode, rd))
+			rd.checkFingerprint(ctx)
 		},
 	})
 
 	r.Add(registry.TestSpec{
 		Name:    "restore/nodeShutdown/coordinator",
-		Owner:   registry.OwnerBulkIO,
-		Cluster: r.MakeClusterSpec(4),
+		Owner:   registry.OwnerDisasterRecovery,
+		Cluster: sp.hardware.makeClusterSpecs(r, sp.backup.cloud),
+		Timeout: sp.timeout,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+
 			gatewayNode := 2
 			nodeToShutdown := 2
-			c.Put(ctx, t.Cockroach(), "./cockroach")
-			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
-			jobSurvivesNodeShutdown(ctx, t, c, nodeToShutdown, makeRestoreStarter(ctx, t, c, gatewayNode))
+			rd := makeRestoreDriver(t, c, sp)
+			rd.prepareCluster(ctx)
+
+			jobSurvivesNodeShutdown(ctx, t, c, nodeToShutdown, makeRestoreStarter(ctx, t, c,
+				gatewayNode, rd))
+			rd.checkFingerprint(ctx)
 		},
 	})
 }
 
-type testDataSet interface {
-	name() string
-	// runRestore does any setup that's required and restores the dataset into
-	// the given cluster. Any setup shouldn't take a long amount of time since
-	// perf artifacts are based on how long this takes.
-	runRestore(ctx context.Context, c cluster.Cluster)
-}
-
-type dataBank2TB struct{}
-
-func (dataBank2TB) name() string {
-	return "2TB"
-}
-
-func (dataBank2TB) runRestore(ctx context.Context, c cluster.Cluster) {
-	c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "CREATE DATABASE restore2tb"`)
-	c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "
-				RESTORE csv.bank FROM
-				'gs://cockroach-fixtures/workload/bank/version=1.0.0,payload-bytes=10240,ranges=0,rows=65104166,seed=1/bank?AUTH=implicit'
-				WITH into_db = 'restore2tb'"`)
-}
-
-// TODO(adityamaru): tpccIncData should be replaced by tpccIncDataLatest. The
-// former is an old fixture that lacks certain directory structure optimizations
-// that were added to backup in a future release.
-type tpccIncData struct{}
-
-func (tpccIncData) name() string {
-	return "TPCCInc"
-}
-
-func (tpccIncData) runRestore(ctx context.Context, c cluster.Cluster) {
-	// This data set restores a 1.80TB (replicated) backup consisting of 50
-	// incremental backup layers taken every 15 minutes. 8000 warehouses
-	// were imported and then a workload of 1000 warehouses was run against
-	// the cluster while the incremental backups were being taken.
-	c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "
-				RESTORE FROM '2021/05/21-020411.00' IN
-				'gs://cockroach-fixtures/tpcc-incrementals?AUTH=implicit'
-				AS OF SYSTEM TIME '2021-05-21 14:40:22'"`)
-}
-
-type tpccIncDataLatest struct{}
-
-func (tpccIncDataLatest) name() string {
-	return "TPCCIncLatest"
-}
-
-func (tpccIncDataLatest) runRestore(ctx context.Context, c cluster.Cluster) {
-	// This data set restores a 1.80TB (replicated) backup consisting of 48
-	// incremental backup layers taken every 15 minutes. 8000 warehouses were
-	// imported and then a workload of 1000 warehouses was run against the cluster
-	// while the incremental backups were being taken.
-	c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "
-				RESTORE FROM '/2022/09/07-000000.00' IN
-				'gs://cockroach-fixtures/tpcc-incrementals-22.2?AUTH=implicit'
-				AS OF SYSTEM TIME '2022-09-07 12:15:00'"`)
-}
-
 func registerRestore(r registry.Registry) {
-	largeVolumeSize := 2500 // the size in GB of disks in large volume configs
 
-	for _, item := range []struct {
-		nodes        int
-		cpus         int
-		largeVolumes bool
-		dataSet      testDataSet
+	durationGauge := r.PromFactory().NewGaugeVec(prometheus.GaugeOpts{Namespace: registry.
+		PrometheusNameSpace, Subsystem: "restore", Name: "duration"}, []string{"test_name"})
 
-		timeout time.Duration
-	}{
-		{dataSet: dataBank2TB{}, nodes: 10, timeout: 6 * time.Hour},
-		{dataSet: dataBank2TB{}, nodes: 32, timeout: 3 * time.Hour},
-		{dataSet: dataBank2TB{}, nodes: 6, timeout: 4 * time.Hour, cpus: 8, largeVolumes: true},
-		{dataSet: tpccIncData{}, nodes: 10, timeout: 6 * time.Hour},
-		{dataSet: tpccIncDataLatest{}, nodes: 10, timeout: 6 * time.Hour},
+	withPauseSpecs := restoreSpecs{
+		hardware: makeHardwareSpecs(hardwareSpecs{}),
+		backup: makeBackupSpecs(
+			backupSpecs{workload: tpceRestore{customers: 1000},
+				version: "v22.2.1"}),
+		timeout:     3 * time.Hour,
+		namePrefix:  "pause",
+		fingerprint: 8445446819555404274,
+	}
+	withPauseSpecs.initTestName()
+
+	r.Add(registry.TestSpec{
+		Name:    withPauseSpecs.testName,
+		Owner:   registry.OwnerDisasterRecovery,
+		Cluster: withPauseSpecs.hardware.makeClusterSpecs(r, withPauseSpecs.backup.cloud),
+		Timeout: withPauseSpecs.timeout,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+
+			rd := makeRestoreDriver(t, c, withPauseSpecs)
+			rd.prepareCluster(ctx)
+
+			// Run the disk usage logger in the monitor to guarantee its
+			// having terminated when the test ends.
+			m := c.NewMonitor(ctx)
+			dul := roachtestutil.NewDiskUsageLogger(t, c)
+			m.Go(dul.Runner)
+			hc := roachtestutil.NewHealthChecker(t, c, c.All())
+			m.Go(hc.Runner)
+
+			jobIDCh := make(chan jobspb.JobID)
+			jobCompleteCh := make(chan struct{}, 1)
+
+			pauseAtProgress := []float32{0.2, 0.45, 0.7}
+			for i := range pauseAtProgress {
+				// Add up to 10% to the pause point.
+				pauseAtProgress[i] = pauseAtProgress[i] + float32(rand.Intn(10))/100
+			}
+			pauseIndex := 0
+			// Spin up go routine which pauses and resumes the Restore job three times.
+			m.Go(func(ctx context.Context) error {
+				// Wait until the restore job has been created.
+				conn, err := c.ConnE(ctx, t.L(), c.Node(1)[0])
+				require.NoError(t, err)
+				sql := sqlutils.MakeSQLRunner(conn)
+
+				// The job should be created fairly quickly once the roachtest starts.
+				done := ctx.Done()
+				jobID := <-jobIDCh
+
+				jobProgressTick := time.NewTicker(time.Minute * 1)
+				defer jobProgressTick.Stop()
+				for {
+					if pauseIndex == len(pauseAtProgress) {
+						t.L().Printf("RESTORE job was paused a maximum number of times; allowing the job to complete")
+						return nil
+					}
+					select {
+					case <-done:
+						return ctx.Err()
+					case <-jobCompleteCh:
+						return nil
+					case <-jobProgressTick.C:
+						var fraction float32
+						sql.QueryRow(t, `SELECT fraction_completed FROM [SHOW JOBS] WHERE job_id = $1`,
+							jobID).Scan(&fraction)
+						t.L().Printf("RESTORE Progress %.2f", fraction)
+						if fraction < pauseAtProgress[pauseIndex] {
+							continue
+						}
+						t.L().Printf("pausing RESTORE job since progress is greater than %.2f", pauseAtProgress[pauseIndex])
+						// Pause the job and wait for it to transition to a paused state.
+						_, err := conn.Query(`PAUSE JOB $1`, jobID)
+						if err != nil {
+							// The pause job request should not fail unless the job has already succeeded,
+							// in which case, the test should gracefully succeed.
+							var status string
+							sql.QueryRow(t, `SELECT status FROM [SHOW JOBS] WHERE job_id = $1`, jobID).Scan(&status)
+							if status == "succeeded" {
+								return nil
+							}
+						}
+						require.NoError(t, err)
+						testutils.SucceedsSoon(t, func() error {
+							var status string
+							sql.QueryRow(t, `SELECT status FROM [SHOW JOBS] WHERE job_id = $1`, jobID).Scan(&status)
+							if status != "paused" {
+								return errors.Newf("expected status `paused` but found %s", status)
+							}
+							t.L().Printf("paused RESTORE job")
+							pauseIndex++
+							return nil
+						})
+
+						t.L().Printf("resuming RESTORE job")
+						sql.Exec(t, `RESUME JOB $1`, jobID)
+					}
+				}
+			})
+
+			m.Go(func(ctx context.Context) error {
+				defer dul.Done()
+				defer hc.Done()
+				defer close(jobCompleteCh)
+				defer close(jobIDCh)
+				t.Status(`running restore`)
+				metricCollector := rd.initRestorePerfMetrics(ctx, durationGauge)
+				jobID, err := rd.runDetached(ctx, "DATABASE tpce", 1)
+				require.NoError(t, err)
+				jobIDCh <- jobID
+
+				// Wait for the job to succeed.
+				succeededJobTick := time.NewTicker(time.Minute * 1)
+				defer succeededJobTick.Stop()
+				done := ctx.Done()
+				conn, err := c.ConnE(ctx, t.L(), c.Node(1)[0])
+				require.NoError(t, err)
+				var isJobComplete bool
+				for {
+					if isJobComplete {
+						succeededJobTick.Stop()
+						jobCompleteCh <- struct{}{}
+						break
+					}
+
+					select {
+					case <-done:
+						return ctx.Err()
+					case <-jobCompleteCh:
+						return nil
+					case <-succeededJobTick.C:
+						var status string
+						err := conn.QueryRow(`SELECT status FROM [SHOW JOBS] WHERE job_type = 'RESTORE'`).Scan(&status)
+						require.NoError(t, err)
+						if status == string(jobs.StatusSucceeded) {
+							isJobComplete = true
+						} else if status == string(jobs.StatusFailed) || status == string(jobs.StatusCanceled) {
+							t.Fatalf("job unexpectedly found in %s state", status)
+						}
+					}
+				}
+				metricCollector()
+				rd.checkFingerprint(ctx)
+				return nil
+			})
+			m.Wait()
+			// All failures from the above go routines surface via a t.Fatal() within
+			// the m.Wait( ) call above; therefore, at this point, the restore job
+			// should have succeeded. This final check ensures this test is actually
+			// doing its job: causing the restore job to pause at least once.
+			require.NotEqual(t, 0, pauseIndex, "the job should have paused at least once")
+		},
+
+		// TODO(msbutler): to test the correctness of checkpointing, we should
+		// restore the same fixture without pausing it and fingerprint both restored
+		// databases.
+	})
+
+	for _, sp := range []restoreSpecs{
+		{
+			hardware: makeHardwareSpecs(hardwareSpecs{}),
+			backup:   makeBackupSpecs(backupSpecs{}),
+			timeout:  1 * time.Hour,
+		},
+		{
+			// Note that the default specs in makeHardwareSpecs() spin up restore tests in aws,
+			// by default.
+			hardware: makeHardwareSpecs(hardwareSpecs{}),
+			backup:   makeBackupSpecs(backupSpecs{cloud: spec.GCE}),
+			timeout:  1 * time.Hour,
+		},
+		{
+			// Benchmarks using a low memory per core ratio - we don't expect ideal
+			// performance but nodes should not OOM.
+			hardware: makeHardwareSpecs(hardwareSpecs{mem: spec.Low}),
+			backup:   makeBackupSpecs(backupSpecs{cloud: spec.GCE}),
+			timeout:  1 * time.Hour,
+		},
+		{
+			// Benchmarks if per node throughput remains constant if the number of
+			// nodes doubles relative to default.
+			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 8}),
+			backup:   makeBackupSpecs(backupSpecs{}),
+			timeout:  1 * time.Hour,
+		},
+		{
+			// Benchmarks if per node throughput remains constant if the cluster
+			// is multi-region.
+			hardware: makeHardwareSpecs(hardwareSpecs{
+				nodes: 9,
+				zones: []string{"us-east-2b", "us-west-2b", "eu-west-1b"}}), // These zones are AWS-specific.
+			backup:  makeBackupSpecs(backupSpecs{}),
+			timeout: 90 * time.Minute,
+		},
+		{
+			// Benchmarks if per node throughput doubles if the vcpu count doubles
+			// relative to default.
+			hardware: makeHardwareSpecs(hardwareSpecs{cpus: 16}),
+			backup:   makeBackupSpecs(backupSpecs{}),
+			timeout:  1 * time.Hour,
+		},
+		{
+			// Ensures we can restore a 48 length incremental chain.
+			// Also benchmarks per node throughput for a long chain.
+			hardware: makeHardwareSpecs(hardwareSpecs{}),
+			backup:   makeBackupSpecs(backupSpecs{backupsIncluded: 48}),
+			timeout:  1 * time.Hour,
+		},
+		{
+			// The nightly 8TB Restore test.
+			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 10, volumeSize: 2000}),
+			backup: makeBackupSpecs(backupSpecs{
+				version:  "v22.2.1",
+				workload: tpceRestore{customers: 500000}}),
+			timeout: 5 * time.Hour,
+		},
+		{
+			// The weekly 32TB Restore test.
+			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 15, cpus: 16, volumeSize: 5000}),
+			backup: makeBackupSpecs(backupSpecs{
+				version:  "v22.2.1",
+				workload: tpceRestore{customers: 2000000}}),
+			timeout: 24 * time.Hour,
+			tags:    []string{"weekly", "aws-weekly"},
+		},
+		{
+			// A teeny weeny 15GB restore that could be used to bisect scale agnostic perf regressions.
+			hardware: makeHardwareSpecs(hardwareSpecs{}),
+			backup: makeBackupSpecs(
+				backupSpecs{workload: tpceRestore{customers: 1000},
+					version: "v22.2.1"}),
+			timeout:     3 * time.Hour,
+			fingerprint: 8445446819555404274,
+		},
+		// TODO(msbutler): add the following tests once roachperf/grafana is hooked up and old tests are
+		// removed:
+		// - restore/tpce/400GB/nodes=30
+		// - restore/tpce/400GB/encryption
 	} {
-		item := item
-		clusterOpts := make([]spec.Option, 0)
-		testName := fmt.Sprintf("restore%s/nodes=%d", item.dataSet.name(), item.nodes)
-		if item.cpus != 0 {
-			clusterOpts = append(clusterOpts, spec.CPU(item.cpus))
-			testName += fmt.Sprintf("/cpus=%d", item.cpus)
-		}
-		if item.largeVolumes {
-			clusterOpts = append(clusterOpts, spec.VolumeSize(largeVolumeSize))
-			testName += fmt.Sprintf("/pd-volume=%dGB", largeVolumeSize)
-		}
-
+		sp := sp
+		sp.initTestName()
 		r.Add(registry.TestSpec{
-			Name:              testName,
-			Owner:             registry.OwnerBulkIO,
-			Cluster:           r.MakeClusterSpec(item.nodes, clusterOpts...),
-			Timeout:           item.timeout,
-			EncryptionSupport: registry.EncryptionMetamorphic,
+			Name:    sp.testName,
+			Owner:   registry.OwnerDisasterRecovery,
+			Cluster: sp.hardware.makeClusterSpecs(r, sp.backup.cloud),
+			Timeout: sp.timeout,
+			// These tests measure performance. To ensure consistent perf,
+			// disable metamorphic encryption.
+			EncryptionSupport: registry.EncryptionAlwaysDisabled,
+			Tags:              sp.tags,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				c.Put(ctx, t.Cockroach(), "./cockroach")
-				c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
-				m := c.NewMonitor(ctx)
+
+				rd := makeRestoreDriver(t, c, sp)
+				rd.prepareCluster(ctx)
 
 				// Run the disk usage logger in the monitor to guarantee its
 				// having terminated when the test ends.
-				dul := NewDiskUsageLogger(t, c)
+				m := c.NewMonitor(ctx)
+				dul := roachtestutil.NewDiskUsageLogger(t, c)
 				m.Go(dul.Runner)
-				hc := NewHealthChecker(t, c, c.All())
+				hc := roachtestutil.NewHealthChecker(t, c, c.All())
 				m.Go(hc.Runner)
 
-				// TODO(peter): This currently causes the test to fail because we see a
-				// flurry of valid merges when the restore finishes.
-				//
-				// m.Go(func(ctx context.Context) error {
-				// 	// Make sure the merge queue doesn't muck with our restore.
-				// 	return verifyMetrics(ctx, c, map[string]float64{
-				// 		"cr.store.queue.merge.process.success": 10,
-				// 		"cr.store.queue.merge.process.failure": 10,
-				// 	})
-				// })
-
-				tick, perfBuf := initBulkJobPerfArtifacts(testName, item.timeout)
 				m.Go(func(ctx context.Context) error {
 					defer dul.Done()
 					defer hc.Done()
 					t.Status(`running restore`)
-					// Tick once before starting the restore, and once after to
-					// capture the total elapsed time. This is used by
-					// roachperf to compute and display the average MB/sec per
-					// node.
-					if item.cpus >= 8 {
-						// If the nodes are large enough (specifically, if they
-						// have enough memory we can increase the parallelism
-						// of restore). Machines with 16 vCPUs typically have
-						// enough memory to support 3 concurrent workers.
-						c.Run(ctx, c.Node(1),
-							`./cockroach sql --insecure -e "SET CLUSTER SETTING kv.bulk_io_write.restore_node_concurrency = 5"`)
-						c.Run(ctx, c.Node(1),
-							`./cockroach sql --insecure -e "SET CLUSTER SETTING kv.bulk_io_write.concurrent_addsstable_requests = 5"`)
+					metricCollector := rd.initRestorePerfMetrics(ctx, durationGauge)
+					if err := rd.run(ctx, ""); err != nil {
+						return err
 					}
-					tick()
-					item.dataSet.runRestore(ctx, c)
-					tick()
-
-					// Upload the perf artifacts to any one of the nodes so that the test
-					// runner copies it into an appropriate directory path.
-					dest := filepath.Join(t.PerfArtifactsDir(), "stats.json")
-					if err := c.RunE(ctx, c.Node(1), "mkdir -p "+filepath.Dir(dest)); err != nil {
-						log.Errorf(ctx, "failed to create perf dir: %+v", err)
-					}
-					if err := c.PutString(ctx, perfBuf.String(), dest, 0755, c.Node(1)); err != nil {
-						log.Errorf(ctx, "failed to upload perf artifacts to node: %s", err.Error())
-					}
+					metricCollector()
+					rd.checkFingerprint(ctx)
 					return nil
 				})
 				m.Wait()
 			},
 		})
+	}
+}
+
+var defaultHardware = hardwareSpecs{
+	cpus:       8,
+	nodes:      4,
+	volumeSize: 1000,
+}
+
+// hardwareSpecs define the cluster setup for a restore roachtest. These values
+// should not get updated as the test runs.
+type hardwareSpecs struct {
+
+	// cpus is the per node cpu count.
+	cpus int
+
+	// nodes is the number of nodes in the restore.
+	nodes int
+
+	// volumeSize indicates the size of per node block storage (pd-ssd for gcs,
+	// ebs for aws). If zero, local ssd's are used.
+	volumeSize int
+
+	// mem is the memory per cpu.
+	mem spec.MemPerCPU
+
+	// Availability zones to use. (Values are cloud-provider-specific.)
+	// If unset, the first of the default availability zones for the provider will be used.
+	zones []string
+}
+
+func (hw hardwareSpecs) makeClusterSpecs(r registry.Registry, backupCloud string) spec.ClusterSpec {
+	clusterOpts := make([]spec.Option, 0)
+	clusterOpts = append(clusterOpts, spec.CPU(hw.cpus))
+	if hw.volumeSize != 0 {
+		clusterOpts = append(clusterOpts, spec.VolumeSize(hw.volumeSize))
+	}
+	if hw.mem != spec.Auto {
+		clusterOpts = append(clusterOpts, spec.Mem(hw.mem))
+	}
+	if len(hw.zones) > 0 {
+		clusterOpts = append(clusterOpts, spec.Zones(strings.Join(hw.zones, ",")))
+		clusterOpts = append(clusterOpts, spec.Geo())
+	}
+	s := r.MakeClusterSpec(hw.nodes, clusterOpts...)
+
+	if backupCloud == spec.AWS && s.Cloud == spec.AWS && s.VolumeSize != 0 {
+		// Work around an issue that RAID0s local NVMe and GP3 storage together:
+		// https://github.com/cockroachdb/cockroach/issues/98783.
+		//
+		// TODO(srosenberg): Remove this workaround when 98783 is addressed.
+		s.InstanceType = spec.AWSMachineType(s.CPUs, s.Mem)
+		s.InstanceType = strings.Replace(s.InstanceType, "d.", ".", 1)
+	}
+	return s
+}
+
+// String prints the hardware specs. If verbose==true, verbose specs are printed.
+func (hw hardwareSpecs) String(verbose bool) string {
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("/nodes=%d", hw.nodes))
+	builder.WriteString(fmt.Sprintf("/cpus=%d", hw.cpus))
+	if hw.mem != spec.Auto {
+		builder.WriteString(fmt.Sprintf("/%smem", hw.mem))
+	}
+	if len(hw.zones) > 0 {
+		builder.WriteString(fmt.Sprintf("/zones=%s", strings.Join(hw.zones, ",")))
+	}
+	if verbose {
+		builder.WriteString(fmt.Sprintf("/volSize=%dGB", hw.volumeSize))
+	}
+	return builder.String()
+}
+
+// makeHardwareSpecs instantiates hardware specs for a restore roachtest.
+// Unless the caller provides any explicit specs, the default specs are used.
+func makeHardwareSpecs(override hardwareSpecs) hardwareSpecs {
+	specs := defaultHardware
+	if override.cpus != 0 {
+		specs.cpus = override.cpus
+	}
+	if override.nodes != 0 {
+		specs.nodes = override.nodes
+	}
+	if override.mem != spec.Auto {
+		specs.mem = override.mem
+	}
+	if override.volumeSize != 0 {
+		specs.volumeSize = override.volumeSize
+	}
+	specs.zones = override.zones
+	return specs
+}
+
+var defaultBackupSpecs = backupSpecs{
+	// TODO(msbutler): write a script that automatically finds the latest versioned fixture.
+	version:          "v22.2.0",
+	cloud:            spec.AWS,
+	backupProperties: "inc-count=48",
+	fullBackupDir:    "LATEST",
+	backupsIncluded:  12,
+	workload:         tpceRestore{customers: 25000},
+}
+
+// backupSpecs define the backup that will get restored. These values should not
+// get updated during the test.
+type backupSpecs struct {
+	// version specifies the crdb version the backup was taken on.
+	version string
+
+	// cloud is the cloud storage provider the backup is stored on.
+	cloud string
+
+	// backupProperties identifies specific backup properties included in the backup fixture
+	// path.
+	backupProperties string
+
+	// specifies the full backup directory in the collection to restore from.
+	fullBackupDir string
+
+	// specifies the number of backups in the chain to restore from
+	backupsIncluded int
+
+	// workload defines the backed up workload.
+	workload backupWorkload
+}
+
+// String returns a stringified version of the backup specs. Note that the
+// backup version, backup directory, and AOST are never included.
+func (bs backupSpecs) String(verbose bool) string {
+	var builder strings.Builder
+	builder.WriteString("/" + bs.workload.String())
+
+	if verbose || bs.backupProperties != defaultBackupSpecs.backupProperties {
+		builder.WriteString("/" + bs.backupProperties)
+	}
+	builder.WriteString("/" + bs.cloud)
+
+	if verbose || bs.backupsIncluded != defaultBackupSpecs.backupsIncluded {
+		builder.WriteString("/" + fmt.Sprintf("backupsIncluded=%d", bs.backupsIncluded))
+	}
+	return builder.String()
+}
+
+func (bs backupSpecs) storagePrefix() string {
+	if bs.cloud == spec.AWS {
+		return "s3"
+	}
+	return "gs"
+}
+
+func (bs backupSpecs) backupCollection() string {
+	return fmt.Sprintf(`'%s://cockroach-fixtures/backups/%s/%s/%s?AUTH=implicit'`,
+		bs.storagePrefix(), bs.workload.fixtureDir(), bs.version, bs.backupProperties)
+}
+
+// getAOSTCmd returns a sql cmd that will return a system time that is equal to the end time of
+// the bs.backupsIncluded'th backup in the target backup chain.
+func (bs backupSpecs) getAostCmd() string {
+	return fmt.Sprintf(
+		`SELECT max(end_time) FROM [SELECT DISTINCT end_time FROM [SHOW BACKUP FROM %s IN %s] ORDER BY end_time LIMIT %d]`,
+		bs.fullBackupDir,
+		bs.backupCollection(),
+		bs.backupsIncluded)
+}
+
+// makeBackupSpecs initializes the default backup specs. The caller can override
+// any of the default backup specs by passing any non-nil params.
+func makeBackupSpecs(override backupSpecs) backupSpecs {
+	specs := defaultBackupSpecs
+
+	if override.cloud != "" {
+		specs.cloud = override.cloud
+	}
+	if override.version != "" {
+		specs.version = override.version
+	}
+
+	if override.backupProperties != "" {
+		specs.backupProperties = override.backupProperties
+	}
+
+	if override.fullBackupDir != "" {
+		specs.fullBackupDir = override.fullBackupDir
+	}
+
+	if override.backupsIncluded != 0 {
+		specs.backupsIncluded = override.backupsIncluded
+	}
+
+	if override.workload != nil {
+		specs.workload = override.workload
+	}
+
+	return specs
+}
+
+type backupWorkload interface {
+	fixtureDir() string
+	String() string
+}
+
+type tpceRestore struct {
+	customers int
+}
+
+func (tpce tpceRestore) fixtureDir() string {
+	return fmt.Sprintf(`tpc-e/customers=%d`, tpce.customers)
+}
+
+func (tpce tpceRestore) String() string {
+	var builder strings.Builder
+	builder.WriteString("tpce/")
+	switch tpce.customers {
+	case 1000:
+		builder.WriteString("15GB")
+	case 5000:
+		builder.WriteString("80GB")
+	case 25000:
+		builder.WriteString("400GB")
+	case 500000:
+		builder.WriteString("8TB")
+	case 2000000:
+		builder.WriteString("32TB")
+	default:
+		panic("tpce customer count not recognized")
+	}
+	return builder.String()
+}
+
+// restoreSpecs define input parameters to a restore roachtest set during
+// registration. They should not be modified within test_spec.run(), as they are shared
+// across driver runs.
+type restoreSpecs struct {
+	hardware hardwareSpecs
+	backup   backupSpecs
+	timeout  time.Duration
+	tags     []string
+
+	// namePrefix appears in the name of the roachtest, i.e. `restore/{prefix}/{config}`.
+	namePrefix string
+
+	// fingerprint, if specified, defines the expected stripped fingerprint of the
+	// restored user space tables.
+	fingerprint int
+
+	testName string
+}
+
+func (sp *restoreSpecs) initTestName() {
+	sp.testName = sp.computeName(false)
+}
+
+func (sp *restoreSpecs) computeName(verbose bool) string {
+	var prefix string
+	if sp.namePrefix != "" {
+		prefix = "/" + sp.namePrefix
+	}
+	return "restore" + prefix + sp.backup.String(verbose) + sp.hardware.String(verbose)
+}
+
+type restoreDriver struct {
+	sp restoreSpecs
+
+	t test.Test
+	c cluster.Cluster
+
+	// aost defines the "As Of System Time" used within the restore. Because this
+	// gets computed during test execution, it is stored in the restoreDriver
+	// rather than the restoreSpecs.
+	aost string
+}
+
+func makeRestoreDriver(t test.Test, c cluster.Cluster, sp restoreSpecs) restoreDriver {
+	return restoreDriver{
+		t:  t,
+		c:  c,
+		sp: sp,
+	}
+}
+
+func (rd *restoreDriver) prepareCluster(ctx context.Context) {
+
+	if rd.c.Spec().Cloud != rd.sp.backup.cloud {
+		// For now, only run the test on the cloud provider that also stores the backup.
+		rd.t.Skip("test configured to run on %s", rd.sp.backup.cloud)
+	}
+
+	rd.c.Put(ctx, rd.t.Cockroach(), "./cockroach")
+	rd.c.Start(ctx, rd.t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
+
+	var aost string
+	conn := rd.c.Conn(ctx, rd.t.L(), 1)
+	err := conn.QueryRowContext(ctx, rd.sp.backup.getAostCmd()).Scan(&aost)
+	require.NoError(rd.t, err)
+	rd.aost = aost
+}
+
+func (rd *restoreDriver) restoreCmd(target, opts string) string {
+	return fmt.Sprintf(`./cockroach sql --insecure -e "RESTORE %s FROM %s IN %s AS OF SYSTEM TIME '%s' %s"`,
+		target, rd.sp.backup.fullBackupDir, rd.sp.backup.backupCollection(), rd.aost, opts)
+}
+
+// run executes the restore, where target injects a restore target into the restore command.
+// Examples:
+// - "DATABASE tpce" will execute a database restore on the tpce cluster.
+// - "" will execute a cluster restore.
+func (rd *restoreDriver) run(ctx context.Context, target string) error {
+	return rd.c.RunE(ctx, rd.c.Node(1), rd.restoreCmd(target, ""))
+}
+
+func (rd *restoreDriver) runDetached(
+	ctx context.Context, target string, node int,
+) (jobspb.JobID, error) {
+	if err := rd.c.RunE(ctx, rd.c.Node(node), rd.restoreCmd(target, "WITH DETACHED")); err != nil {
+		return 0, err
+	}
+
+	db, err := rd.c.ConnE(ctx, rd.t.L(), rd.c.Node(node)[0])
+	if err != nil {
+		return 0, errors.Wrapf(err, "failed to connect to node %d; running restore detached", node)
+	}
+	var jobID jobspb.JobID
+	if err := db.QueryRow(`SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'RESTORE'`).Scan(&jobID); err != nil {
+		return 0, err
+	}
+	return jobID, nil
+}
+
+// initRestorePerfMetrics returns a function that will collect restore throughput at the end of
+// the test.
+//
+// TODO(msbutler): only export metrics to test-eng prometheus server once it begins scraping
+// nightly roachtest runs.
+func (rd *restoreDriver) initRestorePerfMetrics(
+	ctx context.Context, durationGauge *prometheus.GaugeVec,
+) func() {
+	dut, err := roachtestutil.NewDiskUsageTracker(rd.c, rd.t.L())
+	require.NoError(rd.t, err)
+	startTime := timeutil.Now()
+	startDu := dut.GetDiskUsage(ctx, rd.c.All())
+
+	return func() {
+		promLabel := registry.PromSub(strings.Replace(rd.sp.testName, "restore/", "", 1)) + "_seconds"
+		testDuration := timeutil.Since(startTime).Seconds()
+		durationGauge.WithLabelValues(promLabel).Set(testDuration)
+
+		// compute throughput as MB / node / second.
+		du := dut.GetDiskUsage(ctx, rd.c.All())
+		throughput := float64(du-startDu) / (float64(rd.sp.hardware.nodes) * testDuration)
+		rd.t.L().Printf("Usage %d , Nodes %d , Duration %f\n; Throughput: %f mb / node / second",
+			du,
+			rd.sp.hardware.nodes,
+			testDuration,
+			throughput)
+		exportToRoachperf(ctx, rd.t, rd.c, rd.sp.testName, int64(throughput))
+	}
+}
+
+// checkFingerprint runs a stripped fingerprint on all user tables in the cluster if the restore
+// spec has a nonzero fingerprint.
+func (rd *restoreDriver) checkFingerprint(ctx context.Context) {
+	if rd.sp.fingerprint == 0 {
+		rd.t.L().Printf("Fingerprint not found in specs. Skipping fingerprint check.")
+		return
+	}
+
+	conn, err := rd.c.ConnE(ctx, rd.t.L(), rd.c.Node(1)[0])
+	require.NoError(rd.t, err)
+	sql := sqlutils.MakeSQLRunner(conn)
+
+	var minUserTableID, maxUserTableID uint32
+	sql.QueryRow(rd.t, `SELECT min(id), max(id) FROM system.namespace WHERE "parentID" >1`).Scan(
+		&minUserTableID, &maxUserTableID)
+
+	codec := keys.MakeSQLCodec(roachpb.SystemTenantID)
+	startKey := codec.TablePrefix(minUserTableID)
+	endkey := codec.TablePrefix(maxUserTableID).PrefixEnd()
+
+	startTime := timeutil.Now()
+	var fingerprint int
+	sql.QueryRow(rd.t, `SELECT * FROM crdb_internal.fingerprint(ARRAY[$1::BYTES, $2::BYTES],true)`,
+		startKey, endkey).Scan(&fingerprint)
+	rd.t.L().Printf("Fingerprint is %d. Took %.2f minutes", fingerprint,
+		timeutil.Since(startTime).Minutes())
+	require.Equal(rd.t, rd.sp.fingerprint, fingerprint, "user table fingerprint mismatch")
+}
+
+// exportToRoachperf exports a single perf metric for the given test to roachperf.
+func exportToRoachperf(
+	ctx context.Context, t test.Test, c cluster.Cluster, testName string, metric int64,
+) {
+
+	// The easiest way to record a precise metric for roachperf is to caste it as a duration,
+	// in seconds in the histogram's upper bound.
+	reg := histogram.NewRegistry(
+		time.Duration(metric)*time.Second,
+		histogram.MockWorkloadName,
+	)
+	bytesBuf := bytes.NewBuffer([]byte{})
+	jsonEnc := json.NewEncoder(bytesBuf)
+
+	// Ensure the histogram contains the name of the roachtest
+	reg.GetHandle().Get(testName)
+
+	// Serialize the histogram into the buffer
+	reg.Tick(func(tick histogram.Tick) {
+		_ = jsonEnc.Encode(tick.Snapshot())
+	})
+	// Upload the perf artifacts to any one of the nodes so that the test
+	// runner copies it into an appropriate directory path.
+	dest := filepath.Join(t.PerfArtifactsDir(), "stats.json")
+	if err := c.RunE(ctx, c.Node(1), "mkdir -p "+filepath.Dir(dest)); err != nil {
+		log.Errorf(ctx, "failed to create perf dir: %+v", err)
+	}
+	if err := c.PutString(ctx, bytesBuf.String(), dest, 0755, c.Node(1)); err != nil {
+		log.Errorf(ctx, "failed to upload perf artifacts to node: %s", err.Error())
 	}
 }
 

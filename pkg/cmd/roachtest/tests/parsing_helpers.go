@@ -17,7 +17,7 @@ import (
 	"regexp"
 )
 
-var rustUnitTestOutputRegex = regexp.MustCompile(`(?P<type>.*) (?P<class>.*)::(?P<name>.*) .\.\.\ (?P<result>.*)`)
+var rustUnitTestOutputRegex = regexp.MustCompile(`(?P<type>.*) (?P<class>.*)::(?P<name>.*) \.\.\. (?P<result>.*)`)
 var pythonUnitTestOutputRegex = regexp.MustCompile(`(?P<name>.*) \((?P<class>.*)\) \.\.\. (?P<result>[^'"]*?)(?: u?['"](?P<reason>.*)['"])?$`)
 
 func (r *ormTestsResults) parsePythonUnitTestOutput(
@@ -43,8 +43,11 @@ func (r *ormTestsResults) parseUnitTestOutput(
 			for i, name := range match {
 				groups[testOutputregex.SubexpNames()[i]] = name
 			}
-			test := fmt.Sprintf("%s.%s", groups["class"], groups["name"])
-			skipped := groups["result"] == "skipped" || groups["result"] == "expected failure"
+			test := groups["name"]
+			if c := groups["class"]; len(c) > 0 {
+				test = fmt.Sprintf("%s.%s", c, test)
+			}
+			skipped := groups["result"] == "skipped" || groups["result"] == "expected failure" || groups["result"] == "Skipped"
 			skipReason := ""
 			if skipped {
 				skipReason = groups["reason"]

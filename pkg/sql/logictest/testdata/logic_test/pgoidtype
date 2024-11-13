@@ -33,8 +33,17 @@ SELECT pg_typeof('1'::OID), pg_typeof('pg_constraint'::REGCLASS), pg_typeof('pub
 ----
 oid  regclass  regnamespace
 
+statement error pq: unknown function: upper\(string\)\(\): function undefined
+SELECT 'upper(string)'::REGPROC
+
+statement error invalid function signature: upper
+SELECT 'upper'::REGPROCEDURE
+
+statement error pq: function upper\(int\) does not exist: function undefined
+SELECT 'upper(int)'::REGPROCEDURE
+
 query TT
-SELECT pg_typeof('upper'::REGPROC), pg_typeof('upper'::REGPROCEDURE)
+SELECT pg_typeof('upper'::REGPROC), pg_typeof('upper(string)'::REGPROCEDURE)
 ----
 regproc  regprocedure
 
@@ -81,28 +90,31 @@ WHERE relname = 'pg_constraint'
 0  pg_constraint  0  pg_constraint  pg_constraint
 
 query OOOO
-SELECT 'upper'::REGPROC, 'upper'::REGPROCEDURE, 'pg_catalog.upper'::REGPROCEDURE, 'upper'::REGPROC::OID
+SELECT 'upper'::REGPROC, 'upper(string)'::REGPROCEDURE, 'pg_catalog.upper(string)'::REGPROCEDURE, 'upper'::REGPROC::OID
 ----
 upper  upper  upper  829
 
-query error invalid function name
+query error pq: invalid function signature: invalid.more.pg_catalog.upper: at or near ".": syntax error
 SELECT 'invalid.more.pg_catalog.upper'::REGPROCEDURE
 
 query OOO
-SELECT 'upper(int)'::REGPROC, 'upper(int)'::REGPROCEDURE, 'upper(int)'::REGPROC::OID
+SELECT 'upper'::REGPROC, 'upper(string)'::REGPROCEDURE, 'upper'::REGPROC::OID
 ----
 upper  upper  829
 
-query error unknown function: blah\(\)
-SELECT 'blah(ignored, ignored)'::REGPROC, 'blah(ignored, ignored)'::REGPROCEDURE
+query error pq: unknown function: blah\(ignored\)\(\): function undefined
+SELECT 'blah(ignored)'::REGPROC
 
-query error unknown function: blah\(\)
+query error pq: unknown function: blah\(\): function undefined
+SELECT 'blah(int, int)'::REGPROCEDURE
+
+query error pq: invalid name: expected separator .: blah \( ignored , ignored \)
 SELECT ' blah ( ignored , ignored ) '::REGPROC
 
-query error unknown function: blah\(\)
+query error pq: invalid name: expected separator .: blah \(\)
 SELECT 'blah ()'::REGPROC
 
-query error unknown function: blah\(\)
+query error pq: invalid name: expected separator .: blah\( \)
 SELECT 'blah( )'::REGPROC
 
 query error invalid name: expected separator \.: blah\(, \)
@@ -111,20 +123,20 @@ SELECT 'blah(, )'::REGPROC
 query error more than one function named 'sqrt'
 SELECT 'sqrt'::REGPROC
 
-query OOOO
-SELECT 'array_in'::REGPROC, 'array_in(a,b,c)'::REGPROC, 'pg_catalog.array_in'::REGPROC, 'pg_catalog.array_in( a ,b, c )'::REGPROC
+query OO
+SELECT 'array_in'::REGPROC, 'pg_catalog.array_in'::REGPROC
 ----
-array_in  array_in  array_in  array_in
+array_in  array_in
 
-query OOOO
-SELECT 'array_in'::REGPROCEDURE, 'array_in(a,b,c)'::REGPROCEDURE, 'pg_catalog.array_in'::REGPROCEDURE, 'pg_catalog.array_in( a ,b, c )'::REGPROCEDURE
+query OO
+SELECT 'array_in(int)'::REGPROCEDURE, 'pg_catalog.array_in(int)'::REGPROCEDURE
 ----
-array_in  array_in  array_in  array_in
+array_in  array_in
 
 query OO
 SELECT 'public'::REGNAMESPACE, 'public'::REGNAMESPACE::OID
 ----
-public  4101115737
+public  105
 
 query OO
 SELECT 'root'::REGROLE, 'root'::REGROLE::OID
@@ -156,7 +168,7 @@ query error pgcode 42883 unknown function: blah\(\)
 SELECT 'blah'::REGPROC
 
 query error pgcode 42883 unknown function: blah\(\)
-SELECT 'blah'::REGPROCEDURE
+SELECT 'blah()'::REGPROCEDURE
 
 query error pgcode 42704 namespace 'blah' does not exist
 SELECT 'blah'::REGNAMESPACE
@@ -472,7 +484,12 @@ SELECT 'pg_catalog."radians"'::regproc
 radians
 
 query T
-SELECT 'pg_catalog."radians"("float4")'::regproc
+SELECT 'pg_catalog."radians"'::regproc
+----
+radians
+
+query T
+SELECT 'pg_catalog."radians"("float4")'::regprocedure
 ----
 radians
 
@@ -562,3 +579,114 @@ SELECT 1:::OID >= -2147483649:::INT8
 
 query error OID out of range: -2147483649
 SELECT -2147483649:::INT8 >= 1:::OID
+
+# Test that we can cast index names to a regclass, and vice-versa.
+
+statement ok
+CREATE TABLE table_with_indexes (a INT PRIMARY key, b INT)
+
+query TT
+SELECT relname, oid::regclass::string from pg_class where oid='table_with_indexes_pkey'::regclass
+----
+table_with_indexes_pkey  table_with_indexes_pkey
+
+statement ok
+CREATE INDEX my_b_index ON table_with_indexes(b)
+
+query TT
+SELECT relname, oid::regclass::string from pg_class where oid='my_b_index'::regclass
+----
+my_b_index  my_b_index
+
+# Test that we can cast table and index names from different schemas.
+
+statement ok
+CREATE SCHEMA other_schema
+
+statement ok
+CREATE TABLE other_schema.table_with_indexes (a INT PRIMARY key, b INT)
+
+statement ok
+CREATE INDEX my_b_index ON other_schema.table_with_indexes(b)
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='other_schema.table_with_indexes'::regclass
+----
+table_with_indexes  table_with_indexes  other_schema
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='other_schema.table_with_indexes_pkey'::regclass
+----
+table_with_indexes_pkey  table_with_indexes_pkey  other_schema
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='other_schema.my_b_index'::regclass
+----
+my_b_index  my_b_index  other_schema
+
+# Changing the search_path should influence what gets resolved while casting.
+
+statement ok
+SET search_path = other_schema, public
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='table_with_indexes'::regclass
+----
+table_with_indexes  table_with_indexes  other_schema
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='table_with_indexes_pkey'::regclass
+----
+table_with_indexes_pkey  table_with_indexes_pkey  other_schema
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='my_b_index'::regclass
+----
+my_b_index  my_b_index  other_schema
+
+statement ok
+SET search_path = public, other_schema
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='table_with_indexes'::regclass
+----
+table_with_indexes  table_with_indexes  public
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='table_with_indexes_pkey'::regclass
+----
+table_with_indexes_pkey  table_with_indexes_pkey  public
+
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='my_b_index'::regclass
+----
+my_b_index  my_b_index  public
+
+statement ok
+RESET search_path
+
+# Check that we can cast table names from pg_catalog also.
+query TTT
+SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.oid='pg_type'::regclass
+----
+pg_type  pg_type  pg_catalog

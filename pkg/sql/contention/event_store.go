@@ -208,6 +208,8 @@ func (s *eventStore) startResolver(ctx context.Context, stopper *stop.Stopper) {
 
 		initialDelay := s.resolutionIntervalWithJitter()
 		timer := timeutil.NewTimer()
+		defer timer.Stop()
+
 		timer.Reset(initialDelay)
 
 		for {
@@ -216,13 +218,13 @@ func (s *eventStore) startResolver(ctx context.Context, stopper *stop.Stopper) {
 
 			select {
 			case <-timer.C:
+				timer.Read = true
 				if err := s.flushAndResolve(ctx); err != nil {
 					if log.V(1) {
 						log.Warningf(ctx, "unexpected error encountered when performing "+
 							"txn id resolution %s", err)
 					}
 				}
-				timer.Read = true
 			case <-resolutionIntervalChanged:
 				continue
 			case <-stopper.ShouldQuiesce():
@@ -276,22 +278,26 @@ func (s *eventStore) ForEachEvent(
 			// getting the event. In this case we simply ignore it.
 			continue
 		}
-		if err := op(&event); err != nil {
+		if err := op(event); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
 func (s *eventStore) getEventByEventHash(
 	hash uint64,
-) (_ contentionpb.ExtendedContentionEvent, ok bool) {
+) (_ *contentionpb.ExtendedContentionEvent, ok bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	event, ok := s.mu.store.Get(hash)
-	return event.(contentionpb.ExtendedContentionEvent), ok
+	var contentionEvent contentionpb.ExtendedContentionEvent
+	var event interface{}
+	if event, ok = s.mu.store.Get(hash); ok {
+		if contentionEvent, ok = event.(contentionpb.ExtendedContentionEvent); ok {
+			return &contentionEvent, ok
+		}
+	}
+	return nil, ok
 }
 
 // flushAndResolve is the main method called by the resolver goroutine each

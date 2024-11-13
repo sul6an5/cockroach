@@ -14,10 +14,10 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
@@ -31,10 +31,10 @@ import (
 // It should only be called for backups which do not restore the jobs table
 // directly.
 func CreateDeclarativeSchemaChangeJobs(
-	ctx context.Context, registry *jobs.Registry, txn *kv.Txn, allMut nstree.Catalog,
+	ctx context.Context, registry *jobs.Registry, txn isql.Txn, allMut nstree.Catalog,
 ) error {
 	byJobID := make(map[catpb.JobID][]catalog.MutableDescriptor)
-	_ = allMut.ForEachDescriptorEntry(func(d catalog.Descriptor) error {
+	_ = allMut.ForEachDescriptor(func(d catalog.Descriptor) error {
 		if s := d.GetDeclarativeSchemaChangerState(); s != nil {
 			byJobID[s.JobID] = append(byJobID[s.JobID], d.(catalog.MutableDescriptor))
 		}

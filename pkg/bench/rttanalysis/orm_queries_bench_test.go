@@ -10,17 +10,13 @@
 
 package rttanalysis
 
-import (
-	"fmt"
-	"strings"
-	"testing"
-)
+import "testing"
 
 func BenchmarkORMQueries(b *testing.B) { reg.Run(b) }
 func init() {
 	reg.Register("ORMQueries", []RoundTripBenchTestCase{
 		{
-			Name:  "django table introspection 1 table",
+			Name:  "django column introspection 1 table",
 			Setup: `CREATE TABLE t1(a int primary key, b int);`,
 			Stmt: `SELECT
     a.attname AS column_name,
@@ -39,7 +35,7 @@ WHERE (
 		},
 
 		{
-			Name: "django table introspection 4 tables",
+			Name: "django column introspection 4 tables",
 			Setup: `CREATE TABLE t1(a int primary key, b int);
 CREATE TABLE t2(a int primary key, b int);
 CREATE TABLE t3(a int primary key, b int);
@@ -61,7 +57,7 @@ WHERE (
 		},
 
 		{
-			Name: "django table introspection 8 tables",
+			Name: "django column introspection 8 tables",
 			Setup: `CREATE TABLE t1(a int primary key, b int);
 CREATE TABLE t2(a int primary key, b int);
 CREATE TABLE t3(a int primary key, b int);
@@ -84,6 +80,73 @@ WHERE (
         (c.relname = '<target table>')
     ) AND (n.nspname NOT IN ('pg_catalog', 'pg_toast'))
 ) AND pg_table_is_visible(c.oid)`,
+		},
+
+		{
+			Name:  "django table introspection 1 table",
+			Setup: `CREATE TABLE t1(a int primary key, b int);`,
+			Stmt: `SELECT
+    c.relname,
+    CASE
+        WHEN c.relispartition THEN 'p'
+        WHEN c.relkind IN ('m', 'v') THEN 'v'
+        ELSE 't'
+    END,
+    obj_description(c.oid)
+FROM pg_catalog.pg_class c
+LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('f', 'm', 'p', 'r', 'v')
+    AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
+    AND pg_catalog.pg_table_is_visible(c.oid)`,
+		},
+
+		{
+			Name: "django table introspection 8 tables",
+			Setup: `CREATE TABLE t1(a int primary key, b int);
+CREATE TABLE t2(a int primary key, b int);
+CREATE TABLE t3(a int primary key, b int);
+CREATE TABLE t4(a int primary key, b int);
+CREATE TABLE t5(a int primary key, b int);
+CREATE TABLE t6(a int primary key, b int);
+CREATE TABLE t7(a int primary key, b int);
+CREATE TABLE t8(a int primary key, b int);`,
+			Stmt: `SELECT
+    c.relname,
+    CASE
+        WHEN c.relispartition THEN 'p'
+        WHEN c.relkind IN ('m', 'v') THEN 'v'
+        ELSE 't'
+    END,
+    obj_description(c.oid)
+FROM pg_catalog.pg_class c
+LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('f', 'm', 'p', 'r', 'v')
+    AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
+    AND pg_catalog.pg_table_is_visible(c.oid)`,
+		},
+
+		{
+			Name: "django comment introspection with comments",
+			Setup: `CREATE TABLE t1(a int primary key, b int);
+CREATE TABLE t2(a int primary key, b int);
+CREATE TABLE t3(a int primary key, b int);
+COMMENT ON TABLE t1 is 't1';
+COMMENT ON TABLE t2 is 't2';
+COMMENT ON TABLE t3 is 't1';
+`,
+			Stmt: `SELECT
+                c.relname,
+                CASE
+                    WHEN c.relispartition THEN 'p'
+                    WHEN c.relkind IN ('m', 'v') THEN 'v'
+                    ELSE 't'
+                END,
+                obj_description(c.oid, 'pg_class')
+            FROM pg_catalog.pg_class c
+            LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('f', 'm', 'p', 'r', 'v')
+                AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
+                AND pg_catalog.pg_table_is_visible(c.oid);`,
 		},
 
 		{
@@ -166,69 +229,60 @@ WHERE
 		},
 
 		{
-			Name:  "has_schema_privilege 1",
+			Name:  "introspection description join",
+			Setup: `CREATE TABLE t1(a int primary key, b int);`,
+			Stmt: `SELECT
+  n.nspname, relname, d.description
+FROM
+  pg_description AS d
+  INNER JOIN pg_class AS c ON d.objoid = c.oid
+  INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE
+  d.objsubid = 0
+  AND n.nspname
+    NOT IN (
+        'gp_toolkit':::STRING:::NAME,
+        'information_schema':::STRING:::NAME,
+        'pgagent':::STRING:::NAME,
+        'bench':::STRING:::NAME
+      )
+  AND n.nspname NOT LIKE 'pg_%';`,
+		},
+
+		{
+			Name:  "has_schema_privilege",
 			Setup: `CREATE SCHEMA s`,
-			Stmt:  `SELECT has_schema_privilege('s', 'CREATE')`,
+			// Force a lease on s.
+			SetupEx: []string{"create table s.foo()", "select 1 from s.foo", "drop table s.foo"},
+			Stmt:    `SELECT has_schema_privilege('s', 'CREATE')`,
 		},
 
 		{
-			Name:  "has_schema_privilege 3",
-			Setup: repeat("CREATE SCHEMA s%d_3", 3, "; "),
-			Stmt:  "SELECT " + repeat("has_schema_privilege('s%d_3', 'CREATE')", 3, ", "),
+			Name:    "has_sequence_privilege",
+			Setup:   `CREATE SEQUENCE seq`,
+			SetupEx: []string{`SELECT nextval('seq')`}, // lease seq early so we don't measure the leasing later
+			Stmt:    `SELECT has_sequence_privilege('seq', 'SELECT')`,
 		},
 
 		{
-			Name:  "has_schema_privilege 5",
-			Setup: repeat("CREATE SCHEMA s%d_5", 5, "; "),
-			Stmt:  "SELECT " + repeat("has_schema_privilege('s%d_5', 'CREATE')", 5, ", "),
+			Name:    "has_table_privilege",
+			Setup:   `CREATE TABLE t(a int primary key, b int); SELECT 1 FROM t;`,
+			SetupEx: []string{`SELECT 1 FROM t`}, // Lease t's descriptor.
+			Stmt:    `SELECT has_table_privilege('t', 'SELECT')`,
 		},
 
 		{
-			Name:  "has_sequence_privilege 1",
-			Setup: `CREATE SEQUENCE seq`,
-			Stmt:  `SELECT has_sequence_privilege('seq', 'SELECT')`,
+			Name:    "has_column_privilege using attnum",
+			Setup:   `CREATE TABLE t(a int primary key, b int)`,
+			SetupEx: []string{`SELECT 1 FROM t`}, // lease t early so we don't measure the leasing later
+			Stmt:    `SELECT has_column_privilege('t', 1, 'INSERT')`,
 		},
 
 		{
-			Name:  "has_sequence_privilege 3",
-			Setup: repeat("CREATE SEQUENCE seq%d_3", 3, "; "),
-			Stmt:  "SELECT " + repeat("has_sequence_privilege('seq%d_3', 'SELECT')", 3, ", "),
-		},
-
-		{
-			Name:  "has_sequence_privilege 5",
-			Setup: repeat("CREATE SEQUENCE seq%d_5", 5, ";"),
-			Stmt:  "SELECT " + repeat("has_sequence_privilege('seq%d_5', 'SELECT')", 5, ", "),
-		},
-
-		{
-			Name:  "has_table_privilege 1",
-			Setup: `CREATE TABLE t(a int primary key, b int)`,
-			Stmt:  `SELECT has_table_privilege('t', 'SELECT')`,
-		},
-
-		{
-			Name:  "has_table_privilege 3",
-			Setup: repeat("CREATE TABLE t%d_3(a int primary key, b int)", 3, "; "),
-			Stmt:  "SELECT " + repeat("has_table_privilege('t%d_3', 'SELECT')", 3, ", "),
-		},
-
-		{
-			Name:  "has_table_privilege 5",
-			Setup: repeat("CREATE TABLE t%d_5(a int primary key, b int)", 5, "; "),
-			Stmt:  "SELECT " + repeat("has_table_privilege('t%d_5', 'SELECT')", 5, ", "),
-		},
-
-		{
-			Name:  "has_column_privilege using attnum",
-			Setup: `CREATE TABLE t(a int primary key, b int)`,
-			Stmt:  `SELECT has_column_privilege('t', 1, 'INSERT')`,
-		},
-
-		{
-			Name:  "has_column_privilege using column name",
-			Setup: `CREATE TABLE t(a int primary key, b int)`,
-			Stmt:  `SELECT has_column_privilege('t', 'a', 'INSERT')`,
+			Name:    "has_column_privilege using column name",
+			Setup:   `CREATE TABLE t(a int primary key, b int)`,
+			SetupEx: []string{`SELECT 1 FROM t`}, // lease t early so we don't measure the leasing later
+			Stmt:    `SELECT has_column_privilege('t', 'a', 'INSERT')`,
 		},
 
 		{
@@ -278,6 +332,7 @@ CREATE VIEW indexes AS
     JOIN pg_catalog.pg_class AS i ON indexrelid = i.oid
    WHERE t.relname = 'indexed'
 ORDER BY i.relname`,
+			SetupEx: []string{`select 1 from indexed; select 1 from indexes;`},
 			Stmt: `SELECT relname,
 	indkey,
 	generate_series(1, 4) input,
@@ -285,13 +340,99 @@ ORDER BY i.relname`,
 FROM indexes
 ORDER BY relname DESC, input`,
 		},
-	})
-}
 
-func repeat(format string, times int, sep string) string {
-	formattedStrings := make([]string, times)
-	for i := 0; i < times; i++ {
-		formattedStrings[i] = fmt.Sprintf(format, i)
-	}
-	return strings.Join(formattedStrings, sep)
+		{
+			Name:  "hasura column descriptions",
+			Setup: "CREATE TABLE t(a INT PRIMARY KEY)",
+			Stmt: `WITH
+  "tabletable" as ( SELECT "table".oid,
+           "table".relkind,
+           "table".relname AS "table_name",
+           "schema".nspname AS "table_schema"
+      FROM pg_catalog.pg_class "table"
+      JOIN pg_catalog.pg_namespace "schema"
+          ON schema.oid = "table".relnamespace
+      WHERE "table".relkind IN ('r', 't', 'v', 'm', 'f', 'p')
+        AND "schema".nspname NOT LIKE 'pg_%'
+        AND "schema".nspname NOT IN ('information_schema', 'hdb_catalog', 'hdb_lib', '_timescaledb_internal', 'crdb_internal')
+  )
+SELECT
+  "table".table_schema,
+  "table".table_name,
+  coalesce(columns.description, '[]') as columns
+FROM "tabletable" "table"
+
+LEFT JOIN LATERAL
+  ( SELECT
+      pg_catalog.col_description("table".oid, "column".attnum) as description
+    FROM pg_catalog.pg_attribute "column"
+    WHERE "column".attrelid = "table".oid
+  ) columns ON true;`,
+		},
+
+		{
+			Name: "hasura column descriptions 8 tables",
+			Setup: `CREATE TABLE t1(a int primary key, b int);
+CREATE TABLE t2(a int primary key, b int);
+CREATE TABLE t3(a int primary key, b int);
+CREATE TABLE t4(a int primary key, b int);
+CREATE TABLE t5(a int primary key, b int);
+CREATE TABLE t6(a int primary key, b int);
+CREATE TABLE t7(a int primary key, b int);
+CREATE TABLE t8(a int primary key, b int);`,
+			Stmt: `WITH
+  "tabletable" as ( SELECT "table".oid,
+           "table".relkind,
+           "table".relname AS "table_name",
+           "schema".nspname AS "table_schema"
+      FROM pg_catalog.pg_class "table"
+      JOIN pg_catalog.pg_namespace "schema"
+          ON schema.oid = "table".relnamespace
+      WHERE "table".relkind IN ('r', 't', 'v', 'm', 'f', 'p')
+        AND "schema".nspname NOT LIKE 'pg_%'
+        AND "schema".nspname NOT IN ('information_schema', 'hdb_catalog', 'hdb_lib', '_timescaledb_internal', 'crdb_internal')
+  )
+SELECT
+  "table".table_schema,
+  "table".table_name,
+  coalesce(columns.description, '[]') as columns
+FROM "tabletable" "table"
+
+LEFT JOIN LATERAL
+  ( SELECT
+      pg_catalog.col_description("table".oid, "column".attnum) as description
+    FROM pg_catalog.pg_attribute "column"
+    WHERE "column".attrelid = "table".oid
+  ) columns ON true;`,
+		},
+
+		{
+			Name:  "hasura column descriptions modified",
+			Setup: "CREATE TABLE t(a INT PRIMARY KEY)",
+			Stmt: `WITH
+  "tabletable" as ( SELECT "table".oid,
+           "table".relkind,
+           "table".relname AS "table_name",
+           "schema".nspname AS "table_schema"
+      FROM pg_catalog.pg_class "table"
+      JOIN pg_catalog.pg_namespace "schema"
+          ON schema.oid = "table".relnamespace
+      WHERE "table".relkind IN ('r', 't', 'v', 'm', 'f', 'p')
+        AND "schema".nspname NOT LIKE 'pg_%'
+        AND "schema".nspname NOT IN ('information_schema', 'hdb_catalog', 'hdb_lib', '_timescaledb_internal', 'crdb_internal')
+  )
+SELECT
+  "table".table_schema,
+  "table".table_name,
+  coalesce(columns.description, '[]') as columns
+FROM "tabletable" "table"
+
+LEFT JOIN LATERAL
+  ( SELECT
+      pg_catalog.col_description("column".attrelid, "column".attnum) as description
+    FROM pg_catalog.pg_attribute "column"
+    WHERE "column".attrelid = "table".oid
+  ) columns ON true;`,
+		},
+	})
 }

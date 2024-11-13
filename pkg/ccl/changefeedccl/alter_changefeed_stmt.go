@@ -16,8 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedvalidators"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsauth"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -25,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -36,10 +38,40 @@ import (
 )
 
 func init() {
-	sql.AddPlanHook("alter changefeed", alterChangefeedPlanHook)
+	sql.AddPlanHook("alter changefeed", alterChangefeedPlanHook, alterChangefeedTypeCheck)
 }
 
 const telemetryPath = `changefeed.alter`
+
+func alterChangefeedTypeCheck(
+	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
+) (matched bool, header colinfo.ResultColumns, _ error) {
+	alterChangefeedStmt, ok := stmt.(*tree.AlterChangefeed)
+	if !ok {
+		return false, nil, nil
+	}
+	toCheck := []exprutil.ToTypeCheck{
+		exprutil.Ints{alterChangefeedStmt.Jobs},
+	}
+	for _, cmd := range alterChangefeedStmt.Cmds {
+		switch v := cmd.(type) {
+		case *tree.AlterChangefeedSetOptions:
+			toCheck = append(toCheck, &exprutil.KVOptions{
+				KVOptions:  v.Options,
+				Validation: changefeedvalidators.AlterOptionValidations,
+			})
+		}
+	}
+	if err := exprutil.TypeCheck(ctx, "ALTER CHANGEFED", p.SemaCtx(), toCheck...); err != nil {
+		return false, nil, err
+	}
+	return true, alterChangefeedHeader, nil
+}
+
+var alterChangefeedHeader = colinfo.ResultColumns{
+	{Name: "job_id", Typ: types.Int},
+	{Name: "job_description", Typ: types.String},
+}
 
 // alterChangefeedPlanHook implements sql.PlanHookFn.
 func alterChangefeedPlanHook(
@@ -49,12 +81,6 @@ func alterChangefeedPlanHook(
 	if !ok {
 		return nil, nil, nil, false, nil
 	}
-
-	header := colinfo.ResultColumns{
-		{Name: "job_id", Typ: types.Int},
-		{Name: "job_description", Typ: types.String},
-	}
-	lockForUpdate := false
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		if err := validateSettings(ctx, p); err != nil {
@@ -67,9 +93,15 @@ func alterChangefeedPlanHook(
 		}
 		jobID := jobspb.JobID(tree.MustBeDInt(typedExpr))
 
-		job, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.Txn())
+		job, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.InternalSQLTxn())
 		if err != nil {
 			err = errors.Wrapf(err, `could not load job with job id %d`, jobID)
+			return err
+		}
+
+		jobPayload := job.Payload()
+
+		if err := jobsauth.Authorize(ctx, p, jobID, &jobPayload, jobsauth.ControlAccess); err != nil {
 			return err
 		}
 
@@ -88,17 +120,20 @@ func alterChangefeedPlanHook(
 		if err != nil {
 			return err
 		}
-		newOptions, newSinkURI, err := generateNewOpts(ctx, p, alterChangefeedStmt.Cmds, prevOpts, prevDetails.SinkURI)
+		exprEval := p.ExprEvaluator("ALTER CHANGEFEED")
+		newOptions, newSinkURI, err := generateNewOpts(
+			ctx, exprEval, alterChangefeedStmt.Cmds, prevOpts, prevDetails.SinkURI,
+		)
 		if err != nil {
 			return err
 		}
 
-		newTargets, newProgress, newStatementTime, originalSpecs, err := generateNewTargets(ctx,
-			p,
+		newTargets, newProgress, newStatementTime, originalSpecs, err := generateAndValidateNewTargets(
+			ctx, exprEval, p,
 			alterChangefeedStmt.Cmds,
 			newOptions.AsMap(), // TODO: Remove .AsMap()
-			prevDetails,
-			job.Progress(),
+			prevDetails, job.Progress(),
+			newSinkURI,
 		)
 		if err != nil {
 			return err
@@ -114,9 +149,23 @@ func alterChangefeedPlanHook(
 		}
 		newChangefeedStmt.SinkURI = tree.NewDString(newSinkURI)
 
+		// We validate that all the tables are resolvable at the
+		// resolveTime below in validateNewTargets. resolveTime is also
+		// the time from which changefeed will resume. Therefore we
+		// will override with this time in createChangefeedJobRecord
+		// when we get table descriptors.
+		var resolveTime hlc.Timestamp
+		highWater := newProgress.GetHighWater()
+		if highWater != nil && !highWater.IsEmpty() {
+			resolveTime = *highWater
+		} else {
+			resolveTime = newStatementTime
+		}
+
 		annotatedStmt := &annotatedChangefeedStatement{
-			CreateChangefeed: newChangefeedStmt,
-			originalSpecs:    originalSpecs,
+			CreateChangefeed:    newChangefeedStmt,
+			originalSpecs:       originalSpecs,
+			alterChangefeedAsOf: resolveTime,
 		}
 
 		jobRecord, err := createChangefeedJobRecord(
@@ -143,18 +192,25 @@ func alterChangefeedPlanHook(
 		newPayload.Details = jobspb.WrapPayloadDetails(newDetails)
 		newPayload.Description = jobRecord.Description
 		newPayload.DescriptorIDs = jobRecord.DescriptorIDs
-
-		err = p.ExecCfg().JobRegistry.UpdateJobWithTxn(ctx, jobID, p.Txn(), lockForUpdate, func(
-			txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+		newExpiration, err := newOptions.GetPTSExpiration()
+		if err != nil {
+			return err
+		}
+		newPayload.MaximumPTSAge = newExpiration
+		j, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.InternalSQLTxn())
+		if err != nil {
+			return err
+		}
+		if err := j.WithTxn(p.InternalSQLTxn()).Update(ctx, func(
+			txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
 		) error {
 			ju.UpdatePayload(&newPayload)
 			if newProgress != nil {
 				ju.UpdateProgress(newProgress)
 			}
-			return nil
-		})
 
-		if err != nil {
+			return nil
+		}); err != nil {
 			return err
 		}
 
@@ -171,7 +227,7 @@ func alterChangefeedPlanHook(
 		}
 	}
 
-	return fn, header, nil, false, nil
+	return fn, alterChangefeedHeader, nil, false, nil
 }
 
 func getTargetDesc(
@@ -206,7 +262,7 @@ func getTargetDesc(
 
 func generateNewOpts(
 	ctx context.Context,
-	p sql.PlanHookState,
+	exprEval exprutil.Evaluator,
 	alterCmds tree.AlterChangefeedCmds,
 	prevOpts map[string]string,
 	prevSinkURI string,
@@ -218,12 +274,9 @@ func generateNewOpts(
 	for _, cmd := range alterCmds {
 		switch v := cmd.(type) {
 		case *tree.AlterChangefeedSetOptions:
-			optsFn, err := p.TypeAsStringOpts(ctx, v.Options, changefeedvalidators.AlterOptionValidations)
-			if err != nil {
-				return null, ``, err
-			}
-
-			opts, err := optsFn()
+			opts, err := exprEval.KVOptions(
+				ctx, v.Options, changefeedvalidators.AlterOptionValidations,
+			)
 			if err != nil {
 				return null, ``, err
 			}
@@ -280,13 +333,15 @@ func generateNewOpts(
 	return changefeedbase.MakeStatementOptions(newOptions), sinkURI, nil
 }
 
-func generateNewTargets(
+func generateAndValidateNewTargets(
 	ctx context.Context,
+	exprEval exprutil.Evaluator,
 	p sql.PlanHookState,
 	alterCmds tree.AlterChangefeedCmds,
 	opts map[string]string,
 	prevDetails jobspb.ChangefeedDetails,
 	prevProgress jobspb.Progress,
+	sinkURI string,
 ) (
 	tree.ChangefeedTargets,
 	*jobspb.Progress,
@@ -352,9 +407,19 @@ func generateNewTargets(
 	}
 
 	prevTargets := AllTargets(prevDetails)
+	noLongerExist := make(map[string]descpb.ID)
 	err = prevTargets.EachTarget(func(targetSpec changefeedbase.Target) error {
 		k := targetKey{TableID: targetSpec.TableID, FamilyName: tree.Name(targetSpec.FamilyName)}
-		desc := descResolver.DescByID[targetSpec.TableID].(catalog.TableDescriptor)
+		var desc catalog.TableDescriptor
+		if d, exists := descResolver.DescByID[targetSpec.TableID]; exists {
+			desc = d.(catalog.TableDescriptor)
+		} else {
+			// Table was dropped; that's okay since the changefeed likely
+			// will handle DROP alter command below; and if not, then we'll resume
+			// the changefeed, which will promptly fail if the table no longer exist.
+			noLongerExist[string(targetSpec.StatementTimeName)] = targetSpec.TableID
+			return nil
+		}
 
 		tbName, err := getQualifiedTableNameObj(ctx, p.ExecCfg(), p.Txn(), desc)
 		if err != nil {
@@ -389,11 +454,9 @@ func generateNewTargets(
 	for _, cmd := range alterCmds {
 		switch v := cmd.(type) {
 		case *tree.AlterChangefeedAddTarget:
-			targetOptsFn, err := p.TypeAsStringOpts(ctx, v.Options, changefeedvalidators.AlterTargetOptionValidations)
-			if err != nil {
-				return nil, nil, hlc.Timestamp{}, nil, err
-			}
-			targetOpts, err := targetOptsFn()
+			targetOpts, err := exprEval.KVOptions(
+				ctx, v.Options, changefeedvalidators.AlterTargetOptionValidations,
+			)
 			if err != nil {
 				return nil, nil, hlc.Timestamp{}, nil, err
 			}
@@ -444,12 +507,12 @@ func generateNewTargets(
 				)
 			}
 
-			var existingTargetDescs []catalog.Descriptor
+			var existingTargetIDs []descpb.ID
 			for _, targetDesc := range newTableDescs {
-				existingTargetDescs = append(existingTargetDescs, targetDesc)
+				existingTargetIDs = append(existingTargetIDs, targetDesc.GetID())
 			}
-			existingTargetSpans := fetchSpansForDescs(p, existingTargetDescs)
-			var newTargetDescs []catalog.Descriptor
+			existingTargetSpans := fetchSpansForDescs(p, existingTargetIDs)
+			var newTargetIDs []descpb.ID
 			for _, target := range v.Targets {
 				desc, found, err := getTargetDesc(ctx, p, descResolver, target.TableName)
 				if err != nil {
@@ -462,13 +525,14 @@ func generateNewTargets(
 						tree.ErrString(&target),
 					)
 				}
+
 				k := targetKey{TableID: desc.GetID(), FamilyName: target.FamilyName}
 				newTargets[k] = target
 				newTableDescs[desc.GetID()] = desc
-				newTargetDescs = append(newTargetDescs, desc)
+				newTargetIDs = append(newTargetIDs, k.TableID)
 			}
 
-			addedTargetSpans := fetchSpansForDescs(p, newTargetDescs)
+			addedTargetSpans := fetchSpansForDescs(p, newTargetIDs)
 
 			// By default, we will not perform an initial scan on newly added
 			// targets. Hence, the user must explicitly state that they want an
@@ -491,11 +555,18 @@ func generateNewTargets(
 					return nil, nil, hlc.Timestamp{}, nil, err
 				}
 				if !found {
-					return nil, nil, hlc.Timestamp{}, nil, pgerror.Newf(
-						pgcode.InvalidParameterValue,
-						`target %q does not exist`,
-						tree.ErrString(&target),
-					)
+					if id, wasDeleted := noLongerExist[target.TableName.String()]; wasDeleted {
+						// Failed to lookup table because it was deleted.
+						k := targetKey{TableID: id, FamilyName: target.FamilyName}
+						droppedTargets[k] = target
+						continue
+					} else {
+						return nil, nil, hlc.Timestamp{}, nil, pgerror.Newf(
+							pgcode.InvalidParameterValue,
+							`target %q does not exist`,
+							tree.ErrString(&target),
+						)
+					}
 				}
 				k := targetKey{TableID: desc.GetID(), FamilyName: target.FamilyName}
 				droppedTargets[k] = target
@@ -507,6 +578,7 @@ func generateNewTargets(
 						tree.ErrString(&target),
 					)
 				}
+				newTableDescs[desc.GetID()] = desc
 				delete(newTargets, k)
 			}
 			telemetry.CountBucketed(telemetryPath+`.dropped_targets`, int64(len(v.Targets)))
@@ -518,27 +590,38 @@ func generateNewTargets(
 	// drop one column family from a table and add another at the same time,
 	// and since we watch entire table spans the set of spans won't change.
 	if len(droppedTargets) > 0 {
-		droppedIDs := make(map[descpb.ID]struct{}, len(droppedTargets))
-		for k := range droppedTargets {
-			droppedIDs[k.TableID] = struct{}{}
-		}
+		addedTargets := make(map[descpb.ID]struct{}, len(newTargets))
 		for k := range newTargets {
-			delete(droppedIDs, k.TableID)
+			addedTargets[k.TableID] = struct{}{}
 		}
-		if len(droppedIDs) > 0 {
-			droppedTargetDescs := make([]catalog.Descriptor, 0, len(droppedIDs))
-			for id := range droppedIDs {
-				droppedTargetDescs = append(droppedTargetDescs, descResolver.DescByID[id])
+		droppedIDs := make([]descpb.ID, 0, len(droppedTargets))
+		for k := range droppedTargets {
+			if _, wasAdded := addedTargets[k.TableID]; !wasAdded {
+				droppedIDs = append(droppedIDs, k.TableID)
 			}
-			droppedTargetSpans := fetchSpansForDescs(p, droppedTargetDescs)
-			removeSpansFromProgress(newJobProgress, droppedTargetSpans)
 		}
+		droppedTargetSpans := fetchSpansForDescs(p, droppedIDs)
+		removeSpansFromProgress(newJobProgress, droppedTargetSpans)
 	}
 
 	newTargetList := tree.ChangefeedTargets{}
 
 	for _, target := range newTargets {
 		newTargetList = append(newTargetList, target)
+	}
+
+	hasSelectPrivOnAllTables := true
+	hasChangefeedPrivOnAllTables := true
+	for _, desc := range newTableDescs {
+		hasSelect, hasChangefeed, err := checkPrivilegesForDescriptor(ctx, p, desc)
+		if err != nil {
+			return nil, nil, hlc.Timestamp{}, nil, err
+		}
+		hasSelectPrivOnAllTables = hasSelectPrivOnAllTables && hasSelect
+		hasChangefeedPrivOnAllTables = hasChangefeedPrivOnAllTables && hasChangefeed
+	}
+	if err := authorizeUserToCreateChangefeed(ctx, p, sinkURI, hasSelectPrivOnAllTables, hasChangefeedPrivOnAllTables); err != nil {
+		return nil, nil, hlc.Timestamp{}, nil, err
 	}
 
 	if err := validateNewTargets(ctx, p, newTargetList, newJobProgress, newJobStatementTime); err != nil {
@@ -712,16 +795,20 @@ func removeSpansFromProgress(prevProgress jobspb.Progress, spansToRemove []roach
 	changefeedProgress.Checkpoint.Spans = spanGroup.Slice()
 }
 
-func fetchSpansForDescs(
-	p sql.PlanHookState, descs []catalog.Descriptor,
-) (primarySpans []roachpb.Span) {
+func fetchSpansForDescs(p sql.PlanHookState, droppedIDs []descpb.ID) (primarySpans []roachpb.Span) {
 	seen := make(map[descpb.ID]struct{})
-	for _, d := range descs {
-		if _, isDup := seen[d.GetID()]; isDup {
+	codec := p.ExtendedEvalContext().Codec
+	for _, id := range droppedIDs {
+		if _, isDup := seen[id]; isDup {
 			continue
 		}
-		seen[d.GetID()] = struct{}{}
-		primarySpans = append(primarySpans, d.(catalog.TableDescriptor).PrimaryIndexSpan(p.ExtendedEvalContext().Codec))
+		seen[id] = struct{}{}
+		tablePrefix := codec.TablePrefix(uint32(id))
+		primarySpan := roachpb.Span{
+			Key:    tablePrefix,
+			EndKey: tablePrefix.PrefixEnd(),
+		}
+		primarySpans = append(primarySpans, primarySpan)
 	}
 	return primarySpans
 }

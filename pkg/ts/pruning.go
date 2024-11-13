@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -72,7 +73,7 @@ func (tsdb *DB) findTimeSeries(
 		} else if !ok || !iter.UnsafeKey().Less(end) {
 			break
 		}
-		foundKey := iter.Key().Key
+		foundKey := iter.UnsafeKey().Key.Clone()
 
 		// Extract the name and resolution from the discovered key.
 		name, _, res, tsNanos, err := DecodeDataKey(foundKey)
@@ -135,8 +136,8 @@ func (tsdb *DB) pruneTimeSeries(
 			end = start.PrefixEnd()
 		}
 
-		b.AddRawRequest(&roachpb.DeleteRangeRequest{
-			RequestHeader: roachpb.RequestHeader{
+		b.AddRawRequest(&kvpb.DeleteRangeRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    start,
 				EndKey: end,
 			},

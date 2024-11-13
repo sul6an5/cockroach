@@ -15,13 +15,12 @@ import (
 	"fmt"
 	"io"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache/rangecachemock"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb/kvpbmock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb/roachpbmock"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -66,7 +65,7 @@ func TestDistSenderRangeFeedRetryOnTransportErrors(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("mux=%t/%s", useMuxRangeFeed, spec.errorCode),
 				func(t *testing.T) {
-					clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+					clock := hlc.NewClockForTesting(nil)
 					ctx, cancel := context.WithCancel(context.Background())
 					defer cancel()
 					stopper := stop.NewStopper()
@@ -129,16 +128,18 @@ func TestDistSenderRangeFeedRetryOnTransportErrors(t *testing.T) {
 					// returning a range descriptor and a client that immediately
 					// cancels the context and closes the range feed stream.
 					if spec.expectRetry {
-						rangeDB.EXPECT().FirstRange().Return(&desc, nil)
-						client := roachpbmock.NewMockInternalClient(ctrl)
+						rangeDB.EXPECT().FirstRange().MinTimes(1).Return(&desc, nil)
+						client := kvpbmock.NewMockInternalClient(ctrl)
 
 						if useMuxRangeFeed {
-							stream := roachpbmock.NewMockInternal_MuxRangeFeedClient(ctrl)
+							stream := kvpbmock.NewMockInternal_MuxRangeFeedClient(ctrl)
 							stream.EXPECT().Send(gomock.Any()).Return(nil)
-							stream.EXPECT().Recv().Do(cancel).Return(nil, io.EOF)
+							stream.EXPECT().Recv().Do(func() {
+								cancel()
+							}).Return(nil, context.Canceled)
 							client.EXPECT().MuxRangeFeed(gomock.Any()).Return(stream, nil)
 						} else {
-							stream := roachpbmock.NewMockInternal_RangeFeedClient(ctrl)
+							stream := kvpbmock.NewMockInternal_RangeFeedClient(ctrl)
 							stream.EXPECT().Recv().Do(cancel).Return(nil, io.EOF)
 							client.EXPECT().RangeFeed(gomock.Any(), gomock.Any()).Return(stream, nil)
 						}
@@ -146,7 +147,7 @@ func TestDistSenderRangeFeedRetryOnTransportErrors(t *testing.T) {
 						transport.EXPECT().IsExhausted().Return(false)
 						transport.EXPECT().NextReplica().Return(desc.InternalReplicas[0])
 						transport.EXPECT().NextInternalClient(gomock.Any()).Return(client, nil)
-						transport.EXPECT().Release()
+						transport.EXPECT().Release().AnyTimes()
 					}
 
 					ds := NewDistSender(DistSenderConfig{
@@ -173,8 +174,7 @@ func TestDistSenderRangeFeedRetryOnTransportErrors(t *testing.T) {
 					if useMuxRangeFeed {
 						opts = append(opts, WithMuxRangeFeed())
 					}
-					err := ds.RangeFeed(ctx, []roachpb.Span{{Key: keys.MinKey, EndKey: keys.MaxKey}}, hlc.Timestamp{},
-						false, nil, opts...)
+					err := ds.RangeFeed(ctx, []roachpb.Span{{Key: keys.MinKey, EndKey: keys.MaxKey}}, hlc.Timestamp{}, nil, opts...)
 					require.Error(t, err)
 				})
 		}

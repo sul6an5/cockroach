@@ -17,37 +17,20 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
-
-// singleKVFetcher is a KVBatchFetcher that returns a single kv.
-type singleKVFetcher struct {
-	kvs  [1]roachpb.KeyValue
-	done bool
-}
-
-var _ KVBatchFetcher = &singleKVFetcher{}
-
-// nextBatch implements the KVBatchFetcher interface.
-func (f *singleKVFetcher) nextBatch(ctx context.Context) (kvBatchFetcherResponse, error) {
-	if f.done {
-		return kvBatchFetcherResponse{moreKVs: false}, nil
-	}
-	f.done = true
-	return kvBatchFetcherResponse{
-		moreKVs: true,
-		kvs:     f.kvs[:],
-	}, nil
-}
 
 // ConvertBatchError attempts to map a key-value error generated during a
 // key-value batch operating over the specified table to a user friendly SQL
@@ -55,35 +38,31 @@ func (f *singleKVFetcher) nextBatch(ctx context.Context) (kvBatchFetcherResponse
 func ConvertBatchError(ctx context.Context, tableDesc catalog.TableDescriptor, b *kv.Batch) error {
 	origPErr := b.MustPErr()
 	switch v := origPErr.GetDetail().(type) {
-	case *roachpb.MinTimestampBoundUnsatisfiableError:
+	case *kvpb.MinTimestampBoundUnsatisfiableError:
 		return pgerror.WithCandidateCode(
 			origPErr.GoError(),
 			pgcode.UnsatisfiableBoundedStaleness,
 		)
 
-	case *roachpb.ConditionFailedError:
+	case *kvpb.ConditionFailedError:
 		if origPErr.Index == nil {
 			break
 		}
 		j := origPErr.Index.Index
-		if j >= int32(len(b.Results)) {
-			return errors.AssertionFailedf("index %d outside of results: %+v", j, b.Results)
+		_, kv, err := b.GetResult(int(j))
+		if err != nil {
+			return err
 		}
-		result := b.Results[j]
-		if len(result.Rows) == 0 {
-			break
-		}
-		key := result.Rows[0].Key
-		return NewUniquenessConstraintViolationError(ctx, tableDesc, key, v.ActualValue)
+		return NewUniquenessConstraintViolationError(ctx, tableDesc, kv.Key, v.ActualValue)
 
-	case *roachpb.WriteIntentError:
+	case *kvpb.WriteIntentError:
 		key := v.Intents[0].Key
 		decodeKeyFn := func() (tableName string, indexName string, colNames []string, values []string, err error) {
 			codec, index, err := decodeKeyCodecAndIndex(tableDesc, key)
 			if err != nil {
 				return "", "", nil, nil, err
 			}
-			var spec descpb.IndexFetchSpec
+			var spec fetchpb.IndexFetchSpec
 			if err := rowenc.InitIndexFetchSpec(&spec, codec, tableDesc, index, nil /* fetchColumnIDs */); err != nil {
 				return "", "", nil, nil, err
 			}
@@ -98,10 +77,10 @@ func ConvertBatchError(ctx context.Context, tableDesc catalog.TableDescriptor, b
 
 // ConvertFetchError attempts to map a key-value error generated during a
 // key-value fetch to a user friendly SQL error.
-func ConvertFetchError(spec *descpb.IndexFetchSpec, err error) error {
+func ConvertFetchError(spec *fetchpb.IndexFetchSpec, err error) error {
 	var errs struct {
-		wi *roachpb.WriteIntentError
-		bs *roachpb.MinTimestampBoundUnsatisfiableError
+		wi *kvpb.WriteIntentError
+		bs *kvpb.MinTimestampBoundUnsatisfiableError
 	}
 	switch {
 	case errors.As(err, &errs.wi):
@@ -132,7 +111,7 @@ func NewUniquenessConstraintViolationError(
 			"duplicate key value got decoding error")
 	}
 	// Resolve the table index descriptor name.
-	indexName, err := tableDesc.GetIndexNameByID(index.GetID())
+	indexName, err := catalog.FindTargetIndexNameByID(tableDesc, index.GetID())
 	if err != nil {
 		log.Warningf(ctx,
 			"unable to find index by ID for NewUniquenessConstraintViolationError: %d",
@@ -148,8 +127,8 @@ func NewUniquenessConstraintViolationError(
 		), indexName),
 		fmt.Sprintf(
 			"Key (%s)=(%s) already exists.",
-			strings.Join(names[skipCols:], ","),
-			strings.Join(values[skipCols:], ","),
+			strings.Join(names[skipCols:], ", "),
+			strings.Join(values[skipCols:], ", "),
 		),
 	)
 }
@@ -157,7 +136,7 @@ func NewUniquenessConstraintViolationError(
 // decodeKeyValsUsingSpec decodes an index key and returns the key column names
 // and values.
 func decodeKeyValsUsingSpec(
-	spec *descpb.IndexFetchSpec, key roachpb.Key,
+	spec *fetchpb.IndexFetchSpec, key roachpb.Key,
 ) (colNames []string, values []string, err error) {
 	// We want the key columns without the suffix columns.
 	keyCols := spec.KeyColumns()
@@ -181,11 +160,11 @@ func decodeKeyValsUsingSpec(
 // acquire a lock. It uses an IndexFetchSpec for the corresponding index (the
 // fetch columns in the spec are not used).
 func newLockNotAvailableError(
-	reason roachpb.WriteIntentError_Reason,
+	reason kvpb.WriteIntentError_Reason,
 	decodeKeyFn func() (tableName string, indexName string, colNames []string, values []string, err error),
 ) error {
 	baseMsg := "could not obtain lock on row"
-	if reason == roachpb.WriteIntentError_REASON_LOCK_TIMEOUT {
+	if reason == kvpb.WriteIntentError_REASON_LOCK_TIMEOUT {
 		baseMsg = "canceling statement due to lock timeout on row"
 	}
 	tableName, indexName, colNames, values, err := decodeKeyFn()
@@ -216,7 +195,7 @@ func decodeKeyCodecAndIndex(
 	if err != nil {
 		return keys.SQLCodec{}, nil, err
 	}
-	index, err := tableDesc.FindIndexWithID(indexID)
+	index, err := catalog.MustFindIndexByID(tableDesc, indexID)
 	if err != nil {
 		return keys.SQLCodec{}, nil, err
 	}
@@ -267,13 +246,13 @@ func DecodeRowInfo(
 	}
 	cols := make([]catalog.Column, len(colIDs))
 	for i, colID := range colIDs {
-		col, err := tableDesc.FindColumnWithID(colID)
+		col, err := catalog.MustFindColumnByID(tableDesc, colID)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		cols[i] = col
 	}
-	var spec descpb.IndexFetchSpec
+	var spec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(&spec, codec, tableDesc, index, colIDs); err != nil {
 		return nil, nil, nil, err
 	}
@@ -281,20 +260,20 @@ func DecodeRowInfo(
 	if err := rf.Init(
 		ctx,
 		FetcherInitArgs{
-			WillUseCustomKVBatchFetcher: true,
-			Alloc:                       &tree.DatumAlloc{},
-			Spec:                        &spec,
+			WillUseKVProvider: true,
+			Alloc:             &tree.DatumAlloc{},
+			Spec:              &spec,
 		},
 	); err != nil {
 		return nil, nil, nil, err
 	}
-	f := singleKVFetcher{kvs: [1]roachpb.KeyValue{{Key: key}}}
+	f := KVProvider{KVs: []roachpb.KeyValue{{Key: key}}}
 	if value != nil {
-		f.kvs[0].Value = *value
+		f.KVs[0].Value = *value
 	}
 	// Use the Fetcher to decode the single kv pair above by passing in
-	// this singleKVFetcher implementation, which doesn't actually hit KV.
-	if err := rf.StartScanFrom(ctx, &f); err != nil {
+	// this KVProvider implementation, which doesn't actually hit KV.
+	if err := rf.ConsumeKVProvider(ctx, &f); err != nil {
 		return nil, nil, nil, err
 	}
 	datums, err := rf.NextRowDecoded(ctx)
@@ -318,10 +297,25 @@ func DecodeRowInfo(
 	return index, names, values, nil
 }
 
-func (f *singleKVFetcher) SetupNextFetch(
-	context.Context, roachpb.Spans, []int, rowinfra.BytesLimit, rowinfra.KeyLimit,
+// CheckFailed returns error message when a check constraint is violated.
+func CheckFailed(
+	ctx context.Context,
+	semaCtx *tree.SemaContext,
+	sessionData *sessiondata.SessionData,
+	tabDesc catalog.TableDescriptor,
+	check catalog.CheckConstraint,
 ) error {
-	return nil
+	// Failed to satisfy CHECK constraint, so unwrap the serialized
+	// check expression to display to the user.
+	expr, err := schemaexpr.FormatExprForDisplay(
+		ctx, tabDesc, check.GetExpr(), semaCtx, sessionData, tree.FmtParsable,
+	)
+	if err != nil {
+		// If we ran into an error trying to read the check constraint, wrap it
+		// and return.
+		return pgerror.WithConstraintName(errors.Wrapf(err, "failed to satisfy CHECK constraint (%s)", check.GetExpr()), check.GetName())
+	}
+	return pgerror.WithConstraintName(pgerror.Newf(
+		pgcode.CheckViolation, "failed to satisfy CHECK constraint (%s)", expr,
+	), check.GetName())
 }
-
-func (f *singleKVFetcher) close(context.Context) {}

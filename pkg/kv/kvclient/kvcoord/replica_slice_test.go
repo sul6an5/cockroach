@@ -12,7 +12,6 @@ package kvcoord
 
 import (
 	"context"
-	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,10 +19,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/shuffle"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,14 +32,26 @@ type mockNodeStore struct {
 
 var _ NodeDescStore = &mockNodeStore{}
 
-// GetNodeDesc is part of the NodeDescStore interface.
+// GetNodeDescriptor is part of the NodeDescStore interface.
 func (ns *mockNodeStore) GetNodeDescriptor(nodeID roachpb.NodeID) (*roachpb.NodeDescriptor, error) {
 	for _, nd := range ns.nodes {
 		if nd.NodeID == nodeID {
 			return &nd, nil
 		}
 	}
-	return nil, errors.Errorf("unable to look up descriptor for n%d", nodeID)
+	return nil, errorutil.NewNodeNotFoundError(nodeID)
+}
+
+// GetNodeDescriptorCount is part of the NodeDescStore interface.
+func (ns *mockNodeStore) GetNodeDescriptorCount() int {
+	return len(ns.nodes)
+}
+
+// GetStoreDescriptor is part of the NodeDescStore interface.
+func (ns *mockNodeStore) GetStoreDescriptor(
+	storeID roachpb.StoreID,
+) (*roachpb.StoreDescriptor, error) {
+	return nil, errorutil.NewStoreNotFoundError(storeID)
 }
 
 func TestNewReplicaSlice(t *testing.T) {
@@ -72,6 +83,9 @@ func TestNewReplicaSlice(t *testing.T) {
 	rs, err := NewReplicaSlice(ctx, ns, rd, nil, OnlyPotentialLeaseholders)
 	require.NoError(t, err)
 	require.Equal(t, 3, rs.Len())
+	rs, err = NewReplicaSlice(ctx, ns, rd, nil, AllReplicas)
+	require.NoError(t, err)
+	require.Equal(t, 3, rs.Len())
 
 	// Check that learners are not included.
 	rd.InternalReplicas[2].Type = roachpb.LEARNER
@@ -81,6 +95,9 @@ func TestNewReplicaSlice(t *testing.T) {
 	rs, err = NewReplicaSlice(ctx, ns, rd, nil, AllExtantReplicas)
 	require.NoError(t, err)
 	require.Equal(t, 2, rs.Len())
+	rs, err = NewReplicaSlice(ctx, ns, rd, nil, AllReplicas)
+	require.NoError(t, err)
+	require.Equal(t, 3, rs.Len())
 
 	// Check that non-voters are included iff we ask for them to be.
 	rd.InternalReplicas[2].Type = roachpb.NON_VOTER
@@ -90,11 +107,18 @@ func TestNewReplicaSlice(t *testing.T) {
 	rs, err = NewReplicaSlice(ctx, ns, rd, nil, OnlyPotentialLeaseholders)
 	require.NoError(t, err)
 	require.Equal(t, 2, rs.Len())
+	rs, err = NewReplicaSlice(ctx, ns, rd, nil, AllReplicas)
+	require.NoError(t, err)
+	require.Equal(t, 3, rs.Len())
 
 	// Check that, if the leaseholder points to a learner, that learner is
 	// included.
+	rd.InternalReplicas[2].Type = roachpb.LEARNER
 	leaseholder := &roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3, ReplicaID: 3}
 	rs, err = NewReplicaSlice(ctx, ns, rd, leaseholder, OnlyPotentialLeaseholders)
+	require.NoError(t, err)
+	require.Equal(t, 3, rs.Len())
+	rs, err = NewReplicaSlice(ctx, ns, rd, leaseholder, AllReplicas)
 	require.NoError(t, err)
 	require.Equal(t, 3, rs.Len())
 }
@@ -155,18 +179,10 @@ func locality(t *testing.T, locStrs []string) roachpb.Locality {
 	return locality
 }
 
-func nodeDesc(t *testing.T, nid roachpb.NodeID, locStrs []string) *roachpb.NodeDescriptor {
-	return &roachpb.NodeDescriptor{
-		NodeID:   nid,
-		Locality: locality(t, locStrs),
-		Address:  util.MakeUnresolvedAddr("tcp", fmt.Sprintf("%d:26257", nid)),
-	}
-}
-
 func info(t *testing.T, nid roachpb.NodeID, sid roachpb.StoreID, locStrs []string) ReplicaInfo {
 	return ReplicaInfo{
 		ReplicaDescriptor: desc(nid, sid),
-		NodeDesc:          nodeDesc(t, nid, locStrs),
+		Tiers:             locality(t, locStrs).Tiers,
 	}
 }
 
@@ -180,7 +196,7 @@ func TestReplicaSliceOptimizeReplicaOrder(t *testing.T) {
 		// locality of the DistSender.
 		locality roachpb.Locality
 		// map from node address (see nodeDesc()) to latency to that node.
-		latencies map[string]time.Duration
+		latencies map[roachpb.NodeID]time.Duration
 		slice     ReplicaSlice
 		// expOrder is the expected order in which the replicas sort. Replicas are
 		// only identified by their node. If multiple replicas are on different
@@ -205,10 +221,10 @@ func TestReplicaSliceOptimizeReplicaOrder(t *testing.T) {
 			name:     "order by latency",
 			nodeID:   1,
 			locality: locality(t, []string{"country=us", "region=west", "city=la"}),
-			latencies: map[string]time.Duration{
-				"2:26257": time.Hour,
-				"3:26257": time.Minute,
-				"4:26257": time.Second,
+			latencies: map[roachpb.NodeID]time.Duration{
+				2: time.Hour,
+				3: time.Minute,
+				4: time.Second,
 			},
 			slice: ReplicaSlice{
 				info(t, 2, 2, []string{"country=us", "region=west", "city=sf"}),
@@ -225,11 +241,11 @@ func TestReplicaSliceOptimizeReplicaOrder(t *testing.T) {
 			name:     "local node comes first",
 			nodeID:   1,
 			locality: locality(t, nil),
-			latencies: map[string]time.Duration{
-				"1:26257": 10 * time.Hour,
-				"2:26257": time.Hour,
-				"3:26257": time.Minute,
-				"4:26257": time.Second,
+			latencies: map[roachpb.NodeID]time.Duration{
+				1: 10 * time.Hour,
+				2: time.Hour,
+				3: time.Minute,
+				4: time.Second,
 			},
 			slice: ReplicaSlice{
 				info(t, 1, 1, nil),
@@ -245,8 +261,8 @@ func TestReplicaSliceOptimizeReplicaOrder(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var latencyFn LatencyFunc
 			if test.latencies != nil {
-				latencyFn = func(addr string) (time.Duration, bool) {
-					lat, ok := test.latencies[addr]
+				latencyFn = func(id roachpb.NodeID) (time.Duration, bool) {
+					lat, ok := test.latencies[id]
 					return lat, ok
 				}
 			}
@@ -266,4 +282,14 @@ func TestReplicaSliceOptimizeReplicaOrder(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReplicaInfoLocalityValue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ri := info(t, 1, 1, []string{"country=us", "region=west", "city=la"})
+	require.Equal(t, "", ri.LocalityValue("foo"))
+	require.Equal(t, "us", ri.LocalityValue("country"))
+	require.Equal(t, "west", ri.LocalityValue("region"))
+	require.Equal(t, "la", ri.LocalityValue("city"))
 }

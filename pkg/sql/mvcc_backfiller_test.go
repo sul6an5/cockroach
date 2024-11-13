@@ -23,7 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
@@ -31,14 +33,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/startupmigrations"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -86,8 +92,8 @@ func TestIndexBackfillMergeRetry(t *testing.T) {
 			if rand.Intn(2) == 0 {
 				return context.DeadlineExceeded
 			} else {
-				errAmbiguous := &roachpb.AmbiguousResultError{}
-				return roachpb.NewError(errAmbiguous).GoError()
+				errAmbiguous := &kvpb.AmbiguousResultError{}
+				return kvpb.NewError(errAmbiguous).GoError()
 			}
 		}
 
@@ -123,21 +129,19 @@ func TestIndexBackfillMergeRetry(t *testing.T) {
 				},
 			},
 		},
-		// Disable backfill upgrades, we still need the jobs table upgrade.
-		StartupMigrationManager: &startupmigrations.MigrationManagerTestingKnobs{
-			DisableBackfillMigrations: true,
-		},
 		// Decrease the adopt loop interval so that retries happen quickly.
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		GCJob: &sql.GCJobTestingKnobs{
 			SkipWaitingForMVCCGC: true,
 		},
+		KeyVisualizer: &keyvisualizer.TestingKnobs{SkipJobBootstrap: true},
 	}
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
+SET use_declarative_schema_changer='off';
 CREATE DATABASE t;
 CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 `); err != nil {
@@ -242,9 +246,6 @@ func TestIndexBackfillFractionTracking(t *testing.T) {
 				},
 			},
 		},
-		StartupMigrationManager: &startupmigrations.MigrationManagerTestingKnobs{
-			DisableBackfillMigrations: true,
-		},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 	}
 
@@ -255,6 +256,10 @@ func TestIndexBackfillFractionTracking(t *testing.T) {
 	defer tc.Stopper().Stop(context.Background())
 	kvDB = tc.Server(0).DB()
 	sqlDB := tc.ServerConn(0)
+	_, err := sqlDB.Exec("SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer='off';")
+	require.NoError(t, err)
+	_, err = sqlDB.Exec("SET use_declarative_schema_changer='off';")
+	require.NoError(t, err)
 	sqlRunner = sqlutils.MakeSQLRunner(sqlDB)
 	sqlRunner.Exec(t, `CREATE DATABASE t; CREATE TABLE t.test (k INT PRIMARY KEY, v INT)`)
 	sqlRunner.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING bulkio.index_backfill.batch_size = %d;`, chunkSize))
@@ -349,6 +354,10 @@ func TestRaceWithIndexBackfillMerge(t *testing.T) {
 	defer tc.Stopper().Stop(context.Background())
 	kvDB := tc.Server(0).DB()
 	sqlDB := tc.ServerConn(0)
+	_, err := sqlDB.Exec("SET use_declarative_schema_changer='off'")
+	require.NoError(t, err)
+	_, err = sqlDB.Exec("SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer='off'")
+	require.NoError(t, err)
 
 	splitTemporaryIndex = func() error {
 		tableDesc := desctestutils.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "public", "test")
@@ -468,6 +477,8 @@ func TestInvertedIndexMergeEveryStateWrite(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderRace(t, "very slow")
+
 	var chunkSize int64 = 1000
 	var initialRows = 10000
 	rowIdx := 0
@@ -574,6 +585,7 @@ func TestIndexBackfillMergeTxnRetry(t *testing.T) {
 		GCJob: &sql.GCJobTestingKnobs{
 			SkipWaitingForMVCCGC: true,
 		},
+		KeyVisualizer: &keyvisualizer.TestingKnobs{SkipJobBootstrap: true},
 	}
 
 	s, sqlDB, kvDB = serverutils.StartServer(t, params)
@@ -583,6 +595,7 @@ func TestIndexBackfillMergeTxnRetry(t *testing.T) {
 	require.NoError(t, err)
 
 	if _, err := sqlDB.Exec(`
+SET use_declarative_schema_changer='off';
 CREATE DATABASE t;
 CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 `); err != nil {
@@ -769,4 +782,95 @@ func TestIndexMergeEveryChunkWrite(t *testing.T) {
 	require.NoError(t, writeMore(), "initial insert")
 	_, err = sqlDB.Exec("CREATE INDEX ON t.test (v)")
 	require.NoError(t, err)
+}
+
+// TestIndexMergeWithSplitsAndDistSQL tests the case where there's an index
+// merge that occurs and that merge is distributed, and the temp index has been
+// split a number of times and scattered over the nodes. The hazard we're
+// working to reproduce is a situation whereby the temp index being results in
+// a situation where the successor key of the last key of the range is the
+// range boundary.
+func TestIndexMergeWithSplitsAndDistSQL(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	var tc *testcluster.TestCluster
+	const createStmts = `
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v int);`
+	const numRanges = 10
+	const rowsToWrite = 1000
+	var called bool
+	writeToAndSplitIndex := func(mi *scop.MergeIndex) error {
+		s := tc.Server(0)
+		db := s.DB()
+		if _, err := tc.ServerConn(0).Exec(
+			"UPSERT INTO t.test SELECT i, i FROM generate_series($1, $2) as t(i)",
+			0, rowsToWrite,
+		); err != nil {
+			return err
+		}
+		indexPrefix := s.Codec().IndexPrefix(uint32(mi.TableID), uint32(mi.TemporaryIndexID))
+		rows, err := db.Scan(ctx, indexPrefix, indexPrefix.PrefixEnd(), 0)
+		if err != nil {
+			return err
+		}
+		perm := rand.Perm(rowsToWrite)
+		splitPoints := perm[:numRanges]
+		// Sometimes split at the next key and sometimes split at a row itself.
+		// The only known hazard was when the split is at the next key, but we
+		// may as well make this test core more situations.
+		splitPoint := func(i int) roachpb.Key {
+			if i%2 == 0 {
+				return rows[i].Key
+			}
+			return rows[i].Key.Next()
+		}
+		for _, i := range splitPoints {
+			if err := db.AdminSplit(ctx, splitPoint(i), hlc.MaxTimestamp); err != nil {
+				return err
+			}
+		}
+
+		for _, i := range splitPoints {
+			if _, err := db.AdminScatter(ctx, splitPoint(i), 0); err != nil {
+				return err
+			}
+		}
+		called = true
+		return nil
+	}
+
+	// Wait for the beginning of the Merge step of the schema change.
+	// Write data to the temp index and split it at the hazardous
+	// points.
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
+			BeforeStage: func(p scplan.Plan, stageIdx int) error {
+				getMergeIndex := func(ops []scop.Op) *scop.MergeIndex {
+					for _, op := range ops {
+						if mi, ok := op.(*scop.MergeIndex); ok {
+							return mi
+						}
+					}
+					return nil
+				}
+				if op := getMergeIndex(p.Stages[stageIdx].EdgeOps); op != nil {
+					return writeToAndSplitIndex(op)
+				}
+				return nil
+			},
+		},
+	}
+
+	ctx := context.Background()
+	tc = testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: params,
+	})
+	defer tc.Stopper().Stop(ctx)
+	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb.Exec(t, createStmts)
+	tdb.Exec(t, "CREATE INDEX ON t.test (v)")
+	require.True(t, called)
 }

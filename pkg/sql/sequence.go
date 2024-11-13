@@ -16,7 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -41,7 +41,11 @@ import (
 func (p *planner) GetSerialSequenceNameFromColumn(
 	ctx context.Context, tn *tree.TableName, columnName tree.Name,
 ) (*tree.TableName, error) {
-	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireTableDesc)
+	flags := tree.ObjectLookupFlags{
+		Required:             true,
+		DesiredObjectKind:    tree.TableObject,
+		DesiredTableDescKind: tree.ResolveRequireTableDesc,
+	}
 	_, tableDesc, err := resolver.ResolveExistingTableObject(ctx, p, tn, flags)
 	if err != nil {
 		return nil, err
@@ -56,12 +60,7 @@ func (p *planner) GetSerialSequenceNameFromColumn(
 			//       as well as backward compatibility) so we're using this heuristic for now.
 			// TODO(#52487): fix this up.
 			if col.NumUsesSequences() == 1 {
-				seq, err := p.Descriptors().GetImmutableTableByID(
-					ctx,
-					p.txn,
-					col.GetUsesSequenceID(0),
-					tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc),
-				)
+				seq, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, col.GetUsesSequenceID(0))
 				if err != nil {
 					return nil, err
 				}
@@ -78,8 +77,7 @@ func (p *planner) IncrementSequenceByID(ctx context.Context, seqID int64) (int64
 	if p.EvalContext().TxnReadOnly {
 		return 0, readOnlyError("nextval()")
 	}
-	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
-	descriptor, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, descpb.ID(seqID), flags)
+	descriptor, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(seqID))
 	if err != nil {
 		return 0, err
 	}
@@ -121,7 +119,9 @@ func incrementSequenceHelper(
 
 	var val int64
 	if seqOpts.Virtual {
-		rowid := builtins.GenerateUniqueInt(p.EvalContext().NodeID.SQLInstanceID())
+		rowid := builtins.GenerateUniqueInt(
+			builtins.ProcessUniqueID(p.EvalContext().NodeID.SQLInstanceID()),
+		)
 		val = int64(rowid)
 	} else {
 		val, err = p.incrementSequenceUsingCache(ctx, descriptor)
@@ -176,7 +176,7 @@ func (p *planner) incrementSequenceUsingCache(
 		}
 
 		if err != nil {
-			if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
+			if errors.HasType(err, (*kvpb.IntegerOverflowError)(nil)) {
 				return 0, 0, 0, boundsExceededError(descriptor)
 			}
 			return 0, 0, 0, err
@@ -249,8 +249,7 @@ func boundsExceededError(descriptor catalog.TableDescriptor) error {
 func (p *planner) GetLatestValueInSessionForSequenceByID(
 	ctx context.Context, seqID int64,
 ) (int64, error) {
-	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
-	descriptor, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, descpb.ID(seqID), flags)
+	descriptor, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(seqID))
 	if err != nil {
 		return 0, err
 	}
@@ -288,8 +287,7 @@ func (p *planner) SetSequenceValueByID(
 		return readOnlyError("setval()")
 	}
 
-	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
-	descriptor, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, descpb.ID(seqID), flags)
+	descriptor, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(seqID))
 	if err != nil {
 		return err
 	}
@@ -374,10 +372,16 @@ func MakeSequenceKeyVal(
 func (p *planner) GetSequenceValue(
 	ctx context.Context, codec keys.SQLCodec, desc catalog.TableDescriptor,
 ) (int64, error) {
-	if desc.GetSequenceOpts() == nil {
+	if !desc.IsSequence() {
 		return 0, errors.New("descriptor is not a sequence")
 	}
-	keyValue, err := p.txn.Get(ctx, codec.SequenceKey(uint32(desc.GetID())))
+	return getSequenceValueFromDesc(ctx, p.txn, codec, desc)
+}
+
+func getSequenceValueFromDesc(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, desc catalog.TableDescriptor,
+) (int64, error) {
+	keyValue, err := txn.Get(ctx, codec.SequenceKey(uint32(desc.GetID())))
 	if err != nil {
 		return 0, err
 	}
@@ -513,7 +517,7 @@ func removeSequenceOwnerIfExists(
 	if !opts.HasOwner() {
 		return nil
 	}
-	tableDesc, err := p.Descriptors().GetMutableTableVersionByID(ctx, opts.SequenceOwner.OwnerTableID, p.txn)
+	tableDesc, err := p.Descriptors().MutableByID(p.txn).Table(ctx, opts.SequenceOwner.OwnerTableID)
 	if err != nil {
 		// Special case error swallowing for #50711 and #50781, which can cause a
 		// column to own sequences that have been dropped/do not exist.
@@ -529,7 +533,7 @@ func removeSequenceOwnerIfExists(
 	if tableDesc.Dropped() {
 		return nil
 	}
-	col, err := tableDesc.FindColumnWithID(opts.SequenceOwner.OwnerColumnID)
+	col, err := catalog.MustFindColumnByID(tableDesc, opts.SequenceOwner.OwnerColumnID)
 	if err != nil {
 		return err
 	}
@@ -570,7 +574,7 @@ func resolveColumnItemToDescriptors(
 	if err != nil {
 		return nil, nil, err
 	}
-	col, err := tableDesc.FindColumnWithName(columnItem.ColumnName)
+	col, err := catalog.MustFindColumnByTreeName(tableDesc, columnItem.ColumnName)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -760,7 +764,7 @@ func (p *planner) dropSequencesOwnedByCol(
 	}
 
 	for _, sequenceID := range colOwnsSequenceIDs {
-		seqDesc, err := p.Descriptors().GetMutableTableVersionByID(ctx, sequenceID, p.txn)
+		seqDesc, err := p.Descriptors().MutableByID(p.txn).Table(ctx, sequenceID)
 		// Special case error swallowing for #50781, which can cause a
 		// column to own sequences that do not exist.
 		if err != nil {
@@ -800,7 +804,7 @@ func (p *planner) removeSequenceDependencies(
 	for i := 0; i < col.NumUsesSequences(); i++ {
 		sequenceID := col.GetUsesSequenceID(i)
 		// Get the sequence descriptor so we can remove the reference from it.
-		seqDesc, err := p.Descriptors().GetMutableTableVersionByID(ctx, sequenceID, p.txn)
+		seqDesc, err := p.Descriptors().MutableByID(p.txn).Table(ctx, sequenceID)
 		if err != nil {
 			return err
 		}

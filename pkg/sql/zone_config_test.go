@@ -25,7 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -74,7 +76,7 @@ func waitForConfigChange(t testing.TB, s *server.TestServer) *config.SystemConfi
 				if err := val.GetProto(&foundDesc); err != nil {
 					t.Fatal(err)
 				}
-				_, db, _, _, _ := descpb.FromDescriptor(&foundDesc)
+				_, db, _, _, _ := descpb.GetDescriptors(&foundDesc)
 				if db.ID != configID {
 					return errors.Errorf("expected database id %d; got %d", configID, db.ID)
 				}
@@ -137,9 +139,9 @@ func TestGetZoneConfig(t *testing.T) {
 
 			// Verify sql.GetZoneConfigInTxn.
 			dummyIndex := systemschema.CommentsTable.GetPrimaryIndex()
-			if err := s.DB().Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+			if err := sql.TestingDescsTxn(context.Background(), s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 				_, zoneCfg, subzone, err := sql.GetZoneConfigInTxn(
-					ctx, txn, keys.SystemSQLCodec, descpb.ID(tc.objectID), dummyIndex, tc.partitionName, false,
+					ctx, txn.KV(), col, descpb.ID(tc.objectID), dummyIndex, tc.partitionName, false,
 				)
 				if err != nil {
 					return err
@@ -373,9 +375,9 @@ func TestCascadingZoneConfig(t *testing.T) {
 
 			// Verify sql.GetZoneConfigInTxn.
 			dummyIndex := systemschema.CommentsTable.GetPrimaryIndex()
-			if err := s.DB().Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+			if err := sql.TestingDescsTxn(context.Background(), s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 				_, zoneCfg, subzone, err := sql.GetZoneConfigInTxn(
-					ctx, txn, keys.SystemSQLCodec, descpb.ID(tc.objectID), dummyIndex, tc.partitionName, false,
+					ctx, txn.KV(), col, descpb.ID(tc.objectID), dummyIndex, tc.partitionName, false,
 				)
 				if err != nil {
 					return err
@@ -386,6 +388,7 @@ func TestCascadingZoneConfig(t *testing.T) {
 					t.Errorf("#%d: bad zone config.\nexpected: %+v\ngot: %+v", tcNum, &tc.zoneCfg, zoneCfg)
 				}
 				return nil
+
 			}); err != nil {
 				t.Fatalf("#%d: err=%s", tcNum, err)
 			}
@@ -657,9 +660,9 @@ func BenchmarkGetZoneConfig(b *testing.B) {
 	s := srv.(*server.TestServer)
 	cfg := forceNewConfig(b, s)
 
+	key := roachpb.RKey(keys.SystemSQLCodec.TablePrefix(bootstrap.TestingUserDescID(0)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := roachpb.RKey(keys.SystemSQLCodec.TablePrefix(bootstrap.TestingUserDescID(0)))
 		_, _, err := config.TestingGetSystemTenantZoneConfigForKey(cfg, key)
 		if err != nil {
 			b.Fatal(err)

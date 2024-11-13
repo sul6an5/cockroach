@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -26,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -67,9 +66,9 @@ const nonIndexColHistogramBuckets = 2
 // StubTableStats generates "stub" statistics for a table which are missing
 // histograms and have 0 for all values.
 func StubTableStats(
-	desc catalog.TableDescriptor, name string, multiColEnabled bool,
+	desc catalog.TableDescriptor, name string, multiColEnabled bool, defaultHistogramBuckets uint32,
 ) ([]*stats.TableStatisticProto, error) {
-	colStats, err := createStatsDefaultColumns(desc, multiColEnabled)
+	colStats, err := createStatsDefaultColumns(desc, multiColEnabled, defaultHistogramBuckets)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +159,7 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 
 	var job *jobs.StartableJob
 	jobID := n.p.ExecCfg().JobRegistry.MakeJobID()
-	if err := n.p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+	if err := n.p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) (err error) {
 		return n.p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &job, jobID, txn, *record)
 	}); err != nil {
 		if job != nil {
@@ -178,7 +177,7 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 		if errors.Is(err, stats.ConcurrentCreateStatsError) {
 			// Delete the job so users don't see it and get confused by the error.
 			const stmt = `DELETE FROM system.jobs WHERE id = $1`
-			if _ /* cols */, delErr := n.p.ExecCfg().InternalExecutor.Exec(
+			if _ /* cols */, delErr := n.p.ExecCfg().InternalDB.Executor().Exec(
 				ctx, "delete-job", nil /* txn */, stmt, jobID,
 			); delErr != nil {
 				log.Warningf(ctx, "failed to delete job: %v", delErr)
@@ -204,10 +203,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		fqTableName = n.p.ResolvedName(t).FQString()
 
 	case *tree.TableRef:
-		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
-			AvoidLeased: n.p.skipDescriptorCache,
-		}}
-		tableDesc, err = n.p.Descriptors().GetImmutableTableByID(ctx, n.p.txn, descpb.ID(t.TableID), flags)
+		tableDesc, err = n.p.byIDGetterBuilder().WithoutNonPublic().Get().Table(ctx, descpb.ID(t.TableID))
 		if err != nil {
 			return nil, err
 		}
@@ -254,21 +250,41 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		)
 	}
 
+	if n.Options.UsingExtremes && !n.p.SessionData().EnableCreateStatsUsingExtremes {
+		return nil, pgerror.New(pgcode.FeatureNotSupported,
+			"creating partial statistics at extremes is not yet supported",
+		)
+	}
+
+	if n.Options.Where != nil {
+		return nil, pgerror.New(pgcode.FeatureNotSupported,
+			"creating partial statistics with a WHERE clause is not yet supported",
+		)
+	}
+
 	if err := n.p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
 		return nil, err
 	}
 
-	// Identify which columns we should create statistics for.
 	var colStats []jobspb.CreateStatsDetails_ColStat
 	var deleteOtherStats bool
 	if len(n.ColumnNames) == 0 {
-		multiColEnabled := stats.MultiColumnStatisticsClusterMode.Get(&n.p.ExecCfg().Settings.SV)
-		if colStats, err = createStatsDefaultColumns(tableDesc, multiColEnabled); err != nil {
+		// Disable multi-column stats and deleting stats
+		// if partial statistics at the extremes are requested.
+		// TODO (faizaanmadhani): Add support for multi-column stats.
+		var multiColEnabled bool
+		if !n.Options.UsingExtremes {
+			multiColEnabled = stats.MultiColumnStatisticsClusterMode.Get(&n.p.ExecCfg().Settings.SV)
+			deleteOtherStats = true
+		}
+		defaultHistogramBuckets := stats.GetDefaultHistogramBuckets(n.p.ExecCfg().SV(), tableDesc)
+		if colStats, err = createStatsDefaultColumns(
+			tableDesc, multiColEnabled, defaultHistogramBuckets,
+		); err != nil {
 			return nil, err
 		}
-		deleteOtherStats = true
 	} else {
-		columns, err := tabledesc.FindPublicColumnsWithNames(tableDesc, n.ColumnNames)
+		columns, err := catalog.MustFindPublicColumnsByNameList(tableDesc, n.ColumnNames)
 		if err != nil {
 			return nil, err
 		}
@@ -284,7 +300,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 			}
 			columnIDs[i] = columns[i].GetID()
 		}
-		col, err := tableDesc.FindColumnWithID(columnIDs[0])
+		col, err := catalog.MustFindColumnByID(tableDesc, columnIDs[0])
 		if err != nil {
 			return nil, err
 		}
@@ -292,12 +308,13 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		// STATISTICS or other SQL on table_statistics.
 		_ = stats.MakeSortedColStatKey(columnIDs)
 		isInvIndex := colinfo.ColumnTypeIsOnlyInvertedIndexable(col.GetType())
+		defaultHistogramBuckets := stats.GetDefaultHistogramBuckets(n.p.ExecCfg().SV(), tableDesc)
 		colStats = []jobspb.CreateStatsDetails_ColStat{{
 			ColumnIDs: columnIDs,
 			// By default, create histograms on all explicitly requested column stats
 			// with a single column that doesn't use an inverted index.
 			HasHistogram:        len(columnIDs) == 1 && !isInvIndex,
-			HistogramMaxBuckets: stats.DefaultHistogramBuckets,
+			HistogramMaxBuckets: defaultHistogramBuckets,
 		}}
 		// Make histograms for inverted index column types.
 		if len(columnIDs) == 1 && isInvIndex {
@@ -305,7 +322,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 				ColumnIDs:           columnIDs,
 				HasHistogram:        true,
 				Inverted:            true,
-				HistogramMaxBuckets: stats.DefaultHistogramBuckets,
+				HistogramMaxBuckets: defaultHistogramBuckets,
 			})
 		}
 	}
@@ -346,6 +363,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 			AsOf:             asOfTimestamp,
 			MaxFractionIdle:  n.Options.Throttling,
 			DeleteOtherStats: deleteOtherStats,
+			UsingExtremes:    n.Options.UsingExtremes,
 		},
 		Progress: jobspb.CreateStatsProgress{},
 	}, nil
@@ -373,7 +391,7 @@ const maxNonIndexCols = 100
 // other columns from the table. We only collect histograms for index columns,
 // plus any other boolean or enum columns (where the "histogram" is tiny).
 func createStatsDefaultColumns(
-	desc catalog.TableDescriptor, multiColEnabled bool,
+	desc catalog.TableDescriptor, multiColEnabled bool, defaultHistogramBuckets uint32,
 ) ([]jobspb.CreateStatsDetails_ColStat, error) {
 	colStats := make([]jobspb.CreateStatsDetails_ColStat, 0, len(desc.ActiveIndexes()))
 
@@ -396,7 +414,7 @@ func createStatsDefaultColumns(
 	// ID if they have not already been added. Histogram stats are collected for
 	// every indexed column.
 	addIndexColumnStatsIfNotExists := func(colID descpb.ColumnID, isInverted bool) error {
-		col, err := desc.FindColumnWithID(colID)
+		col, err := catalog.MustFindColumnByID(desc, colID)
 		if err != nil {
 			return err
 		}
@@ -419,7 +437,7 @@ func createStatsDefaultColumns(
 		colStat := jobspb.CreateStatsDetails_ColStat{
 			ColumnIDs:           colIDs,
 			HasHistogram:        !isInverted,
-			HistogramMaxBuckets: stats.DefaultHistogramBuckets,
+			HistogramMaxBuckets: defaultHistogramBuckets,
 		}
 		colStats = append(colStats, colStat)
 
@@ -483,7 +501,7 @@ func createStatsDefaultColumns(
 
 			colIDs := make([]descpb.ColumnID, 0, j+1)
 			for k := 0; k <= j; k++ {
-				col, err := desc.FindColumnWithID(idx.GetKeyColumnID(k))
+				col, err := catalog.MustFindColumnByID(desc, idx.GetKeyColumnID(k))
 				if err != nil {
 					return nil, err
 				}
@@ -526,7 +544,7 @@ func createStatsDefaultColumns(
 
 			// Generate stats for each column individually.
 			for _, colID := range colIDs.Ordered() {
-				col, err := desc.FindColumnWithID(colID)
+				col, err := catalog.MustFindColumnByID(desc, colID)
 				if err != nil {
 					return nil, err
 				}
@@ -561,7 +579,7 @@ func createStatsDefaultColumns(
 		// for those types, up to DefaultHistogramBuckets.
 		maxHistBuckets := uint32(nonIndexColHistogramBuckets)
 		if col.GetType().Family() == types.BoolFamily || col.GetType().Family() == types.EnumFamily {
-			maxHistBuckets = stats.DefaultHistogramBuckets
+			maxHistBuckets = defaultHistogramBuckets
 		}
 		colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
 			ColumnIDs:           colIDs,
@@ -599,37 +617,30 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 	evalCtx := p.ExtendedEvalContext()
 
 	dsp := p.DistSQLPlanner()
-	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	if err := p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// Set the transaction on the EvalContext to this txn. This allows for
 		// use of the txn during processor setup during the execution of the flow.
-		evalCtx.Txn = txn
+		evalCtx.Txn = txn.KV()
 
 		if details.AsOf != nil {
 			p.ExtendedEvalContext().AsOfSystemTime = &eval.AsOfSystemTime{Timestamp: *details.AsOf}
 			p.ExtendedEvalContext().SetTxnTimestamp(details.AsOf.GoTime())
-			if err := txn.SetFixedTimestamp(ctx, *details.AsOf); err != nil {
+			if err := txn.KV().SetFixedTimestamp(ctx, *details.AsOf); err != nil {
 				return err
 			}
 		}
 
-		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* planner */, txn,
+		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* planner */, txn.KV(),
 			DistributionTypeSystemTenantOnly)
 		// CREATE STATS flow doesn't produce any rows and only emits the
 		// metadata, so we can use a nil rowContainerHelper.
 		resultWriter := NewRowResultWriter(nil /* rowContainer */)
 		if err := dsp.planAndRunCreateStats(
-			ctx, evalCtx, planCtx, txn, r.job, resultWriter,
+			ctx, evalCtx, planCtx, txn.KV(), r.job, resultWriter,
 		); err != nil {
 			// Check if this was a context canceled error and restart if it was.
 			if grpcutil.IsContextCanceled(err) {
 				return jobs.MarkAsRetryJobError(err)
-			}
-
-			// We can't re-use the txn from above since it has a fixed timestamp set on
-			// it, and our write will be into the behind.
-			txnForJobProgress := txn
-			if details.AsOf != nil {
-				txnForJobProgress = nil
 			}
 
 			// If the job was canceled, any of the distsql processors could have been
@@ -639,12 +650,12 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 			// job progress to coerce out the correct error type. If the update succeeds
 			// then return the original error, otherwise return this error instead so
 			// it can be cleaned up at a higher level.
-			if jobErr := r.job.FractionProgressed(
-				ctx, txnForJobProgress,
-				func(ctx context.Context, _ jobspb.ProgressDetails) float32 {
-					// The job failed so the progress value here doesn't really matter.
-					return 0
-				},
+			if jobErr := r.job.NoTxn().FractionProgressed(ctx, func(
+				ctx context.Context, _ jobspb.ProgressDetails,
+			) float32 {
+				// The job failed so the progress value here doesn't really matter.
+				return 0
+			},
 			); jobErr != nil {
 				return jobErr
 			}
@@ -670,7 +681,7 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 	// TODO(knz): figure out why this is not triggered for a regular
 	// CREATE STATISTICS statement.
 	// See: https://github.com/cockroachdb/cockroach/issues/57739
-	return evalCtx.ExecCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	return evalCtx.ExecCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		return logEventInternalForSQLStatements(ctx,
 			evalCtx.ExecCfg, txn,
 			0, /* depth: use event_log=2 for vmodule filtering */
@@ -699,11 +710,13 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) erro
 	if job != nil {
 		jobID = job.ID()
 	}
-	exists, err := jobs.RunningJobExists(ctx, jobID, p.ExecCfg().InternalExecutor, nil /* txn */, func(payload *jobspb.Payload) bool {
-		return payload.Type() == jobspb.TypeCreateStats || payload.Type() == jobspb.TypeAutoCreateStats
-	})
-
-	if err != nil {
+	var exists bool
+	if err := p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) (err error) {
+		exists, err = jobs.RunningJobExists(ctx, jobID, txn, p.ExecCfg().Settings.Version,
+			jobspb.TypeCreateStats, jobspb.TypeAutoCreateStats,
+		)
+		return err
+	}); err != nil {
 		return err
 	}
 

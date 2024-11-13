@@ -58,7 +58,7 @@ func normalizeAndExpr(v *Visitor, expr *tree.AndExpr) tree.TypedExpr {
 
 	// Use short-circuit evaluation to simplify AND expressions.
 	if v.isConst(left) {
-		dleft, v.err = eval.Expr(v.ctx, left)
+		dleft, v.err = eval.Expr(v.ctx, v.evalCtx, left)
 		if v.err != nil {
 			return expr
 		}
@@ -77,7 +77,7 @@ func normalizeAndExpr(v *Visitor, expr *tree.AndExpr) tree.TypedExpr {
 		)
 	}
 	if v.isConst(right) {
-		dright, v.err = eval.Expr(v.ctx, right)
+		dright, v.err = eval.Expr(v.ctx, v.evalCtx, right)
 		if v.err != nil {
 			return expr
 		}
@@ -172,7 +172,7 @@ func normalizeCoalesceExpr(v *Visitor, expr *tree.CoalesceExpr) tree.TypedExpr {
 			return &exprCopy
 		}
 
-		val, err := eval.Expr(v.ctx, subExpr)
+		val, err := eval.Expr(v.ctx, v.evalCtx, subExpr)
 		if err != nil {
 			v.err = err
 			return expr
@@ -210,183 +210,37 @@ func normalizeComparisonExpr(v *Visitor, expr *tree.ComparisonExpr) tree.TypedEx
 		// pre-condition, we know there is at least one variable in the expression
 		// tree or we would not have entered this code path.
 		exprCopied := false
-		for {
-			if expr.TypedLeft() == tree.DNull || expr.TypedRight() == tree.DNull {
-				return tree.DNull
-			}
+		if expr.TypedLeft() == tree.DNull || expr.TypedRight() == tree.DNull {
+			return tree.DNull
+		}
 
-			if v.isConst(expr.Left) {
-				switch expr.Right.(type) {
-				case *tree.BinaryExpr, tree.VariableExpr:
-					break
-				default:
-					return expr
-				}
-
-				invertedOp, err := invertComparisonOp(expr.Operator)
-				if err != nil {
-					v.err = err
-					return expr
-				}
-
-				// The left side is const and the right side is a binary expression or a
-				// variable. Flip the comparison op so that the right side is const and
-				// the left side is a binary expression or variable.
-				// Create a new ComparisonExpr so the function cache isn't reused.
-				if !exprCopied {
-					exprCopy := *expr
-					expr = &exprCopy
-					exprCopied = true
-				}
-
-				expr = tree.NewTypedComparisonExpr(invertedOp, expr.TypedRight(), expr.TypedLeft())
-			} else if !v.isConst(expr.Right) {
+		if v.isConst(expr.Left) {
+			switch expr.Right.(type) {
+			case *tree.BinaryExpr, tree.VariableExpr:
+				break
+			default:
 				return expr
 			}
 
-			left, ok := expr.Left.(*tree.BinaryExpr)
-			if !ok {
+			invertedOp, err := invertComparisonOp(expr.Operator)
+			if err != nil {
+				v.err = err
 				return expr
 			}
-			// The right is const and the left side is a binary expression. Rotate the
-			// comparison combining portions that are const.
 
-			switch {
-			case v.isConst(left.Right) &&
-				(left.Operator.Symbol == treebin.Plus || left.Operator.Symbol == treebin.Minus || left.Operator.Symbol == treebin.Div):
-
-				//        cmp          cmp
-				//       /   \        /   \
-				//    [+-/]   2  ->  a   [-+*]
-				//   /     \            /     \
-				//  a       1          2       1
-				var op treebin.BinaryOperator
-				switch left.Operator.Symbol {
-				case treebin.Plus:
-					op = treebin.MakeBinaryOperator(treebin.Minus)
-				case treebin.Minus:
-					op = treebin.MakeBinaryOperator(treebin.Plus)
-				case treebin.Div:
-					op = treebin.MakeBinaryOperator(treebin.Mult)
-					if expr.Operator.Symbol != treecmp.EQ {
-						// In this case, we must remember to *flip* the inequality if the
-						// divisor is negative, since we are in effect multiplying both sides
-						// of the inequality by a negative number.
-						divisor, err := eval.Expr(v.ctx, left.TypedRight())
-						if err != nil {
-							v.err = err
-							return expr
-						}
-						if divisor.Compare(v.ctx, tree.DZero) < 0 {
-							if !exprCopied {
-								exprCopy := *expr
-								expr = &exprCopy
-								exprCopied = true
-							}
-
-							invertedOp, err := invertComparisonOp(expr.Operator)
-							if err != nil {
-								v.err = err
-								return expr
-							}
-							expr = tree.NewTypedComparisonExpr(invertedOp, expr.TypedLeft(), expr.TypedRight())
-						}
-					}
-				}
-
-				newBinExpr := tree.NewBinExprIfValidOverload(op,
-					expr.TypedRight(), left.TypedRight())
-				if newBinExpr == nil {
-					// Substitution is not possible type-wise. Nothing else to do.
-					break
-				}
-
-				newRightExpr, err := eval.Expr(v.ctx, newBinExpr)
-				if err != nil {
-					// In the case of an error during Eval, give up on normalizing this
-					// expression. There are some expected errors here if, for example,
-					// normalization produces a result that overflows an int64.
-					break
-				}
-
-				if !exprCopied {
-					exprCopy := *expr
-					expr = &exprCopy
-					exprCopied = true
-				}
-
-				expr.Left = left.Left
-				expr.Right = newRightExpr
-				tree.MemoizeComparisonExprOp(expr)
-				if !eval.IsVar(v.ctx, expr.Left, true /*allowConstPlaceholders*/) {
-					// Continue as long as the left side of the comparison is not a
-					// variable.
-					continue
-				}
-
-			case v.isConst(left.Left) && (left.Operator.Symbol == treebin.Plus || left.Operator.Symbol == treebin.Minus):
-				//       cmp              cmp
-				//      /   \            /   \
-				//    [+-]   2  ->     [+-]   a
-				//   /    \           /    \
-				//  1      a         1      2
-
-				op := expr.Operator
-				var newBinExpr *tree.BinaryExpr
-
-				switch left.Operator.Symbol {
-				case treebin.Plus:
-					//
-					// (A + X) cmp B => X cmp (B - C)
-					//
-					newBinExpr = tree.NewBinExprIfValidOverload(
-						treebin.MakeBinaryOperator(treebin.Minus),
-						expr.TypedRight(),
-						left.TypedLeft(),
-					)
-				case treebin.Minus:
-					//
-					// (A - X) cmp B => X cmp' (A - B)
-					//
-					newBinExpr = tree.NewBinExprIfValidOverload(
-						treebin.MakeBinaryOperator(treebin.Minus),
-						left.TypedLeft(),
-						expr.TypedRight(),
-					)
-					op, v.err = invertComparisonOp(op)
-					if v.err != nil {
-						return expr
-					}
-				}
-
-				if newBinExpr == nil {
-					break
-				}
-
-				newRightExpr, err := eval.Expr(v.ctx, newBinExpr)
-				if err != nil {
-					break
-				}
-
-				if !exprCopied {
-					exprCopy := *expr
-					expr = &exprCopy
-					exprCopied = true
-				}
-
-				expr.Operator = op
-				expr.Left = left.Right
-				expr.Right = newRightExpr
-				tree.MemoizeComparisonExprOp(expr)
-				if !eval.IsVar(v.ctx, expr.Left, true /*allowConstPlaceholders*/) {
-					// Continue as long as the left side of the comparison is not a
-					// variable.
-					continue
-				}
+			// The left side is const and the right side is a binary expression or a
+			// variable. Flip the comparison op so that the right side is const and
+			// the left side is a binary expression or variable.
+			// Create a new ComparisonExpr so the function cache isn't reused.
+			if !exprCopied {
+				exprCopy := *expr
+				expr = &exprCopy
+				exprCopied = true
 			}
 
-			// We've run out of work to do.
-			break
+			expr = tree.NewTypedComparisonExpr(invertedOp, expr.TypedRight(), expr.TypedLeft())
+		} else if !v.isConst(expr.Right) {
+			return expr
 		}
 	case treecmp.In, treecmp.NotIn:
 		// If the right tuple in an In or NotIn comparison expression is constant, it can
@@ -394,7 +248,7 @@ func normalizeComparisonExpr(v *Visitor, expr *tree.ComparisonExpr) tree.TypedEx
 		tuple, ok := expr.Right.(*tree.DTuple)
 		if ok {
 			tupleCopy := *tuple
-			tupleCopy.Normalize(v.ctx)
+			tupleCopy.Normalize(v.evalCtx)
 
 			// If the tuple only contains NULL values, Normalize will have reduced
 			// it to a single NULL value.
@@ -431,9 +285,12 @@ func normalizeComparisonExpr(v *Visitor, expr *tree.ComparisonExpr) tree.TypedEx
 		treecmp.ILike, treecmp.NotILike,
 		treecmp.SimilarTo, treecmp.NotSimilarTo,
 		treecmp.RegMatch, treecmp.NotRegMatch,
-		treecmp.RegIMatch, treecmp.NotRegIMatch,
-		treecmp.Any, treecmp.Some, treecmp.All:
+		treecmp.RegIMatch, treecmp.NotRegIMatch:
 		if expr.TypedLeft() == tree.DNull || expr.TypedRight() == tree.DNull {
+			return tree.DNull
+		}
+	case treecmp.Any, treecmp.Some, treecmp.All:
+		if expr.TypedRight() == tree.DNull {
 			return tree.DNull
 		}
 	}
@@ -443,7 +300,7 @@ func normalizeComparisonExpr(v *Visitor, expr *tree.ComparisonExpr) tree.TypedEx
 
 func normalizeIfExpr(v *Visitor, expr *tree.IfExpr) tree.TypedExpr {
 	if v.isConst(expr.Cond) {
-		cond, err := eval.Expr(v.ctx, expr.TypedCondExpr())
+		cond, err := eval.Expr(v.ctx, v.evalCtx, expr.TypedCondExpr())
 		if err != nil {
 			v.err = err
 			return expr
@@ -479,7 +336,7 @@ func normalizeOrExpr(v *Visitor, expr *tree.OrExpr) tree.TypedExpr {
 
 	// Use short-circuit evaluation to simplify OR expressions.
 	if v.isConst(left) {
-		dleft, v.err = eval.Expr(v.ctx, left)
+		dleft, v.err = eval.Expr(v.ctx, v.evalCtx, left)
 		if v.err != nil {
 			return expr
 		}
@@ -498,7 +355,7 @@ func normalizeOrExpr(v *Visitor, expr *tree.OrExpr) tree.TypedExpr {
 		)
 	}
 	if v.isConst(right) {
-		dright, v.err = eval.Expr(v.ctx, right)
+		dright, v.err = eval.Expr(v.ctx, v.evalCtx, right)
 		if v.err != nil {
 			return expr
 		}
@@ -527,7 +384,7 @@ func normalizeRangeCond(v *Visitor, expr *tree.RangeCond) tree.TypedExpr {
 	leftFrom, from := expr.TypedLeftFrom(), expr.TypedFrom()
 	leftTo, to := expr.TypedLeftTo(), expr.TypedTo()
 	// The visitor hasn't walked down into leftTo; do it now.
-	if leftTo, v.err = Expr(v.ctx, leftTo); v.err != nil {
+	if leftTo, v.err = Expr(v.ctx, v.evalCtx, leftTo); v.err != nil {
 		return expr
 	}
 
@@ -599,7 +456,7 @@ func normalizeTuple(v *Visitor, expr *tree.Tuple) tree.TypedExpr {
 	if !isConst {
 		return expr
 	}
-	e, err := eval.Expr(v.ctx, expr)
+	e, err := eval.Expr(v.ctx, v.evalCtx, expr)
 	if err != nil {
 		v.err = err
 	}

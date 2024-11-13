@@ -24,6 +24,8 @@ import (
 	"strconv"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 	"github.com/xdg-go/pbkdf2"
 	"github.com/xdg-go/scram"
@@ -35,7 +37,7 @@ const (
 	// DefaultBcryptCost is the hashing cost for the hashing method crdb-bcrypt.
 	DefaultBcryptCost = 10
 	// DefaultSCRAMCost is the hashing cost for the hashing method SCRAM.
-	DefaultSCRAMCost = 119680
+	DefaultSCRAMCost = 10610
 	// ScramMinCost is as per RFC 5802.
 	ScramMinCost = 4096
 	// ScramMaxCost is an arbitrary value to prevent unreasonably long logins
@@ -344,7 +346,11 @@ func HashPassword(
 			}
 			defer alloc()
 		}
-		return bcrypt.GenerateFromPassword(AppendEmptySha256(password), cost)
+		ret, err := bcrypt.GenerateFromPassword(AppendEmptySha256(password), cost)
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			err = pgerror.Wrap(err, pgcode.InvalidPassword, "")
+		}
+		return ret, err
 
 	case HashSCRAMSHA256:
 		return hashPasswordUsingSCRAM(ctx, cost, password, hashSem)
@@ -568,7 +574,7 @@ func isMD5Hash(hashedPassword []byte) bool {
 //   - hashedPassword is a translated version from the input,
 //     suitable for storage in the password database.
 func CheckPasswordHashValidity(
-	ctx context.Context, inputPassword []byte,
+	inputPassword []byte,
 ) (
 	isPreHashed, supportedScheme bool,
 	issueNum int,
@@ -645,123 +651,228 @@ func CheckPasswordHashValidity(
 // server.user_login.password_hashes.default_cost.scram_sha_256 and
 // re-encode their passwords.
 var BcryptCostToSCRAMIterCount = []int64{
-	0,            // 0-3 are not valid bcrypt costs.
-	0,            // 0-3 are not valid bcrypt costs.
-	0,            // 0-3 are not valid bcrypt costs.
-	0,            // 0-3 are not valid bcrypt costs.
-	4096,         // 4 - special case to select lowest cost possible. Model would predict 7000.
-	9420,         // 5
-	12977,        // 6
-	20090,        // 7
-	34318,        // 8
-	62772,        // 9
-	119680,       // 10 - common default, 50-100ms login latency on 2021 hardware
-	233497,       // 11
-	461131,       // 12
-	916398,       // 13
-	1826932,      // 14
-	3648001,      // 15
-	7290139,      // 16
-	14574415,     // 17
-	29142967,     // 18
-	58280072,     // 19
-	116554280,    // 20
-	233102696,    // 21
-	466199529,    // 22
-	932393195,    // 23
-	1864780528,   // 24
-	3729555192,   // 25
-	7459104520,   // 26
-	14918203177,  // 27
-	29836400491,  // 28
-	59672795119,  // 29
-	119345584374, // 30
-	238691162884, // 31
+	0,           // 0-3 are not valid bcrypt costs.
+	0,           // 0-3 are not valid bcrypt costs.
+	0,           // 0-3 are not valid bcrypt costs.
+	0,           // 0-3 are not valid bcrypt costs.
+	4096,        // 4 - special case to select lowest cost possible. Model would predict 1288.
+	4096,        // 5 - special case to select lowest cost possible. Model would predict 1654.
+	4096,        // 6 - special case to select lowest cost possible. Model would predict 2384.
+	4096,        // 7 - special case to select lowest cost possible. Model would predict 3846.
+	6768,        // 8
+	8768,        // 9
+	10610,       // 10 - common default, 50-100ms login latency on 2021 hardware
+	24302,       // 11
+	47682,       // 12
+	94441,       // 13
+	187958,      // 14
+	374993,      // 15
+	749063,      // 16
+	1497202,     // 17
+	2993481,     // 18
+	5986039,     // 19
+	11971154,    // 20
+	23941385,    // 21
+	47881848,    // 22
+	95762772,    // 23
+	191524622,   // 24
+	383048320,   // 25
+	766095717,   // 26
+	1532190512,  // 27
+	3064380100,  // 28
+	6128759277,  // 29
+	12257517630, // 30
+	24515034337, // 31
 }
 
-// MaybeUpgradePasswordHash looks at the cleartext and the hashed
-// password and determines whether the hash can be upgraded from
-// crdb-bcrypt to scram-sha-256. If it can, it computes an equivalent
-// SCRAM hash and returns it.
+// ScramIterCountToBcryptCost computes the inverse of the
+// BcryptCostToSCRAMIterCount mapping.
+func ScramIterCountToBcryptCost(scramIters int) int {
+	for i, thisIterCount := range BcryptCostToSCRAMIterCount {
+		if i >= bcrypt.MaxCost {
+			return bcrypt.MaxCost
+		}
+		if int64(scramIters) >= thisIterCount && int64(scramIters) < BcryptCostToSCRAMIterCount[i+1] {
+			return i
+		}
+	}
+	return 0
+}
+
+// MaybeConvertPasswordHash looks at the cleartext and the hashed
+// password and determines whether the hash can be converted from/to
+// crdb-bcrypt to/from scram-sha-256. If it can, it computes an equivalent
+// hash and returns it.
 //
 // See the documentation on BcryptCostToSCRAMIterCount[] for details.
-func MaybeUpgradePasswordHash(
+func MaybeConvertPasswordHash(
 	ctx context.Context,
-	autoUpgradePasswordHashes bool,
-	PasswordHashMethod HashMethod,
+	autoUpgradePasswordHashes, autoDowngradePasswordHashesBool, autoRehashOnCostChangeBool bool,
+	configuredHashMethod HashMethod,
+	configuredSCRAMCost int64,
 	cleartext string,
 	hashed PasswordHash,
 	hashSem HashSemaphore,
 	logEvent func(context.Context, string, ...interface{}),
 ) (converted bool, prevHashBytes, newHashBytes []byte, newMethod string, err error) {
 	bh, isBcrypt := hashed.(bcryptHash)
+	sh, isScram := hashed.(*scramHash)
 
-	// Do we want to perform the conversion?
-	//
-	// We stop here in the following cases:
-	// - password not currently hashed using crdb-bcrypt: we can't convert.
-	// - conversion disabled by cluster setting.
-	// - some nodes don't know about SCRAM just yet during an upgrade.
-	//   (checked in GetConfiguredPasswordHashMethod)
-	// - the configured default method is not scram-sha-256.
-	if !isBcrypt || !autoUpgradePasswordHashes ||
-		PasswordHashMethod != HashSCRAMSHA256 {
-		// Nothing to do.
-		return false, nil, nil, "", nil
+	// First check upgrading hashes. We need the following:
+	// - password currently hashed using crdb-bcrypt.
+	// - conversion enabled by cluster setting.
+	// - the configured default method is scram-sha-256.
+	if isBcrypt && autoUpgradePasswordHashes && configuredHashMethod == HashSCRAMSHA256 {
+		bcryptCost, err := bcrypt.Cost(bh)
+		if err != nil {
+			// The caller should only call this function after authentication
+			// has succeeded, so the bcrypt cost should have been validated
+			// already.
+			return false, nil, nil, "", errors.NewAssertionErrorWithWrappedErrf(err, "programming error: authn succeeded but invalid bcrypt hash")
+		}
+		if bcryptCost < bcrypt.MinCost || bcryptCost > bcrypt.MaxCost || BcryptCostToSCRAMIterCount[bcryptCost] == 0 {
+			// The bcryptCost was smaller than 4 or greater than 31? That's a violation of a bcrypt invariant.
+			// Or perhaps the BcryptCostToSCRAMIterCount was incorrectly modified and there's a hole with value zero.
+			return false, nil, nil, "", errors.AssertionFailedf("unexpected: bcrypt cost %d is out of bounds or has no mapping", bcryptCost)
+		}
+
+		scramIterCount := BcryptCostToSCRAMIterCount[bcryptCost]
+		if scramIterCount > math.MaxInt {
+			// scramIterCount is an int64. However, the SCRAM library we're using (xdg/scram) uses
+			// an int for the iteration count. This is not an issue when this code is running
+			// on a 64-bit platform, where sizeof(int) == sizeof(int64). However, when running
+			// on 32-bit, we can't allow a conversion to proceed because it would potentially
+			// truncate the iter count to a low value.
+			// However, this situation is not an error. The hash could still be converted later
+			// when the system is upgraded to 64-bit.
+			return false, nil, nil, "", nil
+		}
+
+		if bcryptCost > 10 {
+			// Tell the logs that we're doing a conversion. This is important
+			// if the new cost is high and the operation takes a long time, so
+			// the operator knows what's up.
+			//
+			// Note: this is an informational message for troubleshooting
+			// purposes, and therefore is best sent to the DEV channel. The
+			// structured event that reports that the conversion has completed
+			// (and the new credentials were stored) is sent by the SQL code
+			// that also owns the storing of the new credentials.
+			logEvent(ctx, "hash conversion: computing a SCRAM hash with iteration count %d (from bcrypt cost %d)", scramIterCount, bcryptCost)
+		}
+
+		newHash, err := hashAndValidate(ctx, int(scramIterCount), HashSCRAMSHA256, cleartext, hashSem)
+		if err != nil {
+			// This call only fail with hard errors.
+			return false, nil, nil, "", err
+		}
+		return true, bh, newHash, HashSCRAMSHA256.String(), nil
 	}
 
-	bcryptCost, err := bcrypt.Cost([]byte(bh))
-	if err != nil {
-		// The caller should only call this function after authentication
-		// has succeeded, so the bcrypt cost should have been validated
-		// already.
-		return false, nil, nil, "", errors.NewAssertionErrorWithWrappedErrf(err, "programming error: authn succeeded but invalid bcrypt hash")
-	}
-	if bcryptCost < 0 || bcryptCost >= len(BcryptCostToSCRAMIterCount) || BcryptCostToSCRAMIterCount[bcryptCost] == 0 {
-		// The bcryptCost was smaller than 4 or greater than 31? That's a violation of a bcrypt invariant.
-		// Or perhaps the BcryptCostToSCRAMIterCount was incorrectly modified and there's a hole with value zero.
-		return false, nil, nil, "", errors.AssertionFailedf("unexpected: bcrypt cost %d is out of bounds or has no mapping", bcryptCost)
+	// Now check updating SCRAM hashes with a new cost. We need the following:
+	// - password currently hashed using scram-sha-256.
+	// - cost conversion enabled by cluster setting.
+	// - the configured default method is scram-sha-256.
+	// - the current password cost is different than the configured default cost.
+	if isScram && autoRehashOnCostChangeBool && configuredHashMethod == HashSCRAMSHA256 {
+		ok, parts := isSCRAMHash(sh.bytes)
+		if !ok {
+			// The caller should only call this function after authentication
+			// has succeeded, so the scram hash should have been validated
+			// already.
+			return false, nil, nil, "", errors.AssertionFailedf("programming error: authn succeeded but invalid scram hash")
+		}
+		scramIters, err := parts.getIters()
+		if err != nil {
+			// The caller should only call this function after authentication
+			// has succeeded, so the scram iters should have been validated
+			// already.
+			return false, nil, nil, "", errors.NewAssertionErrorWithWrappedErrf(err, "programming error: authn succeeded but invalid scram hash")
+		}
+
+		if scramIters < ScramMinCost || scramIters > ScramMaxCost {
+			// The scramIters being out of range is a violation of our SCRAM preconditions.
+			return false, nil, nil, "", errors.AssertionFailedf("unexpected: scram iteration count %d is out of bounds", scramIters)
+		}
+
+		if configuredSCRAMCost != int64(scramIters) {
+			newHash, err := hashAndValidate(ctx, int(configuredSCRAMCost), HashSCRAMSHA256, cleartext, hashSem)
+			if err != nil {
+				// This call only fail with hard errors.
+				return false, nil, nil, "", err
+			}
+			return true, sh.bytes, newHash, HashSCRAMSHA256.String(), nil
+		}
 	}
 
-	scramIterCount := BcryptCostToSCRAMIterCount[bcryptCost]
-	if scramIterCount > math.MaxInt {
-		// scramIterCount is an int64. However, the SCRAM library we're using (xdg/scram) uses
-		// an int for the iteration count. This is not an issue when this code is running
-		// on a 64-bit platform, where sizeof(int) == sizeof(int64). However, when running
-		// on 32-bit, we can't allow a conversion to proceed because it would potentially
-		// truncate the iter count to a low value.
-		// However, this situation is not an error. The hash could still be converted later
-		// when the system is upgraded to 64-bit.
-		return false, nil, nil, "", nil
+	// Now check downgrading hashes. We need the following:
+	// - password currently hashed using scram-sha-256.
+	// - conversion enabled by cluster setting.
+	// - the configured default method is crdb-bcrypt.
+	if isScram && autoDowngradePasswordHashesBool && configuredHashMethod == HashBCrypt {
+		ok, parts := isSCRAMHash(sh.bytes)
+		if !ok {
+			// The caller should only call this function after authentication
+			// has succeeded, so the scram hash should have been validated
+			// already.
+			return false, nil, nil, "", errors.AssertionFailedf("programming error: authn succeeded but invalid scram hash")
+		}
+		scramIters, err := parts.getIters()
+		if err != nil {
+			// The caller should only call this function after authentication
+			// has succeeded, so the scram iters should have been validated
+			// already.
+			return false, nil, nil, "", errors.NewAssertionErrorWithWrappedErrf(err, "programming error: authn succeeded but invalid scram hash")
+		}
+		if scramIters < ScramMinCost || scramIters > ScramMaxCost {
+			// The scramIters being out of range is a violation of our SCRAM preconditions.
+			return false, nil, nil, "", errors.AssertionFailedf("unexpected: scram iteration count %d is out of bounds", scramIters)
+		}
+
+		bcryptCost := ScramIterCountToBcryptCost(scramIters)
+		if bcryptCost > 10 {
+			// Tell the logs that we're doing a conversion. This is important
+			// if the new cost is high and the operation takes a long time, so
+			// the operator knows what's up.
+			//
+			// Note: this is an informational message for troubleshooting
+			// purposes, and therefore is best sent to the DEV channel. The
+			// structured event that reports that the conversion has completed
+			// (and the new credentials were stored) is sent by the SQL code
+			// that also owns the storing of the new credentials.
+			logEvent(ctx, "hash conversion: computing a bcrypt hash with cost %d (from SCRAM iteration count %d)", bcryptCost, scramIters)
+		}
+
+		newHash, err := hashAndValidate(ctx, bcryptCost, HashBCrypt, cleartext, hashSem)
+		if err != nil {
+			// This call only fail with hard errors.
+			return false, nil, nil, "", err
+		}
+		return true, sh.bytes, newHash, HashBCrypt.String(), nil
 	}
 
-	if bcryptCost > 10 {
-		// Tell the logs that we're doing a conversion. This is important
-		// if the new cost is high and the operation takes a long time, so
-		// the operator knows what's up.
-		//
-		// Note: this is an informational message for troubleshooting
-		// purposes, and therefore is best sent to the DEV channel. The
-		// structured event that reports that the conversion has completed
-		// (and the new credentials were stored) is sent by the SQL code
-		// that also owns the storing of the new credentials.
-		logEvent(ctx, "hash conversion: computing a SCRAM hash with iteration count %d (from bcrypt cost %d)", scramIterCount, bcryptCost)
-	}
+	// Nothing to do.
+	return false, nil, nil, "", nil
+}
 
-	rawHash, err := hashPasswordUsingSCRAM(ctx, int(scramIterCount), cleartext, hashSem)
+// hashAndValidate hashes the cleartext password and validates that it can
+// be decoded.
+func hashAndValidate(
+	ctx context.Context, cost int, newHashMethod HashMethod, cleartext string, hashSem HashSemaphore,
+) (newHashBytes []byte, err error) {
+	rawHash, err := HashPassword(ctx, cost, newHashMethod, cleartext, hashSem)
 	if err != nil {
 		// This call only fail with hard errors.
-		return false, nil, nil, "", err
+		return nil, err
 	}
 
 	// Check the raw hash can be decoded using our decoder.
 	// This checks that we're able to re-parse what we just generated,
 	// which is a safety mechanism to ensure the result is valid.
-	expectedMethod := HashSCRAMSHA256
 	newHash := LoadPasswordHash(ctx, rawHash)
-	if newHash.Method() != expectedMethod {
+	if newHash.Method() != newHashMethod {
 		// In contrast to logs, we don't want the details of the hash in the error with %+v.
-		return false, nil, nil, "", errors.AssertionFailedf("programming error: re-hash failed to produce SCRAM hash, produced %T instead", newHash)
+		return nil, errors.AssertionFailedf("programming error: re-hash failed to produce %s hash, produced %T instead", newHashMethod, newHash)
 	}
-	return true, []byte(bh), rawHash, expectedMethod.String(), nil
+	return rawHash, nil
 }

@@ -12,8 +12,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -52,6 +54,22 @@ func mustGetFlagString(cmd *cobra.Command, name string) string {
 	return val
 }
 
+func mustGetFlagStringArray(cmd *cobra.Command, name string) []string {
+	val, err := cmd.Flags().GetStringArray(name)
+	if err != nil {
+		log.Fatalf("unexpected error: %v", err)
+	}
+	return val
+}
+
+func mustGetFlagStringSlice(cmd *cobra.Command, name string) []string {
+	val, err := cmd.Flags().GetStringSlice(name)
+	if err != nil {
+		log.Fatalf("unexpected error: %v", err)
+	}
+	return val
+}
+
 func mustGetFlagBool(cmd *cobra.Command, name string) bool {
 	val, err := cmd.Flags().GetBool(name)
 	if err != nil {
@@ -64,6 +82,14 @@ func mustGetFlagInt(cmd *cobra.Command, name string) int {
 	val, err := cmd.Flags().GetInt(name)
 	if err != nil {
 		log.Fatalf("unexpected error: %v", err)
+	}
+	return val
+}
+
+func mustGetConstrainedFlagInt(cmd *cobra.Command, name string, validate func(int) error) int {
+	val := mustGetFlagInt(cmd, name)
+	if err := validate(val); err != nil {
+		log.Fatalf("invalid argument: %v", err)
 	}
 	return val
 }
@@ -182,4 +208,28 @@ func logCommand(cmd string, args ...string) {
 	fullArgs = append(fullArgs, cmd)
 	fullArgs = append(fullArgs, args...)
 	log.Printf("$ %s", shellescape.QuoteCommand(fullArgs))
+}
+
+func sendBepDataToBeaverHubIfNeeded(bepFilepath string) error {
+	// Check if a BEP file exists.
+	if _, err := os.Stat(bepFilepath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	file, err := os.Open(bepFilepath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	httpClient := &http.Client{}
+	req, _ := http.NewRequest("POST", beaverHubServerEndpoint, file)
+	req.Header.Add("Run-Env", "dev")
+	req.Header.Add("Content-Type", "application/octet-stream")
+	if _, err := httpClient.Do(req); err != nil {
+		return err
+	}
+	_ = os.Remove(bepFilepath)
+	return nil
 }

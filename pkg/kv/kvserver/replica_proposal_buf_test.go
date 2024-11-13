@@ -18,10 +18,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -33,9 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/raftpb"
-	rafttracker "go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
+	rafttracker "go.etcd.io/raft/v3/tracker"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -59,8 +61,10 @@ type testProposer struct {
 	// If nil, rejectProposalWithLeaseTransferRejectedLocked() panics.
 	onRejectProposalWithLeaseTransferRejectedLocked func(
 		lease *roachpb.Lease, reason raftutil.ReplicaNeedsSnapshotStatus)
-	// ownsValidLease is returned by ownsValidLeaseRLocked()
-	ownsValidLease bool
+	// validLease is returned by ownsValidLease()
+	validLease bool
+	// leaderNotLive is returned from shouldCampaignOnRedirect().
+	leaderNotLive bool
 
 	// leaderReplicaInDescriptor is set if the leader (as indicated by raftGroup)
 	// is known, and that leader is part of the range's descriptor (as seen by the
@@ -82,7 +86,8 @@ type testProposerRaft struct {
 	status raft.Status
 	// proposals are the commands that the propBuf flushed (i.e. passed to the
 	// Raft group) and have not yet been consumed with consumeProposals().
-	proposals []kvserverpb.RaftCommand
+	proposals  []kvserverpb.RaftCommand
+	campaigned bool
 }
 
 var _ proposerRaft = &testProposerRaft{}
@@ -93,11 +98,11 @@ func (t *testProposerRaft) Step(msg raftpb.Message) error {
 	}
 	// Decode and save all the commands.
 	for _, e := range msg.Entries {
-		_ /* idKey */, encodedCommand := kvserverbase.DecodeRaftCommand(e.Data)
-		t.proposals = append(t.proposals, kvserverpb.RaftCommand{})
-		if err := protoutil.Unmarshal(encodedCommand, &t.proposals[len(t.proposals)-1]); err != nil {
+		ent, err := raftlog.NewEntry(e)
+		if err != nil {
 			return err
 		}
+		t.proposals = append(t.proposals, ent.Cmd)
 	}
 	return nil
 }
@@ -113,8 +118,17 @@ func (t testProposerRaft) Status() raft.Status {
 	return t.status
 }
 
+func (t testProposerRaft) BasicStatus() raft.BasicStatus {
+	return t.status.BasicStatus
+}
+
 func (t testProposerRaft) ProposeConfChange(i raftpb.ConfChangeI) error {
 	// TODO(andrei, nvanbenschoten): Capture the message and test against it.
+	return nil
+}
+
+func (t *testProposerRaft) Campaign() error {
+	t.campaigned = true
 	return nil
 }
 
@@ -173,14 +187,8 @@ func (t *testProposer) registerProposalLocked(p *ProposalData) {
 	t.registered++
 }
 
-func (t *testProposer) ownsValidLeaseRLocked(ctx context.Context, now hlc.ClockTimestamp) bool {
-	return t.ownsValidLease
-}
-
-func (t *testProposer) leaderStatusRLocked(
-	ctx context.Context, raftGroup proposerRaft,
-) rangeLeaderInfo {
-	lead := raftGroup.Status().Lead
+func (t *testProposer) leaderStatus(ctx context.Context, raftGroup proposerRaft) rangeLeaderInfo {
+	lead := raftGroup.BasicStatus().Lead
 	leaderKnown := lead != raft.None
 	var leaderRep roachpb.ReplicaID
 	var iAmTheLeader, leaderEligibleForLease bool
@@ -206,11 +214,19 @@ func (t *testProposer) leaderStatusRLocked(
 		}
 	}
 	return rangeLeaderInfo{
+		iAmTheLeader:           iAmTheLeader,
 		leaderKnown:            leaderKnown,
 		leader:                 leaderRep,
-		iAmTheLeader:           iAmTheLeader,
 		leaderEligibleForLease: leaderEligibleForLease,
 	}
+}
+
+func (t *testProposer) ownsValidLease(ctx context.Context, now hlc.ClockTimestamp) bool {
+	return t.validLease
+}
+
+func (t *testProposer) shouldCampaignOnRedirect(raftGroup proposerRaft) bool {
+	return t.leaderNotLive
 }
 
 func (t *testProposer) rejectProposalWithRedirectLocked(
@@ -240,32 +256,32 @@ type proposalCreator struct {
 }
 
 func (pc proposalCreator) newPutProposal(ts hlc.Timestamp) *ProposalData {
-	var ba roachpb.BatchRequest
-	ba.Add(&roachpb.PutRequest{})
+	ba := &kvpb.BatchRequest{}
+	ba.Add(&kvpb.PutRequest{})
 	ba.Timestamp = ts
 	return pc.newProposal(ba)
 }
 
 func (pc proposalCreator) newLeaseRequestProposal(lease roachpb.Lease) *ProposalData {
-	var ba roachpb.BatchRequest
-	ba.Add(&roachpb.RequestLeaseRequest{Lease: lease, PrevLease: pc.lease.Lease})
+	ba := &kvpb.BatchRequest{}
+	ba.Add(&kvpb.RequestLeaseRequest{Lease: lease, PrevLease: pc.lease.Lease})
 	return pc.newProposal(ba)
 }
 
 func (pc proposalCreator) newLeaseTransferProposal(lease roachpb.Lease) *ProposalData {
-	var ba roachpb.BatchRequest
-	ba.Add(&roachpb.TransferLeaseRequest{Lease: lease, PrevLease: pc.lease.Lease})
+	ba := &kvpb.BatchRequest{}
+	ba.Add(&kvpb.TransferLeaseRequest{Lease: lease, PrevLease: pc.lease.Lease})
 	return pc.newProposal(ba)
 }
 
-func (pc proposalCreator) newProposal(ba roachpb.BatchRequest) *ProposalData {
+func (pc proposalCreator) newProposal(ba *kvpb.BatchRequest) *ProposalData {
 	var lease *roachpb.Lease
 	var isLeaseRequest bool
 	switch v := ba.Requests[0].GetInner().(type) {
-	case *roachpb.RequestLeaseRequest:
+	case *kvpb.RequestLeaseRequest:
 		lease = &v.Lease
 		isLeaseRequest = true
-	case *roachpb.TransferLeaseRequest:
+	case *kvpb.TransferLeaseRequest:
 		lease = &v.Lease
 	}
 	p := &ProposalData{
@@ -277,7 +293,7 @@ func (pc proposalCreator) newProposal(ba roachpb.BatchRequest) *ProposalData {
 				State:          &kvserverpb.ReplicaState{Lease: lease},
 			},
 		},
-		Request:     &ba,
+		Request:     ba,
 		leaseStatus: pc.lease,
 	}
 	p.encodedCommand = pc.encodeProposal(p)
@@ -286,11 +302,11 @@ func (pc proposalCreator) newProposal(ba roachpb.BatchRequest) *ProposalData {
 
 func (pc proposalCreator) encodeProposal(p *ProposalData) []byte {
 	cmdLen := p.command.Size()
-	needed := kvserverbase.RaftCommandPrefixLen + cmdLen + kvserverpb.MaxRaftCommandFooterSize()
-	data := make([]byte, kvserverbase.RaftCommandPrefixLen, needed)
-	kvserverbase.EncodeRaftCommandPrefix(data, kvserverbase.RaftVersionStandard, p.idKey)
-	data = data[:kvserverbase.RaftCommandPrefixLen+p.command.Size()]
-	if _, err := protoutil.MarshalTo(p.command, data[kvserverbase.RaftCommandPrefixLen:]); err != nil {
+	needed := raftlog.RaftCommandPrefixLen + cmdLen + kvserverpb.MaxRaftCommandFooterSize()
+	data := make([]byte, raftlog.RaftCommandPrefixLen, needed)
+	raftlog.EncodeRaftCommandPrefix(data, raftlog.EntryEncodingStandardWithoutAC, p.idKey)
+	data = data[:raftlog.RaftCommandPrefixLen+p.command.Size()]
+	if _, err := protoutil.MarshalTo(p.command, data[raftlog.RaftCommandPrefixLen:]); err != nil {
 		panic(err)
 	}
 	return data
@@ -308,7 +324,7 @@ func TestProposalBuffer(t *testing.T) {
 	}
 	var b propBuf
 	var pc proposalCreator
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	b.Init(&p, tracker.NewLockfreeTracker(), clock, cluster.MakeTestingClusterSettings())
 
 	// Insert propBufArrayMinSize proposals. The buffer should not be flushed.
@@ -377,7 +393,7 @@ func TestProposalBufferConcurrentWithDestroy(t *testing.T) {
 	}
 	var b propBuf
 	var pc proposalCreator
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	b.Init(&p, tracker.NewLockfreeTracker(), clock, cluster.MakeTestingClusterSettings())
 
 	dsErr := errors.New("destroyed")
@@ -445,7 +461,7 @@ func TestProposalBufferRegistersAllOnProposalError(t *testing.T) {
 	p.raftGroup = raft
 	var b propBuf
 	var pc proposalCreator
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	b.Init(&p, tracker.NewLockfreeTracker(), clock, cluster.MakeTestingClusterSettings())
 
 	num := propBufArrayMinSize
@@ -495,10 +511,14 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 		// Set to simulate situations where the local replica is so behind that the
 		// leader is not even part of the range descriptor.
 		leaderNotInRngDesc bool
+		// Set to simulate situations where the Raft leader is not live in the node
+		// liveness map.
+		leaderNotLive bool
 		// If true, the follower has a valid lease.
 		ownsValidLease bool
 
 		expRejection bool
+		expCampaign  bool
 	}{
 		{
 			name:   "leader",
@@ -554,6 +574,17 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 			// FlushLockedWithRaftGroup().
 			expRejection: false,
 		},
+		{
+			name:  "follower, known eligible non-live leader",
+			state: raft.StateFollower,
+			// Someone else is leader.
+			leader:        self + 1,
+			leaderNotLive: true,
+			// Rejection - a follower can't request a lease.
+			expRejection: true,
+			// The leader is non-live, so we should campaign.
+			expCampaign: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var p testProposer
@@ -586,10 +617,11 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 			p.raftGroup = r
 			p.leaderReplicaInDescriptor = !tc.leaderNotInRngDesc
 			p.leaderReplicaType = tc.leaderRepType
-			p.ownsValidLease = tc.ownsValidLease
+			p.validLease = tc.ownsValidLease
+			p.leaderNotLive = tc.leaderNotLive
 
 			var b propBuf
-			clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+			clock := hlc.NewClockForTesting(nil)
 			tracker := tracker.NewLockfreeTracker()
 			b.Init(&p, tracker, clock, cluster.MakeTestingClusterSettings())
 
@@ -603,6 +635,7 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 			} else {
 				require.Equal(t, roachpb.ReplicaID(0), rejected)
 			}
+			require.Equal(t, tc.expCampaign, r.campaigned)
 			require.Zero(t, tracker.Count())
 		})
 	}
@@ -729,7 +762,7 @@ func TestProposalBufferRejectUnsafeLeaseTransfer(t *testing.T) {
 			p.fi = proposerFirstIndex
 
 			var b propBuf
-			clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+			clock := hlc.NewClockForTesting(nil)
 			tracker := tracker.NewLockfreeTracker()
 			b.Init(&p, tracker, clock, cluster.MakeTestingClusterSettings())
 
@@ -769,7 +802,7 @@ func TestProposalBufferClosedTimestamp(t *testing.T) {
 
 	const maxOffset = 500 * time.Millisecond
 	mc := timeutil.NewManualTime(timeutil.Unix(1613588135, 0))
-	clock := hlc.NewClock(mc, maxOffset /* maxOffset */)
+	clock := hlc.NewClock(mc, maxOffset, maxOffset)
 	st := cluster.MakeTestingClusterSettings()
 	closedts.TargetDuration.Override(ctx, &st.SV, time.Second)
 	closedts.SideTransportCloseInterval.Override(ctx, &st.SV, 200*time.Millisecond)

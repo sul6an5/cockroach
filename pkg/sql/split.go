@@ -42,7 +42,7 @@ type splitRun struct {
 	lastExpirationTime hlc.Timestamp
 }
 
-func (n *splitNode) startExec(params runParams) error {
+func (n *splitNode) startExec(runParams) error {
 	return nil
 }
 
@@ -55,12 +55,13 @@ func (n *splitNode) Next(params runParams) (bool, error) {
 		return ok, err
 	}
 
-	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, n.rows.Values())
+	execCfg := params.ExecCfg()
+	rowKey, err := getRowKey(execCfg.Codec, n.tableDesc, n.index, n.rows.Values())
 	if err != nil {
 		return false, err
 	}
 
-	if err := params.ExecCfg().DB.AdminSplit(params.ctx, rowKey, n.expirationTime); err != nil {
+	if err := execCfg.DB.AdminSplit(params.ctx, rowKey, n.expirationTime); err != nil {
 		return false, err
 	}
 
@@ -109,11 +110,13 @@ func getRowKey(
 
 // parseExpriationTime parses an expression into a hlc.Timestamp representing
 // the expiration time of the split.
-func parseExpirationTime(evalCtx *eval.Context, expireExpr tree.TypedExpr) (hlc.Timestamp, error) {
+func parseExpirationTime(
+	ctx context.Context, evalCtx *eval.Context, expireExpr tree.TypedExpr,
+) (hlc.Timestamp, error) {
 	if !eval.IsConst(evalCtx, expireExpr) {
 		return hlc.Timestamp{}, errors.Errorf("SPLIT AT: only constant expressions are allowed for expiration")
 	}
-	d, err := eval.Expr(evalCtx, expireExpr)
+	d, err := eval.Expr(ctx, evalCtx, expireExpr)
 	if err != nil {
 		return hlc.Timestamp{}, err
 	}
@@ -121,7 +124,7 @@ func parseExpirationTime(evalCtx *eval.Context, expireExpr tree.TypedExpr) (hlc.
 		return hlc.MaxTimestamp, nil
 	}
 	stmtTimestamp := evalCtx.GetStmtTimestamp()
-	ts, err := asof.DatumToHLC(evalCtx, stmtTimestamp, d)
+	ts, err := asof.DatumToHLC(evalCtx, stmtTimestamp, d, asof.Split)
 	if err != nil {
 		return ts, errors.Wrap(err, "SPLIT AT")
 	}

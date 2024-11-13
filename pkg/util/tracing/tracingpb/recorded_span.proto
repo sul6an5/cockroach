@@ -10,7 +10,7 @@
 
 syntax = "proto3";
 package cockroach.util.tracing.tracingpb;
-option go_package = "tracingpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb";
 
 import "gogoproto/gogo.proto";
 import "google/protobuf/any.proto";
@@ -72,11 +72,6 @@ message RecordedSpan {
   // Operation name.
   string operation = 4;
 
-  // Tags associated with the span.
-  // Deprecated. Avoid new uses. Prefer tag_groups.
-  // TODO(benbardin): Remove the tags field for 23.1.
-  map<string, string> tags = 6;
-
   // tag_groups describes tags associated with the span, potentially in a
   // shallow structured hierarchy.
   //
@@ -125,9 +120,10 @@ message RecordedSpan {
   //
   // A StructuredRecord wraps the Payload with a RecordedAt timestamp to expose
   // information about when this event occurred.
-  // DeprecatedInternalStructured only stores the Payloads.
   repeated StructuredRecord structured_records = 14 [(gogoproto.nullable) = false];
-
+  // structured_records_size_bytes represents the total size of the logs in
+  // structured_records.
+  int64 structured_records_size_bytes = 20;
 
   // ChildrenMetadata is a mapping from operation to the aggregated metadata of
   // that operation.
@@ -137,7 +133,7 @@ message RecordedSpan {
   // view of the various operations that are being traced as part of a span.
   map<string, OperationMetadata> children_metadata = 19 [(gogoproto.nullable) = false];
 
-  reserved 5,10,11,15;
+  reserved 5,6,10,11,15;
 }
 
 message TagGroup {
@@ -177,4 +173,19 @@ message NormalizedSpan {
   repeated StructuredRecord structured_records = 7 [(gogoproto.nullable) = false];
   map<string, OperationMetadata> children_metadata = 9 [(gogoproto.nullable) = false];
   repeated NormalizedSpan children = 6 [(gogoproto.nullable) = false];
+}
+
+message CapturedStack {
+  option (gogoproto.goproto_stringer) = false;
+  // Stack is the strack trace, or distinct prefix of the stack trace if a previous
+  // capture of this stack is also being recorded.
+  string stack = 1;
+  // SharedSuffix indicates the length of the elided suffix of this stack that 
+  // was identical to the previous capture of this stack.
+  int32 shared_suffix = 2;
+  // SharedLines indicated how many newlines were in the elided shared suffix.
+  int32 shared_lines = 3;
+  // Age indicates the duration prior to being recorded that this stack was captured.
+  int64 age = 4 [(gogoproto.casttype) = "time.Duration"];
+  // NEXT ID: 5.
 }

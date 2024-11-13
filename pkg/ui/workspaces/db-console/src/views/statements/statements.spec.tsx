@@ -9,7 +9,7 @@
 // licenses/APL.txt.
 
 import Long from "long";
-import moment from "moment";
+import moment from "moment-timezone";
 import { RouteComponentProps } from "react-router-dom";
 import * as H from "history";
 import { merge } from "lodash";
@@ -22,16 +22,16 @@ import {
   statementAttr,
   unset,
 } from "src/util/constants";
-import {
-  selectStatements,
-  selectApps,
-  selectTotalFingerprints,
-  selectLastReset,
-} from "./statementsPage";
+import { selectStatements, selectLastReset } from "./statementsPage";
 import { selectStatementDetails } from "./statementDetails";
 import ISensitiveInfo = protos.cockroach.sql.ISensitiveInfo;
 import { AdminUIState, createAdminUIStore } from "src/redux/state";
-import { TimeScale, toRoundedDateRange, util } from "@cockroachlabs/cluster-ui";
+import {
+  TimeScale,
+  toRoundedDateRange,
+  util,
+  selectStmtsAllApps as selectApps,
+} from "@cockroachlabs/cluster-ui";
 
 const { generateStmtDetailsToID, longToInt } = util;
 
@@ -84,6 +84,28 @@ describe("selectStatements", () => {
     expect(actualFingerprints).toEqual(expectedFingerprints);
   });
 
+  it("returns the statements currently without grouping on fingerprint_id", () => {
+    const stmtA = makeFingerprint(1);
+    const stmtB = makeFingerprint(2, "foobar");
+    const stmtC = makeFingerprint(3, "another");
+    const stmtsWithSameFingerprintAsA = Array.from(new Array(5)).map(() =>
+      makeFingerprint(1, "duplicate_fingerprints"),
+    );
+
+    const stmts = [stmtA, stmtB, stmtC, ...stmtsWithSameFingerprintAsA];
+    const state = makeStateWithStatements(stmts, timeScale);
+    const props = makeEmptyRouteProps();
+
+    const result = selectStatements(state, props);
+    expect(result.length).toBe(8);
+
+    const expectedFingerprints = stmts.map(stmt => stmt.key.key_data.query);
+    expectedFingerprints.sort();
+    const actualFingerprints = result.map((stmt: any) => stmt.label);
+    actualFingerprints.sort();
+    expect(actualFingerprints).toEqual(expectedFingerprints);
+  });
+
   it("returns the statements without Internal for default ALL filter", () => {
     const stmtA = makeFingerprint(1);
     const stmtB = makeFingerprint(2, INTERNAL_STATEMENT_PREFIX);
@@ -98,56 +120,6 @@ describe("selectStatements", () => {
     const result = selectStatements(state, props);
 
     expect(result.length).toBe(2);
-  });
-
-  it("coalesces statements from different apps", () => {
-    const stmtA = makeFingerprint(1);
-    const stmtB = makeFingerprint(1, "foobar");
-    const stmtC = makeFingerprint(1, "another");
-    const sumCount = stmtA.stats.count
-      .add(stmtB.stats.count.add(stmtC.stats.count))
-      .toNumber();
-    const state = makeStateWithStatements([stmtA, stmtB, stmtC], timeScale);
-    const props = makeEmptyRouteProps();
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(1);
-    expect(result[0].label).toEqual(stmtA.key.key_data.query);
-    expect(result[0].stats.count.toNumber()).toEqual(sumCount);
-  });
-
-  it("coalesces statements with differing node ids", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "", 1),
-        makeFingerprint(1, "", 2),
-        makeFingerprint(1, "", 3),
-      ],
-      timeScale,
-    );
-    const props = makeEmptyRouteProps();
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(1);
-  });
-
-  it("coalesces statements with differing distSQL and failed values", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "", 1, false, false),
-        makeFingerprint(1, "", 1, false, true),
-        makeFingerprint(1, "", 1, true, false),
-        makeFingerprint(1, "", 1, true, true),
-      ],
-      timeScale,
-    );
-    const props = makeEmptyRouteProps();
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(1);
   });
 
   it("filters out statements when app param is set", () => {
@@ -201,7 +173,7 @@ describe("selectApps", () => {
   it("returns an empty array if the statements data is invalid", () => {
     const state = makeInvalidState();
 
-    const result = selectApps(state);
+    const result = selectApps(state?.cachedData?.statements?.data);
 
     expect(result).toEqual([]);
   });
@@ -210,6 +182,8 @@ describe("selectApps", () => {
     const state = makeStateWithStatements(
       [
         makeFingerprint(1),
+        makeFingerprint(1, "hello"),
+        makeFingerprint(1, "world"),
         makeFingerprint(1, "foobar"),
         makeFingerprint(2, "foobar"),
         makeFingerprint(3, "cockroach sql"),
@@ -217,76 +191,15 @@ describe("selectApps", () => {
       timeScale,
     );
 
-    const result = selectApps(state);
+    const result = selectApps(state?.cachedData?.statements?.data);
 
-    expect(result).toEqual([unset, "cockroach sql", "foobar"]);
-  });
-});
-
-describe("selectTotalFingerprints", () => {
-  it("returns zero if the statements data is invalid", () => {
-    const state = makeInvalidState();
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(0);
-  });
-
-  it("returns the number of statement fingerprints", () => {
-    const state = makeStateWithStatements(
-      [makeFingerprint(1), makeFingerprint(2), makeFingerprint(3)],
-      timeScale,
-    );
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(3);
-  });
-
-  it("coalesces statements from different apps", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1),
-        makeFingerprint(1, "foobar"),
-        makeFingerprint(1, "another"),
-      ],
-      timeScale,
-    );
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(1);
-  });
-
-  it("coalesces statements with differing node ids", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "", 1),
-        makeFingerprint(1, "", 2),
-        makeFingerprint(1, "", 3),
-      ],
-      timeScale,
-    );
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(1);
-  });
-
-  it("coalesces statements with differing distSQL and failed keys", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "", 1, false, false),
-        makeFingerprint(1, "", 1, false, true),
-        makeFingerprint(1, "", 1, true, false),
-        makeFingerprint(1, "", 1, true, true),
-      ],
-      timeScale,
-    );
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(1);
+    expect(result).toEqual([
+      unset,
+      "cockroach sql",
+      "foobar",
+      "hello",
+      "world",
+    ]);
   });
 });
 
@@ -314,9 +227,8 @@ describe("selectStatement", () => {
     const state = makeInvalidState();
     const props = makeEmptyRouteProps();
     const { statementDetails } = selectStatementDetails(state, props);
-    const result = statementDetails;
 
-    expect(result).toBeNull();
+    expect(statementDetails).toBeNull();
   });
 
   it("returns the statement currently loaded", () => {
@@ -496,7 +408,6 @@ function makeDetails(
       statement_statistics_per_aggregated_ts: [],
       statement_statistics_per_plan_hash: [],
       internal_app_name_prefix: "$ internal",
-      toJSON: () => ({}),
     },
   };
 }
@@ -510,6 +421,7 @@ function makeStats(): Required<StatementStatistics> {
     legacy_last_err: "",
     legacy_last_err_redacted: "",
     num_rows: makeStat(),
+    idle_lat: makeStat(),
     parse_lat: makeStat(),
     plan_lat: makeStat(),
     run_lat: makeStat(),
@@ -526,12 +438,22 @@ function makeStats(): Required<StatementStatistics> {
       nanos: 111613000,
     },
     nodes: [Long.fromInt(1), Long.fromInt(2), Long.fromInt(3)],
+    regions: ["gcp-us-east1"],
     plan_gists: ["Ais="],
     index_recommendations: [],
+    indexes: ["123@456"],
+    latency_info: {
+      min: 0.01,
+      max: 1.2,
+      p50: 0.4,
+      p90: 0.7,
+      p99: 1.1,
+    },
+    last_error_code: "",
   };
 }
 
-function makeExecStats(): Required<ExecStats> {
+function makeExecStats(): ExecStats {
   return {
     count: Long.fromNumber(10),
     network_bytes: makeStat(),
@@ -539,6 +461,7 @@ function makeExecStats(): Required<ExecStats> {
     contention_time: makeStat(),
     network_messages: makeStat(),
     max_disk_usage: makeStat(),
+    cpu_sql_nanos: makeStat(),
   };
 }
 
@@ -584,12 +507,12 @@ function makeStateWithStatementsAndLastReset(
   const state = merge(store.getState(), {
     cachedData: {
       statements: {
-        data: protos.cockroach.server.serverpb.StatementsResponse.fromObject({
+        data: new protos.cockroach.server.serverpb.StatementsResponse({
           statements,
-          last_reset: {
-            seconds: lastReset,
+          last_reset: new protos.google.protobuf.Timestamp({
+            seconds: Long.fromNumber(lastReset),
             nanos: 0,
-          },
+          }),
           internal_app_name_prefix: INTERNAL_STATEMENT_PREFIX,
         }),
         inFlight: false,
@@ -602,7 +525,7 @@ function makeStateWithStatementsAndLastReset(
       },
     },
     localSettings: {
-      "timeScale/SQLActivity": timeScale,
+      [localStorage.GlOBAL_TIME_SCALE]: timeScale,
     },
     timeScale: {
       scale: timeScale,
@@ -623,16 +546,15 @@ function makeStateWithStatementsAndLastReset(
           timeEnd,
         )
       ] = {
-        data: protos.cockroach.server.serverpb.StatementDetailsResponse.fromObject(
-          {
-            statement: stmt.details.statement,
-            statement_statistics_per_aggregated_ts: [],
-            statement_statistics_per_plan_hash: [],
-            internal_app_name_prefix: "$ internal",
-          },
-        ),
+        data: new protos.cockroach.server.serverpb.StatementDetailsResponse({
+          statement: stmt.details.statement,
+          statement_statistics_per_aggregated_ts: [],
+          statement_statistics_per_plan_hash: [],
+          internal_app_name_prefix: "$ internal",
+        }),
         inFlight: false,
         valid: true,
+        unauthorized: false,
       };
     }
   }

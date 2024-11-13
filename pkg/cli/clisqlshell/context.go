@@ -42,12 +42,21 @@ type Context struct {
 	// `demo` command, if that is the command being run.
 	DemoCluster democlusterapi.DemoCluster
 
+	// DisableLineEditor, if set, causes the shell to use a dumb line editor
+	// (disable the interactive one), which simplifies testing by avoiding
+	// escape sequences in the output.
+	DisableLineEditor bool
+
 	// ParseURL is a custom URL parser.
 	//
 	// When left undefined, the code defaults to pgurl.Parse.
 	// CockroachDB's own CLI package has a more advanced URL
 	// parser that is used instead.
 	ParseURL URLParser
+
+	// CertsDir is an extra directory to look for client certs in,
+	// when the \c command is used.
+	CertsDir string
 }
 
 // internalContext represents the internal configuration state of the
@@ -83,11 +92,26 @@ type internalContext struct {
 	// The string used to produce the value of fullPrompt.
 	customPromptPattern string
 
+	// reflowMaxWidth is the maximum reflow width.
+	reflowMaxWidth int
+
+	// reflowAlignMode is the SQL prettify alignment mode.
+	reflowAlignMode int
+
+	// reflowCaseMode is the SQL prettify case mode.
+	reflowCaseMode int
+
+	// reflowTabWidth is the tab width used by the prettify_statement function.
+	reflowTabWidth int
+
 	// current database name, if known. This is maintained on a best-effort basis.
 	dbName string
 
 	// hook to run once, then clear, after running the next batch of statements.
 	afterRun func()
+
+	// file where the history is saved.
+	histFile string
 
 	statementWrappers []statementWrapper
 
@@ -117,7 +141,7 @@ func (c *internalContext) addStatementWrapper(w statementWrapper) {
 func (c *internalContext) maybeWrapStatement(
 	ctx context.Context, statement string, state *cliState,
 ) (err error) {
-	var s scanner.Scanner
+	var s scanner.SQLScanner
 	for _, sw := range c.statementWrappers {
 		s.Init(statement)
 		if sw.Pattern.matches(s) {

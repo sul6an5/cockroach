@@ -56,6 +56,7 @@ func TestColumnarizeMaterialize(t *testing.T) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 
@@ -100,6 +101,7 @@ func BenchmarkMaterializer(b *testing.B) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	rng, _ := randutil.NewTestRand()
@@ -113,7 +115,7 @@ func BenchmarkMaterializer(b *testing.B) {
 				b.Run(fmt.Sprintf("%s/hasNulls=%t/useSel=%t", typ, hasNulls, useSelectionVector), func(b *testing.B) {
 					nullProb := 0.0
 					if hasNulls {
-						nullProb = nullProbability
+						nullProb = 0.1
 					}
 					batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 					for _, colVec := range batch.ColVecs() {
@@ -183,6 +185,7 @@ func TestMaterializerNextErrorAfterConsumerDone(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	m := NewMaterializer(
@@ -224,6 +227,7 @@ func BenchmarkColumnarizeMaterialize(b *testing.B) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 

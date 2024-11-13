@@ -15,11 +15,11 @@ import classNames from "classnames/bind";
 import React from "react";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 
-import { ContendedExecution, ExecutionType } from "src/activeExecutions";
-import { capitalize, Duration } from "../util";
+import { ContendedExecution, ExecutionType } from "src/recentExecutions";
+import { capitalize, Duration, NO_SAMPLES_FOUND } from "../util";
 
 import { Heading } from "@cockroachlabs/ui-components";
-import { ExecutionContentionTable } from "../activeExecutions/activeTransactionsTable/execContentionTable";
+import { ExecutionContentionTable } from "../recentExecutions/recentTransactionsTable/execContentionTable";
 import styles from "../statementDetails/statementDetails.module.scss";
 
 const cx = classNames.bind(styles);
@@ -52,7 +52,6 @@ type WaitTimeInsightsPanelProps = {
   schemaName?: string;
   tableName?: string;
   indexName?: string;
-  contendedKey?: string;
   waitTime?: moment.Duration;
   waitingExecutions: ContendedExecution[];
   blockingExecutions: ContendedExecution[];
@@ -65,7 +64,6 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
   schemaName,
   tableName,
   indexName,
-  contendedKey,
   waitTime,
   waitingExecutions,
   blockingExecutions,
@@ -78,7 +76,9 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
     >
       <Row gutter={24}>
         <Col>
-          <Heading type="h5">{WaitTimeInsightsLabels.SECTION_HEADING}</Heading>
+          <Heading type="h5" className={cx("margin-header")}>
+            {WaitTimeInsightsLabels.SECTION_HEADING}
+          </Heading>
           {showWaitTimeInsightsDetails && (
             <Row gutter={24}>
               {" "}
@@ -89,7 +89,7 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
                     value={
                       waitTime
                         ? Duration(waitTime.asMilliseconds() * 1e6)
-                        : "no samples"
+                        : NO_SAMPLES_FOUND
                     }
                   />
                   {schemaName && (
@@ -119,12 +119,6 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
                         value={indexName}
                       />
                     )}
-                    {contendedKey && (
-                      <SummaryCardItem
-                        label={WaitTimeInsightsLabels.CONTENDED_KEY}
-                        value={contendedKey}
-                      />
-                    )}
                   </SummaryCard>
                 </Col>
               )}
@@ -132,7 +126,7 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
           )}
           {blockingExecutions.length > 0 && (
             <Row>
-              <Heading type="h5">
+              <Heading type="h5" className={cx("margin-header")}>
                 {WaitTimeInsightsLabels.BLOCKING_TXNS_TABLE_TITLE(
                   executionID,
                   execType,
@@ -148,7 +142,7 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
           )}
           {waitingExecutions.length > 0 && (
             <Row>
-              <Heading type="h5">
+              <Heading type="h5" className={cx("margin-header")}>
                 {WaitTimeInsightsLabels.WAITING_TXNS_TABLE_TITLE(
                   executionID,
                   execType,

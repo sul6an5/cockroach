@@ -16,7 +16,6 @@ import (
 
 	democlusterapi "github.com/cockroachdb/cockroach/pkg/cli/democluster/api"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 )
 
 // DemoCluster represents a demo cluster.
@@ -28,7 +27,6 @@ type DemoCluster interface {
 	// before the initialization completes.
 	Start(
 		ctx context.Context,
-		runInitialSQL func(ctx context.Context, s *server.Server, startSingleNode bool, adminUser, adminPassword string) error,
 	) error
 
 	// GetConnURL retrieves the connection URL to the first node.
@@ -55,6 +53,12 @@ type DemoCluster interface {
 	// SetClusterSetting overrides a default cluster setting at system level
 	// and for all tenants.
 	SetClusterSetting(ctx context.Context, setting string, value interface{}) error
+
+	// SetSimulatedLatency is used to enable or disable simulated latency.
+	SetSimulatedLatency(on bool)
+
+	// TenantName returns the tenant name that the default connection is for.
+	TenantName() string
 }
 
 // EnableEnterprise is not implemented here in order to keep OSS/BSL builds successful.

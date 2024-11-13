@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -29,13 +30,13 @@ import (
 var adminPrefix = "/_admin/v1/"
 
 func getAdminJSONProto(
-	ts serverutils.TestServerInterface, path string, response protoutil.Message,
+	ts serverutils.TestTenantInterface, path string, response protoutil.Message,
 ) error {
 	return getAdminJSONProtoWithAdminOption(ts, path, response, true)
 }
 
 func getAdminJSONProtoWithAdminOption(
-	ts serverutils.TestServerInterface, path string, response protoutil.Message, isAdmin bool,
+	ts serverutils.TestTenantInterface, path string, response protoutil.Message, isAdmin bool,
 ) error {
 	return serverutils.GetJSONProtoWithAdminOption(ts, adminPrefix+path, response, isAdmin)
 }
@@ -46,13 +47,14 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Need to disable the test tenant because this test fails
+	// when run through a tenant (with internal server error).
+	// More investigation is required. Tracked with #76387.
+	disableDefaultTestTenant := true
 	testCluster := serverutils.StartNewTestCluster(t, 3,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				// Need to disable the test tenant because this test fails
-				// when run through a tenant (with internal server error).
-				// More investigation is required. Tracked with #76387.
-				DisableDefaultTestTenant: true,
+				DisableDefaultTestTenant: disableDefaultTestTenant,
 			},
 		})
 	defer testCluster.Stopper().Stop(context.Background())
@@ -79,6 +81,11 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	// Would use locality constraints except this test cluster hasn't been started up with localities.
 	sqlDB.Exec(t, `ALTER PARTITION us OF TABLE comments CONFIGURE ZONE USING gc.ttlseconds = 9001`)
 	sqlDB.Exec(t, `ALTER PARTITION eu OF TABLE comments CONFIGURE ZONE USING gc.ttlseconds = 9002`)
+
+	if disableDefaultTestTenant {
+		// Make sure secondary tenants don't cause the endpoint to error.
+		sqlDB.Exec(t, "CREATE TENANT 'app'")
+	}
 
 	// Assert that we get all roachblog zone configs back.
 	expectedZoneConfigNames := map[string]struct{}{
@@ -129,7 +136,7 @@ func TestAdminAPIJobs(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
-	sqlDB.Exec(t, `BACKUP INTO 'nodelocal://0/backup/1?AWS_SECRET_ACCESS_KEY=neverappears'`)
+	sqlDB.Exec(t, `BACKUP INTO 'nodelocal://1/backup/1?AWS_SECRET_ACCESS_KEY=neverappears'`)
 
 	var jobsRes serverpb.JobsResponse
 	err := getAdminJSONProto(s, "jobs", &jobsRes)
@@ -156,4 +163,78 @@ func TestAdminAPIJobs(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, backups[0], jobRes)
+}
+
+func TestListTenants(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DisableDefaultTestTenant: true,
+	})
+	defer s.Stopper().Stop(ctx)
+
+	_, _, err := s.(*server.TestServer).StartSharedProcessTenant(ctx,
+		base.TestSharedProcessTenantArgs{
+			TenantName: "test",
+		})
+	require.NoError(t, err)
+
+	const path = "tenants"
+	var response serverpb.ListTenantsResponse
+
+	if err := getAdminJSONProto(s, path, &response); err != nil {
+		t.Fatalf("unexpected error: %v\n", err)
+	}
+
+	require.NotEmpty(t, response.Tenants)
+	appTenantFound := false
+	for _, tenant := range response.Tenants {
+		if tenant.TenantName == "test" {
+			appTenantFound = true
+		}
+		require.NotNil(t, tenant.TenantId)
+		require.NotEmpty(t, tenant.TenantName)
+		require.NotEmpty(t, tenant.RpcAddr)
+		require.NotEmpty(t, tenant.SqlAddr)
+	}
+	require.True(t, appTenantFound, "test tenant not found")
+}
+
+func TestTableAndDatabaseDetailsAndStats(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	st, db := serverutils.StartTenant(t, s, base.TestTenantArgs{
+		TenantID: serverutils.TestTenantID(),
+	})
+	_, err := db.Exec("CREATE TABLE test (id int)")
+	require.NoError(t, err)
+	_, err = db.Exec("INSERT INTO test VALUES (1)")
+	require.NoError(t, err)
+
+	// DatabaseDetails
+	dbResp := &serverpb.DatabaseDetailsResponse{}
+	err = getAdminJSONProto(st, "databases/defaultdb", dbResp)
+	require.NoError(t, err)
+
+	require.Equal(t, dbResp.TableNames[0], "public.test")
+
+	// TableStats
+	tableStatsResp := &serverpb.TableStatsResponse{}
+	err = getAdminJSONProto(st, "databases/defaultdb/tables/public.test/stats", tableStatsResp)
+	require.NoError(t, err)
+
+	require.Greater(t, tableStatsResp.Stats.LiveBytes, int64(0))
+
+	// TableDetails
+	tableDetailsResp := &serverpb.TableDetailsResponse{}
+	err = getAdminJSONProto(st, "databases/defaultdb/tables/public.test", tableDetailsResp)
+	require.NoError(t, err)
+
+	require.Greater(t, tableDetailsResp.DataLiveBytes, int64(0))
 }

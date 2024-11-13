@@ -9,7 +9,21 @@
 // licenses/APL.txt.
 
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { fetchData } from "src/api";
+import {
+  convertStatementRawFormatToAggregatedStatistics,
+  executeInternalSql,
+  fetchData,
+  formatApiResult,
+  LARGE_RESULT_SIZE,
+  SqlApiResponse,
+  SqlExecutionRequest,
+  sqlResultsAreEmpty,
+  StatementRawFormat,
+} from "src/api";
+import moment from "moment-timezone";
+import { TimeScale, toRoundedDateRange } from "../timeScaleDropdown";
+import { AggregateStatistics } from "../statementsTable";
+import { INTERNAL_APP_NAME_PREFIX } from "../recentExecutions/recentStatementUtils";
 
 export type TableIndexStatsRequest =
   cockroach.server.serverpb.TableIndexStatsRequest;
@@ -45,8 +59,81 @@ export const resetIndexStats = (
   return fetchData(
     cockroach.server.serverpb.ResetIndexUsageStatsResponse,
     "/_status/resetindexusagestats",
-    null,
+    cockroach.server.serverpb.ResetIndexUsageStatsRequest,
     req,
     "30M",
   );
 };
+
+export type StatementsUsingIndexRequest = {
+  table: string;
+  index: string;
+  database: string;
+  start?: moment.Moment;
+  end?: moment.Moment;
+};
+
+export function StatementsListRequestFromDetails(
+  table: string,
+  index: string,
+  database: string,
+  ts: TimeScale,
+): StatementsUsingIndexRequest {
+  if (ts === null) return { table, index, database };
+  const [start, end] = toRoundedDateRange(ts);
+  return { table, index, database, start, end };
+}
+
+export async function getStatementsUsingIndex({
+  table,
+  index,
+  database,
+  start,
+  end,
+}: StatementsUsingIndexRequest): Promise<
+  SqlApiResponse<AggregateStatistics[]>
+> {
+  const args: any = [`"${table}@${index}"`];
+  let whereClause = "";
+  if (start) {
+    whereClause = `${whereClause} AND aggregated_ts >= '${start.toISOString()}'`;
+  }
+  if (end) {
+    whereClause = `${whereClause} AND aggregated_ts <= '${end.toISOString()}'`;
+  }
+
+  const selectStatements = {
+    sql: `SELECT * FROM crdb_internal.statement_statistics_persisted 
+            WHERE $1::jsonb <@ indexes_usage
+                AND app_name NOT LIKE '${INTERNAL_APP_NAME_PREFIX}%' 
+                ${whereClause}
+            ORDER BY (statistics -> 'statistics' ->> 'cnt')::INT DESC
+            LIMIT 20;`,
+    arguments: args,
+  };
+
+  const req: SqlExecutionRequest = {
+    execute: true,
+    statements: [selectStatements],
+    database: database,
+    max_result_size: LARGE_RESULT_SIZE,
+  };
+
+  const result = await executeInternalSql<StatementRawFormat>(req);
+  if (sqlResultsAreEmpty(result)) {
+    return formatApiResult<AggregateStatistics[]>(
+      [],
+      result.error,
+      "retrieving list of statements per index",
+    );
+  }
+
+  const rows = result.execution.txn_results[0].rows.map(s =>
+    convertStatementRawFormatToAggregatedStatistics(s),
+  );
+  return formatApiResult<AggregateStatistics[]>(
+    rows,
+    result.error,
+    "retrieving list of statements per index",
+  );
+}

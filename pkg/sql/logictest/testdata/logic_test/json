@@ -20,7 +20,7 @@ SELECT '1.00'::JSON
 ----
 1.00
 
-statement error unexpected EOF
+statement error could not parse JSON
 SELECT '{'::JSON
 
 query T
@@ -209,7 +209,7 @@ SELECT * from foo where bar->'x' = '{}'
 query T
 SELECT array_agg(bar ORDER BY pk) FROM foo
 ----
-{"'{\"a\": \"b\"}'","'[1, 2, 3]'","\"hello\"",1.000,true,false,NULL,"'{\"x\": [1, 2, 3]}'","'{\"x\": {\"y\": \"z\"}}'"}
+{"{\"a\": \"b\"}","[1, 2, 3]","\"hello\"",1.000,true,false,NULL,"{\"x\": [1, 2, 3]}","{\"x\": {\"y\": \"z\"}}"}
 
 statement ok
 DELETE FROM foo
@@ -606,6 +606,15 @@ query B
 SELECT true FROM x WHERE j->'a' @> '2'::JSONB
 ----
 true
+
+query T
+SELECT j FROM x WHERE j ?| ARRAY[NULL]
+----
+
+query T
+SELECT j FROM x WHERE j ?& ARRAY[NULL::STRING]
+----
+{"a": [1, 2, 3]}
 
 query T
 SELECT '{"foo": {"bar": 1}}'::JSONB #- ARRAY['foo', 'bar']

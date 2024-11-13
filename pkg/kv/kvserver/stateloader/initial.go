@@ -29,15 +29,6 @@ import (
 const (
 	raftInitialLogIndex = 10
 	raftInitialLogTerm  = 5
-
-	// RaftLogTermSignalForAddRaftAppliedIndexTermMigration is never persisted
-	// in the state machine or in HardState. It is only used in
-	// AddRaftAppliedIndexTermMigration to signal to the below raft code that
-	// the migration should happen when applying the raft log entry that
-	// contains ReplicatedEvalResult.State.RaftAppliedIndexTerm equal to this
-	// value. It is less than raftInitialLogTerm since that ensures it will
-	// never be used under normal operation.
-	RaftLogTermSignalForAddRaftAppliedIndexTermMigration = 3
 )
 
 // WriteInitialReplicaState sets up a new Range, but without writing an
@@ -56,8 +47,6 @@ func WriteInitialReplicaState(
 	gcThreshold hlc.Timestamp,
 	gcHint roachpb.GCHint,
 	replicaVersion roachpb.Version,
-	writeRaftAppliedIndexTerm bool,
-	gcHintsAllowed bool,
 ) (enginepb.MVCCStats, error) {
 	rsl := Make(desc.RangeID)
 	var s kvserverpb.ReplicaState
@@ -66,9 +55,7 @@ func WriteInitialReplicaState(
 		Index: raftInitialLogIndex,
 	}
 	s.RaftAppliedIndex = s.TruncatedState.Index
-	if writeRaftAppliedIndexTerm {
-		s.RaftAppliedIndexTerm = s.TruncatedState.Term
-	}
+	s.RaftAppliedIndexTerm = s.TruncatedState.Term
 	s.Desc = &roachpb.RangeDescriptor{
 		RangeID: desc.RangeID,
 	}
@@ -104,7 +91,7 @@ func WriteInitialReplicaState(
 		log.Fatalf(ctx, "expected trivial version, but found %+v", existingVersion)
 	}
 
-	newMS, err := rsl.Save(ctx, readWriter, s, gcHintsAllowed)
+	newMS, err := rsl.Save(ctx, readWriter, s)
 	if err != nil {
 		return enginepb.MVCCStats{}, err
 	}
@@ -128,11 +115,13 @@ func WriteInitialRangeState(
 
 	if _, err := WriteInitialReplicaState(
 		ctx, readWriter, initialMS, desc, initialLease, initialGCThreshold, initialGCHint,
-		replicaVersion, true, /* 22.1:AddRaftAppliedIndexTermMigration */
-		true, /* 22.2: GCHintInReplicaState */
+		replicaVersion,
 	); err != nil {
 		return err
 	}
+
+	// TODO(sep-raft-log): when the log storage is separated, the below can't be
+	// written in the same batch. Figure out the ordering required here.
 	sl := Make(desc.RangeID)
 	if err := sl.SynthesizeRaftState(ctx, readWriter); err != nil {
 		return err

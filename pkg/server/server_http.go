@@ -14,27 +14,28 @@ import (
 	"context"
 	"crypto/tls"
 	"net/http"
-	"strings"
 
+	"github.com/NYTimes/gziphandler"
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ui"
-	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/metadata"
 )
 
 type httpServer struct {
-	cfg   BaseConfig
-	mux   http.ServeMux
+	cfg BaseConfig
+	mux http.ServeMux
+	// gzMux is an HTTP handler that gzip-compresses mux.
+	gzMux http.Handler
 	proxy *nodeProxy
 }
 
@@ -44,7 +45,7 @@ func newHTTPServer(
 	parseNodeID ParseNodeIDFn,
 	getNodeIDHTTPAddress GetNodeIDHTTPAddressFn,
 ) *httpServer {
-	return &httpServer{
+	server := &httpServer{
 		cfg: cfg,
 		proxy: &nodeProxy{
 			scheme:               cfg.HTTPRequestScheme(),
@@ -53,6 +54,8 @@ func newHTTPServer(
 			rpcContext:           rpcContext,
 		},
 	}
+	server.gzMux = gziphandler.GzipHandler(http.HandlerFunc(server.mux.ServeHTTP))
+	return server
 }
 
 // HSTSEnabled is a boolean that enables HSTS headers on the HTTP
@@ -91,7 +94,8 @@ func (s *httpServer) setupRoutes(
 	runtimeStatSampler *status.RuntimeStatSampler,
 	handleRequestsUnauthenticated http.Handler,
 	handleDebugUnauthenticated http.Handler,
-	apiServer *apiV2Server,
+	apiServer http.Handler,
+	flags serverpb.FeatureFlags,
 ) error {
 	// OIDC Configuration must happen prior to the UI Handler being defined below so that we have
 	// the system settings initialized for it to pick up from the oidcAuthenticationServer.
@@ -105,16 +109,17 @@ func (s *httpServer) setupRoutes(
 
 	// Define the http.Handler for UI assets.
 	assetHandler := ui.Handler(ui.Config{
-		ExperimentalUseLogin: s.cfg.EnableWebSessionAuthentication,
-		LoginEnabled:         s.cfg.RequireWebSession(),
-		NodeID:               s.cfg.IDContainer,
-		OIDC:                 oidc,
+		Insecure: s.cfg.InsecureWebAccess(),
+		NodeID:   s.cfg.IDContainer,
+		OIDC:     oidc,
 		GetUser: func(ctx context.Context) *string {
-			if u, ok := ctx.Value(webSessionUserKey{}).(string); ok {
-				return &u
+			if user, ok := maybeUserFromHTTPAuthInfoContext(ctx); ok {
+				ustring := user.Normalized()
+				return &ustring
 			}
 			return nil
 		},
+		Flags: flags,
 	})
 
 	// The authentication mux used here is created in "allow anonymous" mode so that the UI
@@ -128,7 +133,7 @@ func (s *httpServer) setupRoutes(
 	// Add HTTP authentication to the gRPC-gateway endpoints used by the UI,
 	// if not disabled by configuration.
 	var authenticatedHandler = handleRequestsUnauthenticated
-	if s.cfg.RequireWebSession() {
+	if !s.cfg.InsecureWebAccess() {
 		authenticatedHandler = newAuthenticationMux(authnServer, authenticatedHandler)
 	}
 
@@ -155,7 +160,11 @@ func (s *httpServer) setupRoutes(
 	// The /_status/vars endpoint is not authenticated either. Useful for monitoring.
 	s.mux.Handle(statusVars, http.HandlerFunc(varsHandler{metricSource, s.cfg.Settings}.handleVars))
 	// Same for /_status/load.
-	s.mux.Handle(loadStatusVars, http.HandlerFunc(makeStatusLoadHandler(ctx, runtimeStatSampler, metricSource)))
+	le, err := newLoadEndpoint(runtimeStatSampler, metricSource)
+	if err != nil {
+		return err
+	}
+	s.mux.Handle(loadStatusVars, le)
 
 	if apiServer != nil {
 		// The new "v2" HTTP API tree.
@@ -164,7 +173,7 @@ func (s *httpServer) setupRoutes(
 
 	// Register debugging endpoints.
 	handleDebugAuthenticated := handleDebugUnauthenticated
-	if s.cfg.RequireWebSession() {
+	if !s.cfg.InsecureWebAccess() {
 		// Mandate both authentication and admin authorization.
 		handleDebugAuthenticated = makeAdminAuthzCheckHandler(adminAuthzCheck, handleDebugAuthenticated)
 		handleDebugAuthenticated = newAuthenticationMux(authnServer, handleDebugAuthenticated)
@@ -182,7 +191,7 @@ func makeAdminAuthzCheckHandler(
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// Retrieve the username embedded in the grpc metadata, if any.
 		// This will be provided by the authenticationMux.
-		md := forwardAuthenticationMetadata(req.Context(), req)
+		md := translateHTTPAuthInfoToGRPCMetadata(req.Context(), req)
 		authCtx := metadata.NewIncomingContext(req.Context(), md)
 		// Check the privileges of the requester.
 		err := adminAuthzCheck.requireViewDebugPermission(authCtx)
@@ -195,19 +204,20 @@ func makeAdminAuthzCheckHandler(
 	})
 }
 
-// start starts the network listener for the HTTP interface
+// startHTTPService starts the network listener for the HTTP interface
 // and also starts accepting incoming HTTP connections.
-func (s *httpServer) start(
+func startHTTPService(
 	ctx, workersCtx context.Context,
-	connManager netutil.Server,
+	cfg *BaseConfig,
 	uiTLSConfig *tls.Config,
 	stopper *stop.Stopper,
+	handler http.HandlerFunc,
 ) error {
-	httpLn, err := ListenAndUpdateAddrs(ctx, &s.cfg.HTTPAddr, &s.cfg.HTTPAdvertiseAddr, "http")
+	httpLn, err := ListenAndUpdateAddrs(ctx, &cfg.HTTPAddr, &cfg.HTTPAdvertiseAddr, "http")
 	if err != nil {
 		return err
 	}
-	log.Eventf(ctx, "listening on http port %s", s.cfg.HTTPAddr)
+	log.Eventf(ctx, "listening on http port %s", cfg.HTTPAddr)
 
 	// The HTTP listener shutdown worker, which closes everything under
 	// the HTTP port when the stopper indicates we are shutting down.
@@ -218,7 +228,7 @@ func (s *httpServer) start(
 		// to close when quiescing starts to allow that worker to shut down.
 		<-stopper.ShouldQuiesce()
 		if err := httpLn.Close(); err != nil {
-			log.Ops.Fatalf(ctx, "%v", err)
+			log.Ops.Warningf(ctx, "%v", err)
 		}
 	}
 	if err := stopper.RunAsyncTask(workersCtx, "wait-quiesce", waitQuiesce); err != nil {
@@ -245,14 +255,14 @@ func (s *httpServer) start(
 		if err := stopper.RunAsyncTask(workersCtx, "serve-health", func(context.Context) {
 			mux := http.NewServeMux()
 			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-				if HSTSEnabled.Get(&s.cfg.Settings.SV) {
+				if HSTSEnabled.Get(&cfg.Settings.SV) {
 					w.Header().Set(hstsHeaderKey, hstsHeaderValue)
 				}
 				http.Redirect(w, r, "https://"+r.Host+r.RequestURI, http.StatusTemporaryRedirect)
 			})
-			mux.Handle(healthPath, http.HandlerFunc(s.baseHandler))
+			mux.Handle(healthPath, handler)
 
-			plainRedirectServer := netutil.MakeServer(workersCtx, stopper, uiTLSConfig, mux)
+			plainRedirectServer := netutil.MakeHTTPServer(workersCtx, stopper, nil /* tlsConfig */, mux)
 
 			netutil.FatalIfUnexpected(plainRedirectServer.Serve(clearL))
 		}); err != nil {
@@ -262,6 +272,10 @@ func (s *httpServer) start(
 		httpLn = tls.NewListener(tlsL, uiTLSConfig)
 	}
 
+	// The connManager is responsible for tearing down the net.Conn
+	// objects when the stopper tells us to shut down.
+	connManager := netutil.MakeHTTPServer(workersCtx, stopper, uiTLSConfig, handler)
+
 	// Serve the HTTP endpoint. This will be the original httpLn
 	// listening on --http-addr without TLS if uiTLSConfig was
 	// nil, or overridden above if uiTLSConfig was not nil to come from
@@ -269,35 +283,6 @@ func (s *httpServer) start(
 	return stopper.RunAsyncTask(workersCtx, "server-http", func(context.Context) {
 		netutil.FatalIfUnexpected(connManager.Serve(httpLn))
 	})
-}
-
-// gzipHandler intercepts HTTP Requests and will gzip the response if
-// the request contains the `Accept-Encoding: gzip` header. Requests
-// are then delegated to the server mux.
-func (s *httpServer) gzipHandler(w http.ResponseWriter, r *http.Request) {
-	ae := r.Header.Get(httputil.AcceptEncodingHeader)
-	switch {
-	case strings.Contains(ae, httputil.GzipEncoding):
-		w.Header().Set(httputil.ContentEncodingHeader, httputil.GzipEncoding)
-		gzw := newGzipResponseWriter(w)
-		defer func() {
-			// Certain requests must not have a body, yet closing the gzip writer will
-			// attempt to write the gzip header. Avoid logging a warning in this case.
-			// This is notably triggered by:
-			//
-			// curl -H 'Accept-Encoding: gzip' \
-			// 	    -H 'If-Modified-Since: Thu, 29 Mar 2018 22:36:32 GMT' \
-			//      -v http://localhost:8080/favicon.ico > /dev/null
-			//
-			// which results in a 304 Not Modified.
-			if err := gzw.Close(); err != nil && !errors.Is(err, http.ErrBodyNotAllowed) {
-				ctx := s.cfg.AmbientCtx.AnnotateCtx(r.Context())
-				log.Ops.Warningf(ctx, "error closing gzip response writer: %v", err)
-			}
-		}()
-		w = gzw
-	}
-	s.mux.ServeHTTP(w, r)
 }
 
 // baseHandler is the top-level HTTP handler for all HTTP traffic, before
@@ -328,5 +313,5 @@ func (s *httpServer) baseHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	s.proxy.nodeProxyHandler(w, r, s.gzipHandler)
+	s.proxy.nodeProxyHandler(w, r, s.gzMux.ServeHTTP)
 }

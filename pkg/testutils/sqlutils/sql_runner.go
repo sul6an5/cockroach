@@ -15,12 +15,14 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -145,12 +147,37 @@ func (sr *SQLRunner) ExecRowsAffected(
 func (sr *SQLRunner) ExpectErr(t Fataler, errRE string, query string, args ...interface{}) {
 	helperOrNoop(t)()
 	_, err := sr.DB.ExecContext(context.Background(), query, args...)
+	sr.expectErr(t, err, errRE)
+}
+
+func (sr *SQLRunner) expectErr(t Fataler, err error, errRE string) {
+	helperOrNoop(t)()
 	if !testutils.IsError(err, errRE) {
 		s := "nil"
 		if err != nil {
 			s = pgerror.FullError(err)
 		}
 		t.Fatalf("expected error '%s', got: %s", errRE, s)
+	}
+}
+
+// ExpectErrWithHint runs the given statement and verifies that it returns an error
+// with a hint matching the expected hint.
+func (sr *SQLRunner) ExpectErrWithHint(
+	t Fataler, errRE string, hintRE string, query string, args ...interface{},
+) {
+	helperOrNoop(t)()
+	_, err := sr.DB.ExecContext(context.Background(), query, args...)
+
+	sr.expectErr(t, err, errRE)
+
+	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
+		matched, merr := regexp.MatchString(hintRE, pqErr.Hint)
+		if !matched || merr != nil {
+			t.Fatalf("expected error with hint '%s', but got error with hint '%s'", hintRE, pqErr.Hint)
+		}
+	} else {
+		t.Fatalf("could not parse pq error")
 	}
 }
 

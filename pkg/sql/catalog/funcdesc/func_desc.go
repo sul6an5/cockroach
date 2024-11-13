@@ -11,23 +11,22 @@
 package funcdesc
 
 import (
-	"context"
+	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -46,6 +45,9 @@ type immutable struct {
 	isUncommittedVersion bool
 
 	changes catalog.PostDeserializationChanges
+
+	// This is the raw bytes (tag + data) of the function descriptor in storage.
+	rawBytesInStorage []byte
 }
 
 // Mutable represents a mutable function descriptor.
@@ -61,7 +63,7 @@ func NewMutableFunctionDescriptor(
 	parentID descpb.ID,
 	parentSchemaID descpb.ID,
 	name string,
-	args []descpb.FunctionDescriptor_Argument,
+	params []descpb.FunctionDescriptor_Parameter,
 	returnType *types.T,
 	returnSet bool,
 	privs *catpb.PrivilegeDescriptor,
@@ -73,14 +75,14 @@ func NewMutableFunctionDescriptor(
 				ID:             id,
 				ParentID:       parentID,
 				ParentSchemaID: parentSchemaID,
-				Args:           args,
+				Params:         params,
 				ReturnType: descpb.FunctionDescriptor_ReturnType{
 					Type:      returnType,
 					ReturnSet: returnSet,
 				},
 				Lang:              catpb.Function_SQL,
-				Volatility:        catpb.Function_VOLATILE,
-				LeakProof:         false,
+				Volatility:        catpb.DefaultFunctionVolatility,
+				LeakProof:         catpb.DefaultFunctionLeakProof,
 				NullInputBehavior: catpb.Function_CALLED_ON_NULL_INPUT,
 				Privileges:        privs,
 				Version:           1,
@@ -112,7 +114,7 @@ func (desc *immutable) Public() bool {
 
 // Adding implements the catalog.Descriptor interface.
 func (desc *immutable) Adding() bool {
-	return false
+	return desc.State == descpb.DescriptorState_ADD
 }
 
 // Dropped implements the catalog.Descriptor interface.
@@ -147,12 +149,16 @@ func (desc *immutable) GetDeclarativeSchemaChangerState() *scpb.DescriptorState 
 
 // NewBuilder implements the catalog.Descriptor interface.
 func (desc *Mutable) NewBuilder() catalog.DescriptorBuilder {
-	return newBuilder(&desc.FunctionDescriptor, desc.IsUncommittedVersion(), desc.changes)
+	b := newBuilder(&desc.FunctionDescriptor, hlc.Timestamp{}, desc.IsUncommittedVersion(), desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // NewBuilder implements the catalog.Descriptor interface.
 func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
-	return newBuilder(&desc.FunctionDescriptor, desc.IsUncommittedVersion(), desc.changes)
+	b := newBuilder(&desc.FunctionDescriptor, hlc.Timestamp{}, desc.IsUncommittedVersion(), desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // GetReferencedDescIDs implements the catalog.Descriptor interface.
@@ -173,7 +179,7 @@ func (desc *immutable) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
 
 // ValidateSelf implements the catalog.Descriptor interface.
 func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
-	vea.Report(catalog.ValidateName(desc.Name, "function"))
+	vea.Report(catalog.ValidateName(desc))
 	if desc.GetID() == descpb.InvalidID {
 		vea.Report(errors.AssertionFailedf("invalid ID %d", desc.GetID()))
 	}
@@ -194,13 +200,14 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	if desc.ReturnType.Type == nil {
 		vea.Report(errors.AssertionFailedf("return type not set"))
 	}
-	for i, arg := range desc.Args {
-		if arg.Type == nil {
+	for i, param := range desc.Params {
+		if param.Type == nil {
 			vea.Report(errors.AssertionFailedf("type not set for arg %d", i))
 		}
 	}
 
-	vea.Report(CheckLeakProofVolatility(desc))
+	vp := funcinfo.MakeVolatilityProperties(desc.Volatility, desc.LeakProof)
+	vea.Report(vp.Validate())
 
 	for i, dep := range desc.DependedOnBy {
 		if dep.ID == descpb.InvalidID {
@@ -284,14 +291,14 @@ func (desc *immutable) validateFuncExistsInSchema(scDesc catalog.SchemaDescripto
 	}
 
 	function, _ := scDesc.GetFunction(desc.GetName())
-	for _, overload := range function.Overloads {
+	for _, sig := range function.Signatures {
 		// TODO (Chengxiong) maybe a overkill, but we could also validate function
 		// signature matches.
-		if overload.ID == desc.GetID() {
+		if sig.ID == desc.GetID() {
 			return nil
 		}
 	}
-	return errors.AssertionFailedf("function overload %q (%d) cannot be found in schema %q (%d)",
+	return errors.AssertionFailedf("function sig %q (%d) cannot be found in schema %q (%d)",
 		desc.GetName(), desc.GetID(), scDesc.GetName(), scDesc.GetID())
 }
 
@@ -307,34 +314,63 @@ func (desc *immutable) validateInboundTableRef(
 			backRefTbl.GetName(), backRefTbl.GetID())
 	}
 
+	if backRefTbl.IsView() {
+		for _, id := range backRefTbl.GetDependsOnFunctions() {
+			if id == desc.GetID() {
+				return nil
+			}
+		}
+		return errors.AssertionFailedf("depended-on-by view %q (%d) has no corresponding depends-on forward reference",
+			backRefTbl.GetName(), by.ID)
+	}
+
+	var foundInTable bool
 	for _, colID := range by.ColumnIDs {
-		_, err := backRefTbl.FindColumnWithID(colID)
-		if err != nil {
+		col := catalog.FindColumnByID(backRefTbl, colID)
+		if col == nil {
 			return errors.AssertionFailedf("depended-on-by relation %q (%d) does not have a column with ID %d",
 				backRefTbl.GetName(), by.ID, colID)
 		}
+		fnIDs := catalog.MakeDescriptorIDSet(col.ColumnDesc().UsesFunctionIds...)
+		if fnIDs.Contains(desc.GetID()) {
+			foundInTable = true
+			continue
+		}
+		return errors.AssertionFailedf(
+			"column %d in depended-on-by relation %q (%d) does not have reference to function %q (%d)",
+			col.GetID(), backRefTbl.GetName(), backRefTbl.GetID(), desc.GetName(), desc.GetID(),
+		)
 	}
 
 	for _, idxID := range by.IndexIDs {
-		_, err := backRefTbl.FindIndexWithID(idxID)
-		if err != nil {
+		if catalog.FindIndexByID(backRefTbl, idxID) == nil {
 			return errors.AssertionFailedf("depended-on-by relation %q (%d) does not have an index with ID %d",
 				backRefTbl.GetName(), by.ID, idxID)
 		}
+		// TODO(chengxiong): add logic to validate reference in index expressions
+		// when UDF usage is allowed in indexes.
 	}
 
 	for _, cstID := range by.ConstraintIDs {
-		_, err := backRefTbl.FindConstraintWithID(cstID)
-		if err != nil {
+		if catalog.FindConstraintByID(backRefTbl, cstID) == nil {
 			return errors.AssertionFailedf("depended-on-by relation %q (%d) does not have a constraint with ID %d",
 				backRefTbl.GetName(), by.ID, cstID)
 		}
-	}
-
-	for _, id := range backRefTbl.GetDependsOn() {
-		if id == desc.GetID() {
-			return nil
+		fnIDs, err := backRefTbl.GetAllReferencedFunctionIDsInConstraint(cstID)
+		if err != nil {
+			return err
 		}
+		if fnIDs.Contains(desc.GetID()) {
+			foundInTable = true
+			continue
+		}
+		return errors.AssertionFailedf(
+			"constraint %d in depended-on-by relation %q (%d) does not have reference to function %q (%d)",
+			cstID, backRefTbl.GetName(), backRefTbl.GetID(), desc.GetName(), desc.GetID(),
+		)
+	}
+	if foundInTable {
+		return nil
 	}
 	return errors.AssertionFailedf("depended-on-by table %q (%d) has no corresponding depends-on forward reference",
 		backRefTbl.GetName(), by.ID)
@@ -363,6 +399,27 @@ func (desc *immutable) SkipNamespace() bool {
 	return true
 }
 
+// GetRawBytesInStorage implements the catalog.Descriptor interface.
+func (desc *immutable) GetRawBytesInStorage() []byte {
+	return desc.rawBytesInStorage
+}
+
+// ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
+func (desc *immutable) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
+	for _, p := range desc.Params {
+		if !catid.IsOIDUserDefined(p.Type.Oid()) {
+			continue
+		}
+		if err := fn(p.Type); err != nil {
+			return iterutil.Map(err)
+		}
+	}
+	if !catid.IsOIDUserDefined(desc.ReturnType.Type.Oid()) {
+		return nil
+	}
+	return iterutil.Map(fn(desc.ReturnType.Type))
+}
+
 // IsUncommittedVersion implements the catalog.LeasableDescriptor interface.
 func (desc *Mutable) IsUncommittedVersion() bool {
 	return desc.IsNew() || desc.clusterVersion.GetVersion() != desc.GetVersion()
@@ -375,6 +432,11 @@ func (desc *Mutable) MaybeIncrementVersion() {
 		return
 	}
 	desc.Version++
+	desc.ResetModificationTime()
+}
+
+// ResetModificationTime implements the catalog.MutableDescriptor interface.
+func (desc *Mutable) ResetModificationTime() {
 	desc.ModificationTime = hlc.Timestamp{}
 }
 
@@ -435,9 +497,9 @@ func (desc *Mutable) SetDeclarativeSchemaChangerState(state *scpb.DescriptorStat
 	desc.DeclarativeSchemaChangerState = state
 }
 
-// AddArguments adds function arguments to argument list.
-func (desc *Mutable) AddArguments(args ...descpb.FunctionDescriptor_Argument) {
-	desc.Args = append(desc.Args, args...)
+// AddParams adds function parameters to the parameter list.
+func (desc *Mutable) AddParams(params ...descpb.FunctionDescriptor_Parameter) {
+	desc.Params = append(desc.Params, params...)
 }
 
 // SetVolatility sets the volatility attribute.
@@ -475,30 +537,135 @@ func (desc *Mutable) SetParentSchemaID(id descpb.ID) {
 	desc.ParentSchemaID = id
 }
 
-// ToFuncObj converts the descriptor to a tree.FuncObj.
-func (desc *immutable) ToFuncObj() tree.FuncObj {
-	ret := tree.FuncObj{
-		FuncName: tree.MakeFunctionNameFromPrefix(tree.ObjectNamePrefix{}, tree.Name(desc.Name)),
-		Args:     make(tree.FuncArgs, len(desc.Args)),
+// AddConstraintReference adds back reference to a constraint to the function.
+func (desc *Mutable) AddConstraintReference(id descpb.ID, constraintID descpb.ConstraintID) error {
+	for _, dep := range desc.DependsOn {
+		if dep == id {
+			return errors.Errorf(
+				"cannot add dependency from descriptor %d to function %s (%d) because there will be a dependency cycle", id, desc.GetName(), desc.GetID(),
+			)
+		}
 	}
-	for i := range desc.Args {
-		ret.Args[i] = tree.FuncArg{
-			Type: desc.Args[i].Type,
+	for i := range desc.DependedOnBy {
+		if desc.DependedOnBy[i].ID == id {
+			ids := catalog.MakeConstraintIDSet(desc.DependedOnBy[i].ConstraintIDs...)
+			ids.Add(constraintID)
+			desc.DependedOnBy[i].ConstraintIDs = ids.Ordered()
+			return nil
+		}
+	}
+	desc.DependedOnBy = append(
+		desc.DependedOnBy,
+		descpb.FunctionDescriptor_Reference{
+			ID:            id,
+			ConstraintIDs: []descpb.ConstraintID{constraintID},
+		},
+	)
+	sort.Slice(desc.DependedOnBy, func(i, j int) bool {
+		return desc.DependedOnBy[i].ID < desc.DependedOnBy[j].ID
+	})
+	return nil
+}
+
+// RemoveConstraintReference removes back reference to a constraint from the
+// function.
+func (desc *Mutable) RemoveConstraintReference(id descpb.ID, constraintID descpb.ConstraintID) {
+	for i := range desc.DependedOnBy {
+		if desc.DependedOnBy[i].ID == id {
+			ids := catalog.MakeConstraintIDSet(desc.DependedOnBy[i].ConstraintIDs...)
+			ids.Remove(constraintID)
+			desc.DependedOnBy[i].ConstraintIDs = ids.Ordered()
+			desc.maybeRemoveTableReference(id)
+			return
+		}
+	}
+}
+
+// AddColumnReference adds back reference to a column to the function.
+func (desc *Mutable) AddColumnReference(id descpb.ID, colID descpb.ColumnID) error {
+	for _, dep := range desc.DependsOn {
+		if dep == id {
+			return errors.Errorf(
+				"cannot add dependency from descriptor %d to function %s (%d) because there will be a dependency cycle", id, desc.GetName(), desc.GetID(),
+			)
+		}
+	}
+	for i := range desc.DependedOnBy {
+		if desc.DependedOnBy[i].ID == id {
+			ids := catalog.MakeTableColSet(desc.DependedOnBy[i].ColumnIDs...)
+			ids.Add(colID)
+			desc.DependedOnBy[i].ColumnIDs = ids.Ordered()
+			return nil
+		}
+	}
+	desc.DependedOnBy = append(
+		desc.DependedOnBy,
+		descpb.FunctionDescriptor_Reference{
+			ID:        id,
+			ColumnIDs: []descpb.ColumnID{colID},
+		},
+	)
+	sort.Slice(desc.DependedOnBy, func(i, j int) bool {
+		return desc.DependedOnBy[i].ID < desc.DependedOnBy[j].ID
+	})
+	return nil
+}
+
+// RemoveColumnReference removes back reference to a column from the function.
+func (desc *Mutable) RemoveColumnReference(id descpb.ID, colID descpb.ColumnID) {
+	for i := range desc.DependedOnBy {
+		if desc.DependedOnBy[i].ID == id {
+			ids := catalog.MakeTableColSet(desc.DependedOnBy[i].ColumnIDs...)
+			ids.Remove(colID)
+			desc.DependedOnBy[i].ColumnIDs = ids.Ordered()
+			desc.maybeRemoveTableReference(id)
+			return
+		}
+	}
+}
+
+// maybeRemoveTableReference removes a table's references from the function if
+// the column, index and constraint references are all empty. This function is
+// only used internally when removing an individual column, index or constraint
+// reference.
+func (desc *Mutable) maybeRemoveTableReference(id descpb.ID) {
+	var ret []descpb.FunctionDescriptor_Reference
+	for _, ref := range desc.DependedOnBy {
+		if ref.ID == id && len(ref.ColumnIDs) == 0 && len(ref.IndexIDs) == 0 && len(ref.ConstraintIDs) == 0 {
+			continue
+		}
+		ret = append(ret, ref)
+	}
+	desc.DependedOnBy = ret
+}
+
+func (desc *Mutable) RemoveReference(id descpb.ID) {
+	var ret []descpb.FunctionDescriptor_Reference
+	for _, ref := range desc.DependedOnBy {
+		if ref.ID != id {
+			ret = append(ret, ref)
+		}
+	}
+	desc.DependedOnBy = ret
+}
+
+// ToFuncObj converts the descriptor to a tree.FuncObj.
+func (desc *immutable) ToFuncObj() *tree.FuncObj {
+	ret := &tree.FuncObj{
+		FuncName: tree.MakeFunctionNameFromPrefix(tree.ObjectNamePrefix{}, tree.Name(desc.Name)),
+		Params:   make(tree.FuncParams, len(desc.Params)),
+	}
+	for i := range desc.Params {
+		ret.Params[i] = tree.FuncParam{
+			Type: desc.Params[i].Type,
 		}
 	}
 	return ret
 }
 
-// GetObjectType implements the PrivilegeObject interface.
+// GetObjectType implements the Object interface.
 func (desc *immutable) GetObjectType() privilege.ObjectType {
 	return privilege.Function
-}
-
-// GetPrivilegeDescriptor implements the PrivilegeObject interface.
-func (desc *immutable) GetPrivilegeDescriptor(
-	ctx context.Context, planner eval.Planner,
-) (*catpb.PrivilegeDescriptor, error) {
-	return desc.GetPrivileges(), nil
 }
 
 // FuncDesc implements the catalog.FunctionDescriptor interface.
@@ -511,16 +678,6 @@ func (desc *immutable) GetLanguage() catpb.Function_Language {
 	return desc.Lang
 }
 
-// ContainsUserDefinedTypes implements the catalog.HydratableDescriptor interface.
-func (desc *immutable) ContainsUserDefinedTypes() bool {
-	for i := range desc.Args {
-		if desc.Args[i].Type.UserDefined() {
-			return true
-		}
-	}
-	return desc.ReturnType.Type.UserDefined()
-}
-
 func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 	ret = &tree.Overload{
 		Oid:        catid.FuncIDToOID(desc.ID),
@@ -528,13 +685,14 @@ func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 		ReturnSet:  desc.ReturnType.ReturnSet,
 		Body:       desc.FunctionBody,
 		IsUDF:      true,
+		Version:    uint64(desc.Version),
 	}
 
-	argTypes := make(tree.ArgTypes, 0, len(desc.Args))
-	for _, arg := range desc.Args {
+	argTypes := make(tree.ParamTypes, 0, len(desc.Params))
+	for _, param := range desc.Params {
 		argTypes = append(
 			argTypes,
-			tree.ArgType{Name: arg.Name, Typ: arg.Type},
+			tree.ParamType{Name: param.Name, Typ: param.Type},
 		)
 	}
 	ret.Types = argTypes
@@ -545,6 +703,9 @@ func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 	ret.CalledOnNullInput, err = desc.calledOnNullInput()
 	if err != nil {
 		return nil, err
+	}
+	if desc.ReturnType.ReturnSet {
+		ret.Class = tree.GeneratorClass
 	}
 
 	return ret, nil
@@ -594,15 +755,15 @@ func (desc *immutable) ToCreateExpr() (ret *tree.CreateFunction, err error) {
 			IsSet: desc.ReturnType.ReturnSet,
 		},
 	}
-	ret.Args = make(tree.FuncArgs, len(desc.Args))
-	for i := range desc.Args {
-		ret.Args[i] = tree.FuncArg{
-			Name:  tree.Name(desc.Args[i].Name),
-			Type:  desc.Args[i].Type,
-			Class: toTreeNodeArgClass(desc.Args[i].Class),
+	ret.Params = make(tree.FuncParams, len(desc.Params))
+	for i := range desc.Params {
+		ret.Params[i] = tree.FuncParam{
+			Name:  tree.Name(desc.Params[i].Name),
+			Type:  desc.Params[i].Type,
+			Class: toTreeNodeParamClass(desc.Params[i].Class),
 		}
-		if desc.Args[i].DefaultExpr != nil {
-			ret.Args[i].DefaultVal, err = parser.ParseExpr(*desc.Args[i].DefaultExpr)
+		if desc.Params[i].DefaultExpr != nil {
+			ret.Params[i].DefaultVal, err = parser.ParseExpr(*desc.Params[i].DefaultExpr)
 			if err != nil {
 				return nil, err
 			}
@@ -624,7 +785,7 @@ func (desc *immutable) getCreateExprLang() tree.FunctionLanguage {
 	case catpb.Function_SQL:
 		return tree.FunctionLangSQL
 	}
-	return 0
+	return tree.FunctionLangUnknown
 }
 
 func (desc *immutable) getCreateExprVolatility() tree.FunctionVolatility {
@@ -651,41 +812,27 @@ func (desc *immutable) getCreateExprNullInputBehavior() tree.FunctionNullInputBe
 	return 0
 }
 
-func toTreeNodeArgClass(class catpb.Function_Arg_Class) tree.FuncArgClass {
+func toTreeNodeParamClass(class catpb.Function_Param_Class) tree.FuncParamClass {
 	switch class {
-	case catpb.Function_Arg_IN:
-		return tree.FunctionArgIn
-	case catpb.Function_Arg_OUT:
-		return tree.FunctionArgOut
-	case catpb.Function_Arg_IN_OUT:
-		return tree.FunctionArgInOut
-	case catpb.Function_Arg_VARIADIC:
-		return tree.FunctionArgVariadic
+	case catpb.Function_Param_IN:
+		return tree.FunctionParamIn
+	case catpb.Function_Param_OUT:
+		return tree.FunctionParamOut
+	case catpb.Function_Param_IN_OUT:
+		return tree.FunctionParamInOut
+	case catpb.Function_Param_VARIADIC:
+		return tree.FunctionParamVariadic
 	}
 	return 0
 }
 
-// UserDefinedFunctionOIDToID converts a UDF OID into a descriptor ID. OID of a
-// UDF must be greater CockroachPredefinedOIDMax. The function returns an error
-// if the given OID is less than or equal to CockroachPredefinedOIDMax.
-func UserDefinedFunctionOIDToID(oid oid.Oid) (descpb.ID, error) {
+// UserDefinedFunctionOIDToID converts a UDF OID into a descriptor ID.
+// Returns zero if the OID is not for something user-defined.
+func UserDefinedFunctionOIDToID(oid oid.Oid) descpb.ID {
 	return catid.UserDefinedOIDToID(oid)
 }
 
 // IsOIDUserDefinedFunc returns true if an oid is a user-defined function oid.
 func IsOIDUserDefinedFunc(oid oid.Oid) bool {
 	return catid.IsOIDUserDefined(oid)
-}
-
-// CheckLeakProofVolatility returns an error when a function is defined as
-// leakproof but not immutable. See more details in comments for volatility.V.
-func CheckLeakProofVolatility(fn catalog.FunctionDescriptor) error {
-	if fn.GetLeakProof() && fn.GetVolatility() != catpb.Function_IMMUTABLE {
-		return pgerror.Newf(
-			pgcode.InvalidFunctionDefinition,
-			"cannot set leakproof on function with non-immutable volatility: %s",
-			fn.GetVolatility().String(),
-		)
-	}
-	return nil
 }

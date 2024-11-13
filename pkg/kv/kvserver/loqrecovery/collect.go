@@ -12,156 +12,211 @@ package loqrecovery
 
 import (
 	"context"
+	"io"
 	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
-// CollectReplicaInfo captures states of all replicas in all stores for the sake of quorum recovery.
-func CollectReplicaInfo(
-	ctx context.Context, stores []storage.Engine,
-) (loqrecoverypb.NodeReplicaInfo, error) {
-	if len(stores) == 0 {
-		return loqrecoverypb.NodeReplicaInfo{}, errors.New("no stores were provided for info collection")
-	}
-
-	var replicas []loqrecoverypb.ReplicaInfo
-	for _, reader := range stores {
-		storeIdent, err := kvserver.ReadStoreIdent(ctx, reader)
-		if err != nil {
-			return loqrecoverypb.NodeReplicaInfo{}, err
-		}
-		if err = kvserver.IterateRangeDescriptorsFromDisk(ctx, reader, func(desc roachpb.RangeDescriptor) error {
-			rsl := stateloader.Make(desc.RangeID)
-			rstate, err := rsl.Load(ctx, reader, &desc)
-			if err != nil {
-				return err
-			}
-			hstate, err := rsl.LoadHardState(ctx, reader)
-			if err != nil {
-				return err
-			}
-			// Check raft log for un-applied range descriptor changes. We start from
-			// applied+1 (inclusive) and read until the end of the log. We also look
-			// at potentially uncommitted entries as we have no way to determine their
-			// outcome, and they will become committed as soon as the replica is
-			// designated as a survivor.
-			rangeUpdates, err := GetDescriptorChangesFromRaftLog(desc.RangeID,
-				rstate.RaftAppliedIndex+1, math.MaxInt64, reader)
-			if err != nil {
-				return err
-			}
-
-			replicaData := loqrecoverypb.ReplicaInfo{
-				StoreID:                  storeIdent.StoreID,
-				NodeID:                   storeIdent.NodeID,
-				Desc:                     desc,
-				RaftAppliedIndex:         rstate.RaftAppliedIndex,
-				RaftCommittedIndex:       hstate.Commit,
-				RaftLogDescriptorChanges: rangeUpdates,
-			}
-			replicas = append(replicas, replicaData)
-			return nil
-		}); err != nil {
-			return loqrecoverypb.NodeReplicaInfo{}, err
-		}
-	}
-	return loqrecoverypb.NodeReplicaInfo{Replicas: replicas}, nil
+type CollectionStats struct {
+	Nodes       int
+	Stores      int
+	Descriptors int
 }
 
-// GetDescriptorChangesFromRaftLog iterates over raft log between indicies
+func CollectRemoteReplicaInfo(
+	ctx context.Context, c serverpb.AdminClient,
+) (loqrecoverypb.ClusterReplicaInfo, CollectionStats, error) {
+	cc, err := c.RecoveryCollectReplicaInfo(ctx, &serverpb.RecoveryCollectReplicaInfoRequest{})
+	if err != nil {
+		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, err
+	}
+	stores := make(map[roachpb.StoreID]struct{})
+	nodes := make(map[roachpb.NodeID]struct{})
+	var descriptors []roachpb.RangeDescriptor
+	var clusterReplInfo []loqrecoverypb.NodeReplicaInfo
+	var nodeReplicas []loqrecoverypb.ReplicaInfo
+	var currentNode roachpb.NodeID
+	var metadata loqrecoverypb.ClusterMetadata
+	for {
+		info, err := cc.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if len(nodeReplicas) > 0 {
+					clusterReplInfo = append(clusterReplInfo, loqrecoverypb.NodeReplicaInfo{Replicas: nodeReplicas})
+				}
+				break
+			}
+			return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, err
+		}
+		if r := info.GetReplicaInfo(); r != nil {
+			if currentNode != r.NodeID {
+				currentNode = r.NodeID
+				if len(nodeReplicas) > 0 {
+					clusterReplInfo = append(clusterReplInfo, loqrecoverypb.NodeReplicaInfo{Replicas: nodeReplicas})
+					nodeReplicas = nil
+				}
+			}
+			nodeReplicas = append(nodeReplicas, *r)
+			stores[r.StoreID] = struct{}{}
+			nodes[r.NodeID] = struct{}{}
+		} else if d := info.GetRangeDescriptor(); d != nil {
+			descriptors = append(descriptors, *d)
+		} else if s := info.GetNodeStreamRestarted(); s != nil {
+			// If server had to restart a fan-out work because of error and retried,
+			// then we discard partial data for the node.
+			if s.NodeID == currentNode {
+				nodeReplicas = nil
+			}
+		} else if m := info.GetMetadata(); m != nil {
+			metadata = *m
+		}
+	}
+	// We don't want to process data outside of safe version range for this CLI
+	// binary. RPC allows us to communicate with a cluster that is newer than
+	// the binary, but it will not version gate the data to binary version so we
+	// can receive entries that we won't be able to persist and process correctly.
+	if err := checkVersionAllowedByBinary(metadata.Version); err != nil {
+		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, errors.Wrap(err,
+			"unsupported cluster info version")
+	}
+	return loqrecoverypb.ClusterReplicaInfo{
+			ClusterID:   metadata.ClusterID,
+			Descriptors: descriptors,
+			LocalInfo:   clusterReplInfo,
+			Version:     metadata.Version,
+		}, CollectionStats{
+			Nodes:       len(nodes),
+			Stores:      len(stores),
+			Descriptors: len(descriptors),
+		}, nil
+}
+
+// CollectStoresReplicaInfo captures states of all replicas in all stores for the sake of quorum recovery.
+func CollectStoresReplicaInfo(
+	ctx context.Context, stores []storage.Engine,
+) (loqrecoverypb.ClusterReplicaInfo, CollectionStats, error) {
+	if len(stores) == 0 {
+		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, errors.New("no stores were provided for info collection")
+	}
+
+	// Synthesizing version from engine ensures that binary is compatible with
+	// the store, so we don't need to do any extra checks.
+	binaryVersion := clusterversion.ByKey(clusterversion.BinaryVersionKey)
+	binaryMinSupportedVersion := clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)
+	version, err := kvstorage.SynthesizeClusterVersionFromEngines(
+		ctx, stores, binaryVersion, binaryMinSupportedVersion,
+	)
+	if err != nil {
+		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, errors.WithHint(err,
+			"ensure that used cli has compatible version with storage")
+	}
+
+	var clusterUUID uuid.UUID
+	nodes := make(map[roachpb.NodeID]struct{})
+	var replicas []loqrecoverypb.ReplicaInfo
+	for i, reader := range stores {
+		ident, err := kvstorage.ReadStoreIdent(ctx, reader)
+		if err != nil {
+			return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, err
+		}
+		if i == 0 {
+			clusterUUID = ident.ClusterID
+		}
+		if !ident.ClusterID.Equal(clusterUUID) {
+			return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, errors.New("can't collect info from stored that belong to different clusters")
+		}
+		nodes[ident.NodeID] = struct{}{}
+		if err := visitStoreReplicas(ctx, reader, ident.StoreID, ident.NodeID, version,
+			func(info loqrecoverypb.ReplicaInfo) error {
+				replicas = append(replicas, info)
+				return nil
+			}); err != nil {
+			return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, err
+		}
+	}
+	return loqrecoverypb.ClusterReplicaInfo{
+			ClusterID: clusterUUID.String(),
+			LocalInfo: []loqrecoverypb.NodeReplicaInfo{{Replicas: replicas}},
+			Version:   version.Version,
+		}, CollectionStats{
+			Nodes:  len(nodes),
+			Stores: len(stores),
+		}, nil
+}
+
+func visitStoreReplicas(
+	ctx context.Context,
+	reader storage.Reader,
+	storeID roachpb.StoreID,
+	nodeID roachpb.NodeID,
+	targetVersion clusterversion.ClusterVersion,
+	send func(info loqrecoverypb.ReplicaInfo) error,
+) error {
+	if err := kvstorage.IterateRangeDescriptorsFromDisk(ctx, reader, func(desc roachpb.RangeDescriptor) error {
+		rsl := stateloader.Make(desc.RangeID)
+		rstate, err := rsl.Load(ctx, reader, &desc)
+		if err != nil {
+			return err
+		}
+		hstate, err := rsl.LoadHardState(ctx, reader)
+		if err != nil {
+			return err
+		}
+		// Check raft log for un-applied range descriptor changes. We start from
+		// applied+1 (inclusive) and read until the end of the log. We also look
+		// at potentially uncommitted entries as we have no way to determine their
+		// outcome, and they will become committed as soon as the replica is
+		// designated as a survivor.
+		rangeUpdates, err := GetDescriptorChangesFromRaftLog(desc.RangeID,
+			rstate.RaftAppliedIndex+1, math.MaxInt64, reader)
+		if err != nil {
+			return err
+		}
+
+		var localIsLeaseholder bool
+		if targetVersion.IsActive(clusterversion.V23_1) {
+			localIsLeaseholder = rstate.Lease != nil && rstate.Lease.Replica.StoreID == storeID
+		}
+
+		return send(loqrecoverypb.ReplicaInfo{
+			StoreID:                  storeID,
+			NodeID:                   nodeID,
+			Desc:                     desc,
+			RaftAppliedIndex:         rstate.RaftAppliedIndex,
+			RaftCommittedIndex:       hstate.Commit,
+			RaftLogDescriptorChanges: rangeUpdates,
+			LocalAssumesLeaseholder:  localIsLeaseholder,
+		})
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GetDescriptorChangesFromRaftLog iterates over raft log between indices
 // lo (inclusive) and hi (exclusive) and searches for changes to range
-// descriptor. Changes are identified by commit trigger content which is
-// extracted either from EntryNormal where change updates key range info
-// (split/merge) or from EntryConfChange* for changes in replica set.
+// descriptors, as identified by presence of a commit trigger.
 func GetDescriptorChangesFromRaftLog(
 	rangeID roachpb.RangeID, lo, hi uint64, reader storage.Reader,
 ) ([]loqrecoverypb.DescriptorChangeInfo, error) {
 	var changes []loqrecoverypb.DescriptorChangeInfo
-
-	key := keys.RaftLogKey(rangeID, lo)
-	endKey := keys.RaftLogKey(rangeID, hi)
-	iter := reader.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
-		UpperBound: endKey,
-	})
-	defer iter.Close()
-
-	var meta enginepb.MVCCMetadata
-	var ent raftpb.Entry
-
-	decodeRaftChange := func(ccI raftpb.ConfChangeI) ([]byte, error) {
-		var ccC kvserverpb.ConfChangeContext
-		if err := protoutil.Unmarshal(ccI.AsV2().Context, &ccC); err != nil {
-			return nil, errors.Wrap(err, "while unmarshaling CCContext")
-		}
-		return ccC.Payload, nil
-	}
-
-	iter.SeekGE(storage.MakeMVCCMetadataKey(key))
-	for ; ; iter.Next() {
-		ok, err := iter.Valid()
+	if err := raftlog.Visit(reader, rangeID, lo, hi, func(ent raftpb.Entry) error {
+		e, err := raftlog.NewEntry(ent)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if !ok {
-			return changes, nil
-		}
-		if err := protoutil.Unmarshal(iter.UnsafeValue(), &meta); err != nil {
-			return nil, errors.Wrap(err, "unable to decode raft log MVCCMetadata")
-		}
-		if err := storage.MakeValue(meta).GetProto(&ent); err != nil {
-			return nil, errors.Wrap(err, "unable to unmarshal raft Entry")
-		}
-		if len(ent.Data) == 0 {
-			continue
-		}
-		// Following code extracts our raft command from raft log entry. Depending
-		// on entry type we either need to extract encoded command from configuration
-		// change (for replica changes) or from normal command (for splits and
-		// merges).
-		var payload []byte
-		switch ent.Type {
-		case raftpb.EntryConfChange:
-			var cc raftpb.ConfChange
-			if err := protoutil.Unmarshal(ent.Data, &cc); err != nil {
-				return nil, errors.Wrap(err, "while unmarshaling ConfChange")
-			}
-			payload, err = decodeRaftChange(cc)
-			if err != nil {
-				return nil, err
-			}
-		case raftpb.EntryConfChangeV2:
-			var cc raftpb.ConfChangeV2
-			if err := protoutil.Unmarshal(ent.Data, &cc); err != nil {
-				return nil, errors.Wrap(err, "while unmarshaling ConfChangeV2")
-			}
-			payload, err = decodeRaftChange(cc)
-			if err != nil {
-				return nil, err
-			}
-		case raftpb.EntryNormal:
-			_, payload = kvserverbase.DecodeRaftCommand(ent.Data)
-		default:
-			continue
-		}
-		if len(payload) == 0 {
-			continue
-		}
-		var raftCmd kvserverpb.RaftCommand
-		if err := protoutil.Unmarshal(payload, &raftCmd); err != nil {
-			return nil, errors.Wrap(err, "unable to unmarshal raft command")
-		}
+		raftCmd := e.Cmd
 		switch {
 		case raftCmd.ReplicatedEvalResult.Split != nil:
 			changes = append(changes,
@@ -183,5 +238,9 @@ func GetDescriptorChangesFromRaftLog(
 				Desc:       raftCmd.ReplicatedEvalResult.ChangeReplicas.Desc,
 			})
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
+	return changes, nil
 }

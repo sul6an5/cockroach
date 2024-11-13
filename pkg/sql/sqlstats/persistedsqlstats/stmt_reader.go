@@ -16,13 +16,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
@@ -44,7 +43,7 @@ func (s *PersistedSQLStats) IterateStatementStats(
 	aggInterval := s.GetAggregationInterval()
 	memIter := newMemStmtStatsIterator(s.SQLStats, options, curAggTs, aggInterval)
 
-	var persistedIter sqlutil.InternalRows
+	var persistedIter isql.Rows
 	var colCnt int
 	persistedIter, colCnt, err = s.persistedStmtStatsIter(ctx, options)
 	if err != nil {
@@ -81,14 +80,14 @@ func (s *PersistedSQLStats) IterateStatementStats(
 
 func (s *PersistedSQLStats) persistedStmtStatsIter(
 	ctx context.Context, options *sqlstats.IteratorOptions,
-) (iter sqlutil.InternalRows, expectedColCnt int, err error) {
-	query, expectedColCnt := s.getFetchQueryForStmtStatsTable(options)
+) (iter isql.Rows, expectedColCnt int, err error) {
+	query, expectedColCnt := s.getFetchQueryForStmtStatsTable(ctx, options)
 
-	persistedIter, err := s.cfg.InternalExecutor.QueryIteratorEx(
+	persistedIter, err := s.cfg.DB.Executor().QueryIteratorEx(
 		ctx,
 		"read-stmt-stats",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		query,
 	)
 
@@ -100,7 +99,7 @@ func (s *PersistedSQLStats) persistedStmtStatsIter(
 }
 
 func (s *PersistedSQLStats) getFetchQueryForStmtStatsTable(
-	options *sqlstats.IteratorOptions,
+	ctx context.Context, options *sqlstats.IteratorOptions,
 ) (query string, colCnt int) {
 	selectedColumns := []string{
 		"aggregated_ts",
@@ -146,22 +145,22 @@ FROM
 	return query, len(selectedColumns)
 }
 
-func rowToStmtStats(row tree.Datums) (*roachpb.CollectedStatementStatistics, error) {
-	var stats roachpb.CollectedStatementStatistics
+func rowToStmtStats(row tree.Datums) (*appstatspb.CollectedStatementStatistics, error) {
+	var stats appstatspb.CollectedStatementStatistics
 	stats.AggregatedTs = tree.MustBeDTimestampTZ(row[0]).Time
 
 	stmtFingerprintID, err := sqlstatsutil.DatumToUint64(row[1])
 	if err != nil {
 		return nil, err
 	}
-	stats.ID = roachpb.StmtFingerprintID(stmtFingerprintID)
+	stats.ID = appstatspb.StmtFingerprintID(stmtFingerprintID)
 
 	transactionFingerprintID, err := sqlstatsutil.DatumToUint64(row[2])
 	if err != nil {
 		return nil, err
 	}
 	stats.Key.TransactionFingerprintID =
-		roachpb.TransactionFingerprintID(transactionFingerprintID)
+		appstatspb.TransactionFingerprintID(transactionFingerprintID)
 
 	stats.Key.PlanHash, err = sqlstatsutil.DatumToUint64(row[3])
 	if err != nil {

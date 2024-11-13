@@ -19,9 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -34,10 +36,11 @@ import (
 // running randomized GC tests as well as benchmarking new code vs preserved
 // legacy GC.
 type randomRunGCTestSpec struct {
-	ds           distSpec
-	now          hlc.Timestamp
-	ttlSec       int32
-	intentAgeSec int32
+	ds                distSpec
+	now               hlc.Timestamp
+	ttlSec            int32
+	intentAgeSec      int32
+	clearRangeMinKeys int64 // Set to 0 for test default value or -1 to disable.
 }
 
 var (
@@ -45,48 +48,52 @@ var (
 		tsSecFrom: 1, tsSecTo: 100,
 		keySuffixMin: 2, keySuffixMax: 6,
 		valueLenMin: 1, valueLenMax: 1,
-		deleteFrac:      0,
-		keysPerValueMin: 1, keysPerValueMax: 2,
+		deleteFrac:        0,
+		versionsPerKeyMin: 1, versionsPerKeyMax: 2,
 		intentFrac: .1,
 	}
 	someVersionsMidSizeRows = uniformDistSpec{
 		tsSecFrom: 1, tsSecTo: 100,
 		keySuffixMin: 8, keySuffixMax: 8,
 		valueLenMin: 8, valueLenMax: 16,
-		deleteFrac:      .1,
-		keysPerValueMin: 1, keysPerValueMax: 100,
+		deleteFrac:        .1,
+		versionsPerKeyMin: 1, versionsPerKeyMax: 100,
 		intentFrac: .1,
 	}
 	lotsOfVersionsMidSizeRows = uniformDistSpec{
 		tsSecFrom: 1, tsSecTo: 100,
-		keySuffixMin: 8, keySuffixMax: 8,
+		keySuffixMin: 7, keySuffixMax: 9,
 		valueLenMin: 8, valueLenMax: 16,
-		deleteFrac:      .1,
-		keysPerValueMin: 1000, keysPerValueMax: 1000000,
+		deleteFrac:        .1,
+		versionsPerKeyMin: 1000, versionsPerKeyMax: 1000000,
 		intentFrac: .1,
 	}
 	// This spec is identical to someVersionsMidSizeRows except for number of
 	// intents.
 	someVersionsMidSizeRowsLotsOfIntents = uniformDistSpec{
 		tsSecFrom: 1, tsSecTo: 100,
-		keySuffixMin: 8, keySuffixMax: 8,
+		keySuffixMin: 7, keySuffixMax: 9,
 		valueLenMin: 8, valueLenMax: 16,
-		deleteFrac:      .1,
-		keysPerValueMin: 1, keysPerValueMax: 100,
+		deleteFrac:        .1,
+		versionsPerKeyMin: 1, versionsPerKeyMax: 100,
 		intentFrac: 1,
 	}
 	someVersionsWithSomeRangeKeys = uniformDistSpec{
 		tsSecFrom: 1, tsSecTo: 100,
 		tsSecMinIntent: 70, tsSecOldIntentTo: 85,
-		keySuffixMin: 8, keySuffixMax: 8,
+		keySuffixMin: 7, keySuffixMax: 9,
 		valueLenMin: 8, valueLenMax: 16,
-		deleteFrac:      .1,
-		keysPerValueMin: 1,
-		keysPerValueMax: 100,
-		intentFrac:      .1,
-		oldIntentFrac:   .1,
-		rangeKeyFrac:    .1,
+		deleteFrac:        .1,
+		versionsPerKeyMin: 1,
+		versionsPerKeyMax: 100,
+		intentFrac:        .1,
+		oldIntentFrac:     .1,
+		rangeKeyFrac:      .1,
 	}
+
+	// smallEngineBlocks configures Pebble with a block size of 1 byte, to provoke
+	// bugs in time-bound iterators.
+	smallEngineBlocks = util.ConstantWithMetamorphicTestBool("small-engine-blocks", false)
 )
 
 const intentAgeThreshold = 2 * time.Hour
@@ -121,11 +128,12 @@ func TestRunNewVsOld(t *testing.T) {
 			rng, seed := randutil.NewTestRand()
 			t.Logf("Using subtest seed: %d", seed)
 
-			eng := storage.NewDefaultInMemForTesting()
+			eng := storage.NewDefaultInMemForTesting(storage.If(smallEngineBlocks, storage.BlockSize(1)))
 			defer eng.Close()
 
 			tc.ds.dist(N, rng).setupTest(t, eng, *tc.ds.desc())
 			snap := eng.NewSnapshot()
+			defer snap.Close()
 
 			oldGCer := makeFakeGCer()
 			ttl := time.Duration(tc.ttlSec) * time.Second
@@ -169,6 +177,7 @@ func BenchmarkRun(b *testing.B) {
 			runGCFunc = runGCOld
 		}
 		snap := eng.NewSnapshot()
+		defer snap.Close()
 		ttl := time.Duration(spec.ttlSec) * time.Second
 		intentThreshold := intentAgeThreshold
 		if spec.intentAgeSec > 0 {
@@ -178,6 +187,7 @@ func BenchmarkRun(b *testing.B) {
 			CalculateThreshold(spec.now, ttl), RunOptions{
 				IntentAgeThreshold:  intentThreshold,
 				TxnCleanupThreshold: txnCleanupThreshold,
+				ClearRangeMinKeys:   defaultClearRangeMinKeys,
 			},
 			ttl,
 			NoopGCer{},
@@ -263,21 +273,67 @@ func TestNewVsInvariants(t *testing.T) {
 			now: hlc.Timestamp{
 				WallTime: 100 * time.Second.Nanoseconds(),
 			},
+			ttlSec:       10,
+			intentAgeSec: 15,
+			// Reduced clear range sequence to allow key batches to be split at
+			// various boundaries.
+			clearRangeMinKeys: 49,
+		},
+		{
+			ds: someVersionsWithSomeRangeKeys,
+			now: hlc.Timestamp{
+				WallTime: 100 * time.Second.Nanoseconds(),
+			},
+			ttlSec:       10,
+			intentAgeSec: 15,
+			// Disable clear range to reliably engage specific code paths that handle
+			// simplified no-clear-range batching.
+			clearRangeMinKeys: -1,
+		},
+		{
+			ds: someVersionsWithSomeRangeKeys,
+			now: hlc.Timestamp{
+				WallTime: 100 * time.Second.Nanoseconds(),
+			},
 			// Higher TTL means range tombstones between 70 sec and 50 sec are
 			// not removed.
 			ttlSec: 50,
 		},
+		{
+			ds: someVersionsWithSomeRangeKeys,
+			now: hlc.Timestamp{
+				WallTime: 100 * time.Second.Nanoseconds(),
+			},
+			// Higher TTL means range tombstones between 70 sec and 50 sec are
+			// not removed.
+			ttlSec: 50,
+			// Reduced clear range sequence to allow key batches to be split at
+			// various boundaries.
+			clearRangeMinKeys: 10,
+		},
 	} {
-		t.Run(fmt.Sprintf("%v@%v,ttl=%vsec", tc.ds, tc.now, tc.ttlSec), func(t *testing.T) {
+		clearRangeMinKeys := int64(0)
+		switch tc.clearRangeMinKeys {
+		case -1:
+		case 0:
+			// Default value for test.
+			clearRangeMinKeys = 100
+		default:
+			clearRangeMinKeys = tc.clearRangeMinKeys
+		}
+		name := fmt.Sprintf("%v@%v,ttl=%vsec,clearRangeMinKeys=%d", tc.ds, tc.now, tc.ttlSec,
+			clearRangeMinKeys)
+		t.Run(name, func(t *testing.T) {
 			rng, seed := randutil.NewTestRand()
 			t.Logf("Using subtest seed: %d", seed)
 
 			desc := tc.ds.desc()
-			eng := storage.NewDefaultInMemForTesting()
+			eng := storage.NewDefaultInMemForTesting(storage.If(smallEngineBlocks, storage.BlockSize(1)))
 			defer eng.Close()
 
 			sortedDistribution(tc.ds.dist(N, rng)).setupTest(t, eng, *desc)
 			beforeGC := eng.NewSnapshot()
+			defer beforeGC.Close()
 
 			// Run GCer over snapshot.
 			ttl := time.Duration(tc.ttlSec) * time.Second
@@ -289,6 +345,7 @@ func TestNewVsInvariants(t *testing.T) {
 				gcThreshold, RunOptions{
 					IntentAgeThreshold:  intentAgeThreshold,
 					TxnCleanupThreshold: txnCleanupThreshold,
+					ClearRangeMinKeys:   clearRangeMinKeys,
 				}, ttl,
 				&gcer,
 				gcer.resolveIntents,
@@ -305,8 +362,17 @@ func TestNewVsInvariants(t *testing.T) {
 					Txn:    i.Txn,
 					Status: roachpb.ABORTED,
 				}
-				_, err := storage.MVCCResolveWriteIntent(ctx, eng, &stats, l)
+				_, _, _, err := storage.MVCCResolveWriteIntent(ctx, eng, &stats, l, storage.MVCCResolveWriteIntentOptions{})
 				require.NoError(t, err, "failed to resolve intent")
+			}
+			for _, cr := range gcer.clearRanges() {
+				require.False(t, cr.StartKeyTimestamp.IsEmpty(), "unexpected full range delete")
+				if cr.EndKey == nil {
+					cr.EndKey = cr.StartKey.Next()
+				}
+				require.NoError(t,
+					storage.MVCCGarbageCollectPointsWithClearRange(ctx, eng, &stats, cr.StartKey, cr.EndKey,
+						cr.StartKeyTimestamp, gcThreshold))
 			}
 			for _, batch := range gcer.rangeKeyBatches() {
 				rangeKeys := makeCollectableGCRangesFromGCRequests(desc.StartKey.AsRawKey(),
@@ -315,6 +381,11 @@ func TestNewVsInvariants(t *testing.T) {
 					storage.MVCCGarbageCollectRangeKeys(ctx, eng, &stats, rangeKeys))
 			}
 
+			// For the sake of assertion we need to reset this counter as it signals
+			// counter for specific feature rather than processed data. Data and number
+			// of cleared keys and versions should be the same regardless of operations
+			// used to clear it.
+			gcInfoNew.ClearRangeSpanOperations = 0
 			assertLiveData(t, eng, beforeGC, *desc, tc.now, gcThreshold, intentThreshold, ttl,
 				gcInfoNew)
 		})
@@ -471,8 +542,9 @@ func getExpectationsGenerator(
 				}
 				p, r := it.HasPointAndRange()
 				if p {
-					k := it.Key()
-					v := it.Value()
+					k := it.UnsafeKey().Clone()
+					v, err := it.Value()
+					require.NoError(t, err)
 					if len(baseKey) == 0 {
 						baseKey = k.Key
 						// We are only interested in range tombstones covering current point,
@@ -552,6 +624,8 @@ func getExpectationsGenerator(
 				}
 
 				// Apply GC checks to produce expected state.
+				v, err := storage.DecodeMVCCValue(history[i].Value)
+				require.NoError(t, err)
 				switch {
 				case gcThreshold.Less(history[i].Key.Timestamp):
 					// Any value above threshold including intents that have no timestamp.
@@ -559,14 +633,14 @@ func getExpectationsGenerator(
 						pending = append(pending, history[i].MVCCKeyValue)
 					}
 					i++
-				case history[i].Key.Timestamp.LessEq(gcThreshold) && len(history[i].Value) > 0:
+				case history[i].Key.Timestamp.LessEq(gcThreshold) && !v.IsTombstone():
 					// First value on or under threshold should be preserved, but the rest
 					// of history should be skipped.
 					pending = append(pending, history[i].MVCCKeyValue)
 					i++
 					stop = true
 				default:
-					// This is ts <= threshold and v == nil
+					// This is ts <= threshold and v.IsTombstone().
 					stop = true
 				}
 			}
@@ -620,7 +694,9 @@ func getKeyHistory(t *testing.T, r storage.Reader, key roachpb.Key) string {
 				result = append(result, fmt.Sprintf("R:%s", rk.RangeKey.String()))
 			}
 		}
-		result = append(result, fmt.Sprintf("P:%s(%d)", it.UnsafeKey().String(), len(it.UnsafeValue())))
+		v, err := it.UnsafeValue()
+		require.NoError(t, err)
+		result = append(result, fmt.Sprintf("P:%s(%d)", it.UnsafeKey().String(), len(v)))
 		it.Next()
 	}
 
@@ -728,12 +804,13 @@ func mergeRanges(fragments [][]storage.MVCCRangeKeyValue) []storage.MVCCRangeKey
 }
 
 type fakeGCer struct {
-	gcKeys map[string]roachpb.GCRequest_GCKey
+	gcKeys          map[string]kvpb.GCRequest_GCKey
+	gcPointsBatches [][]kvpb.GCRequest_GCKey
 	// fake GCer stores range key batches as it since we need to be able to
 	// feed them into MVCCGarbageCollectRangeKeys and ranges argument should be
 	// non-overlapping.
-	gcRangeKeyBatches [][]roachpb.GCRequest_GCRangeKey
-	gcClearRangeKeys  []roachpb.GCRequest_GCClearRangeKey
+	gcRangeKeyBatches [][]kvpb.GCRequest_GCRangeKey
+	gcClearRanges     []kvpb.GCRequest_GCClearRange
 	threshold         Threshold
 	intents           []roachpb.Intent
 	batches           [][]roachpb.Intent
@@ -742,7 +819,7 @@ type fakeGCer struct {
 
 func makeFakeGCer() fakeGCer {
 	return fakeGCer{
-		gcKeys: make(map[string]roachpb.GCRequest_GCKey),
+		gcKeys: make(map[string]kvpb.GCRequest_GCKey),
 	}
 }
 
@@ -755,16 +832,25 @@ func (f *fakeGCer) SetGCThreshold(ctx context.Context, t Threshold) error {
 
 func (f *fakeGCer) GC(
 	ctx context.Context,
-	keys []roachpb.GCRequest_GCKey,
-	rangeKeys []roachpb.GCRequest_GCRangeKey,
-	clearRangeKey *roachpb.GCRequest_GCClearRangeKey,
+	keys []kvpb.GCRequest_GCKey,
+	rangeKeys []kvpb.GCRequest_GCRangeKey,
+	clearRange *kvpb.GCRequest_GCClearRange,
 ) error {
 	for _, k := range keys {
 		f.gcKeys[k.Key.String()] = k
 	}
-	f.gcRangeKeyBatches = append(f.gcRangeKeyBatches, rangeKeys)
-	if clearRangeKey != nil {
-		f.gcClearRangeKeys = append(f.gcClearRangeKeys, *clearRangeKey)
+	if keys != nil {
+		f.gcPointsBatches = append(f.gcPointsBatches, keys)
+	}
+	if rangeKeys != nil {
+		f.gcRangeKeyBatches = append(f.gcRangeKeyBatches, rangeKeys)
+	}
+	if clearRange != nil {
+		f.gcClearRanges = append(f.gcClearRanges, kvpb.GCRequest_GCClearRange{
+			StartKey:          clearRange.StartKey.Clone(),
+			StartKeyTimestamp: clearRange.StartKeyTimestamp,
+			EndKey:            clearRange.EndKey.Clone(),
+		})
 	}
 	return nil
 }
@@ -780,6 +866,10 @@ func (f *fakeGCer) resolveIntents(_ context.Context, intents []roachpb.Intent) e
 	return nil
 }
 
+// normalize will converge GC request history between old and new
+// implementations and drop info that is not produced by old GC.
+// It will however preserve info like clear range which covers functionality
+// not relevant for old gc as it shouldn't be compared between such invocations.
 func (f *fakeGCer) normalize() {
 	sortIntents := func(i, j int) bool {
 		return intentLess(&f.intents[i], &f.intents[j])
@@ -792,26 +882,31 @@ func (f *fakeGCer) normalize() {
 		return f.txnIntents[i].txn.ID.String() < f.txnIntents[j].txn.ID.String()
 	})
 	f.batches = nil
+	f.gcPointsBatches = nil
 }
 
-func (f *fakeGCer) pointKeys() []roachpb.GCRequest_GCKey {
-	var reqs []roachpb.GCRequest_GCKey
+func (f *fakeGCer) pointKeys() []kvpb.GCRequest_GCKey {
+	var reqs []kvpb.GCRequest_GCKey
 	for _, r := range f.gcKeys {
 		reqs = append(reqs, r)
 	}
 	return reqs
 }
 
-func (f *fakeGCer) rangeKeyBatches() [][]roachpb.GCRequest_GCRangeKey {
+func (f *fakeGCer) rangeKeyBatches() [][]kvpb.GCRequest_GCRangeKey {
 	return f.gcRangeKeyBatches
 }
 
-func (f *fakeGCer) rangeKeys() []roachpb.GCRequest_GCRangeKey {
-	var reqs []roachpb.GCRequest_GCRangeKey
+func (f *fakeGCer) rangeKeys() []kvpb.GCRequest_GCRangeKey {
+	var reqs []kvpb.GCRequest_GCRangeKey
 	for _, r := range f.gcRangeKeyBatches {
 		reqs = append(reqs, r...)
 	}
 	return reqs
+}
+
+func (f *fakeGCer) clearRanges() []kvpb.GCRequest_GCClearRange {
+	return f.gcClearRanges
 }
 
 func intentLess(a, b *roachpb.Intent) bool {
@@ -834,29 +929,40 @@ type txnIntents struct {
 // makeCollectableGCRangesFromGCRequests mirrors
 // MakeCollectableGCRangesFromGCRequests to break cyclic dependecies.
 func makeCollectableGCRangesFromGCRequests(
-	rangeStart, rangeEnd roachpb.Key, rangeKeys []roachpb.GCRequest_GCRangeKey,
+	rangeStart, rangeEnd roachpb.Key, rangeKeys []kvpb.GCRequest_GCRangeKey,
 ) []storage.CollectableGCRangeKey {
 	collectableKeys := make([]storage.CollectableGCRangeKey, len(rangeKeys))
 	for i, rk := range rangeKeys {
-		leftPeekBound := rk.StartKey.Prevish(roachpb.PrevishKeyLength)
-		if len(rangeStart) > 0 && leftPeekBound.Compare(rangeStart) <= 0 {
-			leftPeekBound = rangeStart
-		}
-		rightPeekBound := rk.EndKey.Next()
-		if len(rangeEnd) > 0 && rightPeekBound.Compare(rangeEnd) >= 0 {
-			rightPeekBound = rangeEnd
-		}
+		peekBounds := expandRangeSpan(roachpb.Span{
+			Key:    rk.StartKey,
+			EndKey: rk.EndKey,
+		}, roachpb.Span{
+			Key:    rangeStart,
+			EndKey: rangeEnd,
+		})
 		collectableKeys[i] = storage.CollectableGCRangeKey{
 			MVCCRangeKey: storage.MVCCRangeKey{
 				StartKey:  rk.StartKey,
 				EndKey:    rk.EndKey,
 				Timestamp: rk.Timestamp,
 			},
-			LatchSpan: roachpb.Span{
-				Key:    leftPeekBound,
-				EndKey: rightPeekBound,
-			},
+			LatchSpan: peekBounds,
 		}
 	}
 	return collectableKeys
+}
+
+func expandRangeSpan(rangeKey, limits roachpb.Span) roachpb.Span {
+	leftPeekBound := rangeKey.Key.Prevish(roachpb.PrevishKeyLength)
+	if len(limits.Key) > 0 && leftPeekBound.Compare(limits.Key) <= 0 {
+		leftPeekBound = limits.Key
+	}
+	rightPeekBound := rangeKey.EndKey.Next()
+	if len(limits.EndKey) > 0 && rightPeekBound.Compare(limits.EndKey) >= 0 {
+		rightPeekBound = limits.EndKey
+	}
+	return roachpb.Span{
+		Key:    leftPeekBound,
+		EndKey: rightPeekBound,
+	}
 }

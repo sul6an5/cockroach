@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 var (
@@ -46,8 +45,6 @@ type TestClusterConfig struct {
 	UseFakeSpanResolver bool
 	// if non-empty, overrides the default distsql mode.
 	OverrideDistSQLMode string
-	// AllowSplitAndScatter enables the AllowSplitAndScatter tenant testing knob.
-	AllowSplitAndScatter bool
 	// if non-empty, overrides the default vectorize mode.
 	OverrideVectorize string
 	// if set, queries using distSQL processors or vectorized operators that can
@@ -58,10 +55,9 @@ type TestClusterConfig struct {
 	SkipShort bool
 	// If not empty, bootstrapVersion controls what version the cluster will be
 	// bootstrapped at.
-	BootstrapVersion roachpb.Version
-	// If not empty, binaryVersion is used to set what the Server will consider
-	// to be the binary version.
-	BinaryVersion  roachpb.Version
+	BootstrapVersion clusterversion.Key
+	// DisableUpgrade prevents the cluster from automatically upgrading to the
+	// latest version.
 	DisableUpgrade bool
 	// If true, a sql tenant server will be started and pointed at a node in the
 	// cluster. Connections on behalf of the logic test will go to that tenant.
@@ -74,7 +70,7 @@ type TestClusterConfig struct {
 	// localities is set if nodes should be set to a particular locality.
 	// Nodes are 1-indexed.
 	Localities map[int]roachpb.Locality
-	// backupRestoreProbability will periodically backup the cluster and restore
+	// BackupRestoreProbability will periodically backup the cluster and restore
 	// it's state to a new cluster at random points during a logic test.
 	BackupRestoreProbability float64
 	// disableDeclarativeSchemaChanger will disable the declarative schema changer
@@ -86,6 +82,12 @@ type TestClusterConfig struct {
 	// DeclarativeCorpusCollection enables support for collecting corpuses
 	// for the declarative schema changer.
 	DeclarativeCorpusCollection bool
+	// UseCockroachGoTestserver determines if the logictest uses the
+	// cockroach-go/testserver package to run the logic test.
+	// This allows us to do testing on different binary versions or to
+	// restart/upgrade nodes. This always bootstraps with the predecessor version
+	// of the current commit, and upgrades to the current commit.
+	UseCockroachGoTestserver bool
 }
 
 const threeNodeTenantConfigName = "3node-tenant"
@@ -276,14 +278,6 @@ var LogicTestConfigs = []TestClusterConfig{
 		OverrideVectorize:   "off",
 	},
 	{
-		Name:                "local-v1.1-at-v1.0-noupgrade",
-		NumNodes:            1,
-		OverrideDistSQLMode: "off",
-		BootstrapVersion:    roachpb.Version{Major: 1},
-		BinaryVersion:       roachpb.Version{Major: 1, Minor: 1},
-		DisableUpgrade:      true,
-	},
-	{
 		Name:                "fakedist",
 		NumNodes:            3,
 		UseFakeSpanResolver: true,
@@ -346,7 +340,6 @@ var LogicTestConfigs = []TestClusterConfig{
 		UseTenant:                   true,
 		IsCCLConfig:                 true,
 		OverrideDistSQLMode:         "on",
-		AllowSplitAndScatter:        true,
 		DeclarativeCorpusCollection: true,
 		Localities: map[int]roachpb.Locality{
 			1: {
@@ -449,24 +442,17 @@ var LogicTestConfigs = []TestClusterConfig{
 		Localities: multiregion15node5region3azsLocalities,
 	},
 	{
-		Name:                "local-mixed-21.2-22.1",
-		NumNodes:            1,
-		OverrideDistSQLMode: "off",
-		// Test fails when run within a test tenant. Tracked with
-		// #76378.
-		DisableDefaultTestTenant: true,
-		BootstrapVersion:         roachpb.Version{Major: 21, Minor: 2},
-		BinaryVersion:            roachpb.Version{Major: 22, Minor: 1},
-		DisableUpgrade:           true,
-	},
-	{
-		Name:                        "local-mixed-22.1-22.2",
+		Name:                        "local-mixed-22.2-23.1",
 		NumNodes:                    1,
 		OverrideDistSQLMode:         "off",
-		BootstrapVersion:            clusterversion.ByKey(clusterversion.V22_1),
-		BinaryVersion:               clusterversion.ByKey(clusterversion.PrioritizeSnapshots), //TODO: switch to 22.2.
+		BootstrapVersion:            clusterversion.V22_2,
 		DisableUpgrade:              true,
 		DeclarativeCorpusCollection: true,
+	},
+	{
+		Name:                     "cockroach-go-testserver-upgrade-to-master",
+		UseCockroachGoTestserver: true,
+		NumNodes:                 3,
 	},
 }
 
@@ -577,6 +563,52 @@ func (l stdlogger) Logf(format string, args ...interface{}) {
 	fmt.Printf(format, args...)
 }
 
+// ReadBackupRestoreProbabilityOverride reads any LogicTest directive at the
+// beginning of a test file. A line that starts with "#
+// BackupRestoreProbability:" specifies the probability with which we should run
+// a cluster backup + restore between lines of the test file.
+//
+// Example:
+//
+//	# BackupRestoreProbability: 0.8
+//
+// If the file doesn't contain a directive, the value of the environment
+// variable COCKROACH_LOGIC_TEST_BACKUP_RESTORE_PROBABILITY is used.
+func ReadBackupRestoreProbabilityOverride(
+	t logger, path string,
+) (hasOverride bool, probability float64) {
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("failed open file %s", path)
+	}
+	defer file.Close()
+
+	s := NewLineScanner(file)
+	for s.Scan() {
+		fields := strings.Fields(s.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		cmd := fields[0]
+		if !strings.HasPrefix(cmd, "#") {
+			// Stop at the first line that's not a comment (or empty).
+			break
+		}
+		if len(fields) > 1 && cmd == "#" && fields[1] == "BackupRestoreProbability:" {
+			if len(fields) == 2 {
+				t.Fatalf("%s: empty LogicTest directive", path)
+			}
+			probability, err := strconv.ParseFloat(fields[2], 64)
+			if err != nil {
+				t.Fatalf("failed to parse backup+restore probability: %+v", err)
+			}
+			return true, probability
+		}
+	}
+
+	return false, 0
+}
+
 // ReadTestFileConfigs reads any LogicTest directive at the beginning of a
 // test file. A line that starts with "# LogicTest:" specifies a list of
 // configuration names. The test file is run against each of those
@@ -589,7 +621,7 @@ func (l stdlogger) Logf(format string, args ...interface{}) {
 // If the file doesn't contain a directive, the default config is returned.
 func ReadTestFileConfigs(
 	t logger, path string, defaults ConfigSet,
-) (_ ConfigSet, onlyNonMetamorphic bool) {
+) (_ ConfigSet, nonMetamorphicBatchSizes bool) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, false
@@ -613,8 +645,8 @@ func ReadTestFileConfigs(
 			if len(fields) == 2 {
 				t.Fatalf("%s: empty LogicTest directive", path)
 			}
-			cs, onlyNonMetamorphic := processConfigs(t, path, defaults, fields[2:])
-			return cs, onlyNonMetamorphic
+			cs, nonMetamorphicBatchSizes := processConfigs(t, path, defaults, fields[2:])
+			return cs, nonMetamorphicBatchSizes
 		}
 	}
 	// No directive found, return the default config.
@@ -640,10 +672,11 @@ func getBlocklistIssueNo(blocklistDirective string) (string, int) {
 
 // processConfigs, given a list of configNames, returns the list of
 // corresponding logicTestConfigIdxs as well as a boolean indicating whether
-// the test works only in non-metamorphic setting.
+// metamorphic settings related to batch sizes should be overridden with default
+// production values.
 func processConfigs(
 	t logger, path string, defaults ConfigSet, configNames []string,
-) (_ ConfigSet, onlyNonMetamorphic bool) {
+) (_ ConfigSet, nonMetamorphicBatchSizes bool) {
 	const blocklistChar = '!'
 	// blocklist is a map from a blocked config to a corresponding issue number.
 	// If 0, there is no associated issue.
@@ -671,12 +704,12 @@ func processConfigs(
 		}
 	}
 
-	if _, ok := blocklist["metamorphic"]; ok && util.IsMetamorphicBuild() {
-		onlyNonMetamorphic = true
+	if _, ok := blocklist["metamorphic-batch-sizes"]; ok {
+		nonMetamorphicBatchSizes = true
 	}
 	if len(blocklist) != 0 && allConfigNamesAreBlocklistDirectives {
 		// No configs specified, this blocklist applies to the default configs.
-		return applyBlocklistToConfigs(defaults, blocklist), onlyNonMetamorphic
+		return applyBlocklistToConfigs(defaults, blocklist), nonMetamorphicBatchSizes
 	}
 
 	var configs ConfigSet
@@ -705,7 +738,7 @@ func processConfigs(
 		}
 	}
 
-	return configs, onlyNonMetamorphic
+	return configs, nonMetamorphicBatchSizes
 }
 
 // applyBlocklistToConfigs applies the given blocklist to configs, returning the

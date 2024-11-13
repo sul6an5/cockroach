@@ -17,14 +17,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/replicastats"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -36,7 +36,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3"
+	"github.com/cockroachdb/redact"
+	raft "go.etcd.io/raft/v3"
 )
 
 const (
@@ -213,49 +214,49 @@ var (
 	}
 	metaReplicateQueueReplaceDeadReplicaSuccessCount = metric.Metadata{
 		Name:        "queue.replicate.replacedeadreplica.success",
-		Help:        "Number of successful dead replica replica replacements processed by the replicate queue",
+		Help:        "Number of successful dead replica replacements processed by the replicate queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaReplicateQueueReplaceDeadReplicaErrorCount = metric.Metadata{
 		Name:        "queue.replicate.replacedeadreplica.error",
-		Help:        "Number of failed dead replica replica replacements processed by the replicate queue",
+		Help:        "Number of failed dead replica replacements processed by the replicate queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaReplicateQueueReplaceDecommissioningReplicaSuccessCount = metric.Metadata{
 		Name:        "queue.replicate.replacedecommissioningreplica.success",
-		Help:        "Number of successful decommissioning replica replica replacements processed by the replicate queue",
+		Help:        "Number of successful decommissioning replica replacements processed by the replicate queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaReplicateQueueReplaceDecommissioningReplicaErrorCount = metric.Metadata{
 		Name:        "queue.replicate.replacedecommissioningreplica.error",
-		Help:        "Number of failed decommissioning replica replica replacements processed by the replicate queue",
+		Help:        "Number of failed decommissioning replica replacements processed by the replicate queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaReplicateQueueRemoveDecommissioningReplicaSuccessCount = metric.Metadata{
 		Name:        "queue.replicate.removedecommissioningreplica.success",
-		Help:        "Number of successful decommissioning replica replica removals processed by the replicate queue",
+		Help:        "Number of successful decommissioning replica removals processed by the replicate queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaReplicateQueueRemoveDecommissioningReplicaErrorCount = metric.Metadata{
 		Name:        "queue.replicate.removedecommissioningreplica.error",
-		Help:        "Number of failed decommissioning replica replica removals processed by the replicate queue",
+		Help:        "Number of failed decommissioning replica removals processed by the replicate queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaReplicateQueueRemoveDeadReplicaSuccessCount = metric.Metadata{
 		Name:        "queue.replicate.removedeadreplica.success",
-		Help:        "Number of successful dead replica replica removals processed by the replicate queue",
+		Help:        "Number of successful dead replica removals processed by the replicate queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaReplicateQueueRemoveDeadReplicaErrorCount = metric.Metadata{
 		Name:        "queue.replicate.removedeadreplica.error",
-		Help:        "Number of failed dead replica replica removals processed by the replicate queue",
+		Help:        "Number of failed dead replica removals processed by the replicate queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -456,53 +457,72 @@ func (metrics *ReplicateQueueMetrics) trackRebalanceReplicaCount(
 	}
 }
 
+// trackSuccessByAllocatorAction increases the corresponding success count
+// metric for successfully applying a particular allocator action through the
+// replicate queue.
+func (metrics *ReplicateQueueMetrics) trackSuccessByAllocatorAction(
+	ctx context.Context, action allocatorimpl.AllocatorAction,
+) {
+	switch action {
+	case allocatorimpl.AllocatorRemoveVoter, allocatorimpl.AllocatorRemoveNonVoter:
+		metrics.RemoveReplicaSuccessCount.Inc(1)
+	case allocatorimpl.AllocatorAddVoter, allocatorimpl.AllocatorAddNonVoter:
+		metrics.AddReplicaSuccessCount.Inc(1)
+	case allocatorimpl.AllocatorReplaceDeadVoter, allocatorimpl.AllocatorReplaceDeadNonVoter:
+		metrics.ReplaceDeadReplicaSuccessCount.Inc(1)
+	case allocatorimpl.AllocatorRemoveDeadVoter, allocatorimpl.AllocatorRemoveDeadNonVoter:
+		metrics.RemoveDeadReplicaSuccessCount.Inc(1)
+	case allocatorimpl.AllocatorReplaceDecommissioningVoter, allocatorimpl.AllocatorReplaceDecommissioningNonVoter:
+		metrics.ReplaceDecommissioningReplicaSuccessCount.Inc(1)
+	case allocatorimpl.AllocatorRemoveDecommissioningVoter, allocatorimpl.AllocatorRemoveDecommissioningNonVoter:
+		metrics.RemoveDecommissioningReplicaSuccessCount.Inc(1)
+	case allocatorimpl.AllocatorConsiderRebalance, allocatorimpl.AllocatorNoop,
+		allocatorimpl.AllocatorRangeUnavailable, allocatorimpl.AllocatorRemoveLearner,
+		allocatorimpl.AllocatorFinalizeAtomicReplicationChange:
+		// Nothing to do, not recorded here.
+	default:
+		log.Errorf(ctx, "AllocatorAction %v unsupported in metrics tracking", action)
+	}
+}
+
+// trackErrorByAllocatorAction increases the corresponding error count metric
+// for failures in applying a particular allocator action through the replicate
+// queue.
+func (metrics *ReplicateQueueMetrics) trackErrorByAllocatorAction(
+	ctx context.Context, action allocatorimpl.AllocatorAction,
+) {
+	switch action {
+	case allocatorimpl.AllocatorRemoveVoter, allocatorimpl.AllocatorRemoveNonVoter:
+		metrics.RemoveReplicaErrorCount.Inc(1)
+	case allocatorimpl.AllocatorAddVoter, allocatorimpl.AllocatorAddNonVoter:
+		metrics.AddReplicaErrorCount.Inc(1)
+	case allocatorimpl.AllocatorReplaceDeadVoter, allocatorimpl.AllocatorReplaceDeadNonVoter:
+		metrics.ReplaceDeadReplicaErrorCount.Inc(1)
+	case allocatorimpl.AllocatorRemoveDeadVoter, allocatorimpl.AllocatorRemoveDeadNonVoter:
+		metrics.RemoveDeadReplicaErrorCount.Inc(1)
+	case allocatorimpl.AllocatorReplaceDecommissioningVoter, allocatorimpl.AllocatorReplaceDecommissioningNonVoter:
+		metrics.ReplaceDecommissioningReplicaErrorCount.Inc(1)
+	case allocatorimpl.AllocatorRemoveDecommissioningVoter, allocatorimpl.AllocatorRemoveDecommissioningNonVoter:
+		metrics.RemoveDecommissioningReplicaErrorCount.Inc(1)
+	case allocatorimpl.AllocatorConsiderRebalance, allocatorimpl.AllocatorNoop,
+		allocatorimpl.AllocatorRangeUnavailable, allocatorimpl.AllocatorRemoveLearner,
+		allocatorimpl.AllocatorFinalizeAtomicReplicationChange:
+		// Nothing to do, not recorded here.
+	default:
+		log.Errorf(ctx, "AllocatorAction %v unsupported in metrics tracking", action)
+	}
+
+}
+
 // trackProcessResult increases the corresponding success/error count metric for
 // processing a particular allocator action through the replicate queue.
 func (metrics *ReplicateQueueMetrics) trackResultByAllocatorAction(
-	ctx context.Context, action allocatorimpl.AllocatorAction, err error, dryRun bool,
+	ctx context.Context, action allocatorimpl.AllocatorAction, err error,
 ) {
-	if dryRun {
-		return
-	}
-	switch action {
-	case allocatorimpl.AllocatorRemoveVoter, allocatorimpl.AllocatorRemoveNonVoter:
-		if err == nil {
-			metrics.RemoveReplicaSuccessCount.Inc(1)
-		} else {
-			metrics.RemoveReplicaErrorCount.Inc(1)
-		}
-	case allocatorimpl.AllocatorAddVoter, allocatorimpl.AllocatorAddNonVoter:
-		if err == nil {
-			metrics.AddReplicaSuccessCount.Inc(1)
-		} else {
-			metrics.AddReplicaErrorCount.Inc(1)
-		}
-	case allocatorimpl.AllocatorReplaceDeadVoter, allocatorimpl.AllocatorReplaceDeadNonVoter:
-		if err == nil {
-			metrics.ReplaceDeadReplicaSuccessCount.Inc(1)
-		} else {
-			metrics.ReplaceDeadReplicaErrorCount.Inc(1)
-		}
-	case allocatorimpl.AllocatorRemoveDeadVoter, allocatorimpl.AllocatorRemoveDeadNonVoter:
-		if err == nil {
-			metrics.RemoveDeadReplicaSuccessCount.Inc(1)
-		} else {
-			metrics.RemoveDeadReplicaErrorCount.Inc(1)
-		}
-	case allocatorimpl.AllocatorReplaceDecommissioningVoter, allocatorimpl.AllocatorReplaceDecommissioningNonVoter:
-		if err == nil {
-			metrics.ReplaceDecommissioningReplicaSuccessCount.Inc(1)
-		} else {
-			metrics.ReplaceDecommissioningReplicaErrorCount.Inc(1)
-		}
-	case allocatorimpl.AllocatorRemoveDecommissioningVoter, allocatorimpl.AllocatorRemoveDecommissioningNonVoter:
-		if err == nil {
-			metrics.RemoveDecommissioningReplicaSuccessCount.Inc(1)
-		} else {
-			metrics.RemoveDecommissioningReplicaErrorCount.Inc(1)
-		}
-	default:
-		log.Errorf(ctx, "AllocatorAction %v unsupported in metrics tracking", action)
+	if err != nil {
+		metrics.trackErrorByAllocatorAction(ctx, action)
+	} else {
+		metrics.trackSuccessByAllocatorAction(ctx, action)
 	}
 }
 
@@ -512,6 +532,7 @@ type replicateQueue struct {
 	*baseQueue
 	metrics   ReplicateQueueMetrics
 	allocator allocatorimpl.Allocator
+	storePool storepool.AllocatorStorePool
 
 	// purgCh is signalled every replicateQueuePurgatoryCheckInterval.
 	purgCh <-chan time.Time
@@ -524,11 +545,18 @@ type replicateQueue struct {
 	logTracesThresholdFunc queueProcessTimeoutFunc
 }
 
+var _ queueImpl = &replicateQueue{}
+
 // newReplicateQueue returns a new instance of replicateQueue.
 func newReplicateQueue(store *Store, allocator allocatorimpl.Allocator) *replicateQueue {
+	var storePool storepool.AllocatorStorePool
+	if store.cfg.StorePool != nil {
+		storePool = store.cfg.StorePool
+	}
 	rq := &replicateQueue{
 		metrics:   makeReplicateQueueMetrics(),
 		allocator: allocator,
+		storePool: storePool,
 		purgCh:    time.NewTicker(replicateQueuePurgatoryCheckInterval).C,
 		updateCh:  make(chan time.Time, 1),
 		logTracesThresholdFunc: makeRateLimitedTimeoutFuncByPermittedSlowdown(
@@ -541,7 +569,7 @@ func newReplicateQueue(store *Store, allocator allocatorimpl.Allocator) *replica
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
-			needsSystemConfig:    true,
+			needsSpanConfigs:     true,
 			acceptsUnsplitRanges: store.TestingKnobs().ReplicateQueueAcceptsUnsplit,
 			// The processing of the replicate queue often needs to send snapshots
 			// so we use the raftSnapshotQueueTimeoutFunc. This function sets a
@@ -587,11 +615,20 @@ func newReplicateQueue(store *Store, allocator allocatorimpl.Allocator) *replica
 	return rq
 }
 
+func (rq *replicateQueue) enabled() bool {
+	st := rq.store.ClusterSettings()
+	return kvserverbase.ReplicateQueueEnabled.Get(&st.SV)
+}
+
 func (rq *replicateQueue) shouldQueue(
 	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, _ spanconfig.StoreReader,
 ) (shouldQueue bool, priority float64) {
+	if !rq.enabled() {
+		return false, 0
+	}
+
 	desc, conf := repl.DescAndSpanConfig()
-	action, priority := rq.allocator.ComputeAction(ctx, conf, desc)
+	action, priority := rq.allocator.ComputeAction(ctx, rq.storePool, conf, desc)
 
 	if action == allocatorimpl.AllocatorNoop {
 		log.KvDistribution.VEventf(ctx, 2, "no action to take")
@@ -604,9 +641,10 @@ func (rq *replicateQueue) shouldQueue(
 	voterReplicas := desc.Replicas().VoterDescriptors()
 	nonVoterReplicas := desc.Replicas().NonVoterDescriptors()
 	if !rq.store.TestingKnobs().DisableReplicaRebalancing {
-		rangeUsageInfo := rangeUsageInfoForRepl(repl)
+		rangeUsageInfo := RangeUsageInfoForRepl(repl)
 		_, _, _, ok := rq.allocator.RebalanceVoter(
 			ctx,
+			rq.storePool,
 			conf,
 			repl.RaftStatus(),
 			voterReplicas,
@@ -621,6 +659,7 @@ func (rq *replicateQueue) shouldQueue(
 		}
 		_, _, _, ok = rq.allocator.RebalanceNonVoter(
 			ctx,
+			rq.storePool,
 			conf,
 			repl.RaftStatus(),
 			voterReplicas,
@@ -637,23 +676,32 @@ func (rq *replicateQueue) shouldQueue(
 	}
 
 	// If the lease is valid, check to see if we should transfer it.
-	status := repl.LeaseStatusAt(ctx, now)
-	if status.IsValid() &&
-		rq.canTransferLeaseFrom(ctx, repl) &&
-		rq.allocator.ShouldTransferLease(ctx, conf, voterReplicas, repl, repl.loadStats.batchRequests) {
-
+	if rq.canTransferLeaseFrom(ctx, repl) &&
+		rq.allocator.ShouldTransferLease(
+			ctx,
+			rq.storePool,
+			conf,
+			voterReplicas,
+			repl,
+			RangeUsageInfoForRepl(repl),
+		) {
 		log.KvDistribution.VEventf(ctx, 2, "lease transfer needed, enqueuing")
 		return true, 0
 	}
-	if !status.IsValid() {
-		// The lease for this range is currently invalid, if this replica is
-		// the raft leader then it is necessary that it acquires the lease. We
-		// enqueue it regardless of being a leader or follower, where the
-		// leader at the time of processing will succeed. There is no
-		// requirement that the expired lease belongs to this replica, as
-		// regardless of the lease history, the current leader should hold the
-		// lease.
+
+	leaseStatus := repl.LeaseStatusAt(ctx, now)
+	if !leaseStatus.IsValid() {
+		// The range has an invalid lease. If this replica is the raft leader then
+		// we'd like it to hold a valid lease. We enqueue it regardless of being a
+		// leader or follower, where the leader at the time of processing will
+		// succeed.
 		log.KvDistribution.VEventf(ctx, 2, "invalid lease, enqueuing")
+		return true, 0
+	}
+	if leaseStatus.OwnedBy(repl.StoreID()) && !repl.hasCorrectLeaseType(leaseStatus.Lease) {
+		// This replica holds (or held) an incorrect lease type, switch it to the
+		// correct type. Typically when changing kv.expiration_leases_only.enabled.
+		log.KvDistribution.VEventf(ctx, 2, "incorrect lease type, enqueueing")
 		return true, 0
 	}
 
@@ -663,6 +711,11 @@ func (rq *replicateQueue) shouldQueue(
 func (rq *replicateQueue) process(
 	ctx context.Context, repl *Replica, confReader spanconfig.StoreReader,
 ) (processed bool, err error) {
+	if !rq.enabled() {
+		log.VEventf(ctx, 2, "skipping replication: queue has been disabled")
+		return false, nil
+	}
+
 	retryOpts := retry.Options{
 		InitialBackoff: 50 * time.Millisecond,
 		MaxBackoff:     1 * time.Second,
@@ -674,9 +727,7 @@ func (rq *replicateQueue) process(
 	// usually signaling that a rebalancing reservation could not be made with the
 	// selected target.
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-		requeue, err := rq.processOneChangeWithTracing(
-			ctx, repl, rq.canTransferLeaseFrom, false /* scatter */, false, /* dryRun */
-		)
+		requeue, err := rq.processOneChangeWithTracing(ctx, repl)
 		if isSnapshotError(err) {
 			// If ChangeReplicas failed because the snapshot failed, we attempt to
 			// retry the operation. The most likely causes of the snapshot failing
@@ -706,31 +757,6 @@ func (rq *replicateQueue) process(
 			}
 		}
 
-		// After we made a replica change, make sure the lease is still on the
-		// correct store.
-		if rq.canTransferLeaseFrom(ctx, repl) {
-			transferStatus, err := rq.shedLease(
-				ctx,
-				repl,
-				repl.Desc(),
-				repl.SpanConfig(),
-				allocator.TransferLeaseOptions{
-					Goal:                   allocator.FollowTheWorkload,
-					ExcludeLeaseRepl:       false,
-					CheckCandidateFullness: true,
-					DryRun:                 false,
-				},
-			)
-			if err != nil {
-				return false, err
-			}
-			// If we successfully transferred the lease, we can't requeue, let the new
-			// leaseholder do it.
-			if transferStatus == allocator.TransferOK {
-				requeue = false
-			}
-		}
-
 		if requeue {
 			log.KvDistribution.VEventf(ctx, 1, "re-processing")
 			rq.maybeAdd(ctx, repl, rq.store.Clock().NowAsClockTimestamp())
@@ -745,6 +771,13 @@ func (rq *replicateQueue) process(
 // rebalance a range that has a replica on a decommissioning node to indicate
 // that the error should send the range to purgatory.
 type decommissionPurgatoryError struct{ error }
+
+var _ errors.SafeFormatter = decommissionPurgatoryError{}
+
+func (e decommissionPurgatoryError) SafeFormatError(p errors.Printer) (next error) {
+	p.Print(e.error)
+	return nil
+}
 
 func (decommissionPurgatoryError) PurgatoryErrorMarker() {}
 
@@ -778,17 +811,16 @@ func filterTracingSpans(rec tracingpb.Recording, opNamesToFilter ...string) trac
 // logging the resulting traces to the DEV channel in the case of errors or
 // when the configured log traces threshold is exceeded.
 func (rq *replicateQueue) processOneChangeWithTracing(
-	ctx context.Context,
-	repl *Replica,
-	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
-	scatter, dryRun bool,
+	ctx context.Context, repl *Replica,
 ) (requeue bool, _ error) {
 	processStart := timeutil.Now()
 	ctx, sp := tracing.EnsureChildSpan(ctx, rq.Tracer, "process replica",
 		tracing.WithRecording(tracingpb.RecordingVerbose))
 	defer sp.Finish()
 
-	requeue, err := rq.processOneChange(ctx, repl, canTransferLeaseFrom, scatter, dryRun)
+	requeue, err := rq.processOneChange(ctx, repl, rq.canTransferLeaseFrom,
+		false /* scatter */, false, /* dryRun */
+	)
 
 	// Utilize a new background context (properly annotated) to avoid writing
 	// traces from a child context into its parent.
@@ -799,8 +831,8 @@ func (rq *replicateQueue) processOneChangeWithTracing(
 		loggingThreshold := rq.logTracesThresholdFunc(rq.store.cfg.Settings, repl)
 		exceededDuration := loggingThreshold > time.Duration(0) && processDuration > loggingThreshold
 
-		var traceOutput string
-		traceLoggingNeeded := err != nil || exceededDuration
+		var traceOutput redact.RedactableString
+		traceLoggingNeeded := (err != nil || exceededDuration) && log.ExpensiveLogEnabled(ctx, 1)
 		if traceLoggingNeeded {
 			// If we have tracing spans from execChangeReplicasTxn, filter it from
 			// the recording so that we can render the traces to the log without it,
@@ -808,11 +840,11 @@ func (rq *replicateQueue) processOneChangeWithTracing(
 			rec = filterTracingSpans(sp.GetConfiguredRecording(),
 				replicaChangeTxnGetDescOpName, replicaChangeTxnUpdateDescOpName,
 			)
-			traceOutput = fmt.Sprintf("\ntrace:\n%s", rec)
+			traceOutput = redact.Sprintf("\ntrace:\n%s", rec)
 		}
 
 		if err != nil {
-			log.KvDistribution.Warningf(ctx, "error processing replica: %v%s", err, traceOutput)
+			log.KvDistribution.Infof(ctx, "error processing replica: %v%s", err, traceOutput)
 		} else if exceededDuration {
 			log.KvDistribution.Infof(ctx, "processing replica took %s, exceeding threshold of %s%s",
 				processDuration, loggingThreshold, traceOutput)
@@ -822,20 +854,191 @@ func (rq *replicateQueue) processOneChangeWithTracing(
 	return requeue, err
 }
 
+// ReplicateQueueChange is a planned change, associated with an allocator
+// action. It originates from the replicate queue planner and is used to apply
+// an allocation step.
+type ReplicateQueueChange struct {
+	Action allocatorimpl.AllocatorAction
+	// replica is the replica of the range associated with the replicate queue
+	// change.
+	//
+	// TODO(kvoli): This will need to change to an interface replica such as
+	// CandidateReplica for simulation to work.
+	replica *Replica
+	// Op is a planned operation associated with a replica.
+	Op AllocationOp
+}
+
+// applyChange applies a range allocation change. It is responsible only for
+// application and returns an error if unsuccessful.
+//
+// TODO(kvoli): Currently applyChange is only called by the replicate queue. It
+// is desirable to funnel all allocation changes via one function. Move this
+// application phase onto a separate struct that will be used by both the
+// replicate queue and the store rebalancer and specifically for operations
+// rather than changes.
+func (rq *replicateQueue) applyChange(ctx context.Context, change ReplicateQueueChange) error {
+	var err error
+	switch op := change.Op.(type) {
+	case AllocationNoop:
+		// Nothing to do.
+	case AllocationFinalizeAtomicReplicationOp:
+		err = rq.finalizeAtomicReplication(ctx, change.replica)
+	case AllocationTransferLeaseOp:
+		err = rq.TransferLease(ctx, change.replica, op.source, op.target, op.usage)
+	case AllocationChangeReplicasOp:
+		err = rq.changeReplicas(
+			ctx,
+			change.replica,
+			op.chgs,
+			change.replica.Desc(),
+			op.priority,
+			op.allocatorPriority,
+			op.reason,
+			op.details,
+		)
+	default:
+		panic(fmt.Sprintf("Unknown operation %+v, unable to apply replicate queue change", op))
+	}
+
+	return err
+}
+
+// ShouldRequeue determines whether a replica should be requeued into the
+// replicate queue, using the planned change and error returned from either
+// application or planning.
+func (rq *replicateQueue) ShouldRequeue(ctx context.Context, change ReplicateQueueChange) bool {
+	var requeue bool
+
+	if _, ok := change.Op.(AllocationNoop); ok {
+		// Don't requeue on a noop, as the replica had nothing to do the first
+		// time around.
+		requeue = false
+
+	} else if change.Action == allocatorimpl.AllocatorConsiderRebalance {
+		// Don't requeue after a successful rebalance operation.
+		requeue = false
+
+	} else if change.Op.lhBeingRemoved() {
+		// Don't requeue if the leaseholder was removed as a voter or the range
+		// lease was transferred away.
+		requeue = false
+
+	} else {
+		// Otherwise, requeue to see if there is more work to do. As the
+		// operation succeeded and was planned for a repair action i.e. not
+		// rebalancing.
+		requeue = true
+	}
+
+	return requeue
+}
+
 func (rq *replicateQueue) processOneChange(
 	ctx context.Context,
 	repl *Replica,
 	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
 	scatter, dryRun bool,
 ) (requeue bool, _ error) {
+	change, err := rq.PlanOneChange(ctx, repl, canTransferLeaseFrom, scatter)
+	// When there is an error planning a change, return the error immediately
+	// and do not requeue. It is unlikely that the range or storepool state
+	// will change quickly enough in order to not get the same error and
+	// outcome.
+	if err != nil {
+		// If there was a change during the planning process, possibly due to
+		// allocator errors finding a target, we should report this as a failure
+		// for the associated allocator action metric if we are not in dry run.
+		if !dryRun {
+			rq.metrics.trackErrorByAllocatorAction(ctx, change.Action)
+		}
+
+		// Annotate the planning error if it is associated with a decommission
+		// allocator action so that the replica will be put into purgatory
+		// rather than waiting for the next scanner cycle. This is also done
+		// for application failures below.
+		return false, maybeAnnotateDecommissionErr(err, change.Action)
+	}
+
+	// There is nothing further to do during a dry run.
+	if dryRun {
+		return false, nil
+	}
+
+	// Track the metrics generated during planning. These are not updated
+	// directly during planning to avoid pushing the dryRun flag into every
+	// function.
+	change.Op.trackPlanningMetrics()
+
+	// Apply the change generated by PlanOneChange. This call will block until
+	// the change has either been applied successfully or failed.
+	err = rq.applyChange(ctx, change)
+
+	// TODO(kvoli): The results tracking currently ignore which operation was
+	// planned and instead adopts the allocator action to update the metrics.
+	// In cases where the action was AllocatorRemoveX, yet a lease transfer
+	// operation was returned, it will treat it as a successful or failed
+	// AllocatorRemoveX. This is despite no operation to remove a replica
+	// having occurred on this store. This should be updated to accurately
+	// reflect which operation was applied.
+	rq.metrics.trackResultByAllocatorAction(ctx, change.Action, err)
+
+	if err != nil {
+		return false, maybeAnnotateDecommissionErr(err, change.Action)
+	}
+
+	// Update the local storepool state to reflect the successful application
+	// of the change.
+	change.Op.applyImpact(rq.storePool)
+
+	// Requeue the replica if it meets the criteria in ShouldRequeue.
+	return rq.ShouldRequeue(ctx, change), nil
+}
+
+// PlanOneChange calls the allocator to determine an action to be taken upon a
+// range. The fn then calls back into the allocator to get the changes
+// necessary to act upon the action and returns them as a ReplicateQueueChange.
+func (rq *replicateQueue) PlanOneChange(
+	ctx context.Context,
+	repl *Replica,
+	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
+	scatter bool,
+) (change ReplicateQueueChange, _ error) {
+	// Initially set the change to be a no-op, it is then modified below if a
+	// step may be taken for this replica.
+	change = ReplicateQueueChange{
+		Action:  allocatorimpl.AllocatorNoop,
+		Op:      AllocationNoop{},
+		replica: repl,
+	}
+
 	// Check lease and destroy status here. The queue does this higher up already, but
 	// adminScatter (and potential other future callers) also call this method and don't
 	// perform this check, which could lead to infinite loops.
 	if _, err := repl.IsDestroyed(); err != nil {
-		return false, err
+		return change, err
 	}
-	if _, pErr := repl.redirectOnOrAcquireLease(ctx); pErr != nil {
-		return false, pErr.GoError()
+
+	// Ensure ranges have a lease (returning NLHE if someone else has it), and
+	// switch the lease type if necessary (e.g. due to
+	// kv.expiration_leases_only.enabled).
+	//
+	// TODO(kvoli): This check should fail if not the leaseholder. In the case
+	// where we want to use the replicate queue to acquire leases, this should
+	// occur before planning or as a result. In order to return this in planning,
+	// it is necessary to simulate the prior change having succeeded to then plan
+	// this lease transfer.
+	//
+	// TODO(erikgrinaker): We shouldn't overload the replicate queue to also be
+	// responsible for lease maintenance, but it'll do for now. See:
+	// https://github.com/cockroachdb/cockroach/issues/98433
+	leaseStatus, pErr := repl.redirectOnOrAcquireLease(ctx)
+	if pErr != nil {
+		return change, pErr.GoError()
+	}
+	pErr = repl.maybeSwitchLeaseType(ctx, leaseStatus)
+	if pErr != nil {
+		return change, pErr.GoError()
 	}
 
 	// TODO(aayush): The fact that we're calling `repl.DescAndZone()` here once to
@@ -847,123 +1050,66 @@ func (rq *replicateQueue) processOneChange(
 	// range descriptor.
 	desc, conf := repl.DescAndSpanConfig()
 
-	voterReplicas := desc.Replicas().VoterDescriptors()
-	nonVoterReplicas := desc.Replicas().NonVoterDescriptors()
-	liveVoterReplicas, deadVoterReplicas := rq.store.cfg.StorePool.LiveAndDeadReplicas(
-		voterReplicas, true, /* includeSuspectAndDrainingStores */
-	)
-	liveNonVoterReplicas, deadNonVoterReplicas := rq.store.cfg.StorePool.LiveAndDeadReplicas(
-		nonVoterReplicas, true, /* includeSuspectAndDrainingStores */
-	)
+	voterReplicas, nonVoterReplicas,
+		liveVoterReplicas, deadVoterReplicas,
+		liveNonVoterReplicas, deadNonVoterReplicas := allocatorimpl.LiveAndDeadVoterAndNonVoterReplicas(rq.storePool, desc)
 
 	// NB: the replication layer ensures that the below operations don't cause
 	// unavailability; see:
 	_ = execChangeReplicasTxn
 
-	action, allocatorPrio := rq.allocator.ComputeAction(ctx, conf, desc)
+	action, allocatorPrio := rq.allocator.ComputeAction(ctx, rq.storePool, conf, desc)
 	log.KvDistribution.VEventf(ctx, 1, "next replica action: %s", action)
 
+	var err error
+	var op AllocationOp
+	removeIdx := -1
+	nothingToDo := false
 	switch action {
 	case allocatorimpl.AllocatorNoop, allocatorimpl.AllocatorRangeUnavailable:
 		// We're either missing liveness information or the range is known to have
 		// lost quorum. Either way, it's not a good idea to make changes right now.
 		// Let the scanner requeue it again later.
-		return false, nil
 
-	// Add replicas.
-	case allocatorimpl.AllocatorAddVoter:
-		requeue, err := rq.addOrReplaceVoters(
-			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, -1 /* removeIdx */, allocatorimpl.Alive, allocatorPrio, dryRun,
-		)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		return requeue, err
-	case allocatorimpl.AllocatorAddNonVoter:
-		requeue, err := rq.addOrReplaceNonVoters(
-			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, -1 /* removeIdx */, allocatorimpl.Alive, allocatorPrio, dryRun,
-		)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		return requeue, err
+	// Add replicas, replace dead replicas, or replace decommissioning replicas.
+	case allocatorimpl.AllocatorAddVoter, allocatorimpl.AllocatorAddNonVoter,
+		allocatorimpl.AllocatorReplaceDeadVoter, allocatorimpl.AllocatorReplaceDeadNonVoter,
+		allocatorimpl.AllocatorReplaceDecommissioningVoter, allocatorimpl.AllocatorReplaceDecommissioningNonVoter:
+		var existing, remainingLiveVoters, remainingLiveNonVoters []roachpb.ReplicaDescriptor
+
+		existing, remainingLiveVoters, remainingLiveNonVoters, removeIdx, nothingToDo, err =
+			allocatorimpl.DetermineReplicaToReplaceAndFilter(
+				rq.storePool,
+				action,
+				voterReplicas, nonVoterReplicas,
+				liveVoterReplicas, deadVoterReplicas,
+				liveNonVoterReplicas, deadNonVoterReplicas,
+			)
+		if nothingToDo || err != nil {
+			// Nothing to do.
+			break
+		}
+
+		switch action.TargetReplicaType() {
+		case allocatorimpl.VoterTarget:
+			op, err = rq.addOrReplaceVoters(
+				ctx, repl, existing, remainingLiveVoters, remainingLiveNonVoters,
+				removeIdx, action.ReplicaStatus(), allocatorPrio,
+			)
+		case allocatorimpl.NonVoterTarget:
+			op, err = rq.addOrReplaceNonVoters(
+				ctx, repl, existing, remainingLiveVoters, remainingLiveNonVoters,
+				removeIdx, action.ReplicaStatus(), allocatorPrio,
+			)
+		default:
+			panic(fmt.Sprintf("unsupported targetReplicaType: %v", action.TargetReplicaType()))
+		}
 
 	// Remove replicas.
 	case allocatorimpl.AllocatorRemoveVoter:
-		requeue, err := rq.removeVoter(ctx, repl, voterReplicas, nonVoterReplicas, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		return requeue, err
+		op, err = rq.removeVoter(ctx, repl, voterReplicas, nonVoterReplicas)
 	case allocatorimpl.AllocatorRemoveNonVoter:
-		requeue, err := rq.removeNonVoter(ctx, repl, voterReplicas, nonVoterReplicas, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		return requeue, err
-
-	// Replace dead replicas.
-	case allocatorimpl.AllocatorReplaceDeadVoter:
-		if len(deadVoterReplicas) == 0 {
-			// Nothing to do.
-			return false, nil
-		}
-		removeIdx := getRemoveIdx(voterReplicas, deadVoterReplicas[0])
-		if removeIdx < 0 {
-			return false, errors.AssertionFailedf(
-				"dead voter %v unexpectedly not found in %v",
-				deadVoterReplicas[0], voterReplicas)
-		}
-		requeue, err := rq.addOrReplaceVoters(
-			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, allocatorimpl.Dead, allocatorPrio, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		return requeue, err
-	case allocatorimpl.AllocatorReplaceDeadNonVoter:
-		if len(deadNonVoterReplicas) == 0 {
-			// Nothing to do.
-			return false, nil
-		}
-		removeIdx := getRemoveIdx(nonVoterReplicas, deadNonVoterReplicas[0])
-		if removeIdx < 0 {
-			return false, errors.AssertionFailedf(
-				"dead non-voter %v unexpectedly not found in %v",
-				deadNonVoterReplicas[0], nonVoterReplicas)
-		}
-		requeue, err := rq.addOrReplaceNonVoters(
-			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, allocatorimpl.Dead, allocatorPrio, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		return requeue, err
-
-	// Replace decommissioning replicas.
-	case allocatorimpl.AllocatorReplaceDecommissioningVoter:
-		decommissioningVoterReplicas := rq.store.cfg.StorePool.DecommissioningReplicas(voterReplicas)
-		if len(decommissioningVoterReplicas) == 0 {
-			// Nothing to do.
-			return false, nil
-		}
-		removeIdx := getRemoveIdx(voterReplicas, decommissioningVoterReplicas[0])
-		if removeIdx < 0 {
-			return false, errors.AssertionFailedf(
-				"decommissioning voter %v unexpectedly not found in %v",
-				decommissioningVoterReplicas[0], voterReplicas)
-		}
-		requeue, err := rq.addOrReplaceVoters(
-			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, allocatorimpl.Decommissioning, allocatorPrio, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		if err != nil {
-			return requeue, decommissionPurgatoryError{err}
-		}
-		return requeue, nil
-	case allocatorimpl.AllocatorReplaceDecommissioningNonVoter:
-		decommissioningNonVoterReplicas := rq.store.cfg.StorePool.DecommissioningReplicas(nonVoterReplicas)
-		if len(decommissioningNonVoterReplicas) == 0 {
-			return false, nil
-		}
-		removeIdx := getRemoveIdx(nonVoterReplicas, decommissioningNonVoterReplicas[0])
-		if removeIdx < 0 {
-			return false, errors.AssertionFailedf(
-				"decommissioning non-voter %v unexpectedly not found in %v",
-				decommissioningNonVoterReplicas[0], nonVoterReplicas)
-		}
-		requeue, err := rq.addOrReplaceNonVoters(
-			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, allocatorimpl.Decommissioning, allocatorPrio, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		if err != nil {
-			return requeue, decommissionPurgatoryError{err}
-		}
-		return requeue, nil
+		op, err = rq.removeNonVoter(ctx, repl, voterReplicas, nonVoterReplicas)
 
 	// Remove decommissioning replicas.
 	//
@@ -971,19 +1117,9 @@ func (rq *replicateQueue) processOneChange(
 	// has decommissioning replicas; in the common case we'll hit
 	// AllocatorReplaceDecommissioning{Non}Voter above.
 	case allocatorimpl.AllocatorRemoveDecommissioningVoter:
-		requeue, err := rq.removeDecommissioning(ctx, repl, allocatorimpl.VoterTarget, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		if err != nil {
-			return requeue, decommissionPurgatoryError{err}
-		}
-		return requeue, nil
+		op, err = rq.removeDecommissioning(ctx, repl, allocatorimpl.VoterTarget)
 	case allocatorimpl.AllocatorRemoveDecommissioningNonVoter:
-		requeue, err := rq.removeDecommissioning(ctx, repl, allocatorimpl.NonVoterTarget, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		if err != nil {
-			return requeue, decommissionPurgatoryError{err}
-		}
-		return requeue, nil
+		op, err = rq.removeDecommissioning(ctx, repl, allocatorimpl.NonVoterTarget)
 
 	// Remove dead replicas.
 	//
@@ -991,16 +1127,20 @@ func (rq *replicateQueue) processOneChange(
 	// over-replicated and has dead replicas; in the common case we'll hit
 	// AllocatorReplaceDead{Non}Voter above.
 	case allocatorimpl.AllocatorRemoveDeadVoter:
-		requeue, err := rq.removeDead(ctx, repl, deadVoterReplicas, allocatorimpl.VoterTarget, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		return requeue, err
+		op, err = rq.removeDead(ctx, repl, deadVoterReplicas, allocatorimpl.VoterTarget)
 	case allocatorimpl.AllocatorRemoveDeadNonVoter:
-		requeue, err := rq.removeDead(ctx, repl, deadNonVoterReplicas, allocatorimpl.NonVoterTarget, dryRun)
-		rq.metrics.trackResultByAllocatorAction(ctx, action, err, dryRun)
-		return requeue, err
+		op, err = rq.removeDead(ctx, repl, deadNonVoterReplicas, allocatorimpl.NonVoterTarget)
 
+	// Rebalance replicas.
+	//
+	// NB: Rebalacing attempts to balance replica counts among stores of
+	// equivalent localities. This action is returned by default for EVERY
+	// replica, when no other action applies. However, it has another important
+	// role in satisfying the zone constraints appled to a range, by performing
+	// swaps when the voter and total replica counts are correct in aggregate,
+	// yet incorrect per locality. See #90110.
 	case allocatorimpl.AllocatorConsiderRebalance:
-		return rq.considerRebalance(
+		op, err = rq.considerRebalance(
 			ctx,
 			repl,
 			voterReplicas,
@@ -1008,32 +1148,38 @@ func (rq *replicateQueue) processOneChange(
 			allocatorPrio,
 			canTransferLeaseFrom,
 			scatter,
-			dryRun,
 		)
 	case allocatorimpl.AllocatorFinalizeAtomicReplicationChange, allocatorimpl.AllocatorRemoveLearner:
-		_, learnersRemoved, err := repl.maybeLeaveAtomicChangeReplicasAndRemoveLearners(
-			ctx, repl.Desc(),
-		)
-		if err != nil {
-			return false, err
-		}
-		rq.metrics.RemoveLearnerReplicaCount.Inc(learnersRemoved)
-		return true, nil
+		op = AllocationFinalizeAtomicReplicationOp{}
 	default:
-		return false, errors.Errorf("unknown allocator action %v", action)
+		err = errors.Errorf("unknown allocator action %v", action)
 	}
+
+	// If an operation was found, then wrap it in the change being returned. If
+	// no operation was found for the allocator action then return a noop.
+	if op == nil {
+		op = AllocationNoop{}
+	}
+	change = ReplicateQueueChange{
+		Action:  action,
+		replica: repl,
+		Op:      op,
+	}
+	return change, err
 }
 
-func getRemoveIdx(
-	repls []roachpb.ReplicaDescriptor, deadOrDecommissioningRepl roachpb.ReplicaDescriptor,
-) (removeIdx int) {
-	for i, rDesc := range repls {
-		if rDesc.StoreID == deadOrDecommissioningRepl.StoreID {
-			removeIdx = i
-			break
-		}
+func maybeAnnotateDecommissionErr(err error, action allocatorimpl.AllocatorAction) error {
+	if err != nil && isDecommissionAction(action) {
+		err = decommissionPurgatoryError{err}
 	}
-	return removeIdx
+	return err
+}
+
+func isDecommissionAction(action allocatorimpl.AllocatorAction) bool {
+	return action == allocatorimpl.AllocatorRemoveDecommissioningVoter ||
+		action == allocatorimpl.AllocatorRemoveDecommissioningNonVoter ||
+		action == allocatorimpl.AllocatorReplaceDecommissioningVoter ||
+		action == allocatorimpl.AllocatorReplaceDecommissioningNonVoter
 }
 
 // addOrReplaceVoters adds or replaces a voting replica. If removeIdx is -1, an
@@ -1047,107 +1193,77 @@ func getRemoveIdx(
 func (rq *replicateQueue) addOrReplaceVoters(
 	ctx context.Context,
 	repl *Replica,
-	liveVoterReplicas, liveNonVoterReplicas []roachpb.ReplicaDescriptor,
+	existingVoters []roachpb.ReplicaDescriptor,
+	remainingLiveVoters, remainingLiveNonVoters []roachpb.ReplicaDescriptor,
 	removeIdx int,
 	replicaStatus allocatorimpl.ReplicaStatus,
 	allocatorPriority float64,
-	dryRun bool,
-) (requeue bool, _ error) {
+) (op AllocationOp, _ error) {
+	effects := effectBuilder{}
 	desc, conf := repl.DescAndSpanConfig()
-	existingVoters := desc.Replicas().VoterDescriptors()
-	if len(existingVoters) == 1 {
-		// If only one replica remains, that replica is the leaseholder and
-		// we won't be able to swap it out. Ignore the removal and simply add
-		// a replica.
-		removeIdx = -1
-	}
-
-	remainingLiveVoters := liveVoterReplicas
-	remainingLiveNonVoters := liveNonVoterReplicas
+	var replacing *roachpb.ReplicaDescriptor
 	if removeIdx >= 0 {
-		replToRemove := existingVoters[removeIdx]
-		for i, r := range liveVoterReplicas {
-			if r.ReplicaID == replToRemove.ReplicaID {
-				remainingLiveVoters = append(liveVoterReplicas[:i:i], liveVoterReplicas[i+1:]...)
-				break
-			}
-		}
+		replacing = &existingVoters[removeIdx]
 	}
 
-	lhBeingRemoved := removeIdx >= 0 && existingVoters[removeIdx].StoreID == repl.store.StoreID()
 	// The allocator should not try to re-add this replica since there is a reason
 	// we're removing it (i.e. dead or decommissioning). If we left the replica in
 	// the slice, the allocator would not be guaranteed to pick a replica that
 	// fills the gap removeRepl leaves once it's gone.
-	newVoter, details, err := rq.allocator.AllocateVoter(ctx, conf, remainingLiveVoters, remainingLiveNonVoters, replicaStatus)
+	newVoter, details, err := rq.allocator.AllocateVoter(ctx, rq.storePool, conf, remainingLiveVoters, remainingLiveNonVoters, replacing, replicaStatus)
 	if err != nil {
-		return false, err
-	}
-	if removeIdx >= 0 && newVoter.StoreID == existingVoters[removeIdx].StoreID {
-		return false, errors.AssertionFailedf("allocator suggested to replace replica on s%d with itself", newVoter.StoreID)
+		return nil, err
 	}
 
-	clusterNodes := rq.store.cfg.StorePool.ClusterNodeCount()
-	neededVoters := allocatorimpl.GetNeededVoters(conf.GetNumVoters(), clusterNodes)
+	isReplace := removeIdx >= 0
+	if isReplace && newVoter.StoreID == existingVoters[removeIdx].StoreID {
+		return nil, errors.AssertionFailedf("allocator suggested to replace replica on s%d with itself", newVoter.StoreID)
+	}
 
-	// Only up-replicate if there are suitable allocation targets such that,
-	// either the replication goal is met, or it is possible to get to the next
+	// We only want to up-replicate if there are suitable allocation targets such
+	// that, either the replication goal is met, or it is possible to get to the next
 	// odd number of replicas. A consensus group of size 2n has worse failure
 	// tolerance properties than a group of size 2n - 1 because it has a larger
 	// quorum. For example, up-replicating from 1 to 2 replicas only makes sense
 	// if it is possible to be able to go to 3 replicas.
-	//
-	// NB: If willHave > neededVoters, then always allow up-replicating as that
-	// will be the case when up-replicating a range with a decommissioning
-	// replica.
-	//
-	// We skip this check if we're swapping a replica, since that does not
-	// change the quorum size.
-	if willHave := len(existingVoters) + 1; removeIdx < 0 && willHave < neededVoters && willHave%2 == 0 {
-		// This means we are going to up-replicate to an even replica state.
-		// Check if it is possible to go to an odd replica state beyond it.
-		oldPlusNewReplicas := append([]roachpb.ReplicaDescriptor(nil), existingVoters...)
-		oldPlusNewReplicas = append(
-			oldPlusNewReplicas,
-			roachpb.ReplicaDescriptor{NodeID: newVoter.NodeID, StoreID: newVoter.StoreID},
-		)
-		_, _, err := rq.allocator.AllocateVoter(ctx, conf, oldPlusNewReplicas, remainingLiveNonVoters, replicaStatus)
-		if err != nil {
-			// It does not seem possible to go to the next odd replica state. Note
-			// that AllocateVoter returns an allocatorError (a PurgatoryError)
-			// when purgatory is requested.
-			return false, errors.Wrap(err, "avoid up-replicating to fragile quorum")
-		}
+	if err := rq.allocator.CheckAvoidsFragileQuorum(ctx, rq.storePool, conf,
+		existingVoters, remainingLiveNonVoters,
+		replicaStatus, allocatorimpl.VoterTarget, newVoter, isReplace); err != nil {
+		// It does not seem possible to go to the next odd replica state. Note
+		// that AllocateVoter returns an allocatorError (a PurgatoryError)
+		// when purgatory is requested.
+		return nil, errors.Wrap(err, "avoid up-replicating to fragile quorum")
 	}
 
 	// Figure out whether we should be promoting an existing non-voting replica to
 	// a voting replica or if we ought to be adding a voter afresh.
-	var ops []roachpb.ReplicationChange
+	var ops []kvpb.ReplicationChange
 	replDesc, found := desc.GetReplicaDescriptor(newVoter.StoreID)
 	if found {
 		if replDesc.Type != roachpb.NON_VOTER {
-			return false, errors.AssertionFailedf("allocation target %s for a voter"+
+			return nil, errors.AssertionFailedf("allocation target %s for a voter"+
 				" already has an unexpected replica: %s", newVoter, replDesc)
 		}
 		// If the allocation target has a non-voter already, we will promote it to a
 		// voter.
-		if !dryRun {
+		effects = effects.add(func() {
 			rq.metrics.NonVoterPromotionsCount.Inc(1)
-		}
-		ops = roachpb.ReplicationChangesForPromotion(newVoter)
+		})
+		ops = kvpb.ReplicationChangesForPromotion(newVoter)
 	} else {
-		if !dryRun {
+		effects = effects.add(func() {
 			rq.metrics.trackAddReplicaCount(allocatorimpl.VoterTarget)
-		}
-		ops = roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, newVoter)
+		})
+		ops = kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, newVoter)
 	}
-	if removeIdx < 0 {
+	if !isReplace {
 		log.KvDistribution.Infof(ctx, "adding voter %+v: %s",
 			newVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
 	} else {
-		if !dryRun {
+		effects = effects.add(func() {
 			rq.metrics.trackRemoveMetric(allocatorimpl.VoterTarget, replicaStatus)
-		}
+		})
+
 		removeVoter := existingVoters[removeIdx]
 		log.KvDistribution.Infof(ctx, "replacing voter %s with %+v: %s",
 			removeVoter, newVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
@@ -1158,85 +1274,81 @@ func (rq *replicateQueue) addOrReplaceVoters(
 		// this allocation is executed, we could be one non-voter short. This will
 		// be handled by the replicateQueue's next attempt at this range.
 		ops = append(ops,
-			roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, roachpb.ReplicationTarget{
+			kvpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, roachpb.ReplicationTarget{
 				StoreID: removeVoter.StoreID,
 				NodeID:  removeVoter.NodeID,
 			})...)
 	}
 
-	if err := rq.changeReplicas(
-		ctx,
-		repl,
-		ops,
-		desc,
-		kvserverpb.SnapshotRequest_RECOVERY,
-		allocatorPriority,
-		kvserverpb.ReasonRangeUnderReplicated,
-		details,
-		dryRun,
-	); err != nil {
-		return false, err
+	op = AllocationChangeReplicasOp{
+		lhStore:           repl.StoreID(),
+		sideEffects:       effects.f(),
+		usage:             RangeUsageInfoForRepl(repl),
+		chgs:              ops,
+		priority:          kvserverpb.SnapshotRequest_RECOVERY,
+		allocatorPriority: allocatorPriority,
+		reason:            kvserverpb.ReasonRangeUnderReplicated,
+		details:           details,
 	}
-	// Unless just removed myself (the leaseholder), always requeue to see
-	// if more work needs to be done. If leaseholder is removed, someone
-	// else will take over.
-	return !lhBeingRemoved, nil
+
+	return op, nil
 }
 
 // addOrReplaceNonVoters adds a non-voting replica to `repl`s range.
 func (rq *replicateQueue) addOrReplaceNonVoters(
 	ctx context.Context,
 	repl *Replica,
+	existingNonVoters []roachpb.ReplicaDescriptor,
 	liveVoterReplicas, liveNonVoterReplicas []roachpb.ReplicaDescriptor,
 	removeIdx int,
 	replicaStatus allocatorimpl.ReplicaStatus,
 	allocatorPrio float64,
-	dryRun bool,
-) (requeue bool, _ error) {
-	desc, conf := repl.DescAndSpanConfig()
-	existingNonVoters := desc.Replicas().NonVoterDescriptors()
+) (op AllocationOp, _ error) {
+	effects := effectBuilder{}
+	conf := repl.SpanConfig()
+	var replacing *roachpb.ReplicaDescriptor
+	if removeIdx >= 0 {
+		replacing = &existingNonVoters[removeIdx]
+	}
 
-	newNonVoter, details, err := rq.allocator.AllocateNonVoter(ctx, conf, liveVoterReplicas, liveNonVoterReplicas, replicaStatus)
+	newNonVoter, details, err := rq.allocator.AllocateNonVoter(ctx, rq.storePool, conf, liveVoterReplicas, liveNonVoterReplicas, replacing, replicaStatus)
 	if err != nil {
-		return false, err
-	}
-	if !dryRun {
-		rq.metrics.trackAddReplicaCount(allocatorimpl.NonVoterTarget)
+		return nil, err
 	}
 
-	ops := roachpb.MakeReplicationChanges(roachpb.ADD_NON_VOTER, newNonVoter)
+	effects = effects.add(func() {
+		rq.metrics.trackAddReplicaCount(allocatorimpl.NonVoterTarget)
+	})
+
+	ops := kvpb.MakeReplicationChanges(roachpb.ADD_NON_VOTER, newNonVoter)
 	if removeIdx < 0 {
 		log.KvDistribution.Infof(ctx, "adding non-voter %+v: %s",
 			newNonVoter, rangeRaftProgress(repl.RaftStatus(), existingNonVoters))
 	} else {
-		if !dryRun {
+		effects = effects.add(func() {
 			rq.metrics.trackRemoveMetric(allocatorimpl.NonVoterTarget, replicaStatus)
-		}
+		})
 		removeNonVoter := existingNonVoters[removeIdx]
 		log.KvDistribution.Infof(ctx, "replacing non-voter %s with %+v: %s",
 			removeNonVoter, newNonVoter, rangeRaftProgress(repl.RaftStatus(), existingNonVoters))
 		ops = append(ops,
-			roachpb.MakeReplicationChanges(roachpb.REMOVE_NON_VOTER, roachpb.ReplicationTarget{
+			kvpb.MakeReplicationChanges(roachpb.REMOVE_NON_VOTER, roachpb.ReplicationTarget{
 				StoreID: removeNonVoter.StoreID,
 				NodeID:  removeNonVoter.NodeID,
 			})...)
 	}
 
-	if err := rq.changeReplicas(
-		ctx,
-		repl,
-		ops,
-		desc,
-		kvserverpb.SnapshotRequest_RECOVERY,
-		allocatorPrio,
-		kvserverpb.ReasonRangeUnderReplicated,
-		details,
-		dryRun,
-	); err != nil {
-		return false, err
+	op = AllocationChangeReplicasOp{
+		lhStore:           repl.StoreID(),
+		sideEffects:       effects.f(),
+		usage:             RangeUsageInfoForRepl(repl),
+		chgs:              ops,
+		priority:          kvserverpb.SnapshotRequest_RECOVERY,
+		allocatorPriority: allocatorPrio,
+		reason:            kvserverpb.ReasonRangeUnderReplicated,
+		details:           details,
 	}
-	// Always requeue to see if more work needs to be done.
-	return true, nil
+	return op, nil
 }
 
 // findRemoveVoter takes a list of voting replicas and picks one to remove,
@@ -1269,9 +1381,10 @@ func (rq *replicateQueue) findRemoveVoter(
 		MaxBackoff:     200 * time.Millisecond,
 		Multiplier:     2,
 	}
+	timeout := 5 * time.Second
 
 	var candidates []roachpb.ReplicaDescriptor
-	deadline := timeutil.Now().Add(2 * base.NetworkTimeout)
+	deadline := timeutil.Now().Add(timeout)
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next() && timeutil.Now().Before(deadline); {
 		lastReplAdded, lastAddedTime := repl.LastReplicaAdded()
 		if timeutil.Since(lastAddedTime) > newReplicaGracePeriod {
@@ -1321,6 +1434,7 @@ func (rq *replicateQueue) findRemoveVoter(
 
 	return rq.allocator.RemoveVoter(
 		ctx,
+		rq.storePool,
 		zone,
 		candidates,
 		existingVoters,
@@ -1329,8 +1443,8 @@ func (rq *replicateQueue) findRemoveVoter(
 	)
 }
 
-// maybeTransferLeaseAway is called whenever a replica on a given store is
-// slated for removal. If the store corresponds to the store of the caller
+// maybeTransferLeaseAwayTarget is called whenever a replica on a given store
+// is slated for removal. If the store corresponds to the store of the caller
 // (which is very likely to be the leaseholder), then this removal would fail.
 // Instead, this method will attempt to transfer the lease away, and returns
 // true to indicate to the caller that it should not pursue the current
@@ -1338,18 +1452,17 @@ func (rq *replicateQueue) findRemoveVoter(
 // returned bool is false, it should continue. On error, the caller should also
 // stop. If canTransferLeaseFrom is non-nil, it is consulted and an error is
 // returned if it returns false.
-func (rq *replicateQueue) maybeTransferLeaseAway(
+func (rq *replicateQueue) maybeTransferLeaseAwayTarget(
 	ctx context.Context,
 	repl *Replica,
 	removeStoreID roachpb.StoreID,
-	dryRun bool,
 	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
-) (done bool, _ error) {
+) (op AllocationOp, _ error) {
 	if removeStoreID != repl.store.StoreID() {
-		return false, nil
+		return nil, nil
 	}
 	if canTransferLeaseFrom != nil && !canTransferLeaseFrom(ctx, repl) {
-		return false, errors.Errorf("cannot transfer lease")
+		return nil, errors.Errorf("cannot transfer lease")
 	}
 	desc, conf := repl.DescAndSpanConfig()
 	// The local replica was selected as the removal target, but that replica
@@ -1362,81 +1475,89 @@ func (rq *replicateQueue) maybeTransferLeaseAway(
 	// out of situations where this store is overfull and yet holds all the
 	// leases. The fullness checks need to be ignored for cases where
 	// a replica needs to be removed for constraint violations.
-	transferred, err := rq.shedLease(
+	target := rq.allocator.TransferLeaseTarget(
 		ctx,
-		repl,
-		desc,
+		rq.storePool,
 		conf,
+		desc.Replicas().VoterDescriptors(),
+		repl,
+		RangeUsageInfoForRepl(repl),
+		false, /* forceDecisionWithoutStats */
 		allocator.TransferLeaseOptions{
-			Goal:   allocator.LeaseCountConvergence,
-			DryRun: dryRun,
+			Goal: allocator.LeaseCountConvergence,
 			// NB: This option means that the allocator is asked to not consider the
 			// current replica in its set of potential candidates.
 			ExcludeLeaseRepl: true,
 		},
 	)
-	return transferred == allocator.TransferOK, err
+
+	if target == (roachpb.ReplicaDescriptor{}) {
+		return nil, nil
+	}
+	log.KvDistribution.Infof(ctx, "transferring lease to s%d", target.StoreID)
+
+	op = AllocationTransferLeaseOp{
+		source:             repl.StoreID(),
+		target:             target.StoreID,
+		usage:              RangeUsageInfoForRepl(repl),
+		bypassSafetyChecks: false,
+	}
+
+	return op, nil
 }
 
 func (rq *replicateQueue) removeVoter(
-	ctx context.Context,
-	repl *Replica,
-	existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
-	dryRun bool,
-) (requeue bool, _ error) {
+	ctx context.Context, repl *Replica, existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
+) (op AllocationOp, _ error) {
+	effects := effectBuilder{}
 	removeVoter, details, err := rq.findRemoveVoter(ctx, repl, existingVoters, existingNonVoters)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	done, err := rq.maybeTransferLeaseAway(
-		ctx, repl, removeVoter.StoreID, dryRun, nil /* canTransferLeaseFrom */)
+
+	transferOp, err := rq.maybeTransferLeaseAwayTarget(
+		ctx, repl, removeVoter.StoreID, nil /* canTransferLeaseFrom */)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	if done {
-		// Lease is now elsewhere, so we're not in charge any more.
-		return false, nil
+	// We found a lease transfer opportunity, exit early.
+	if transferOp != nil {
+		return transferOp, nil
 	}
+	effects = effects.add(func() {
+		rq.metrics.trackRemoveMetric(allocatorimpl.VoterTarget, allocatorimpl.Alive)
+	})
 
 	// Remove a replica.
-	if !dryRun {
-		rq.metrics.trackRemoveMetric(allocatorimpl.VoterTarget, allocatorimpl.Alive)
-	}
-
 	log.KvDistribution.Infof(ctx, "removing voting replica %+v due to over-replication: %s",
 		removeVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
-	desc := repl.Desc()
 	// TODO(aayush): Directly removing the voter here is a bit of a missed
 	// opportunity since we could potentially be 1 non-voter short and the
 	// `target` could be a valid store for a non-voter. In such a scenario, we
 	// could save a bunch of work by just performing an atomic demotion of a
 	// voter.
-	if err := rq.changeReplicas(
-		ctx,
-		repl,
-		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, removeVoter),
-		desc,
-		kvserverpb.SnapshotRequest_UNKNOWN, // unused
-		0.0,                                // unused
-		kvserverpb.ReasonRangeOverReplicated,
-		details,
-		dryRun,
-	); err != nil {
-		return false, err
+	op = AllocationChangeReplicasOp{
+		lhStore:           repl.StoreID(),
+		sideEffects:       effects.f(),
+		usage:             RangeUsageInfoForRepl(repl),
+		chgs:              kvpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, removeVoter),
+		priority:          kvserverpb.SnapshotRequest_UNKNOWN, // unused
+		allocatorPriority: 0.0,                                // unused
+		reason:            kvserverpb.ReasonRangeOverReplicated,
+		details:           details,
 	}
-	return true, nil
+	return op, nil
 }
 
 func (rq *replicateQueue) removeNonVoter(
-	ctx context.Context,
-	repl *Replica,
-	existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
-	dryRun bool,
-) (requeue bool, _ error) {
+	ctx context.Context, repl *Replica, existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
+) (op AllocationOp, _ error) {
+	effects := effectBuilder{}
 
-	desc, conf := repl.DescAndSpanConfig()
+	_, conf := repl.DescAndSpanConfig()
 	removeNonVoter, details, err := rq.allocator.RemoveNonVoter(
 		ctx,
+		rq.storePool,
 		conf,
 		existingNonVoters,
 		existingVoters,
@@ -1444,11 +1565,12 @@ func (rq *replicateQueue) removeNonVoter(
 		rq.allocator.ScorerOptions(ctx),
 	)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	if !dryRun {
+	effects = effects.add(func() {
 		rq.metrics.trackRemoveMetric(allocatorimpl.NonVoterTarget, allocatorimpl.Alive)
-	}
+	})
+
 	log.KvDistribution.Infof(ctx, "removing non-voting replica %+v due to over-replication: %s",
 		removeNonVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
 	target := roachpb.ReplicationTarget{
@@ -1456,34 +1578,32 @@ func (rq *replicateQueue) removeNonVoter(
 		StoreID: removeNonVoter.StoreID,
 	}
 
-	if err := rq.changeReplicas(
-		ctx,
-		repl,
-		roachpb.MakeReplicationChanges(roachpb.REMOVE_NON_VOTER, target),
-		desc,
-		kvserverpb.SnapshotRequest_UNKNOWN, // unused
-		0.0,                                // unused
-		kvserverpb.ReasonRangeOverReplicated,
-		details,
-		dryRun,
-	); err != nil {
-		return false, err
+	op = AllocationChangeReplicasOp{
+		lhStore:           repl.StoreID(),
+		sideEffects:       effects.f(),
+		usage:             RangeUsageInfoForRepl(repl),
+		chgs:              kvpb.MakeReplicationChanges(roachpb.REMOVE_NON_VOTER, target),
+		priority:          kvserverpb.SnapshotRequest_UNKNOWN, // unused
+		allocatorPriority: 0.0,                                // unused
+		reason:            kvserverpb.ReasonRangeOverReplicated,
+		details:           details,
 	}
-	return true, nil
+	return op, nil
 }
 
 func (rq *replicateQueue) removeDecommissioning(
-	ctx context.Context, repl *Replica, targetType allocatorimpl.TargetReplicaType, dryRun bool,
-) (requeue bool, _ error) {
+	ctx context.Context, repl *Replica, targetType allocatorimpl.TargetReplicaType,
+) (op AllocationOp, _ error) {
 	desc := repl.Desc()
+	effects := effectBuilder{}
 	var decommissioningReplicas []roachpb.ReplicaDescriptor
 	switch targetType {
 	case allocatorimpl.VoterTarget:
-		decommissioningReplicas = rq.store.cfg.StorePool.DecommissioningReplicas(
+		decommissioningReplicas = rq.storePool.DecommissioningReplicas(
 			desc.Replicas().VoterDescriptors(),
 		)
 	case allocatorimpl.NonVoterTarget:
-		decommissioningReplicas = rq.store.cfg.StorePool.DecommissioningReplicas(
+		decommissioningReplicas = rq.storePool.DecommissioningReplicas(
 			desc.Replicas().NonVoterDescriptors(),
 		)
 	default:
@@ -1491,44 +1611,42 @@ func (rq *replicateQueue) removeDecommissioning(
 	}
 
 	if len(decommissioningReplicas) == 0 {
-		log.KvDistribution.Infof(ctx, "range of %[1]ss %[2]s was identified as having decommissioning %[1]ss, "+
+		return nil, errors.AssertionFailedf("range of %[1]ss %[2]s was identified as having decommissioning %[1]ss, "+
 			"but no decommissioning %[1]ss were found", targetType, repl)
-		return true, nil
 	}
 	decommissioningReplica := decommissioningReplicas[0]
 
-	done, err := rq.maybeTransferLeaseAway(
-		ctx, repl, decommissioningReplica.StoreID, dryRun, nil /* canTransferLease */)
+	transferOp, err := rq.maybeTransferLeaseAwayTarget(
+		ctx, repl, decommissioningReplica.StoreID, nil /* canTransferLeaseFrom */)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	if done {
-		// Not leaseholder any more.
-		return false, nil
+	// We found a lease transfer opportunity, exit early.
+	if transferOp != nil {
+		return transferOp, nil
 	}
 
-	// Remove the decommissioning replica.
-	if !dryRun {
+	effects = effects.add(func() {
 		rq.metrics.trackRemoveMetric(targetType, allocatorimpl.Decommissioning)
-	}
+	})
+
 	log.KvDistribution.Infof(ctx, "removing decommissioning %s %+v from store", targetType, decommissioningReplica)
 	target := roachpb.ReplicationTarget{
 		NodeID:  decommissioningReplica.NodeID,
 		StoreID: decommissioningReplica.StoreID,
 	}
-	if err := rq.changeReplicas(
-		ctx,
-		repl,
-		roachpb.MakeReplicationChanges(targetType.RemoveChangeType(), target),
-		desc,
-		kvserverpb.SnapshotRequest_UNKNOWN, // unused
-		0.0,                                // unused
-		kvserverpb.ReasonStoreDecommissioning, "", dryRun,
-	); err != nil {
-		return false, err
+
+	op = AllocationChangeReplicasOp{
+		lhStore:           repl.StoreID(),
+		sideEffects:       effects.f(),
+		usage:             RangeUsageInfoForRepl(repl),
+		chgs:              kvpb.MakeReplicationChanges(targetType.RemoveChangeType(), target),
+		priority:          kvserverpb.SnapshotRequest_UNKNOWN, // unused
+		allocatorPriority: 0.0,                                // unused
+		reason:            kvserverpb.ReasonStoreDecommissioning,
+		details:           "",
 	}
-	// We removed a replica, so check if there's more to do.
-	return true, nil
+	return op, nil
 }
 
 func (rq *replicateQueue) removeDead(
@@ -1536,22 +1654,21 @@ func (rq *replicateQueue) removeDead(
 	repl *Replica,
 	deadReplicas []roachpb.ReplicaDescriptor,
 	targetType allocatorimpl.TargetReplicaType,
-	dryRun bool,
-) (requeue bool, _ error) {
-	desc := repl.Desc()
+) (op AllocationOp, _ error) {
+	effects := effectBuilder{}
 	if len(deadReplicas) == 0 {
-		log.KvDistribution.Infof(
-			ctx,
+		return nil, errors.AssertionFailedf(
 			"range of %[1]s %[2]s was identified as having dead %[1]ss, but no dead %[1]ss were found",
 			targetType,
 			repl,
 		)
-		return true, nil
 	}
 	deadReplica := deadReplicas[0]
-	if !dryRun {
+
+	effects = effects.add(func() {
 		rq.metrics.trackRemoveMetric(targetType, allocatorimpl.Dead)
-	}
+	})
+
 	log.KvDistribution.Infof(ctx, "removing dead %s %+v from store", targetType, deadReplica)
 	target := roachpb.ReplicationTarget{
 		NodeID:  deadReplica.NodeID,
@@ -1562,20 +1679,18 @@ func (rq *replicateQueue) removeDead(
 	// lease away because if the removal target is dead, it's not the voter being
 	// removed (and if for some reason that happens, the removal is simply going
 	// to fail).
-	if err := rq.changeReplicas(
-		ctx,
-		repl,
-		roachpb.MakeReplicationChanges(targetType.RemoveChangeType(), target),
-		desc,
-		kvserverpb.SnapshotRequest_UNKNOWN, // unused
-		0.0,                                // unused
-		kvserverpb.ReasonStoreDead,
-		"",
-		dryRun,
-	); err != nil {
-		return false, err
+	op = AllocationChangeReplicasOp{
+		lhStore:           repl.StoreID(),
+		sideEffects:       effects.f(),
+		usage:             RangeUsageInfoForRepl(repl),
+		chgs:              kvpb.MakeReplicationChanges(targetType.RemoveChangeType(), target),
+		priority:          kvserverpb.SnapshotRequest_UNKNOWN, // unused
+		allocatorPriority: 0.0,                                // unused
+		reason:            kvserverpb.ReasonStoreDead,
+		details:           "",
 	}
-	return true, nil
+
+	return op, nil
 }
 
 func (rq *replicateQueue) considerRebalance(
@@ -1584,8 +1699,14 @@ func (rq *replicateQueue) considerRebalance(
 	existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
 	allocatorPrio float64,
 	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
-	scatter, dryRun bool,
-) (requeue bool, _ error) {
+	scatter bool,
+) (op AllocationOp, _ error) {
+	// When replicate queue rebalancing is not enabled return early.
+	if rq.store.TestingKnobs().DisableReplicaRebalancing {
+		return nil, nil
+	}
+	effects := effectBuilder{}
+
 	desc, conf := repl.DescAndSpanConfig()
 	rebalanceTargetType := allocatorimpl.VoterTarget
 
@@ -1593,10 +1714,25 @@ func (rq *replicateQueue) considerRebalance(
 	if scatter {
 		scorerOpts = rq.allocator.ScorerOptionsForScatter(ctx)
 	}
-	if !rq.store.TestingKnobs().DisableReplicaRebalancing {
-		rangeUsageInfo := rangeUsageInfoForRepl(repl)
-		addTarget, removeTarget, details, ok := rq.allocator.RebalanceVoter(
+	rangeUsageInfo := RangeUsageInfoForRepl(repl)
+	addTarget, removeTarget, details, ok := rq.allocator.RebalanceVoter(
+		ctx,
+		rq.storePool,
+		conf,
+		repl.RaftStatus(),
+		existingVoters,
+		existingNonVoters,
+		rangeUsageInfo,
+		storepool.StoreFilterThrottled,
+		scorerOpts,
+	)
+	if !ok {
+		// If there was nothing to do for the set of voting replicas on this
+		// range, attempt to rebalance non-voters.
+		log.KvDistribution.VInfof(ctx, 2, "no suitable rebalance target for voters")
+		addTarget, removeTarget, details, ok = rq.allocator.RebalanceNonVoter(
 			ctx,
+			rq.storePool,
 			conf,
 			repl.RaftStatus(),
 			existingVoters,
@@ -1605,83 +1741,83 @@ func (rq *replicateQueue) considerRebalance(
 			storepool.StoreFilterThrottled,
 			scorerOpts,
 		)
-		if !ok {
-			// If there was nothing to do for the set of voting replicas on this
-			// range, attempt to rebalance non-voters.
-			log.KvDistribution.Infof(ctx, "no suitable rebalance target for voters")
-			addTarget, removeTarget, details, ok = rq.allocator.RebalanceNonVoter(
-				ctx,
-				conf,
-				repl.RaftStatus(),
-				existingVoters,
-				existingNonVoters,
-				rangeUsageInfo,
-				storepool.StoreFilterThrottled,
-				scorerOpts,
-			)
-			rebalanceTargetType = allocatorimpl.NonVoterTarget
-		}
+		rebalanceTargetType = allocatorimpl.NonVoterTarget
+	}
 
-		// Determines whether we can remove the leaseholder without first
-		// transferring the lease away
-		lhRemovalAllowed := addTarget != (roachpb.ReplicationTarget{})
-		lhBeingRemoved := removeTarget.StoreID == repl.store.StoreID()
+	// Determine whether we can remove the leaseholder without first
+	// transferring the lease away.
+	lhRemovalAllowed := addTarget != (roachpb.ReplicationTarget{})
 
-		if !ok {
-			log.KvDistribution.Infof(ctx, "no suitable rebalance target for non-voters")
-		} else if !lhRemovalAllowed {
-			if done, err := rq.maybeTransferLeaseAway(
-				ctx, repl, removeTarget.StoreID, dryRun, canTransferLeaseFrom,
-			); err != nil {
-				log.KvDistribution.Infof(ctx, "want to remove self, but failed to transfer lease away: %s", err)
-				ok = false
-			} else if done {
-				// Lease is now elsewhere, so we're not in charge any more.
-				return false, nil
-			}
-		}
-		if ok {
-			// If we have a valid rebalance action (ok == true) and we haven't
-			// transferred our lease away, execute the rebalance.
-			chgs, performingSwap, err := replicationChangesForRebalance(ctx, desc, len(existingVoters), addTarget,
-				removeTarget, rebalanceTargetType)
-			if err != nil {
-				return false, err
-			}
-			if !dryRun {
-				rq.metrics.trackRebalanceReplicaCount(rebalanceTargetType)
-				if performingSwap {
-					rq.metrics.VoterDemotionsCount.Inc(1)
-					rq.metrics.NonVoterPromotionsCount.Inc(1)
-				}
-			}
-			log.KvDistribution.Infof(ctx,
-				"rebalancing %s %+v to %+v: %s",
-				rebalanceTargetType,
-				removeTarget,
-				addTarget,
-				rangeRaftProgress(repl.RaftStatus(), existingVoters))
-
-			if err := rq.changeReplicas(
-				ctx,
-				repl,
-				chgs,
-				desc,
-				kvserverpb.SnapshotRequest_REBALANCE,
-				allocatorPrio,
-				kvserverpb.ReasonRebalance,
-				details,
-				dryRun,
-			); err != nil {
-				return false, err
-			}
-			// Unless just removed myself (the leaseholder), always requeue to see
-			// if more work needs to be done. If leaseholder is removed, someone
-			// else will take over.
-			return !lhBeingRemoved, nil
+	if !ok {
+		log.KvDistribution.VInfof(ctx, 2, "no suitable rebalance target for non-voters")
+	} else if !lhRemovalAllowed {
+		if transferOp, err := rq.maybeTransferLeaseAwayTarget(
+			ctx, repl, removeTarget.StoreID, canTransferLeaseFrom,
+		); err != nil {
+			// No transfer possible.
+			ok = false
+			log.KvDistribution.Infof(ctx, "want to remove self, but failed to find lease transfer target: %s", err)
+		} else if transferOp != nil {
+			// We found a lease transfer opportunity, exit early.
+			return transferOp, nil
 		}
 	}
-	return false, nil
+
+	// No rebalance target was found, check whether we are able and should
+	// transfer the lease away to another store.
+	if !ok {
+		if !canTransferLeaseFrom(ctx, repl) {
+			return nil, nil
+		}
+		return rq.shedLeaseTarget(
+			ctx,
+			repl,
+			desc,
+			conf,
+			allocator.TransferLeaseOptions{
+				Goal:                   allocator.FollowTheWorkload,
+				ExcludeLeaseRepl:       false,
+				CheckCandidateFullness: true,
+			},
+		), nil
+
+	}
+
+	// If we have a valid rebalance action (ok == true) and we haven't
+	// transferred our lease away, find the rebalance changes and return them
+	// in an operation.
+	chgs, performingSwap, err := replicationChangesForRebalance(ctx, desc, len(existingVoters), addTarget,
+		removeTarget, rebalanceTargetType)
+	if err != nil {
+		return nil, err
+	}
+
+	effects = effects.add(func() {
+		rq.metrics.trackRebalanceReplicaCount(rebalanceTargetType)
+		if performingSwap {
+			rq.metrics.VoterDemotionsCount.Inc(1)
+			rq.metrics.NonVoterPromotionsCount.Inc(1)
+		}
+	})
+
+	log.KvDistribution.Infof(ctx,
+		"rebalancing %s %+v to %+v: %s",
+		rebalanceTargetType,
+		removeTarget,
+		addTarget,
+		rangeRaftProgress(repl.RaftStatus(), existingVoters))
+
+	op = AllocationChangeReplicasOp{
+		lhStore:           repl.StoreID(),
+		sideEffects:       effects.f(),
+		usage:             RangeUsageInfoForRepl(repl),
+		chgs:              chgs,
+		priority:          kvserverpb.SnapshotRequest_REBALANCE,
+		allocatorPriority: allocatorPrio,
+		reason:            kvserverpb.ReasonRebalance,
+		details:           details,
+	}
+	return op, nil
 }
 
 // replicationChangesForRebalance returns a list of ReplicationChanges to
@@ -1696,7 +1832,7 @@ func replicationChangesForRebalance(
 	numExistingVoters int,
 	addTarget, removeTarget roachpb.ReplicationTarget,
 	rebalanceTargetType allocatorimpl.TargetReplicaType,
-) (chgs []roachpb.ReplicationChange, performingSwap bool, err error) {
+) (chgs []kvpb.ReplicationChange, performingSwap bool, err error) {
 	if rebalanceTargetType == allocatorimpl.VoterTarget && numExistingVoters == 1 {
 		// If there's only one replica, the removal target is the
 		// leaseholder and this is unsupported and will fail. However,
@@ -1719,7 +1855,7 @@ func replicationChangesForRebalance(
 		// when we know it's necessary, picking the smaller of two evils.
 		//
 		// See https://github.com/cockroachdb/cockroach/issues/40333.
-		chgs = []roachpb.ReplicationChange{
+		chgs = []kvpb.ReplicationChange{
 			{ChangeType: roachpb.ADD_VOTER, Target: addTarget},
 		}
 		log.KvDistribution.Infof(ctx, "can't swap replica due to lease; falling back to add")
@@ -1748,8 +1884,8 @@ func replicationChangesForRebalance(
 			// replica into the replicateQueue. So we expect the replicateQueue's next
 			// attempt at rebalancing this range to rebalance the non-voter if it ends
 			// up being in violation of the range's constraints.
-			promo := roachpb.ReplicationChangesForPromotion(addTarget)
-			demo := roachpb.ReplicationChangesForDemotion(removeTarget)
+			promo := kvpb.ReplicationChangesForPromotion(addTarget)
+			demo := kvpb.ReplicationChangesForDemotion(removeTarget)
 			chgs = append(promo, demo...)
 			performingSwap = true
 		} else if found {
@@ -1759,7 +1895,7 @@ func replicationChangesForRebalance(
 			)
 		} else {
 			// We have a replica to remove and one we can add, so let's swap them out.
-			chgs = []roachpb.ReplicationChange{
+			chgs = []kvpb.ReplicationChange{
 				{ChangeType: roachpb.ADD_VOTER, Target: addTarget},
 				{ChangeType: roachpb.REMOVE_VOTER, Target: removeTarget},
 			}
@@ -1774,12 +1910,48 @@ func replicationChangesForRebalance(
 					" move non-voter to a store that already has a replica %s for the range", rdesc,
 			)
 		}
-		chgs = []roachpb.ReplicationChange{
+		chgs = []kvpb.ReplicationChange{
 			{ChangeType: roachpb.ADD_NON_VOTER, Target: addTarget},
 			{ChangeType: roachpb.REMOVE_NON_VOTER, Target: removeTarget},
 		}
 	}
 	return chgs, performingSwap, nil
+}
+
+// shedLeaseTarget takes in a leaseholder replica, looks for a target for
+// transferring the lease and, if a suitable target is found (e.g. alive, not
+// draining), returns an allocation op to transfer the lease away.
+func (rq *replicateQueue) shedLeaseTarget(
+	ctx context.Context,
+	repl *Replica,
+	desc *roachpb.RangeDescriptor,
+	conf roachpb.SpanConfig,
+	opts allocator.TransferLeaseOptions,
+) (op AllocationOp) {
+	usage := RangeUsageInfoForRepl(repl)
+	// Learner replicas aren't allowed to become the leaseholder or raft leader,
+	// so only consider the `VoterDescriptors` replicas.
+	target := rq.allocator.TransferLeaseTarget(
+		ctx,
+		rq.storePool,
+		conf,
+		desc.Replicas().VoterDescriptors(),
+		repl,
+		usage,
+		false, /* forceDecisionWithoutStats */
+		opts,
+	)
+	if target == (roachpb.ReplicaDescriptor{}) {
+		return nil
+	}
+
+	op = AllocationTransferLeaseOp{
+		source:             repl.StoreID(),
+		target:             target.StoreID,
+		usage:              usage,
+		bypassSafetyChecks: false,
+	}
+	return op
 }
 
 // shedLease takes in a leaseholder replica, looks for a target for transferring
@@ -1796,10 +1968,11 @@ func (rq *replicateQueue) shedLease(
 	// so only consider the `VoterDescriptors` replicas.
 	target := rq.allocator.TransferLeaseTarget(
 		ctx,
+		rq.storePool,
 		conf,
 		desc.Replicas().VoterDescriptors(),
 		repl,
-		repl.loadStats.batchRequests,
+		RangeUsageInfoForRepl(repl),
 		false, /* forceDecisionWithoutStats */
 		opts,
 	)
@@ -1807,16 +1980,7 @@ func (rq *replicateQueue) shedLease(
 		return allocator.NoSuitableTarget, nil
 	}
 
-	if opts.DryRun {
-		log.KvDistribution.Infof(ctx, "transferring lease to s%d", target.StoreID)
-		return allocator.NoTransferDryRun, nil
-	}
-
-	avgQPS, qpsMeasurementDur := repl.loadStats.batchRequests.AverageRatePerSecond()
-	if qpsMeasurementDur < replicastats.MinStatsDuration {
-		avgQPS = 0
-	}
-	if err := rq.TransferLease(ctx, repl, repl.store.StoreID(), target.StoreID, avgQPS); err != nil {
+	if err := rq.TransferLease(ctx, repl, repl.store.StoreID(), target.StoreID, RangeUsageInfoForRepl(repl)); err != nil {
 		return allocator.TransferErr, err
 	}
 	return allocator.TransferOK, nil
@@ -1825,13 +1989,17 @@ func (rq *replicateQueue) shedLease(
 // ReplicaLeaseMover handles lease transfers for a single range.
 type ReplicaLeaseMover interface {
 	// AdminTransferLease moves the lease to the requested store.
-	AdminTransferLease(ctx context.Context, target roachpb.StoreID) error
+	AdminTransferLease(ctx context.Context, target roachpb.StoreID, bypassSafetyChecks bool) error
 
 	// String returns info about the replica.
 	String() string
 }
 
 // RangeRebalancer handles replica moves and lease transfers.
+//
+// TODO(kvoli): Evaluate whether we want to keep this. It would be nice to move
+// all application methods off of the replicate queue into somewhere neutral.
+// This synchronous method won't work easily with simulation.
 type RangeRebalancer interface {
 	// TransferLease uses a LeaseMover interface to move a lease between stores.
 	// The QPS is used to update stats for the stores.
@@ -1839,7 +2007,7 @@ type RangeRebalancer interface {
 		ctx context.Context,
 		rlm ReplicaLeaseMover,
 		source, target roachpb.StoreID,
-		rangeQPS float64,
+		rangeUsageInfo allocator.RangeUsageInfo,
 	) error
 
 	// RelocateRange relocates replicas to the requested stores, and can transfer
@@ -1852,18 +2020,32 @@ type RangeRebalancer interface {
 	) error
 }
 
+func (rq *replicateQueue) finalizeAtomicReplication(ctx context.Context, repl *Replica) error {
+	var learnersRemoved int64
+	_, learnersRemoved, err := repl.maybeLeaveAtomicChangeReplicasAndRemoveLearners(
+		ctx, repl.Desc(),
+	)
+	if err == nil {
+		rq.metrics.RemoveLearnerReplicaCount.Inc(learnersRemoved)
+	}
+	return err
+}
+
 // TransferLease implements the RangeRebalancer interface.
 func (rq *replicateQueue) TransferLease(
-	ctx context.Context, rlm ReplicaLeaseMover, source, target roachpb.StoreID, rangeQPS float64,
+	ctx context.Context,
+	rlm ReplicaLeaseMover,
+	source, target roachpb.StoreID,
+	rangeUsageInfo allocator.RangeUsageInfo,
 ) error {
 	rq.metrics.TransferLeaseCount.Inc(1)
 	log.KvDistribution.Infof(ctx, "transferring lease to s%d", target)
-	if err := rlm.AdminTransferLease(ctx, target); err != nil {
+	if err := rlm.AdminTransferLease(ctx, target, false /* bypassSafetyChecks */); err != nil {
 		return errors.Wrapf(err, "%s: unable to transfer lease to s%d", rlm, target)
 	}
+
+	rq.storePool.UpdateLocalStoresAfterLeaseTransfer(source, target, rangeUsageInfo)
 	rq.lastLeaseTransfer.Store(timeutil.Now())
-	rq.store.cfg.StorePool.UpdateLocalStoresAfterLeaseTransfer(
-		source, target, rangeQPS)
 	return nil
 }
 
@@ -1886,43 +2068,35 @@ func (rq *replicateQueue) RelocateRange(
 func (rq *replicateQueue) changeReplicas(
 	ctx context.Context,
 	repl *Replica,
-	chgs roachpb.ReplicationChanges,
+	chgs kvpb.ReplicationChanges,
 	desc *roachpb.RangeDescriptor,
 	priority kvserverpb.SnapshotRequest_Priority,
 	allocatorPriority float64,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
-	dryRun bool,
 ) error {
-	if dryRun {
-		return nil
-	}
 	// NB: this calls the impl rather than ChangeReplicas because
 	// the latter traps tests that try to call it while the replication
 	// queue is active.
-	if _, err := repl.changeReplicasImpl(
+	_, err := repl.changeReplicasImpl(
 		ctx, desc, priority, kvserverpb.SnapshotRequest_REPLICATE_QUEUE, allocatorPriority, reason,
 		details, chgs,
-	); err != nil {
-		return err
-	}
-	rangeUsageInfo := rangeUsageInfoForRepl(repl)
-	for _, chg := range chgs {
-		rq.store.cfg.StorePool.UpdateLocalStoreAfterRebalance(
-			chg.Target.StoreID, rangeUsageInfo, chg.ChangeType)
-	}
-	return nil
+	)
+	return err
 }
 
 // canTransferLeaseFrom checks is a lease can be transferred from the specified
 // replica. It considers two factors if the replica is in -conformance with
 // lease preferences and the last time a transfer occurred to avoid thrashing.
 func (rq *replicateQueue) canTransferLeaseFrom(ctx context.Context, repl *Replica) bool {
+	if !repl.OwnsValidLease(ctx, repl.store.cfg.Clock.NowAsClockTimestamp()) {
+		// This replica is not the leaseholder, so it can't transfer the lease.
+		return false
+	}
 	// Do a best effort check to see if this replica conforms to the configured
 	// lease preferences (if any), if it does not we want to encourage more
 	// aggressive lease movement and not delay it.
-	respectsLeasePreferences, err := repl.checkLeaseRespectsPreferences(ctx)
-	if err == nil && !respectsLeasePreferences {
+	if repl.leaseViolatesPreferences(ctx) {
 		return true
 	}
 	if lastLeaseTransfer := rq.lastLeaseTransfer.Load(); lastLeaseTransfer != nil {
@@ -1930,6 +2104,11 @@ func (rq *replicateQueue) canTransferLeaseFrom(ctx context.Context, repl *Replic
 		return timeutil.Since(lastLeaseTransfer.(time.Time)) > minInterval
 	}
 	return true
+}
+
+func (*replicateQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 func (*replicateQueue) timer(_ time.Duration) time.Duration {
@@ -1973,15 +2152,23 @@ func rangeRaftProgress(raftStatus *raft.Status, replicas []roachpb.ReplicaDescri
 	return buf.String()
 }
 
-func rangeUsageInfoForRepl(repl *Replica) allocator.RangeUsageInfo {
-	info := allocator.RangeUsageInfo{
-		LogicalBytes: repl.GetMVCCStats().Total(),
+// RangeUsageInfoForRepl returns the usage information for the replica,
+// assigning it to the range usage information.
+// NB: This is currently just the replicas usage, it assumes that the range's
+// usage information matches. Which is dubious in some cases but often
+// reasonable when we only consider the leaseholder.
+func RangeUsageInfoForRepl(repl *Replica) allocator.RangeUsageInfo {
+	loadStats := repl.LoadStats()
+	localityInfo := repl.loadStats.RequestLocalityInfo()
+	return allocator.RangeUsageInfo{
+		LogicalBytes:             repl.GetMVCCStats().Total(),
+		QueriesPerSecond:         loadStats.QueriesPerSecond,
+		WritesPerSecond:          loadStats.WriteKeysPerSecond,
+		RaftCPUNanosPerSecond:    loadStats.RaftCPUNanosPerSecond,
+		RequestCPUNanosPerSecond: loadStats.RequestCPUNanosPerSecond,
+		RequestLocality: &allocator.RangeRequestLocalityInfo{
+			Counts:   localityInfo.LocalityCounts,
+			Duration: localityInfo.Duration,
+		},
 	}
-	if queriesPerSecond, dur := repl.loadStats.batchRequests.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-		info.QueriesPerSecond = queriesPerSecond
-	}
-	if writesPerSecond, dur := repl.loadStats.writeKeys.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-		info.WritesPerSecond = writesPerSecond
-	}
-	return info
 }

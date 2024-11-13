@@ -35,6 +35,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/util",
+        "//pkg/util/intsets",
         "//pkg/util/iterutil",
         "//pkg/util/syncutil",
         "//pkg/util/uuid",
@@ -62,7 +63,10 @@ go_test(
         "//pkg/sql/schemachanger/rel/internal/cyclegraphtest",
         "//pkg/sql/schemachanger/rel/internal/entitynodetest",
         "//pkg/sql/schemachanger/rel/reltest",
+        "//pkg/util/leaktest",
+        "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_x_sync//errgroup",
     ],
 )
 

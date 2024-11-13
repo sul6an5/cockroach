@@ -19,11 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -109,14 +110,16 @@ func doCreateSequence(
 		return nil, err
 	}
 
-	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
 		dbDesc.GetDefaultPrivilegeDescriptor(),
 		scDesc.GetDefaultPrivilegeDescriptor(),
 		dbDesc.GetID(),
 		sessionData.User(),
 		privilege.Sequences,
-		dbDesc.GetPrivileges(),
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	if persistence.IsTemporary() {
 		telemetry.Inc(sqltelemetry.CreateTempSequenceCounter)
@@ -146,11 +149,7 @@ func doCreateSequence(
 		return nil, err
 	}
 
-	// makeSequenceTableDesc already validates the table. No call to
-	// desc.ValidateSelf() needed here.
-
-	key := catalogkeys.MakeObjectNameKey(p.ExecCfg().Codec, dbDesc.GetID(), scDesc.GetID(), name.Object())
-	if err = p.createDescriptorWithID(ctx, key, id, desc, jobDesc); err != nil {
+	if err = p.createDescriptor(ctx, desc, jobDesc); err != nil {
 		return nil, err
 	}
 
@@ -292,8 +291,8 @@ func NewSequenceTableDesc(
 		Name:                tabledesc.LegacyPrimaryKeyIndexName,
 		KeyColumnIDs:        []descpb.ColumnID{tabledesc.SequenceColumnID},
 		KeyColumnNames:      []string{tabledesc.SequenceColumnName},
-		KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC},
-		EncodingType:        descpb.PrimaryIndexEncoding,
+		KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+		EncodingType:        catenumpb.PrimaryIndexEncoding,
 		Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
 		CreatedAtNanos:      creationTime.WallTime,
 	})
@@ -334,7 +333,12 @@ func NewSequenceTableDesc(
 	}
 
 	version := settings.Version.ActiveVersion(ctx)
-	if err := descbuilder.ValidateSelf(&desc, version); err != nil {
+	var sd *sessiondata.SessionData
+	if p != nil {
+		sd = p.SessionData()
+	}
+	dvmp := catsessiondata.NewDescriptorSessionDataProvider(sd)
+	if err := descs.ValidateSelf(&desc, version, dvmp); err != nil {
 		return nil, err
 	}
 	return &desc, nil

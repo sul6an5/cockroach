@@ -23,22 +23,25 @@ import (
 )
 
 const (
-	awsAccessKeyIDKey      = "AWS_ACCESS_KEY_ID"
-	awsSecretAccessKeyKey  = "AWS_SECRET_ACCESS_KEY"
 	teamcityBuildBranchKey = "TC_BUILD_BRANCH"
 )
 
 func main() {
-	var destBucket = flag.String("bucket", "cockroach", "override default bucket")
-	var gcsBucket = flag.String("gcs-bucket", "", "override default bucket")
+	var gcsBucket string
+	flag.StringVar(&gcsBucket, "gcs-bucket", "", "GCS bucket")
 	flag.Parse()
 
-	if _, ok := os.LookupEnv(awsAccessKeyIDKey); !ok {
-		log.Fatalf("AWS access key ID environment variable %s is not set", awsAccessKeyIDKey)
+	if gcsBucket == "" {
+		log.Fatal("GCS bucket is not set")
 	}
-	if _, ok := os.LookupEnv(awsSecretAccessKeyKey); !ok {
-		log.Fatalf("AWS secret access key environment variable %s is not set", awsSecretAccessKeyKey)
+	if _, ok := os.LookupEnv("GOOGLE_APPLICATION_CREDENTIALS"); !ok {
+		log.Fatal("GOOGLE_APPLICATION_CREDENTIALS environment variable is not set")
 	}
+	gcs, err := release.NewGCS(gcsBucket)
+	if err != nil {
+		log.Fatalf("Creating GCS session: %s", err)
+	}
+	providers := []release.ObjectPutGetter{gcs}
 
 	branch, ok := os.LookupEnv(teamcityBuildBranchKey)
 	if !ok {
@@ -63,24 +66,6 @@ func main() {
 	}
 	versionStr := string(bytes.TrimSpace(out))
 
-	var providers []release.ObjectPutGetter
-	s3, err := release.NewS3("us-east-1", *destBucket)
-	if err != nil {
-		log.Fatalf("Creating AWS S3 session: %s", err)
-	}
-	providers = append(providers, s3)
-
-	if *gcsBucket != "" {
-		if _, ok := os.LookupEnv("GOOGLE_APPLICATION_CREDENTIALS"); !ok {
-			log.Fatal("GOOGLE_APPLICATION_CREDENTIALS environment variable is not set")
-		}
-		gcs, err := release.NewGCS(*gcsBucket)
-		if err != nil {
-			log.Fatalf("Creating GCS session: %s", err)
-		}
-		providers = append(providers, gcs)
-	}
-
 	run(providers, runFlags{
 		pkgDir: pkg,
 		branch: branch,
@@ -95,7 +80,14 @@ type runFlags struct {
 }
 
 func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.ExecFn) {
-	for _, platform := range []release.Platform{release.PlatformLinux, release.PlatformLinuxArm, release.PlatformMacOS, release.PlatformWindows} {
+	for _, platform := range []release.Platform{
+		release.PlatformLinux,
+		release.PlatformLinuxFIPS,
+		release.PlatformLinuxArm,
+		release.PlatformMacOS,
+		release.PlatformMacOSArm,
+		release.PlatformWindows,
+	} {
 		var o opts
 		o.Platform = platform
 		o.ReleaseVersions = []string{flags.sha}
@@ -104,6 +96,7 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 		o.VersionStr = flags.sha
 		o.AbsolutePath = filepath.Join(flags.pkgDir, "cockroach"+release.SuffixFromPlatform(platform))
 		o.CockroachSQLAbsolutePath = filepath.Join(flags.pkgDir, "cockroach-sql"+release.SuffixFromPlatform(platform))
+		o.Channel = release.ChannelFromPlatform(platform)
 
 		log.Printf("building %s", pretty.Sprint(o))
 		buildOneCockroach(providers, o, execFn)
@@ -119,7 +112,11 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 
 func buildOneCockroach(providers []release.ObjectPutGetter, o opts, execFn release.ExecFn) {
 	log.Printf("building cockroach %s", pretty.Sprint(o))
-	if err := release.MakeRelease(o.Platform, release.BuildOptions{ExecFn: execFn}, o.PkgDir); err != nil {
+	buildOpts := release.BuildOptions{
+		ExecFn:  execFn,
+		Channel: o.Channel,
+	}
+	if err := release.MakeRelease(o.Platform, buildOpts, o.PkgDir); err != nil {
 		log.Fatal(err)
 	}
 	for _, provider := range providers {
@@ -168,4 +165,5 @@ type opts struct {
 	AbsolutePath             string
 	CockroachSQLAbsolutePath string
 	PkgDir                   string
+	Channel                  string
 }

@@ -38,13 +38,18 @@ import (
 // Histograms are immutable.
 type Histogram struct {
 	evalCtx *eval.Context
-	col     opt.ColumnID
-	buckets []cat.HistogramBucket
+	// selectivity tracks the total applied selectivity over time, which will be
+	// applied to the histogram when counting values or printing. We use a float64
+	// to allow this to go below epsilon, because it could be the product of
+	// multiple selectivities.
+	selectivity float64
+	buckets     []cat.HistogramBucket
+	col         opt.ColumnID
 }
 
 func (h *Histogram) String() string {
 	w := histogramWriter{}
-	w.init(h.buckets)
+	w.init(h.selectivity, h.buckets)
 	var buf bytes.Buffer
 	w.write(&buf)
 	return buf.String()
@@ -55,32 +60,57 @@ func (h *Histogram) Init(evalCtx *eval.Context, col opt.ColumnID, buckets []cat.
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*h = Histogram{
-		evalCtx: evalCtx,
-		col:     col,
-		buckets: buckets,
+		evalCtx:     evalCtx,
+		col:         col,
+		selectivity: 1,
+		buckets:     buckets,
 	}
 }
 
-// copy returns a deep copy of the histogram.
-func (h *Histogram) copy() *Histogram {
-	buckets := make([]cat.HistogramBucket, len(h.buckets))
-	copy(buckets, h.buckets)
-	return &Histogram{
-		evalCtx: h.evalCtx,
-		col:     h.col,
-		buckets: buckets,
-	}
-}
-
-// BucketCount returns the number of buckets in the histogram.
-func (h *Histogram) BucketCount() int {
+// bucketCount returns the number of buckets in the histogram.
+func (h *Histogram) bucketCount() int {
 	return len(h.buckets)
 }
 
-// Bucket returns a pointer to the ith bucket in the histogram.
-// i must be greater than or equal to 0 and less than BucketCount.
-func (h *Histogram) Bucket(i int) *cat.HistogramBucket {
-	return &h.buckets[i]
+// numEq returns NumEq for the ith histogram bucket, with the histogram's
+// selectivity applied. i must be greater than or equal to 0 and less than
+// bucketCount.
+func (h *Histogram) numEq(i int) float64 {
+	return h.buckets[i].NumEq * h.selectivity
+}
+
+// numRange returns NumRange for the ith histogram bucket, with the histogram's
+// selectivity applied. i must be greater than or equal to 0 and less than
+// bucketCount.
+func (h *Histogram) numRange(i int) float64 {
+	return h.buckets[i].NumRange * h.selectivity
+}
+
+// distinctRange returns DistinctRange for the ith histogram bucket, with the
+// histogram's selectivity applied. i must be greater than or equal to 0 and
+// less than bucketCount.
+func (h *Histogram) distinctRange(i int) float64 {
+	n := h.buckets[i].NumRange
+	d := h.buckets[i].DistinctRange
+
+	if d == 0 {
+		return 0
+	}
+
+	// If each distinct value appears n/d times, and the probability of a row
+	// being filtered out is (1 - selectivity), the probability that all n/d rows
+	// are filtered out is (1 - selectivity)^(n/d). So the expected number of
+	// values that are filtered out is d*(1 - selectivity)^(n/d).
+	//
+	// This formula returns d * selectivity when d=n but is closer to d when
+	// d << n.
+	return d - d*math.Pow(1-h.selectivity, n/d)
+}
+
+// upperBound returns UpperBound for the ith histogram bucket. i must be
+// greater than or equal to 0 and less than bucketCount.
+func (h *Histogram) upperBound(i int) tree.Datum {
+	return h.buckets[i].UpperBound
 }
 
 // ValuesCount returns the total number of values in the histogram. It can
@@ -89,8 +119,8 @@ func (h *Histogram) Bucket(i int) *cat.HistogramBucket {
 func (h *Histogram) ValuesCount() float64 {
 	var count float64
 	for i := range h.buckets {
-		count += h.buckets[i].NumRange
-		count += h.buckets[i].NumEq
+		count += h.numRange(i)
+		count += h.numEq(i)
 	}
 	return count
 }
@@ -100,12 +130,12 @@ func (h *Histogram) ValuesCount() float64 {
 func (h *Histogram) DistinctValuesCount() float64 {
 	var count float64
 	for i := range h.buckets {
-		b := &h.buckets[i]
-		count += b.DistinctRange
-		if b.NumEq > 1 {
+		count += h.distinctRange(i)
+		numEq := h.numEq(i)
+		if numEq > 1 {
 			count++
 		} else {
-			count += b.NumEq
+			count += numEq
 		}
 	}
 	if maxCount := h.maxDistinctValuesCount(); maxCount < count {
@@ -123,52 +153,64 @@ func (h *Histogram) maxDistinctValuesCount() float64 {
 
 	// The first bucket always has a zero value for NumRange, so the lower bound
 	// of the histogram is the upper bound of the first bucket.
-	if h.Bucket(0).NumRange != 0 {
+	if h.numRange(0) != 0 {
 		panic(errors.AssertionFailedf("the first bucket should have NumRange=0"))
 	}
-	lowerBound := h.Bucket(0).UpperBound
+	previousUpperBound := h.upperBound(0)
 
 	var count float64
 	for i := range h.buckets {
-		b := &h.buckets[i]
-		rng, ok := maxDistinctValuesInRange(lowerBound, b.UpperBound)
+		upperBound := h.upperBound(i)
+		rng, ok := maxDistinctValuesInRange(previousUpperBound, upperBound)
 
-		if ok && b.NumRange > rng {
+		numRange := h.numRange(i)
+		if ok && numRange > rng {
 			count += rng
 		} else {
-			count += b.NumRange
+			count += numRange
 		}
 
-		if b.NumEq > 1 {
+		numEq := h.numEq(i)
+		if numEq > 1 {
 			count++
 		} else {
-			count += b.NumEq
+			count += numEq
 		}
-		lowerBound = h.getNextLowerBound(b.UpperBound)
+		previousUpperBound = upperBound
 	}
 	return count
 }
 
 // maxDistinctValuesInRange returns the maximum number of distinct values in
-// the range [lowerBound, upperBound). It returns ok=false when it is not
+// the range (lowerBound, upperBound). It returns ok=false when it is not
 // possible to determine a finite value (which is the case for all types other
 // than integers and dates).
-func maxDistinctValuesInRange(lowerBound, upperBound tree.Datum) (_ float64, ok bool) {
+func maxDistinctValuesInRange(lowerBound, upperBound tree.Datum) (n float64, ok bool) {
+	// TODO(mgartner): We should probably use tree.MaxDistinctCount here
+	// instead. We may have to adjust the result by one or two because it
+	// returns a distinct count inclusive of the bounds.
 	switch lowerBound.ResolvedType().Family() {
 	case types.IntFamily:
-		return float64(*upperBound.(*tree.DInt)) - float64(*lowerBound.(*tree.DInt)), true
+		n = float64(*upperBound.(*tree.DInt)) - float64(*lowerBound.(*tree.DInt))
 
 	case types.DateFamily:
 		lower := lowerBound.(*tree.DDate)
 		upper := upperBound.(*tree.DDate)
-		if lower.IsFinite() && upper.IsFinite() {
-			return float64(upper.PGEpochDays()) - float64(lower.PGEpochDays()), true
+		if !lower.IsFinite() || !upper.IsFinite() {
+			return 0, false
 		}
-		return 0, false
+		n = float64(upper.PGEpochDays()) - float64(lower.PGEpochDays())
 
 	default:
 		return 0, false
 	}
+
+	// Subtract one to exclude the lower bound value.
+	n = n - 1
+	if n < 0 {
+		n = 0
+	}
+	return n, true
 }
 
 // CanFilter returns true if the given constraint can filter the histogram.
@@ -195,11 +237,12 @@ func (h *Histogram) filter(
 	prefix []tree.Datum,
 	columns constraint.Columns,
 ) *Histogram {
-	bucketCount := h.BucketCount()
+	bucketCount := h.bucketCount()
 	filtered := &Histogram{
-		evalCtx: h.evalCtx,
-		col:     h.col,
-		buckets: make([]cat.HistogramBucket, 0, bucketCount),
+		evalCtx:     h.evalCtx,
+		col:         h.col,
+		selectivity: h.selectivity,
+		buckets:     make([]cat.HistogramBucket, 0, bucketCount),
 	}
 	if bucketCount == 0 {
 		return filtered
@@ -207,7 +250,7 @@ func (h *Histogram) filter(
 
 	// The first bucket always has a zero value for NumRange, so the lower bound
 	// of the histogram is the upper bound of the first bucket.
-	if h.Bucket(0).NumRange != 0 {
+	if h.numRange(0) != 0 {
 		panic(errors.AssertionFailedf("the first bucket should have NumRange=0"))
 	}
 
@@ -250,7 +293,7 @@ func (h *Histogram) filter(
 	}
 	iter.setIdx(bucIndex)
 	if !desc && bucIndex > 0 {
-		prevUpperBound := h.Bucket(bucIndex - 1).UpperBound
+		prevUpperBound := h.upperBound(bucIndex - 1)
 		filtered.addEmptyBucket(prevUpperBound, desc)
 	}
 
@@ -285,8 +328,18 @@ func (h *Histogram) filter(
 		if filteredSpan.Compare(&keyCtx, &left) != 0 {
 			// The bucket was cut off in the middle. Get the resulting filtered
 			// bucket.
+			//
+			// The span generated from the bucket may have an exclusive bound in
+			// order to avoid a datum allocation for the majority of cases where
+			// the span does not intersect the bucket. If the span does
+			// intersect with the bucket, we transform the bucket span into an
+			// inclusive one to make it easier to work with. Note that this
+			// conversion is best-effort; not all datums support Next or Prev
+			// which allow exclusive ranges to be converted to inclusive ones.
+			cmpStarts := filteredSpan.CompareStarts(&keyCtx, &left)
+			filteredSpan.PreferInclusive(&keyCtx)
 			filteredBucket = getFilteredBucket(&iter, &keyCtx, &filteredSpan, colOffset)
-			if !desc && filteredSpan.CompareStarts(&keyCtx, &left) != 0 {
+			if !desc && cmpStarts != 0 {
 				// We need to add an empty bucket before the new bucket.
 				ub := h.getPrevUpperBound(filteredSpan.StartKey(), filteredSpan.StartBoundary(), colOffset)
 				filtered.addEmptyBucket(ub, desc)
@@ -319,7 +372,7 @@ func (h *Histogram) filter(
 		// bucket if needed.
 		if iter.next() {
 			// The remaining buckets from the original histogram have been removed.
-			filtered.addEmptyBucket(iter.lb, desc)
+			filtered.addEmptyBucket(iter.inclusiveLowerBound(), desc)
 		} else if lastBucket := filtered.buckets[len(filtered.buckets)-1]; lastBucket.NumRange != 0 {
 			iter.setIdx(0)
 			span := makeSpanFromBucket(&iter, prefix)
@@ -431,36 +484,18 @@ func (h *Histogram) addBucket(bucket *cat.HistogramBucket, desc bool) {
 	h.buckets = append(h.buckets, *bucket)
 }
 
-// ApplySelectivity reduces the size of each histogram bucket according to
-// the given selectivity, and returns a new histogram with the results.
+// ApplySelectivity returns a histogram with the given selectivity applied. If
+// the selectivity was 1 the returned histogram will be the same as before.
 func (h *Histogram) ApplySelectivity(selectivity Selectivity) *Histogram {
 	if selectivity == ZeroSelectivity {
 		return nil
 	}
-	res := h.copy()
-	for i := range res.buckets {
-		b := &res.buckets[i]
-
-		// Save n and d for the distinct count formula below.
-		n := b.NumRange
-		d := b.DistinctRange
-
-		b.NumEq *= selectivity.AsFloat()
-		b.NumRange *= selectivity.AsFloat()
-
-		if d == 0 {
-			continue
-		}
-		// If each distinct value appears n/d times, and the probability of a
-		// row being filtered out is (1 - selectivity), the probability that all
-		// n/d rows are filtered out is (1 - selectivity)^(n/d). So the expected
-		// number of values that are filtered out is d*(1 - selectivity)^(n/d).
-		//
-		// This formula returns d * selectivity when d=n but is closer to d
-		// when d << n.
-		b.DistinctRange = d - d*math.Pow(1-selectivity.AsFloat(), n/d)
+	if selectivity == OneSelectivity {
+		return h
 	}
-	return res
+	h2 := *h
+	h2.selectivity *= selectivity.AsFloat()
+	return &h2
 }
 
 // histogramIter is a helper struct for iterating through the buckets in a
@@ -471,8 +506,10 @@ type histogramIter struct {
 	desc bool
 	idx  int
 	b    *cat.HistogramBucket
-	lb   tree.Datum
-	ub   tree.Datum
+	elb  tree.Datum // exclusive lower bound
+	lb   tree.Datum // inclusive lower bound
+	eub  tree.Datum // exclusive upper bound
+	ub   tree.Datum // inclusive upper bound
 }
 
 // init initializes a histogramIter to point to the first bucket of the given
@@ -487,7 +524,7 @@ func (hi *histogramIter) init(h *Histogram, desc bool) {
 		desc: desc,
 	}
 	if desc {
-		hi.idx = h.BucketCount()
+		hi.idx = h.bucketCount()
 	}
 	hi.next()
 }
@@ -506,15 +543,18 @@ func (hi *histogramIter) setIdx(i int) {
 // the "next" bucket is actually the previous bucket in the histogram. Returns
 // false if there are no more buckets.
 func (hi *histogramIter) next() (ok bool) {
-	getBounds := func() (lb, ub tree.Datum) {
-		hi.b = hi.h.Bucket(hi.idx)
+	getBounds := func() (elb, lb, eub, ub tree.Datum) {
+		hi.b = &hi.h.buckets[hi.idx]
 		ub = hi.b.UpperBound
 		if hi.idx == 0 {
 			lb = ub
 		} else {
-			lb = hi.h.getNextLowerBound(hi.h.Bucket(hi.idx - 1).UpperBound)
+			elb = hi.h.upperBound(hi.idx - 1)
 		}
-		return lb, ub
+		// We return an exclusive upper bound, eub, even though it is always nil
+		// because it makes it easier to handle both the iter.desc=true and
+		// iter.desc=false cases below.
+		return elb, lb, nil /* eub */, ub
 	}
 
 	if hi.desc {
@@ -522,24 +562,83 @@ func (hi *histogramIter) next() (ok bool) {
 		if hi.idx < 0 {
 			return false
 		}
-		hi.ub, hi.lb = getBounds()
+		// If iter.desc=true, the lower bounds are greater than the upper
+		// bounds. Either hi.eub or hi.ub will be set, hi.elb will always be
+		// nil, and hi.lb will always be non-nil.
+		hi.eub, hi.ub, hi.elb, hi.lb = getBounds()
 	} else {
 		hi.idx++
-		if hi.idx >= hi.h.BucketCount() {
+		if hi.idx >= hi.h.bucketCount() {
 			return false
 		}
-		hi.lb, hi.ub = getBounds()
+		// If iter.desc=false, the lower bounds are less than the upper bounds.
+		// Either hi.elb or hi.lb will be set, hi.eub will always be nil, and
+		// hi.ub will always be non-nil.
+		hi.elb, hi.lb, hi.eub, hi.ub = getBounds()
 	}
 
 	return true
 }
 
+// lowerBound returns the lower bound of the current bucket, and whether the
+// bound is inclusive or exclusive. It will never allocate a new datum.
+func (hi *histogramIter) lowerBound() (tree.Datum, constraint.SpanBoundary) {
+	if hi.lb != nil {
+		return hi.lb, constraint.IncludeBoundary
+	}
+	return hi.elb, constraint.ExcludeBoundary
+}
+
+// inclusiveLowerBound returns the inclusive lower bound of the current bucket.
+// It may allocate a new datum.
+func (hi *histogramIter) inclusiveLowerBound() tree.Datum {
+	if hi.lb == nil {
+		// hi.lb is only nil if iter.desc=false (see histogramIter.next), which
+		// means that the lower bounds are less than the upper bounds. So the
+		// inclusive lower bound is greater than the exclusive lower bound. For
+		// example, the range (/10 - /20] is equivalent to [/11 - /20].
+		hi.lb = hi.h.getNextLowerBound(hi.elb)
+	}
+	return hi.lb
+}
+
+// upperBound returns the upper bound of the current bucket, and whether the
+// bound is inclusive or exclusive. It will never allocate a new datum.
+func (hi *histogramIter) upperBound() (tree.Datum, constraint.SpanBoundary) {
+	if hi.ub != nil {
+		return hi.ub, constraint.IncludeBoundary
+	}
+	return hi.eub, constraint.ExcludeBoundary
+}
+
+// inclusiveUpperBound returns the inclusive upper bound of the current bucket.
+// It may allocate a new datum.
+func (hi *histogramIter) inclusiveUpperBound() tree.Datum {
+	if hi.ub == nil {
+		// hi.ub is only nil if iter.desc=true (see histogramIter.next), which
+		// means that the lower bounds are greater than the upper bounds. So the
+		// inclusive upper bound is greater than the exclusive upper bound. For
+		// example, the range [/20 - /10) is equivalent to [/20 - /11].
+		hi.ub = hi.h.getNextLowerBound(hi.eub)
+	}
+	return hi.ub
+}
+
 func makeSpanFromBucket(iter *histogramIter, prefix []tree.Datum) (span constraint.Span) {
+	start, startBoundary := iter.lowerBound()
+	end, endBoundary := iter.upperBound()
+	if start.Compare(iter.h.evalCtx, end) == 0 &&
+		(startBoundary == constraint.IncludeBoundary || endBoundary == constraint.IncludeBoundary) {
+		// If the start and ends are equal and one of the boundaries is
+		// inclusive, the other boundary should be inclusive.
+		startBoundary = constraint.IncludeBoundary
+		endBoundary = constraint.IncludeBoundary
+	}
 	span.Init(
-		constraint.MakeCompositeKey(append(prefix[:len(prefix):len(prefix)], iter.lb)...),
-		constraint.IncludeBoundary,
-		constraint.MakeCompositeKey(append(prefix[:len(prefix):len(prefix)], iter.ub)...),
-		constraint.IncludeBoundary,
+		constraint.MakeCompositeKey(append(prefix[:len(prefix):len(prefix)], start)...),
+		startBoundary,
+		constraint.MakeCompositeKey(append(prefix[:len(prefix):len(prefix)], end)...),
+		endBoundary,
 	)
 	return span
 }
@@ -580,8 +679,8 @@ func getFilteredBucket(
 ) *cat.HistogramBucket {
 	spanLowerBound := filteredSpan.StartKey().Value(colOffset)
 	spanUpperBound := filteredSpan.EndKey().Value(colOffset)
-	bucketLowerBound := iter.lb
-	bucketUpperBound := iter.ub
+	bucketLowerBound := iter.inclusiveLowerBound()
+	bucketUpperBound := iter.inclusiveUpperBound()
 	b := iter.b
 
 	// Check that the given span is contained in the bucket.
@@ -644,14 +743,21 @@ func getFilteredBucket(
 
 	// Calculate the new value for numRange.
 	var numRange float64
-	if isEqualityCondition {
+	switch {
+	case isEqualityCondition:
 		numRange = 0
-	} else if ok && rangeBefore > 0 {
-		// If we were successful in finding the ranges before and after filtering,
-		// calculate the fraction of values that should be assigned to the new
-		// bucket.
+	case ok && rangeBefore > 0:
+		// If we were successful in finding the ranges before and after
+		// filtering, calculate the fraction of values that should be assigned
+		// to the new bucket.
 		numRange = b.NumRange * rangeAfter / rangeBefore
-	} else {
+		if !math.IsNaN(numRange) {
+			break
+		}
+		// If the new value is NaN, fallthrough to the default case to estimate
+		// the numRange.
+		fallthrough
+	default:
 		// In the absence of any information, assume we reduced the size of the
 		// bucket by half.
 		numRange = 0.5 * b.NumRange
@@ -957,7 +1063,7 @@ const (
 	boundaries
 )
 
-func (w *histogramWriter) init(buckets []cat.HistogramBucket) {
+func (w *histogramWriter) init(selectivity float64, buckets []cat.HistogramBucket) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*w = histogramWriter{
@@ -969,8 +1075,8 @@ func (w *histogramWriter) init(buckets []cat.HistogramBucket) {
 	}
 
 	for i, b := range buckets {
-		w.cells[counts][i*2] = fmt.Sprintf(" %.5g ", b.NumRange)
-		w.cells[counts][i*2+1] = fmt.Sprintf("%.5g", b.NumEq)
+		w.cells[counts][i*2] = fmt.Sprintf(" %.5g ", b.NumRange*selectivity)
+		w.cells[counts][i*2+1] = fmt.Sprintf("%.5g", b.NumEq*selectivity)
 		// TODO(rytaft): truncate large strings.
 		w.cells[boundaries][i*2+1] = fmt.Sprintf(" %s ", b.UpperBound.String())
 		if width := tablewriter.DisplayWidth(w.cells[counts][i*2]); width > w.colWidths[i*2] {

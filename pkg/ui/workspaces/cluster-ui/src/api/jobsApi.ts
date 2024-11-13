@@ -19,18 +19,30 @@ export type JobsResponse = cockroach.server.serverpb.JobsResponse;
 
 export type JobRequest = cockroach.server.serverpb.JobRequest;
 export type JobResponse = cockroach.server.serverpb.JobResponse;
+export type JobResponseWithKey = {
+  jobResponse: JobResponse;
+  key: string;
+};
+export type ErrorWithKey = {
+  err: Error;
+  key: string;
+};
 
 export const getJobs = (
   req: JobsRequest,
 ): Promise<cockroach.server.serverpb.JobsResponse> => {
+  let jobsRequestPath = `${JOBS_PATH}`;
   const queryStr = propsToQueryString({
     status: req.status,
     type: req.type.toString(),
     limit: req.limit,
   });
+  if (queryStr) {
+    jobsRequestPath = jobsRequestPath.concat(`?${queryStr}`);
+  }
   return fetchData(
     cockroach.server.serverpb.JobsResponse,
-    `${JOBS_PATH}?${queryStr}`,
+    jobsRequestPath,
     null,
     null,
     "30M",

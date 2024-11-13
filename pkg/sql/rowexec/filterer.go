@@ -36,22 +36,22 @@ var _ execopnode.OpNode = &filtererProcessor{}
 const filtererProcName = "filterer"
 
 func newFiltererProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.FiltererSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*filtererProcessor, error) {
 	f := &filtererProcessor{input: input}
 	types := input.OutputTypes()
 	if err := f.Init(
+		ctx,
 		f,
 		post,
 		types,
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{InputsToDrain: []execinfra.RowSource{f.input}},
 	); err != nil {
@@ -59,11 +59,10 @@ func newFiltererProcessor(
 	}
 
 	f.filter = &execinfrapb.ExprHelper{}
-	if err := f.filter.Init(spec.Filter, types, &f.SemaCtx, f.EvalCtx); err != nil {
+	if err := f.filter.Init(ctx, spec.Filter, types, &f.SemaCtx, f.EvalCtx); err != nil {
 		return nil, err
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
 	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		f.input = newInputStatCollector(f.input)
 		f.ExecStatsForTrace = f.execStatsForTrace
@@ -94,7 +93,7 @@ func (f *filtererProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMet
 		}
 
 		// Perform the actual filtering.
-		passes, err := f.filter.EvalFilter(row)
+		passes, err := f.filter.EvalFilter(f.Ctx(), row)
 		if err != nil {
 			f.MoveToDraining(err)
 			break

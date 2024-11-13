@@ -80,7 +80,7 @@ func TestValidateSchemaSelf(t *testing.T) {
 		desc descpb.SchemaDescriptor
 	}{
 		{ // 0
-			err:  `empty descriptor name`,
+			err:  `empty schema name`,
 			desc: descpb.SchemaDescriptor{},
 		},
 		{ // 1
@@ -98,7 +98,7 @@ func TestValidateSchemaSelf(t *testing.T) {
 			},
 		},
 		{ // 3
-			err: `user testuser must not have SELECT privileges on schema "schema1"`,
+			err: `user testuser must not have [SELECT] privileges on schema "schema1"`,
 			desc: descpb.SchemaDescriptor{
 				ID:         52,
 				ParentID:   51,
@@ -114,7 +114,7 @@ func TestValidateSchemaSelf(t *testing.T) {
 				Name:       "schema1",
 				Privileges: defaultPrivilege,
 				Functions: map[string]descpb.SchemaDescriptor_Function{
-					"f": {Overloads: []descpb.SchemaDescriptor_FunctionOverload{{ID: 0}}},
+					"f": {Signatures: []descpb.SchemaDescriptor_FunctionSignature{{ID: 0}}},
 				},
 			},
 		},
@@ -211,7 +211,7 @@ func TestValidateCrossSchemaReferences(t *testing.T) {
 				ParentID: 51,
 				Name:     "schema1",
 				Functions: map[string]descpb.SchemaDescriptor_Function{
-					"f": {Overloads: []descpb.SchemaDescriptor_FunctionOverload{{ID: 500}}},
+					"f": {Signatures: []descpb.SchemaDescriptor_FunctionSignature{{ID: 500}}},
 				},
 			},
 			dbDesc: descpb.DatabaseDescriptor{
@@ -228,9 +228,9 @@ func TestValidateCrossSchemaReferences(t *testing.T) {
 		var cb nstree.MutableCatalog
 		test.desc.Privileges = privilege
 		desc := schemadesc.NewBuilder(&test.desc).BuildImmutable()
-		cb.UpsertDescriptorEntry(desc)
+		cb.UpsertDescriptor(desc)
 		test.dbDesc.Privileges = privilege
-		cb.UpsertDescriptorEntry(dbdesc.NewBuilder(&test.dbDesc).BuildImmutable())
+		cb.UpsertDescriptor(dbdesc.NewBuilder(&test.dbDesc).BuildImmutable())
 		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
 		const validateCrossReferencesOnly = catalog.ValidationLevelBackReferences &^ catalog.ValidationLevelSelfOnly
 		results := cb.Validate(ctx, clusterversion.TestingClusterVersion, catalog.NoValidationTelemetry, validateCrossReferencesOnly, desc)

@@ -22,6 +22,9 @@
 .section {
   flex: 0 0 auto;
   padding: 12px 24px 12px 0px;
+  row-gap: 24px;
+  display: flex;
+  flex-direction: column;
 
   &--heading {
     padding-top: 0;
@@ -71,6 +74,10 @@
       letter-spacing: 0.1px;
     }
   }
+}
+
+.table-area {
+  overflow-x: scroll;
 }
 
 .last-cleared-tooltip,
@@ -143,4 +150,16 @@
 
 .margin-bottom-large {
   margin-bottom: 40px;
+}
+
+.margin-right {
+  margin-right: 12px !important;
+}
+
+.margin-header {
+  margin-top: 10px;
+}
+
+.margin-left-neg {
+  margin-left: -11px !important;
 }

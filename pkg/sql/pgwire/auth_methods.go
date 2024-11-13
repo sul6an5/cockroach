@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/sessionrevival"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/identmap"
@@ -29,7 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/xdg-go/scram"
 )
@@ -100,6 +103,7 @@ var _ AuthMethod = authCertScram
 var _ AuthMethod = authTrust
 var _ AuthMethod = authReject
 var _ AuthMethod = authSessionRevivalToken([]byte{})
+var _ AuthMethod = authJwtToken
 
 // authPassword is the AuthMethod constructor for HBA method
 // "password": authenticate using a cleartext password received from
@@ -192,14 +196,15 @@ func passwordAuthenticator(
 	)(ctx, systemIdentity, clientConnection)
 
 	if err == nil {
-		// Password authentication succeeded using cleartext.  If the
-		// stored hash was encoded using crdb-bcrypt, we might want to
-		// upgrade it to SCRAM instead.
+		// Password authentication succeeded using cleartext.  If the stored hash
+		// was encoded using crdb-bcrypt, we might want to upgrade it to SCRAM
+		// instead. Conversely, if the stored hash was encoded using SCRAM, we might
+		// want to downgrade it to crdb-bcrypt.
 		//
-		// This auto-conversion is a CockroachDB-specific feature, which
-		// pushes clusters upgraded from a previous version into using
-		// SCRAM-SHA-256.
-		sql.MaybeUpgradeStoredPasswordHash(ctx,
+		// This auto-conversion is a CockroachDB-specific feature, which pushes
+		// clusters upgraded from a previous version into using SCRAM-SHA-256, and
+		// makes it easy to rollback from SCRAM-SHA-256 if there are issues.
+		sql.MaybeConvertStoredPasswordHash(ctx,
 			execCfg,
 			systemIdentity,
 			passwordStr, hashedPassword)
@@ -502,19 +507,49 @@ func authAutoSelectPasswordProtocol(
 		pwRetrieveFn PasswordRetrievalFn,
 	) error {
 		// Request information about the password hash.
-		expired, hashedPassword, err := pwRetrieveFn(ctx)
+		expired, hashedPassword, pwRetrieveErr := pwRetrieveFn(ctx)
 		// Note: we could be checking 'expired' and 'err' here, and exit
 		// early. However, we already have code paths to do just that in
 		// each authenticator, so we might as well use them. To do this,
 		// we capture the same information into the closure that the
 		// authenticator will call anyway.
-		newpwfn := func(ctx context.Context) (bool, password.PasswordHash, error) { return expired, hashedPassword, err }
+		newpwfn := func(ctx context.Context) (bool, password.PasswordHash, error) {
+			return expired, hashedPassword, pwRetrieveErr
+		}
 
 		// Was the password using the bcrypt hash encoding?
-		if err == nil && hashedPassword.Method() == password.HashBCrypt {
+		if pwRetrieveErr == nil && hashedPassword.Method() == password.HashBCrypt {
 			// Yes: we have no choice but to request a cleartext password.
 			c.LogAuthInfof(ctx, "found stored crdb-bcrypt credentials; requesting cleartext password")
 			return passwordAuthenticator(ctx, systemIdentity, clientConnection, newpwfn, c, execCfg)
+		}
+
+		if pwRetrieveErr == nil && hashedPassword.Method() == password.HashSCRAMSHA256 {
+			autoDowngradePasswordHashesBool := security.AutoDowngradePasswordHashes.Get(&execCfg.Settings.SV)
+			autoRehashOnCostChangeBool := security.AutoRehashOnSCRAMCostChange.Get(&execCfg.Settings.SV)
+			configuredHashMethod := security.GetConfiguredPasswordHashMethod(&execCfg.Settings.SV)
+			configuredSCRAMCost := security.SCRAMCost.Get(&execCfg.Settings.SV)
+
+			if autoDowngradePasswordHashesBool && configuredHashMethod == password.HashBCrypt {
+				// If the cluster is configured to automatically downgrade from SCRAM to
+				// bcrypt, then we also request the cleartext password.
+				c.LogAuthInfof(ctx, "found stored SCRAM-SHA-256 credentials but cluster is configured to downgrade to bcrypt; requesting cleartext password")
+				return passwordAuthenticator(ctx, systemIdentity, clientConnection, newpwfn, c, execCfg)
+			}
+
+			if autoRehashOnCostChangeBool && configuredHashMethod == password.HashSCRAMSHA256 {
+				ok, creds := password.GetSCRAMStoredCredentials(hashedPassword)
+				if !ok {
+					return errors.AssertionFailedf("programming error: password retrieved but invalid scram hash")
+				}
+				if int64(creds.Iters) != configuredSCRAMCost {
+					// If the cluster is configured to automatically re-hash the SCRAM
+					// password when the default cost is changed, then we also request the
+					// cleartext password.
+					c.LogAuthInfof(ctx, "found stored SCRAM-SHA-256 credentials but cluster is configured to re-hash after SCRAM cost change; requesting cleartext password")
+					return passwordAuthenticator(ctx, systemIdentity, clientConnection, newpwfn, c, execCfg)
+				}
+			}
 		}
 
 		// Error, no credentials or stored SCRAM hash: use the
@@ -591,6 +626,16 @@ func authReject(
 
 // authSessionRevivalToken is the AuthMethod constructor for the CRDB-specific
 // session revival token.
+// The session revival token is passed in the crdb:session_revival_token_base64
+// field during initial connection. This value is then extracted, base64 decoded
+// and verified.
+// This field is only expected to be used in instances where we have a SQL proxy.
+// The SQL proxy prevents the end customer from sending this field.  In the future,
+// We may decide to pass the token in the password field with a boolean field to
+// indicate the contents of the password field is a sessionRevivalToken as an
+// additional method. This could reduce the risk of the sessionRevivalToken being
+// logged accidentally. This risk is already fairly low because it should only be
+// passed by the SQL proxy.
 func authSessionRevivalToken(token []byte) AuthMethod {
 	return func(
 		_ context.Context,
@@ -618,4 +663,97 @@ func authSessionRevivalToken(token []byte) AuthMethod {
 		})
 		return b, nil
 	}
+}
+
+// JWTVerifier is an interface for the `jwtauthccl` library to add JWT login support.
+// This interface has a method that validates whether a given JWT token is a proper
+// credential for a given user to login.
+type JWTVerifier interface {
+	ValidateJWTLogin(_ *cluster.Settings,
+		_ username.SQLUsername,
+		_ []byte,
+		_ *identmap.Conf,
+	) error
+}
+
+var jwtVerifier JWTVerifier
+
+type noJWTConfigured struct{}
+
+func (c *noJWTConfigured) ValidateJWTLogin(
+	_ *cluster.Settings, _ username.SQLUsername, _ []byte, _ *identmap.Conf,
+) error {
+	return errors.New("JWT token authentication requires CCL features")
+}
+
+// ConfigureJWTAuth is a hook for the `jwtauthccl` library to add JWT login support. It's called to
+// setup the JWTVerifier just as it is needed.
+var ConfigureJWTAuth = func(
+	serverCtx context.Context,
+	ambientCtx log.AmbientContext,
+	st *cluster.Settings,
+	clusterUUID uuid.UUID,
+) JWTVerifier {
+	return &noJWTConfigured{}
+}
+
+// authJwtToken is the AuthMethod constructor for the CRDB-specific
+// jwt auth token.
+// The method is triggered when the client passes a specific option indicating
+// that it is passing a token in the password field. The token is then extracted
+// from the password field and verified.
+// The decision was made to pass the token in the password field instead of in
+// the options parameter as some drivers may insecurely handle options parameters.
+// In contrast, all drivers SHOULD know not to log the password, for example.
+func authJwtToken(
+	sctx context.Context,
+	c AuthConn,
+	_ tls.ConnectionState,
+	execCfg *sql.ExecutorConfig,
+	_ *hba.Entry,
+	identMap *identmap.Conf,
+) (*AuthBehaviors, error) {
+	// Initialize the jwt verifier if it hasn't been already.
+	if jwtVerifier == nil {
+		jwtVerifier = ConfigureJWTAuth(sctx, execCfg.AmbientCtx, execCfg.Settings, execCfg.NodeInfo.LogicalClusterID())
+	}
+	b := &AuthBehaviors{}
+	b.SetRoleMapper(UseProvidedIdentity)
+	b.SetAuthenticator(func(ctx context.Context, user username.SQLUsername, clientConnection bool, pwRetrieveFn PasswordRetrievalFn) error {
+		c.LogAuthInfof(ctx, "JWT token detected; attempting to use it")
+		if !clientConnection {
+			err := errors.New("JWT token authentication is only available for client connections")
+			c.LogAuthFailed(ctx, eventpb.AuthFailReason_PRE_HOOK_ERROR, err)
+			return err
+		}
+		// Request password from client.
+		if err := c.SendAuthRequest(authCleartextPassword, nil /* data */); err != nil {
+			c.LogAuthFailed(ctx, eventpb.AuthFailReason_PRE_HOOK_ERROR, err)
+			return err
+		}
+		// Wait for the password response from the client.
+		pwdData, err := c.GetPwdData()
+		if err != nil {
+			c.LogAuthFailed(ctx, eventpb.AuthFailReason_PRE_HOOK_ERROR, err)
+			return err
+		}
+
+		// Extract the token response from the password field.
+		token, err := passwordString(pwdData)
+		if err != nil {
+			c.LogAuthFailed(ctx, eventpb.AuthFailReason_PRE_HOOK_ERROR, err)
+			return err
+		}
+		// If there is no token send the Password Auth Failed error to make the client prompt for a password.
+		if len(token) == 0 {
+			return security.NewErrPasswordUserAuthFailed(user)
+		}
+		if err = jwtVerifier.ValidateJWTLogin(execCfg.Settings, user, []byte(token), identMap); err != nil {
+			c.LogAuthFailed(ctx, eventpb.AuthFailReason_CREDENTIALS_INVALID, err)
+			return err
+		}
+		c.LogAuthOK(ctx)
+		return nil
+	})
+	return b, nil
 }

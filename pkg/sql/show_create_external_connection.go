@@ -15,7 +15,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -38,21 +37,18 @@ func loadExternalConnections(
 	var rows []tree.Datums
 
 	if n.ConnectionLabel != nil {
-		externalConnectionName, err := params.p.TypeAsString(params.ctx, n.ConnectionLabel,
-			externalConnectionOp)
-		if err != nil {
-			return nil, err
-		}
-		name, err := externalConnectionName()
+		name, err := params.p.ExprEvaluator(externalConnectionOp).String(
+			params.ctx, n.ConnectionLabel,
+		)
 		if err != nil {
 			return nil, err
 		}
 		rows = append(rows, tree.Datums{tree.NewDString(name)})
 	} else {
-		datums, _, err := params.ExecCfg().InternalExecutor.QueryBufferedExWithCols(
+		datums, _, err := params.p.InternalSQLTxn().QueryBufferedExWithCols(
 			params.ctx,
 			"load-external-connections",
-			params.p.Txn(), sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+			params.p.Txn(), sessiondata.NodeUserSessionDataOverride,
 			"SELECT connection_name FROM system.external_connections")
 		if err != nil {
 			return nil, err
@@ -62,8 +58,9 @@ func loadExternalConnections(
 
 	for _, row := range rows {
 		connectionName := tree.MustBeDString(row[0])
-		connection, err := externalconn.LoadExternalConnection(params.ctx, string(connectionName),
-			params.p.ExecCfg().InternalExecutor, params.p.Txn())
+		connection, err := externalconn.LoadExternalConnection(
+			params.ctx, string(connectionName), params.p.InternalSQLTxn(),
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -83,19 +80,16 @@ func (p *planner) ShowCreateExternalConnection(
 
 	// If the user is not admin, and is running a `SHOW CREATE EXTERNAL CONNECTION foo`
 	// check if the user is the owner of the object.
+	exprEval := p.ExprEvaluator(externalConnectionOp)
 	if !hasPrivileges && n.ConnectionLabel != nil {
-		externalConnectionName, err := p.TypeAsString(ctx, n.ConnectionLabel, externalConnectionOp)
-		if err != nil {
-			return nil, err
-		}
-		name, err := externalConnectionName()
+		name, err := exprEval.String(ctx, n.ConnectionLabel)
 		if err != nil {
 			return nil, err
 		}
 		ecPrivilege := &syntheticprivilege.ExternalConnectionPrivilege{
 			ConnectionName: name,
 		}
-		isOwner, err := IsOwner(ctx, p, ecPrivilege, p.User())
+		isOwner, err := isOwner(ctx, p, ecPrivilege, p.User())
 		if err != nil {
 			return nil, err
 		}

@@ -16,23 +16,23 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.Subsume, declareKeysSubsume, Subsume)
+	RegisterReadWriteCommand(kvpb.Subsume, declareKeysSubsume, Subsume)
 }
 
 func declareKeysSubsume(
 	_ ImmutableRangeState,
-	_ *roachpb.Header,
-	_ roachpb.Request,
+	_ *kvpb.Header,
+	_ kvpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
@@ -73,10 +73,10 @@ func declareKeysSubsume(
 // The period of time after intents have been placed but before the merge
 // transaction is complete is called the merge's "critical phase".
 func Subsume(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.SubsumeRequest)
-	reply := resp.(*roachpb.SubsumeResponse)
+	args := cArgs.Args.(*kvpb.SubsumeRequest)
+	reply := resp.(*kvpb.SubsumeResponse)
 
 	// Verify that the Subsume request was sent to the correct range and that
 	// the range's bounds have not changed during the merge transaction.
@@ -100,17 +100,17 @@ func Subsume(
 	// the maximum timestamp to ensure that we see an intent if one exists,
 	// regardless of what timestamp it is written at.
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
-	_, intent, err := storage.MVCCGet(ctx, readWriter, descKey, hlc.MaxTimestamp,
+	intentRes, err := storage.MVCCGet(ctx, readWriter, descKey, hlc.MaxTimestamp,
 		storage.MVCCGetOptions{Inconsistent: true})
 	if err != nil {
 		return result.Result{}, errors.Wrap(err, "fetching local range descriptor")
-	} else if intent == nil {
+	} else if intentRes.Intent == nil {
 		return result.Result{}, errors.Errorf("range missing intent on its local descriptor")
 	}
-	val, _, err := storage.MVCCGetAsTxn(ctx, readWriter, descKey, intent.Txn.WriteTimestamp, intent.Txn)
+	valRes, err := storage.MVCCGetAsTxn(ctx, readWriter, descKey, intentRes.Intent.Txn.WriteTimestamp, intentRes.Intent.Txn)
 	if err != nil {
 		return result.Result{}, errors.Wrap(err, "fetching local range descriptor as txn")
-	} else if val != nil {
+	} else if valRes.Value != nil {
 		return result.Result{}, errors.Errorf("non-deletion intent on local range descriptor")
 	}
 

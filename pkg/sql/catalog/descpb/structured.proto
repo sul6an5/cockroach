@@ -11,13 +11,15 @@
 // Cannot be proto3 because we use nullable primitives.
 syntax = "proto2";
 package cockroach.sql.sqlbase;
-option go_package = "descpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb";
 
 import "config/zonepb/zone.proto";
 import "util/hlc/timestamp.proto";
+import "sql/catalog/catenumpb/index.proto";
 import "sql/catalog/catpb/catalog.proto";
+import "sql/catalog/catpb/enum.proto";
+import "sql/sem/semenumpb/constraint.proto";
 import "sql/catalog/catpb/privilege.proto";
-import "sql/catalog/catpb/index.proto";
 import "sql/catalog/catpb/function.proto";
 import "sql/schemachanger/scpb/scpb.proto";
 import "sql/types/types.proto";
@@ -47,15 +49,6 @@ enum ConstraintValidity {
 // traditional foreign key references.
 message ForeignKeyReference {
   option (gogoproto.equal) = true;
-
-  // Match is the algorithm used to compare composite keys.
-  enum Match {
-    option (gogoproto.goproto_enum_stringer) = false;
-    SIMPLE = 0;
-    FULL = 1;
-    PARTIAL = 2; // Note: not actually supported, but we reserve the value for future use.
-  }
-
   optional uint32 table = 1 [(gogoproto.nullable) = false, (gogoproto.casttype) = "ID"];
   optional uint32 index = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID"];
   optional string name = 3 [(gogoproto.nullable) = false];
@@ -63,11 +56,11 @@ message ForeignKeyReference {
   // If this FK only uses a prefix of the columns in its index, we record how
   // many to avoid spuriously counting the additional cols as used by this FK.
   optional int32 shared_prefix_len = 5 [(gogoproto.nullable) = false];
-  optional cockroach.sql.catalog.catpb.ForeignKeyAction on_delete = 6 [(gogoproto.nullable) = false];
-  optional cockroach.sql.catalog.catpb.ForeignKeyAction on_update = 7 [(gogoproto.nullable) = false];
+  optional cockroach.sql.sem.semenumpb.ForeignKeyAction on_delete = 6 [(gogoproto.nullable) = false];
+  optional cockroach.sql.sem.semenumpb.ForeignKeyAction on_update = 7 [(gogoproto.nullable) = false];
   // This is only important for composite keys. For all prior matches before
   // the addition of this value, MATCH SIMPLE will be used.
-  optional Match match = 8 [(gogoproto.nullable) = false];
+  optional cockroach.sql.sem.semenumpb.Match match = 8 [(gogoproto.nullable) = false];
 }
 
 // ForeignKeyConstraint is the new (as of 19.2 and VersionTopLevelForeignKeys)
@@ -89,11 +82,11 @@ message ForeignKeyConstraint {
                                           (gogoproto.casttype) = "ID"];
   optional string name = 5 [(gogoproto.nullable) = false];
   optional ConstraintValidity validity = 6 [(gogoproto.nullable) = false];
-  optional cockroach.sql.catalog.catpb.ForeignKeyAction on_delete = 7 [(gogoproto.nullable) = false];
-  optional cockroach.sql.catalog.catpb.ForeignKeyAction on_update = 8 [(gogoproto.nullable) = false];
+  optional cockroach.sql.sem.semenumpb.ForeignKeyAction on_delete = 7 [(gogoproto.nullable) = false];
+  optional cockroach.sql.sem.semenumpb.ForeignKeyAction on_update = 8 [(gogoproto.nullable) = false];
   // This is only important for composite keys. For all prior matches before
   // the addition of this value, MATCH SIMPLE will be used.
-  optional ForeignKeyReference.Match match = 9 [(gogoproto.nullable) = false];
+  optional cockroach.sql.sem.semenumpb.Match match = 9 [(gogoproto.nullable) = false];
 
   // These fields were used for foreign keys until 20.1.
   reserved 10, 11, 12, 13;
@@ -183,6 +176,8 @@ message ColumnDescriptor {
   repeated uint32 uses_sequence_ids = 10 [(gogoproto.casttype) = "ID"];
   // Ids of sequences that the column owns.
   repeated uint32 owns_sequence_ids = 12 [(gogoproto.casttype) = "ID"];
+  // Ids of functions used in the column's DEFAULT and ON UPDATE expressions.
+  repeated uint32 uses_function_ids = 21 [(gogoproto.casttype) = "ID"];
   // Expression to use to compute the value of this column if this is a
   // computed column. Note that it is not correct to use ComputeExpr
   // as output to display to a user. User defined types within ComputeExpr
@@ -209,6 +204,8 @@ message ColumnDescriptor {
   // SystemColumnKind represents what kind of system column this column
   // descriptor represents, if any.
   optional cockroach.sql.catalog.catpb.SystemColumnKind system_column_kind = 15 [(gogoproto.nullable) = false];
+
+  // Next id: 22
 }
 
 // ColumnFamilyDescriptor is set of columns stored together in one kv entry.
@@ -436,8 +433,8 @@ message IndexDescriptor {
   // EncodingType represents what sort of k/v encoding is used to store this descriptor on disk.
   // As of now, this includes the existing secondary index encoding, or the primary index encoding.
   // N.B. This field is only recognized on secondary indexes.
-  optional uint32 encoding_type = 19
-    [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexDescriptorEncodingType"];
+  optional uint32 encoding_type = 19 [(gogoproto.nullable) = false,
+                                      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb.IndexDescriptorEncodingType"];
 
   // Sharded, if it's not the zero value, describes how this index is sharded.
   optional cockroach.sql.catalog.catpb.ShardedDescriptor sharded = 20 [(gogoproto.nullable) = false];
@@ -667,8 +664,8 @@ message DescriptorMutation {
     //
     // When adding a descriptor, all descriptor related data
     // (column default or index data) can only be backfilled once
-    // all nodes have transitioned into the DELETE_AND_WRITE_ONLY state.
-    DELETE_AND_WRITE_ONLY = 2;
+    // all nodes have transitioned into the WRITE_ONLY state.
+    WRITE_ONLY = 2;
 
     // Operations other than non-transactional backfilling must not
     // use this descriptor.
@@ -690,7 +687,7 @@ message DescriptorMutation {
     // this state is a programming error.
     //
     // Index: INSERT, UPDATE and DELETE treat this index like a
-    // DELETE_AND_WRITE_ONLY index, but use Put in instead of CPut or
+    // WRITE_ONLY index, but use Put in instead of CPut or
     // InitPut, effectively ignoring unique constraints.
     MERGING = 4;
 
@@ -900,20 +897,7 @@ message TableDescriptor {
   optional PrivilegeDescriptor privileges = 13;
   // Columns or indexes being added or deleted in a FIFO order.
   repeated DescriptorMutation mutations = 14 [(gogoproto.nullable) = false];
-  // The schema update lease. A single goroutine across a cockroach cluster
-  // can own it, and will execute pending schema changes for this table.
-  // Since the execution of a pending schema change is through transactions,
-  // it is legal for more than one goroutine to attempt to execute it. This
-  // lease reduces write contention on the schema change.
-  message SchemaChangeLease {
-    option (gogoproto.equal) = true;
-    optional uint32 node_id = 1 [(gogoproto.nullable) = false,
-        (gogoproto.customname) = "NodeID",
-        (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
-    // Nanoseconds since the Unix epoch.
-    optional int64 expiration_time = 2 [(gogoproto.nullable) = false];
-  }
-  optional SchemaChangeLease lease = 15 [deprecated = true];
+  reserved  15;
   // An id for the next group of mutations to be applied together.
   optional uint32 next_mutation_id = 16 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "NextMutationID", (gogoproto.casttype) = "MutationID"];
@@ -943,11 +927,12 @@ message TableDescriptor {
     repeated uint32 column_ids = 5 [(gogoproto.customname) = "ColumnIDs",
       (gogoproto.casttype) = "ColumnID"];
     optional bool is_non_null_constraint = 6 [(gogoproto.nullable) = false];
-    // Hidden is set to true for hash-sharded column check constraints.
+    // FromHashShardedColumn is set to true for hash-sharded column check
+    // constraints.
     // Previously, this field was used to hide these constraints in the output
     // of SHOW CREATE TABLE. We no longer them in order to make the output to be
     // round-trippable, but we still set this field for now. See #68031.
-    optional bool hidden = 7 [(gogoproto.nullable) = false];
+    optional bool from_hash_sharded_column = 7 [(gogoproto.nullable) = false];
     // Used within the table descriptor to uniquely identify individual
     // constraints.
     optional uint32 constraint_id = 8 [(gogoproto.customname) = "ConstraintID",
@@ -985,6 +970,11 @@ message TableDescriptor {
   // The IDs of all types that this depends on.
   // Only ever populated if this descriptor is for a view.
   repeated uint32 dependsOnTypes = 45 [(gogoproto.customname) = "DependsOnTypes",
+    (gogoproto.casttype) = "ID"];
+
+  // The IDs of all functions that this depends on.
+  // Only ever populated if this descriptor is for a view.
+  repeated uint32 depends_on_functions = 55 [(gogoproto.customname) = "DependsOnFunctions",
     (gogoproto.casttype) = "ID"];
 
   message Reference {
@@ -1180,11 +1170,24 @@ message TableDescriptor {
   // this table, in which case the global setting is used.
   optional bool forecast_stats = 52 [(gogoproto.nullable) = true, (gogoproto.customname) = "ForecastStats"];
 
+  // HistogramSamples indicates the number of rows to sample when building a
+  // histogram for this table. It is null if unset for this table, in which case
+  // the global setting is used.
+  optional uint32 histogram_samples = 56 [(gogoproto.nullable) = true, (gogoproto.customname) = "HistogramSamples"];
+
+  // HistogramBuckets indicates the number of buckets to build when constructing
+  // a histogram for this table. It is null if unset for this table, in which
+  // case the global setting is used.
+  optional uint32 histogram_buckets = 57 [(gogoproto.nullable) = true, (gogoproto.customname) = "HistogramBuckets"];
+
   // ImportStartWallTime contains the start wall time of an in-progress import.
   // This field is non zero if this table is offline during an import.
   optional int64 import_start_wall_time = 54 [(gogoproto.nullable) = false, (gogoproto.customname) = "ImportStartWallTime"];
 
-  // Next ID: 55
+  // SchemaLocked, if set, disallows schema change to this table.
+  optional bool schema_locked = 58 [(gogoproto.nullable) = false, (gogoproto.customname) = "SchemaLocked"];
+
+  // Next ID: 59
 }
 
 // SurvivalGoal is the survival goal for a database.
@@ -1379,6 +1382,8 @@ message TypeDescriptor {
     // kind of TypeDescriptor is *never* persisted to disk! If you are here,
     // thinking about using or persisting this value, you should *not* do that!
     TABLE_IMPLICIT_RECORD_TYPE = 3;
+    // Represents a user-defined composite type.
+    COMPOSITE = 4;
     // Add more entries as we support more user defined types.
   }
   optional Kind kind = 5 [(gogoproto.nullable) = false];
@@ -1452,7 +1457,30 @@ message TypeDescriptor {
   // descriptor being changed as part of a declarative schema change.
   optional cockroach.sql.schemachanger.scpb.DescriptorState declarative_schema_changer_state = 17;
 
-  // Next field is 18.
+  // Composite describes a composite type, which is just a stored, labeled tuple
+  // type, like a struct in Go.
+  message Composite {
+    option (gogoproto.equal) = true;
+
+    // CompositeElement describes one element of a composite type.
+    message CompositeElement {
+      option (gogoproto.equal) = true;
+
+      // ElementType is the type of this composite element.
+      optional sql.sem.types.T element_type = 1;
+      // ElementLabel is the label of this composite element.
+      optional string element_label = 2 [(gogoproto.nullable) = false];
+    }
+
+    // Elements is a slice of the fields within this composite type, including
+    // the type and the label.
+    repeated CompositeElement elements = 1 [(gogoproto.nullable) = false];
+  }
+
+  // Composite is the list of fields if this is a composite type.
+  optional Composite composite = 18;
+
+  // Next field is 19.
 }
 
 // SchemaDescriptor represents a physical schema and is stored in a structured
@@ -1494,8 +1522,8 @@ message SchemaDescriptor {
   // descriptor being changed as part of a declarative schema change.
   optional cockroach.sql.schemachanger.scpb.DescriptorState declarative_schema_changer_state = 11;
 
-  // FunctionOverload represent a UDF signature and its descriptor ID.
-  message FunctionOverload {
+  // FunctionSignature represent a UDF signature and its descriptor ID.
+  message FunctionSignature {
     option (gogoproto.equal) = true;
 
     optional uint32 id = 1 [(gogoproto.nullable) = false,
@@ -1513,7 +1541,7 @@ message SchemaDescriptor {
   message Function {
     option (gogoproto.equal) = true;
     optional string name = 1 [(gogoproto.nullable) = false];
-    repeated FunctionOverload overloads = 2 [(gogoproto.nullable) = false];
+    repeated FunctionSignature signatures = 2 [(gogoproto.nullable) = false];
   }
 
   // functions contains all UDFs created in this schema.
@@ -1528,9 +1556,9 @@ message FunctionDescriptor {
   // Needed for the descriptorProto interface.
   option (gogoproto.goproto_getters) = true;
 
-  message Argument {
+  message Parameter {
     option (gogoproto.equal) = true;
-    optional cockroach.sql.catalog.catpb.Function.Arg.Class class = 1 [(gogoproto.nullable) = false];
+    optional cockroach.sql.catalog.catpb.Function.Param.Class class = 1 [(gogoproto.nullable) = false];
     optional string name = 2 [(gogoproto.nullable) = false];
     optional sql.sem.types.T type = 3;
     optional string default_expr = 4;
@@ -1569,8 +1597,8 @@ message FunctionDescriptor {
   optional uint32 parent_schema_id = 4 [(gogoproto.nullable) = false,
     (gogoproto.customname) = "ParentSchemaID", (gogoproto.casttype) = "ID"];
 
-  // args represents the list of arguments of the UDF signature.
-  repeated Argument args = 5 [(gogoproto.nullable) = false];
+  // params represents the list of parameters of the UDF signature.
+  repeated Parameter params = 5 [(gogoproto.nullable) = false];
 
   // return_type represents the return type of the UDF signature.
   optional ReturnType return_type = 6 [(gogoproto.nullable) = false];

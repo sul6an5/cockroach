@@ -21,12 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud/userfile/filetable"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/stretchr/testify/require"
@@ -100,14 +101,16 @@ func checkMetadataEntryExists(
 
 func TestListAndDeleteFiles(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, _, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, username.RootUserName())
 	require.NoError(t, err)
@@ -151,14 +154,16 @@ func TestListAndDeleteFiles(t *testing.T) {
 
 func TestReadWriteFile(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, username.RootUserName())
 	require.NoError(t, err)
@@ -324,6 +329,7 @@ func TestReadWriteFile(t *testing.T) {
 // file and payload tables.
 func TestUserGrants(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
@@ -340,8 +346,9 @@ func TestUserGrants(t *testing.T) {
 	require.NoError(t, err)
 
 	// Operate under non-admin user.
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	johnUser := username.MakeSQLUsernameFromPreNormalizedString("john")
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, johnUser)
@@ -402,6 +409,7 @@ func getTableGrantees(ctx context.Context, tablename string, conn *gosql.Conn) (
 // tables once they have been created/written to.
 func TestDifferentUserDisallowed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
@@ -424,8 +432,9 @@ func TestDifferentUserDisallowed(t *testing.T) {
 	require.NoError(t, err)
 
 	// Operate under non-admin user john.
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	johnUser := username.MakeSQLUsernameFromPreNormalizedString("john")
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, johnUser)
@@ -454,6 +463,7 @@ func TestDifferentUserDisallowed(t *testing.T) {
 // access the tables once they have been created/written to.
 func TestDifferentRoleDisallowed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
@@ -482,8 +492,9 @@ func TestDifferentRoleDisallowed(t *testing.T) {
 	require.NoError(t, err)
 
 	// Operate under non-admin user john.
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	johnUser := username.MakeSQLUsernameFromPreNormalizedString("john")
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, johnUser)
@@ -511,14 +522,16 @@ func TestDifferentRoleDisallowed(t *testing.T) {
 // internal queries wrt the database it is given.
 func TestDatabaseScope(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, username.RootUserName())
 	require.NoError(t, err)

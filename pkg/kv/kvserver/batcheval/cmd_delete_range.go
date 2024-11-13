@@ -14,8 +14,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -27,17 +27,17 @@ import (
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.DeleteRange, declareKeysDeleteRange, DeleteRange)
+	RegisterReadWriteCommand(kvpb.DeleteRange, declareKeysDeleteRange, DeleteRange)
 }
 
 func declareKeysDeleteRange(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
-	req roachpb.Request,
+	header *kvpb.Header,
+	req kvpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 	maxOffset time.Duration,
 ) {
-	args := req.(*roachpb.DeleteRangeRequest)
+	args := req.(*kvpb.DeleteRangeRequest)
 	if args.Inline {
 		DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
 	} else {
@@ -82,13 +82,13 @@ const maxDeleteRangeBatchBytes = 32 << 20
 // DeleteRange deletes the range of key/value pairs specified by
 // start and end keys.
 func DeleteRange(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.DeleteRangeRequest)
+	args := cArgs.Args.(*kvpb.DeleteRangeRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.DeleteRangeResponse)
+	reply := resp.(*kvpb.DeleteRangeResponse)
 
-	if args.Predicates != (roachpb.DeleteRangePredicates{}) && !args.UseRangeTombstone {
+	if args.Predicates != (kvpb.DeleteRangePredicates{}) && !args.UseRangeTombstone {
 		// This ensures predicate based DeleteRange piggybacks on the version gate,
 		// roachpb api flags, and latch declarations used by the UseRangeTombstone.
 		return result.Result{}, errors.AssertionFailedf(
@@ -136,9 +136,7 @@ func DeleteRange(
 			if !hint.ForwardLatestRangeDeleteTimestamp(h.Timestamp) {
 				return nil
 			}
-			canUseGCHint := cArgs.EvalCtx.ClusterSettings().Version.IsActive(ctx,
-				clusterversion.GCHintInReplicaState)
-			if updated, err := sl.SetGCHint(ctx, readWriter, cArgs.Stats, hint, canUseGCHint); err != nil || !updated {
+			if updated, err := sl.SetGCHint(ctx, readWriter, cArgs.Stats, hint); err != nil || !updated {
 				return err
 			}
 			res.Replicated.State = &kvserverpb.ReplicaState{
@@ -154,7 +152,7 @@ func DeleteRange(
 		// If no predicate parameters are passed, use the fast path. If we're
 		// deleting the entire Raft range, use an even faster path that avoids a
 		// point key scan to update MVCC stats.
-		if args.Predicates == (roachpb.DeleteRangePredicates{}) {
+		if args.Predicates == (kvpb.DeleteRangePredicates{}) {
 			var statsCovered *enginepb.MVCCStats
 			if args.Key.Equal(desc.StartKey.AsRawKey()) && args.EndKey.Equal(desc.EndKey.AsRawKey()) {
 				// NB: We take the fast path even if stats are estimates, because the
@@ -198,7 +196,7 @@ func DeleteRange(
 
 		if resumeSpan != nil {
 			reply.ResumeSpan = resumeSpan
-			reply.ResumeReason = roachpb.RESUME_KEY_LIMIT
+			reply.ResumeReason = kvpb.RESUME_KEY_LIMIT
 
 			// Note: While MVCCPredicateDeleteRange _could_ return reply.NumKeys, as
 			// the number of keys iterated through, doing so could lead to a
@@ -233,7 +231,7 @@ func DeleteRange(
 	reply.NumKeys = num
 	if resumeSpan != nil {
 		reply.ResumeSpan = resumeSpan
-		reply.ResumeReason = roachpb.RESUME_KEY_LIMIT
+		reply.ResumeReason = kvpb.RESUME_KEY_LIMIT
 	}
 
 	// If requested, replace point tombstones with range tombstones.

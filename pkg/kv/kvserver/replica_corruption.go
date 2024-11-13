@@ -15,7 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -38,8 +38,8 @@ import (
 // @bdarnell remarks: Corruption errors should be rare so we may want the store
 // to just recompute its stats in the background when one occurs.
 func (r *Replica) setCorruptRaftMuLocked(
-	ctx context.Context, cErr *roachpb.ReplicaCorruptionError,
-) *roachpb.Error {
+	ctx context.Context, cErr *kvpb.ReplicaCorruptionError,
+) *kvpb.Error {
 	r.readOnlyCmdMu.Lock()
 	defer r.readOnlyCmdMu.Unlock()
 	r.mu.Lock()
@@ -49,8 +49,8 @@ func (r *Replica) setCorruptRaftMuLocked(
 	cErr.Processed = true
 	r.mu.destroyStatus.Set(cErr, destroyReasonRemoved)
 
-	auxDir := r.store.engine.GetAuxiliaryDir()
-	_ = r.store.engine.MkdirAll(auxDir)
+	auxDir := r.store.TODOEngine().GetAuxiliaryDir()
+	_ = r.store.TODOEngine().MkdirAll(auxDir)
 	path := base.PreventedStartupFile(auxDir)
 
 	preventStartupMsg := fmt.Sprintf(`ATTENTION:
@@ -63,10 +63,10 @@ A file preventing this node from restarting was placed at:
 %s
 `, r, path)
 
-	if err := fs.WriteFile(r.store.engine, path, []byte(preventStartupMsg)); err != nil {
+	if err := fs.WriteFile(r.store.TODOEngine(), path, []byte(preventStartupMsg)); err != nil {
 		log.Warningf(ctx, "%v", err)
 	}
 
 	log.FatalfDepth(ctx, 1, "replica is corrupted: %s", cErr)
-	return roachpb.NewError(cErr)
+	return kvpb.NewError(cErr)
 }

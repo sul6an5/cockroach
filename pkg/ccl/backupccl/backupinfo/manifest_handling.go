@@ -10,7 +10,6 @@ package backupinfo
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,18 +27,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -51,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	gzip "github.com/klauspost/compress/gzip"
 )
 
 // Files that may appear in a backup directory.
@@ -88,6 +95,17 @@ var WriteMetadataSST = settings.RegisterBoolSetting(
 	"kv.bulkio.write_metadata_sst.enabled",
 	"write experimental new format BACKUP metadata file",
 	util.ConstantWithMetamorphicTestBool("write-metadata-sst", false),
+)
+
+// WriteMetadataWithExternalSSTsEnabled controls if we write a `BACKUP_METADATA`
+// file along with external SSTs containing lists of `BackupManifest_Files` and
+// descriptors. This new format of metadata is written in addition to the
+// `BACKUP_MANIFEST` file, and is expected to be its replacement in the future.
+var WriteMetadataWithExternalSSTsEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"backup.write_metadata_with_external_ssts.enabled",
+	"write BACKUP metadata along with supporting SST files",
+	util.ConstantWithMetamorphicTestBool("backup.write_metadata_with_external_ssts.enabled", true),
 )
 
 // IsGZipped detects whether the given bytes represent GZipped data. This check
@@ -148,21 +166,54 @@ func ReadBackupManifestFromStore(
 ) (backuppb.BackupManifest, int64, error) {
 	ctx, sp := tracing.ChildSpan(ctx, "backupinfo.ReadBackupManifestFromStore")
 	defer sp.Finish()
-	backupManifest, memSize, err := ReadBackupManifest(ctx, mem, exportStore, backupbase.BackupManifestName,
+
+	manifest, memSize, err := ReadBackupManifest(ctx, mem, exportStore, backupbase.BackupMetadataName,
 		encryption, kmsEnv)
 	if err != nil {
-		oldManifest, newMemSize, newErr := ReadBackupManifest(ctx, mem, exportStore, backupbase.BackupOldManifestName,
-			encryption, kmsEnv)
-		if newErr != nil {
+		if !errors.Is(err, cloud.ErrFileDoesNotExist) {
 			return backuppb.BackupManifest{}, 0, err
 		}
-		backupManifest = oldManifest
-		memSize = newMemSize
+
+		// If we did not find `BACKUP_METADATA` we look for the
+		// `BACKUP_MANIFEST` file as it is possible the backup was created by a
+		// pre-23.1 node.
+		log.VInfof(ctx, 2, "could not find BACKUP_METADATA, falling back to BACKUP_MANIFEST")
+		backupManifest, backupManifestMemSize, backupManifestErr := ReadBackupManifest(ctx, mem, exportStore,
+			backupbase.BackupManifestName, encryption, kmsEnv)
+		if backupManifestErr != nil {
+			if !errors.Is(backupManifestErr, cloud.ErrFileDoesNotExist) {
+				return backuppb.BackupManifest{}, 0, backupManifestErr
+			}
+
+			// If we did not find a `BACKUP_MANIFEST` we look for a `BACKUP` file as
+			// it is possible the backup was created by a pre-20.1 node.
+			//
+			// TODO(adityamaru): Remove this logic once we disallow restores beyond
+			// the binary upgrade compatibility window.
+			log.VInfof(ctx, 2, "could not find BACKUP_MANIFEST, falling back to BACKUP")
+			oldBackupManifest, oldBackupManifestMemSize, oldBackupManifestErr := ReadBackupManifest(ctx, mem, exportStore,
+				backupbase.BackupOldManifestName, encryption, kmsEnv)
+			if oldBackupManifestErr != nil {
+				if errors.Is(oldBackupManifestErr, cloud.ErrFileDoesNotExist) {
+					log.VInfof(ctx, 2, "could not find any of the supported backup metadata files")
+					return backuppb.BackupManifest{}, 0,
+						errors.Wrapf(oldBackupManifestErr, "could not find BACKUP manifest file in any of the known locations: %s, %s, %s",
+							backupbase.BackupMetadataName, backupbase.BackupManifestName, backupbase.BackupOldManifestName)
+				}
+				return backuppb.BackupManifest{}, 0, oldBackupManifestErr
+			} else {
+				// We found a `BACKUP` manifest file.
+				manifest = oldBackupManifest
+				memSize = oldBackupManifestMemSize
+			}
+		} else {
+			// We found a `BACKUP_MANIFEST` file.
+			manifest = backupManifest
+			memSize = backupManifestMemSize
+		}
 	}
-	backupManifest.Dir = exportStore.Conf()
-	// TODO(dan): Sanity check this BackupManifest: non-empty EndTime, non-empty
-	// Paths, and non-overlapping Spans and keyranges in Files.
-	return backupManifest, memSize, nil
+	manifest.Dir = exportStore.Conf()
+	return manifest, memSize, nil
 }
 
 // compressData compresses data buffer and returns compressed
@@ -185,7 +236,10 @@ func DecompressData(ctx context.Context, mem *mon.BoundAccount, descBytes []byte
 	if err != nil {
 		return nil, err
 	}
-	defer r.Close()
+	defer func() {
+		// Swallow any errors, this is only a read operation.
+		_ = r.Close()
+	}()
 	return mon.ReadAll(ctx, ioctx.ReaderAdapter(r), mem)
 }
 
@@ -521,6 +575,78 @@ func WriteBackupLock(
 	return cloud.WriteFile(ctx, defaultStore, lockFileName, bytes.NewReader([]byte("lock")))
 }
 
+// WriteMetadataWithExternalSSTs writes a "slim" version of manifest to
+// `exportStore`. This version has the alloc heavy `Files`, `Descriptors`, and
+// `DescriptorChanges` repeated fields nil'ed out, and written to an
+// accompanying SST instead.
+func WriteMetadataWithExternalSSTs(
+	ctx context.Context,
+	exportStore cloud.ExternalStorage,
+	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
+	manifest *backuppb.BackupManifest,
+) error {
+	if err := WriteFilesListSST(ctx, exportStore, encryption, kmsEnv, manifest,
+		BackupMetadataFilesListPath); err != nil {
+		return errors.Wrap(err, "failed to write backup metadata Files SST")
+	}
+
+	if err := WriteDescsSST(ctx, manifest, exportStore, encryption, kmsEnv, BackupMetadataDescriptorsListPath); err != nil {
+		return errors.Wrap(err, "failed to write backup metadata descriptors SST")
+	}
+
+	return errors.Wrap(writeExternalSSTsMetadata(ctx, exportStore, backupbase.BackupMetadataName, encryption,
+		kmsEnv, manifest), "failed to write the backup metadata with external Files list")
+}
+
+// writeExternalSSTsMetadata compresses and writes a slimmer version of the
+// BackupManifest `desc` to `exportStore` with the `Files`, `Descriptors`, and
+// `DescriptorChanges` fields of the proto set to bogus values that will error
+// out on incorrect use.
+func writeExternalSSTsMetadata(
+	ctx context.Context,
+	exportStore cloud.ExternalStorage,
+	filename string,
+	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
+	manifest *backuppb.BackupManifest,
+) error {
+	slimManifest := *manifest
+	// We write a bogus file entry to ensure that no call site incorrectly uses
+	// the `Files` field from the FilesListMetadata proto.
+	bogusFile := backuppb.BackupManifest_File{
+		Span: roachpb.Span{Key: keys.MinKey, EndKey: keys.MaxKey},
+		Path: "assertion: this placeholder legacy Files entry should never be opened",
+	}
+	slimManifest.Files = []backuppb.BackupManifest_File{bogusFile}
+
+	// We write a bogus descriptor to Descriptors and DescriptorChanges with max
+	// timestamp as the modification time so RunPostDeserializationChanges()
+	// always fails on restore.
+	bogusTableID := descpb.ID(1)
+	bogusTableDesc := descpb.Descriptor{
+		Union: &descpb.Descriptor_Table{
+			Table: &descpb.TableDescriptor{
+				ID:               bogusTableID,
+				Name:             "assertion: this placeholder legacy Descriptor entry should never be used",
+				Version:          1,
+				ModificationTime: hlc.MaxTimestamp,
+			},
+		},
+	}
+	slimManifest.Descriptors = []descpb.Descriptor{bogusTableDesc}
+
+	bogusDescRev := backuppb.BackupManifest_DescriptorRevision{
+		ID:   bogusTableID,
+		Time: hlc.MaxTimestamp,
+		Desc: &bogusTableDesc,
+	}
+	slimManifest.DescriptorChanges = []backuppb.BackupManifest_DescriptorRevision{bogusDescRev}
+
+	slimManifest.HasExternalManifestSSTs = true
+	return WriteBackupManifest(ctx, exportStore, filename, encryption, kmsEnv, &slimManifest)
+}
+
 // WriteBackupManifest compresses and writes the passed in BackupManifest `desc`
 // to `exportStore`.
 func WriteBackupManifest(
@@ -652,12 +778,12 @@ func WriteTableStatistics(
 	return cloud.WriteFile(ctx, exportStore, BackupStatisticsFileName, bytes.NewReader(statsBuf))
 }
 
-// LoadBackupManifests reads and returns the BackupManifests at the
-// ExternalStorage locations in `uris`.
+// LoadBackupManifestsAtTime reads and returns the BackupManifests at the
+// ExternalStorage locations in `uris`. Only manifests with a startTime < AsOf are returned.
 //
 // The caller is responsible for shrinking `mem` by the returned size once they
 // are done with the returned manifests.
-func LoadBackupManifests(
+func LoadBackupManifestsAtTime(
 	ctx context.Context,
 	mem *mon.BoundAccount,
 	uris []string,
@@ -665,6 +791,7 @@ func LoadBackupManifests(
 	makeExternalStorageFromURI cloud.ExternalStorageFromURIFactory,
 	encryption *jobspb.BackupEncryptionOptions,
 	kmsEnv cloud.KMSEnv,
+	asOf hlc.Timestamp,
 ) ([]backuppb.BackupManifest, int64, error) {
 	ctx, sp := tracing.ChildSpan(ctx, "backupinfo.LoadBackupManifests")
 	defer sp.Finish()
@@ -681,6 +808,9 @@ func LoadBackupManifests(
 			encryption, kmsEnv)
 		if err != nil {
 			return nil, 0, errors.Wrapf(err, "failed to read backup descriptor")
+		}
+		if !asOf.IsEmpty() && asOf.Less(desc.StartTime) {
+			break
 		}
 		reserved += memSize
 		backupManifests[i] = desc
@@ -841,21 +971,24 @@ func GetBackupIndexAtTime(
 
 // LoadSQLDescsFromBackupsAtTime returns the Descriptors found in the last
 // (latest) backup with a StartTime >= asOf.
+//
+// TODO(rui): note that materializing all descriptors doesn't scale with cluster
+// size. We temporarily materialize all descriptors here to limit the scope of
+// changes required to use BackupManifest with iterating repeated fields in
+// restore.
 func LoadSQLDescsFromBackupsAtTime(
-	backupManifests []backuppb.BackupManifest, asOf hlc.Timestamp,
-) ([]catalog.Descriptor, backuppb.BackupManifest) {
+	ctx context.Context,
+	backupManifests []backuppb.BackupManifest,
+	layerToBackupManifestFileIterFactory LayerToBackupManifestFileIterFactory,
+	asOf hlc.Timestamp,
+) ([]catalog.Descriptor, backuppb.BackupManifest, error) {
 	lastBackupManifest := backupManifests[len(backupManifests)-1]
+	lastIterFactory := layerToBackupManifestFileIterFactory[len(backupManifests)-1]
 
-	unwrapDescriptors := func(raw []descpb.Descriptor) []catalog.Descriptor {
-		ret := make([]catalog.Descriptor, 0, len(raw))
-		for i := range raw {
-			ret = append(ret, descbuilder.NewBuilder(&raw[i]).BuildExistingMutable())
-		}
-		return ret
-	}
 	if asOf.IsEmpty() {
 		if lastBackupManifest.DescriptorCoverage != tree.AllDescriptors {
-			return unwrapDescriptors(lastBackupManifest.Descriptors), lastBackupManifest
+			descs, err := BackupManifestDescriptors(ctx, lastIterFactory, lastBackupManifest.EndTime)
+			return descs, lastBackupManifest, err
 		}
 
 		// Cluster backups with revision history may have included previous database
@@ -871,27 +1004,69 @@ func LoadSQLDescsFromBackupsAtTime(
 		}
 		lastBackupManifest = b
 	}
-	if len(lastBackupManifest.DescriptorChanges) == 0 {
-		return unwrapDescriptors(lastBackupManifest.Descriptors), lastBackupManifest
+
+	// From this point on we try to load descriptors based on descriptor
+	// revisions. The algorithm below assumes that descriptor revisions are sorted
+	// by DescChangesLess, which is a sort by descriptor ID, then descending by
+	// revision time for revisions with the same ID. The external SST for
+	// descriptors already have entries sorted in this order, we just have to make
+	// sure the in-memory descriptors in the manifest are ordered as well.
+	sort.Slice(lastBackupManifest.DescriptorChanges, func(i, j int) bool {
+		return DescChangesLess(&lastBackupManifest.DescriptorChanges[i], &lastBackupManifest.DescriptorChanges[j])
+	})
+
+	descRevIt := lastIterFactory.NewDescriptorChangesIter(ctx)
+	defer descRevIt.Close()
+	if ok, err := descRevIt.Valid(); err != nil {
+		return nil, backuppb.BackupManifest{}, err
+	} else if !ok {
+		descs, err := BackupManifestDescriptors(ctx, lastIterFactory, lastBackupManifest.EndTime)
+		if err != nil {
+			return nil, backuppb.BackupManifest{}, err
+		}
+		return descs, lastBackupManifest, nil
 	}
 
-	byID := make(map[descpb.ID]*descpb.Descriptor, len(lastBackupManifest.Descriptors))
-	for _, rev := range lastBackupManifest.DescriptorChanges {
-		if asOf.Less(rev.Time) {
+	byID := make(map[descpb.ID]catalog.DescriptorBuilder, 0)
+	prevRevID := descpb.InvalidID
+	for ; ; descRevIt.Next() {
+		if ok, err := descRevIt.Valid(); err != nil {
+			return nil, backuppb.BackupManifest{}, err
+		} else if !ok {
 			break
 		}
-		if rev.Desc == nil {
-			delete(byID, rev.ID)
-		} else {
-			byID[rev.ID] = rev.Desc
+
+		rev := descRevIt.Value()
+		if asOf.Less(rev.Time) {
+			continue
 		}
+
+		// At this point descriptor revisions are sorted by DescChangesLess, which
+		// is a sort by descriptor ID, then descending by revision time for
+		// revisions with the same ID. If we've already seen a revision for this
+		// descriptor ID that's not greater than asOf, then we can skip the rest of
+		// the revisions for the ID.
+		if rev.ID == prevRevID {
+			continue
+		}
+
+		if rev.Desc != nil {
+			byID[rev.ID] = newDescriptorBuilder(rev.Desc, rev.Time)
+		}
+		prevRevID = rev.ID
 	}
 
 	allDescs := make([]catalog.Descriptor, 0, len(byID))
-	for _, raw := range byID {
+	for _, b := range byID {
+		if b == nil {
+			continue
+		}
 		// A revision may have been captured before it was in a DB that is
 		// backed up -- if the DB is missing, filter the object.
-		desc := descbuilder.NewBuilder(raw).BuildExistingMutable()
+		if err := b.RunPostDeserializationChanges(); err != nil {
+			return nil, backuppb.BackupManifest{}, err
+		}
+		desc := b.BuildCreatedMutable()
 		var isObject bool
 		switch d := desc.(type) {
 		case catalog.TableDescriptor:
@@ -908,7 +1083,7 @@ func LoadSQLDescsFromBackupsAtTime(
 		}
 		allDescs = append(allDescs, desc)
 	}
-	return allDescs, lastBackupManifest
+	return allDescs, lastBackupManifest, nil
 }
 
 // SanitizeLocalityKV returns a sanitized version of the input string where all
@@ -1008,7 +1183,7 @@ func CheckForPreviousBackup(
 
 	// Check for the presence of a BACKUP-LOCK file with a job ID different from
 	// that of our job.
-	if err := defaultStore.List(ctx, "", "", func(s string) error {
+	if err := defaultStore.List(ctx, "", backupbase.ListingDelimDataSlash, func(s string) error {
 		s = strings.TrimPrefix(s, "/")
 		if strings.HasPrefix(s, BackupLockFilePrefix) {
 			jobIDSuffix := strings.TrimPrefix(s, BackupLockFilePrefix)
@@ -1057,6 +1232,74 @@ func CheckForPreviousBackup(
 // TempCheckpointFileNameForJob returns temporary filename for backup manifest checkpoint.
 func TempCheckpointFileNameForJob(jobID jobspb.JobID) string {
 	return fmt.Sprintf("%s-%d", BackupManifestCheckpointName, jobID)
+}
+
+// BackupManifestDescriptors returns the descriptors encoded in the manifest as
+// a slice of mutable descriptors.
+func BackupManifestDescriptors(
+	ctx context.Context, iterFactory *IterFactory, endTime hlc.Timestamp,
+) ([]catalog.Descriptor, error) {
+	descIt := iterFactory.NewDescIter(ctx)
+	defer descIt.Close()
+
+	ret := make([]catalog.Descriptor, 0)
+	for ; ; descIt.Next() {
+		if ok, err := descIt.Valid(); err != nil {
+			return nil, err
+		} else if !ok {
+			break
+		}
+
+		b := newDescriptorBuilder(descIt.Value(), endTime)
+		if b == nil {
+			continue
+		}
+		if err := b.RunPostDeserializationChanges(); err != nil {
+			return nil, err
+		}
+		ret = append(ret, b.BuildCreatedMutable())
+	}
+	return ret, nil
+}
+
+// NewDescriptorForManifest returns a descriptor instance for a protobuf
+// to be added to a backup manifest or in a backup job.
+// In these cases, we know that the ModificationTime field has already correctly
+// been set in the descriptor protobuf, because this descriptor has been read
+// from storage and therefore has been updated using the MVCC timestamp.
+func NewDescriptorForManifest(descProto *descpb.Descriptor) catalog.Descriptor {
+	b := newDescriptorBuilder(descProto, hlc.Timestamp{})
+	if b == nil {
+		return nil
+	}
+	// No need to call RunPostDeserializationChanges, because the descriptor has
+	// been read from storage and therefore this has been called already.
+	//
+	// Return a mutable descriptor because that's what the call sites assume.
+	// TODO(postamar): revisit that assumption.
+	return b.BuildCreatedMutable()
+}
+
+// newDescriptorBuilder constructs a catalog.DescriptorBuilder instance
+// initialized using the descriptor protobuf message and a fake MVCC timestamp
+// for the purpose of setting the descriptor's ModificationTime field to a
+// valid value if it's still unset.
+func newDescriptorBuilder(
+	descProto *descpb.Descriptor, fakeMVCCTimestamp hlc.Timestamp,
+) catalog.DescriptorBuilder {
+	tbl, db, typ, sc, f := descpb.GetDescriptors(descProto)
+	if tbl != nil {
+		return tabledesc.NewBuilderWithMVCCTimestamp(tbl, fakeMVCCTimestamp)
+	} else if db != nil {
+		return dbdesc.NewBuilderWithMVCCTimestamp(db, fakeMVCCTimestamp)
+	} else if typ != nil {
+		return typedesc.NewBuilderWithMVCCTimestamp(typ, fakeMVCCTimestamp)
+	} else if sc != nil {
+		return schemadesc.NewBuilderWithMVCCTimestamp(sc, fakeMVCCTimestamp)
+	} else if f != nil {
+		return funcdesc.NewBuilderWithMVCCTimestamp(f, fakeMVCCTimestamp)
+	}
+	return nil
 }
 
 // WriteBackupManifestCheckpoint writes a new BACKUP-CHECKPOINT MANIFEST and
@@ -1226,43 +1469,11 @@ func NewTimestampedCheckpointFileName() string {
 	return fmt.Sprintf("%s-%s", BackupManifestCheckpointName, hex.EncodeToString(buffer))
 }
 
-// FetchPreviousBackups takes a list of URIs of previous backups and returns
-// their manifest as well as the encryption options of the first backup in the
-// chain.
-func FetchPreviousBackups(
-	ctx context.Context,
-	mem *mon.BoundAccount,
-	user username.SQLUsername,
-	makeCloudStorage cloud.ExternalStorageFromURIFactory,
-	prevBackupURIs []string,
-	encryptionParams jobspb.BackupEncryptionOptions,
-	kmsEnv cloud.KMSEnv,
-) ([]backuppb.BackupManifest, *jobspb.BackupEncryptionOptions, int64, error) {
-	ctx, sp := tracing.ChildSpan(ctx, "backupinfo.FetchPreviousBackups")
-	defer sp.Finish()
-
-	if len(prevBackupURIs) == 0 {
-		return nil, nil, 0, nil
-	}
-
-	baseBackup := prevBackupURIs[0]
-	encryptionOptions, err := backupencryption.GetEncryptionFromBase(ctx, user, makeCloudStorage, baseBackup,
-		encryptionParams, kmsEnv)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	prevBackups, size, err := getBackupManifests(ctx, mem, user, makeCloudStorage, prevBackupURIs,
-		encryptionOptions, kmsEnv)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-
-	return prevBackups, encryptionOptions, size, nil
-}
-
-// getBackupManifests fetches the backup manifest from a list of backup URIs.
-// The manifests are loaded from External Storage in parallel.
-func getBackupManifests(
+// GetBackupManifests fetches the backup manifest from a list of backup URIs.
+// The caller is expected to pass in the fully hydrated encryptionParams
+// required to read the manifests. The manifests are loaded from External
+// Storage in parallel.
+func GetBackupManifests(
 	ctx context.Context,
 	mem *mon.BoundAccount,
 	user username.SQLUsername,
@@ -1271,6 +1482,9 @@ func getBackupManifests(
 	encryption *jobspb.BackupEncryptionOptions,
 	kmsEnv cloud.KMSEnv,
 ) ([]backuppb.BackupManifest, int64, error) {
+	ctx, sp := tracing.ChildSpan(ctx, "backupinfo.GetBackupManifests")
+	defer sp.Finish()
+
 	manifests := make([]backuppb.BackupManifest, len(backupURIs))
 	if len(backupURIs) == 0 {
 		return manifests, 0, nil
@@ -1327,4 +1541,141 @@ func getBackupManifests(
 	}
 
 	return manifests, memMu.total, nil
+}
+
+// MakeBackupCodec returns the codec that was used to encode the keys in the backup.
+func MakeBackupCodec(manifest backuppb.BackupManifest) (keys.SQLCodec, error) {
+	backupCodec := keys.SystemSQLCodec
+	if len(manifest.Spans) != 0 && !manifest.HasTenants() {
+		// If there are no tenant targets, then the entire keyspace covered by
+		// Spans must lie in 1 tenant.
+		_, backupTenantID, err := keys.DecodeTenantPrefix(manifest.Spans[0].Key)
+		if err != nil {
+			return backupCodec, err
+		}
+		backupCodec = keys.MakeSQLCodec(backupTenantID)
+	}
+	return backupCodec, nil
+}
+
+// IterFactory has provides factory methods to construct iterators that iterate
+// over the `BackupManifest_Files`, `Descriptors`, and
+// `BackupManifest_DescriptorRevision` in a `BackupManifest`. It is the callers
+// responsibility to close the returned iterators.
+type IterFactory struct {
+	m                 *backuppb.BackupManifest
+	store             cloud.ExternalStorage
+	fileSSTPath       string
+	descriptorSSTPath string
+	encryption        *jobspb.BackupEncryptionOptions
+	kmsEnv            cloud.KMSEnv
+}
+
+// NewIterFactory constructs a new IterFactory for a BackupManifest.
+func NewIterFactory(
+	m *backuppb.BackupManifest,
+	store cloud.ExternalStorage,
+	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
+) *IterFactory {
+	return &IterFactory{
+		m:                 m,
+		store:             store,
+		fileSSTPath:       BackupMetadataFilesListPath,
+		descriptorSSTPath: BackupMetadataDescriptorsListPath,
+		encryption:        encryption,
+		kmsEnv:            kmsEnv,
+	}
+}
+
+// LayerToBackupManifestFileIterFactory is the mapping from the idx of the
+// backup layer to an IterFactory.
+type LayerToBackupManifestFileIterFactory map[int]*IterFactory
+
+// NewFileIter creates a new Iterator over BackupManifest_Files. It is assumed
+// that the BackupManifest_File are sorted by FileCmp.
+func (f *IterFactory) NewFileIter(
+	ctx context.Context,
+) (bulk.Iterator[*backuppb.BackupManifest_File], error) {
+	if f.m.HasExternalManifestSSTs {
+		storeFile := storageccl.StoreFile{
+			Store:    f.store,
+			FilePath: f.fileSSTPath,
+		}
+		var encOpts *kvpb.FileEncryptionOptions
+		if f.encryption != nil {
+			key, err := backupencryption.GetEncryptionKey(ctx, f.encryption, f.kmsEnv)
+			if err != nil {
+				return nil, err
+			}
+			encOpts = &kvpb.FileEncryptionOptions{Key: key}
+		}
+		return NewFileSSTIter(ctx, storeFile, encOpts)
+	}
+
+	return newSlicePointerIterator(f.m.Files), nil
+}
+
+// NewDescIter creates a new Iterator over Descriptors.
+func (f *IterFactory) NewDescIter(ctx context.Context) bulk.Iterator[*descpb.Descriptor] {
+	if f.m.HasExternalManifestSSTs {
+		backing := makeBytesIter(ctx, f.store, f.descriptorSSTPath, []byte(sstDescsPrefix), f.encryption, true, f.kmsEnv)
+		it := DescIterator{
+			backing: backing,
+		}
+		it.Next()
+		return &it
+	}
+
+	return newSlicePointerIterator(f.m.Descriptors)
+}
+
+// NewDescriptorChangesIter creates a new Iterator over
+// BackupManifest_DescriptorRevisions. It is assumed that descriptor changes are
+// sorted by DescChangesLess.
+func (f *IterFactory) NewDescriptorChangesIter(
+	ctx context.Context,
+) bulk.Iterator[*backuppb.BackupManifest_DescriptorRevision] {
+	if f.m.HasExternalManifestSSTs {
+		if f.m.MVCCFilter == backuppb.MVCCFilter_Latest {
+			// If the manifest is backuppb.MVCCFilter_Latest, then return an empty
+			// iterator for descriptor changes.
+			var backing []backuppb.BackupManifest_DescriptorRevision
+			return newSlicePointerIterator(backing)
+		}
+
+		backing := makeBytesIter(ctx, f.store, f.descriptorSSTPath, []byte(sstDescsPrefix), f.encryption,
+			false, f.kmsEnv)
+		dri := DescriptorRevisionIterator{
+			backing: backing,
+		}
+
+		dri.Next()
+		return &dri
+	}
+
+	return newSlicePointerIterator(f.m.DescriptorChanges)
+}
+
+// GetBackupManifestIterFactories constructs a mapping from the idx of the
+// backup layer to an IterFactory.
+func GetBackupManifestIterFactories(
+	ctx context.Context,
+	storeFactory cloud.ExternalStorageFactory,
+	backupManifests []backuppb.BackupManifest,
+	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
+) (map[int]*IterFactory, error) {
+	layerToFileIterFactory := make(map[int]*IterFactory)
+	for layer := range backupManifests {
+		es, err := storeFactory(ctx, backupManifests[layer].Dir)
+		if err != nil {
+			return nil, err
+		}
+
+		f := NewIterFactory(&backupManifests[layer], es, encryption, kmsEnv)
+		layerToFileIterFactory[layer] = f
+	}
+
+	return layerToFileIterFactory, nil
 }

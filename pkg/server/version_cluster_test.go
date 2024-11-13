@@ -17,19 +17,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
-	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -193,11 +194,8 @@ func TestClusterVersionPersistedOnJoin(t *testing.T) {
 
 	for i := 0; i < len(tc.TestCluster.Servers); i++ {
 		for _, engine := range tc.TestCluster.Servers[i].Engines() {
-			cv, err := kvserver.ReadClusterVersion(ctx, engine)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cv.Version != newVersion {
+			cv := engine.MinVersion()
+			if cv != newVersion {
 				t.Fatalf("n%d: expected version %v, got %v", i+1, newVersion, cv)
 			}
 		}
@@ -207,6 +205,9 @@ func TestClusterVersionPersistedOnJoin(t *testing.T) {
 func TestClusterVersionUpgrade(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderShort(t, "test takes minutes")
+	skip.UnderRace(t, "takes >5mn under race")
 
 	ctx := context.Background()
 
@@ -251,7 +252,7 @@ func TestClusterVersionUpgrade(t *testing.T) {
 	// Check the cluster version is still oldVersion.
 	curVersion := tc.getVersionFromSelect(0)
 	if curVersion != oldVersion.String() {
-		t.Fatalf("cluster version should still be %s, but get %s", oldVersion, curVersion)
+		t.Fatalf("cluster version should still be %s, but got %s", oldVersion, curVersion)
 	}
 
 	// Reset cluster.preserve_downgrade_option to enable auto upgrade.
@@ -260,16 +261,16 @@ func TestClusterVersionUpgrade(t *testing.T) {
 	}
 
 	// Check the cluster version is bumped to newVersion.
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		if version := tc.getVersionFromSelect(0); version != newVersion.String() {
-			return errors.Errorf("cluster version is still %s, should be %s", oldVersion, newVersion)
+			return errors.Errorf("cluster version is still %s, should be %s", version, newVersion)
 		}
 		return nil
-	})
+	}, 3*time.Minute)
 	curVersion = tc.getVersionFromSelect(0)
 	isNoopUpdate := curVersion == newVersion.String()
 
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		for i := 0; i < tc.NumServers(); i++ {
 			st := tc.Servers[i].ClusterSettings()
 			v := st.Version.ActiveVersion(ctx)
@@ -283,14 +284,14 @@ func TestClusterVersionUpgrade(t *testing.T) {
 			}
 		}
 		return nil
-	})
+	}, 3*time.Minute)
 
 	exp := newVersion.String()
 
 	// Read the versions from the table from each node. Note that under the
 	// hood, everything goes to the lease holder and so it's pretty much
 	// guaranteed that they all read the same, but it doesn't hurt to check.
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		for i := 0; i < tc.NumServers(); i++ {
 			if version := tc.getVersionFromSelect(i); version != exp {
 				return errors.Errorf("%d: incorrect version %q (wanted %s)", i, version, exp)
@@ -300,13 +301,13 @@ func TestClusterVersionUpgrade(t *testing.T) {
 			}
 		}
 		return nil
-	})
+	}, 3*time.Minute)
 
 	// Now check the Settings.Version variable. That is the tricky one for which
 	// we "hold back" a gossip update until we've written to the engines. We may
 	// have to wait a bit until we see the new version here, even though it's
 	// already in the table.
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		for i := 0; i < tc.NumServers(); i++ {
 			vers := tc.Servers[i].ClusterSettings().Version.ActiveVersion(ctx)
 			if v := vers.String(); v == curVersion {
@@ -319,16 +320,13 @@ func TestClusterVersionUpgrade(t *testing.T) {
 			}
 		}
 		return nil
-	})
+	}, 3*time.Minute)
 
 	// Since the wrapped version setting exposes the new versions, it must
 	// definitely be present on all stores on the first try.
 	if err := tc.Servers[1].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
-		cv, err := kvserver.ReadClusterVersion(ctx, s.Engine())
-		if err != nil {
-			return err
-		}
-		if act := cv.Version.String(); act != exp {
+		cv := s.TODOEngine().MinVersion()
+		if act := cv.String(); act != exp {
 			t.Fatalf("%s: %s persisted, but should be %s", s, act, exp)
 		}
 		return nil
@@ -419,20 +417,19 @@ func TestClusterVersionMixedVersionTooOld(t *testing.T) {
 		},
 		// Inject an upgrade which would run to upgrade the cluster.
 		// We'll validate that we never create a job for this upgrade.
-		UpgradeManager: &upgrade.TestingKnobs{
-			ListBetweenOverride: func(from, to clusterversion.ClusterVersion) []clusterversion.ClusterVersion {
-				return []clusterversion.ClusterVersion{to}
+		UpgradeManager: &upgradebase.TestingKnobs{
+			ListBetweenOverride: func(from, to roachpb.Version) []roachpb.Version {
+				return []roachpb.Version{to}
 			},
-			RegistryOverride: func(cv clusterversion.ClusterVersion) (upgrade.Upgrade, bool) {
-				if !cv.Version.Equal(v1) {
+			RegistryOverride: func(cv roachpb.Version) (upgradebase.Upgrade, bool) {
+				if !cv.Equal(v1) {
 					return nil, false
 				}
-				return upgrade.NewTenantUpgrade("testing", clusterversion.ClusterVersion{
-					Version: v1,
-				},
-					upgrades.NoPrecondition,
+				return upgrade.NewTenantUpgrade("testing",
+					v1,
+					upgrade.NoPrecondition,
 					func(
-						ctx context.Context, version clusterversion.ClusterVersion, deps upgrade.TenantDeps, _ *jobs.Job,
+						ctx context.Context, version clusterversion.ClusterVersion, deps upgrade.TenantDeps,
 					) error {
 						return nil
 					}), true

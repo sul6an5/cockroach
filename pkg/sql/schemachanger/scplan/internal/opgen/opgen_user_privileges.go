@@ -20,8 +20,10 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.UserPrivileges) *scop.NotImplemented {
-					return notImplemented(this)
+				emit(func(this *scpb.UserPrivileges) *scop.UpdateUserPrivileges {
+					return &scop.UpdateUserPrivileges{
+						Privileges: *this,
+					}
 				}),
 			),
 		),
@@ -32,8 +34,8 @@ func init() {
 				revertible(false),
 				emit(func(this *scpb.UserPrivileges) *scop.RemoveUserPrivileges {
 					return &scop.RemoveUserPrivileges{
-						DescID: this.DescriptorID,
-						User:   this.UserName,
+						DescriptorID: this.DescriptorID,
+						User:         this.UserName,
 					}
 				}),
 			),

@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam"
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam/indexstorageparam"
@@ -91,6 +90,11 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 		}
 	}
 
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
+		return nil, err
+	}
+
 	return &createIndexNode{tableDesc: tableDesc, n: n}, nil
 }
 
@@ -113,19 +117,14 @@ func (p *planner) maybeSetupConstraintForShard(
 		return err
 	}
 	ckBuilder := schemaexpr.MakeCheckConstraintBuilder(ctx, p.tableName, tableDesc, &p.semaCtx)
-	ckDesc, err := ckBuilder.Build(ckDef)
-	if err != nil {
-		return err
-	}
-
-	curConstraintInfos, err := tableDesc.GetConstraintInfo()
+	ckDesc, err := ckBuilder.Build(ckDef, p.ExecCfg().Settings.Version.ActiveVersion(ctx))
 	if err != nil {
 		return err
 	}
 
 	// Avoid creating duplicate check constraints.
-	for _, info := range curConstraintInfos {
-		if info.CheckConstraint != nil && info.CheckConstraint.Expr == ckDesc.Expr {
+	for _, ck := range tableDesc.CheckConstraints() {
+		if ck.GetExpr() == ckDesc.Expr && ck.IsConstraintValidated() {
 			return nil
 		}
 	}
@@ -176,6 +175,7 @@ func makeIndexDescriptor(
 		n.Inverted,
 		false, /* isNewTable */
 		params.p.SemaCtx(),
+		params.ExecCfg().Settings.Version.ActiveVersion(params.ctx),
 	); err != nil {
 		return nil, err
 	}
@@ -187,14 +187,14 @@ func makeIndexDescriptor(
 	}
 
 	// Ensure that the index name does not exist before trying to create the index.
-	if idx, _ := tableDesc.FindIndexWithName(string(n.Name)); idx != nil {
+	if idx := catalog.FindIndexByName(tableDesc, string(n.Name)); idx != nil {
 		if idx.Dropped() {
 			return nil, pgerror.Newf(pgcode.DuplicateRelation, "index with name %q already exists and is being dropped, try again later", n.Name)
 		}
 		return nil, pgerror.Newf(pgcode.DuplicateRelation, "index with name %q already exists", n.Name)
 	}
 
-	if err := checkIndexColumns(tableDesc, columns, n.Storing); err != nil {
+	if err := checkIndexColumns(tableDesc, columns, n.Storing, n.Inverted); err != nil {
 		return nil, err
 	}
 
@@ -207,9 +207,7 @@ func makeIndexDescriptor(
 		NotVisible:        n.NotVisible,
 	}
 
-	columnsToCheckForOpclass := columns
 	if n.Inverted {
-		columnsToCheckForOpclass = columns[:len(columns)-1]
 		if n.Sharded != nil {
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support hash sharding")
 		}
@@ -224,20 +222,13 @@ func makeIndexDescriptor(
 
 		indexDesc.Type = descpb.IndexDescriptor_INVERTED
 		invCol := columns[len(columns)-1]
-		column, err := tableDesc.FindColumnWithName(invCol.Column)
+		column, err := catalog.MustFindColumnByTreeName(tableDesc, invCol.Column)
 		if err != nil {
 			return nil, err
 		}
 		if err := populateInvertedIndexDescriptor(
 			params.ctx, params.ExecCfg().Settings, column, &indexDesc, invCol); err != nil {
 			return nil, err
-		}
-	}
-
-	for i := range columnsToCheckForOpclass {
-		col := &columns[i]
-		if col.OpClass != "" {
-			return nil, newUndefinedOpclassError(col.OpClass)
 		}
 	}
 
@@ -270,6 +261,7 @@ func makeIndexDescriptor(
 	if n.Predicate != nil {
 		expr, err := schemaexpr.ValidatePartialIndexPredicate(
 			params.ctx, tableDesc, n.Predicate, &n.Table, params.p.SemaCtx(),
+			params.ExecCfg().Settings.Version.ActiveVersion(params.ctx),
 		)
 		if err != nil {
 			return nil, err
@@ -282,6 +274,7 @@ func makeIndexDescriptor(
 	}
 
 	if err := storageparam.Set(
+		params.ctx,
 		params.p.SemaCtx(),
 		params.EvalContext(),
 		n.StorageParams,
@@ -320,10 +313,10 @@ func makeIndexDescriptor(
 }
 
 func checkIndexColumns(
-	desc catalog.TableDescriptor, columns tree.IndexElemList, storing tree.NameList,
+	desc catalog.TableDescriptor, columns tree.IndexElemList, storing tree.NameList, inverted bool,
 ) error {
 	for i, colDef := range columns {
-		col, err := desc.FindColumnWithName(colDef.Column)
+		col, err := catalog.MustFindColumnByTreeName(desc, colDef.Column)
 		if err != nil {
 			return errors.Wrapf(err, "finding column %d", i)
 		}
@@ -333,9 +326,13 @@ func checkIndexColumns(
 				"cannot index system column %v", colDef.Column,
 			)
 		}
+		if colDef.OpClass != "" && (i < len(columns)-1 || !inverted) {
+			return pgerror.New(pgcode.DatatypeMismatch,
+				"operator classes are only allowed for the last column of an inverted index")
+		}
 	}
 	for i, colName := range storing {
-		col, err := desc.FindColumnWithName(colName)
+		col, err := catalog.MustFindColumnByTreeName(desc, colName)
 		if err != nil {
 			return errors.Wrapf(err, "finding store column %d", i)
 		}
@@ -401,11 +398,6 @@ func populateInvertedIndexDescriptor(
 		// we're going to inverted index.
 		switch invCol.OpClass {
 		case "gin_trgm_ops", "gist_trgm_ops":
-			if !cs.Version.IsActive(ctx, clusterversion.TrigramInvertedIndexes) {
-				return pgerror.Newf(pgcode.FeatureNotSupported,
-					"version %v must be finalized to create trigram inverted indexes",
-					clusterversion.ByKey(clusterversion.TrigramInvertedIndexes))
-			}
 		case "":
 			return errors.WithHint(
 				pgerror.New(pgcode.UndefinedObject, "data type text has no default operator class for access method \"gin\""),
@@ -414,6 +406,12 @@ func populateInvertedIndexDescriptor(
 			return newUndefinedOpclassError(invCol.OpClass)
 		}
 		indexDesc.InvertedColumnKinds[0] = catpb.InvertedIndexColumnKind_TRIGRAM
+	case types.TSVectorFamily:
+		switch invCol.OpClass {
+		case "tsvector_ops", "":
+		default:
+			return newUndefinedOpclassError(invCol.OpClass)
+		}
 	default:
 		return tabledesc.NewInvalidInvertedColumnError(column.GetName(), column.GetType().Name())
 	}
@@ -433,7 +431,7 @@ func validateColumnsAreAccessible(desc *tabledesc.Mutable, columns tree.IndexEle
 		if column.Expr != nil {
 			continue
 		}
-		foundColumn, err := desc.FindColumnWithName(column.Column)
+		foundColumn, err := catalog.MustFindColumnByTreeName(desc, column.Column)
 		if err != nil {
 			return err
 		}
@@ -455,7 +453,7 @@ func validateIndexColumnsExist(desc *tabledesc.Mutable, columns tree.IndexElemLi
 		if column.Expr != nil {
 			return errors.AssertionFailedf("index elem expression should have been replaced with a column")
 		}
-		foundColumn, err := desc.FindColumnWithName(column.Column)
+		foundColumn, err := catalog.MustFindColumnByTreeName(desc, column.Column)
 		if err != nil {
 			return err
 		}
@@ -478,6 +476,7 @@ func replaceExpressionElemsWithVirtualCols(
 	isInverted bool,
 	isNewTable bool,
 	semaCtx *tree.SemaContext,
+	version clusterversion.ClusterVersion,
 ) error {
 	findExistingExprIndexCol := func(expr string) (colName string, ok bool) {
 		for _, col := range desc.AllColumns() {
@@ -508,8 +507,9 @@ func replaceExpressionElemsWithVirtualCols(
 				desc,
 				colDef,
 				tn,
-				"index element",
+				tree.ExpressionIndexElementExpr,
 				semaCtx,
+				version,
 			)
 			if err != nil {
 				return err
@@ -585,8 +585,7 @@ func replaceExpressionElemsWithVirtualCols(
 
 			// Create a new virtual column and add it to the table descriptor.
 			colName := tabledesc.GenerateUniqueName("crdb_internal_idx_expr", func(name string) bool {
-				_, err := desc.FindColumnWithName(tree.Name(name))
-				return err == nil
+				return catalog.FindColumnByName(desc, name) != nil
 			})
 			col := &descpb.ColumnDescriptor{
 				Name:         colName,
@@ -689,8 +688,8 @@ func maybeCreateAndAddShardCol(
 	if err != nil {
 		return nil, err
 	}
-	existingShardCol, err := desc.FindColumnWithName(tree.Name(shardColDesc.Name))
-	if err == nil && !existingShardCol.Dropped() {
+	existingShardCol := catalog.FindColumnByName(desc, shardColDesc.Name)
+	if existingShardCol != nil && !existingShardCol.Dropped() {
 		// TODO(ajwerner): In what ways is existingShardCol allowed to differ from
 		// the newly made shardCol? Should there be some validation of
 		// existingShardCol?
@@ -702,25 +701,20 @@ func maybeCreateAndAddShardCol(
 		}
 		return existingShardCol, nil
 	}
-	columnIsUndefined := sqlerrors.IsUndefinedColumnError(err)
-	if err != nil && !columnIsUndefined {
-		return nil, err
-	}
-	if columnIsUndefined || existingShardCol.Dropped() {
+	if existingShardCol == nil || existingShardCol.Dropped() {
 		if isNewTable {
 			desc.AddColumn(shardColDesc)
 		} else {
 			desc.AddColumnMutation(shardColDesc, descpb.DescriptorMutation_ADD)
 		}
 	}
-	shardCol, err := desc.FindColumnWithName(tree.Name(shardColDesc.Name))
-	return shardCol, err
+	return catalog.MustFindColumnByName(desc, shardColDesc.Name)
 }
 
 func (n *createIndexNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("index"))
-	foundIndex, err := n.tableDesc.FindIndexWithName(string(n.n.Name))
-	if err == nil {
+	foundIndex := catalog.FindIndexByName(n.tableDesc, string(n.n.Name))
+	if foundIndex != nil {
 		if foundIndex.Dropped() {
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 				"index %q being dropped, try again later", string(n.n.Name))
@@ -912,9 +906,9 @@ func (p *planner) configureZoneConfigForNewIndexPartitioning(
 
 		if err := ApplyZoneConfigForMultiRegionTable(
 			ctx,
-			p.txn,
+			p.InternalSQLTxn(),
 			p.ExecCfg(),
-			p.Descriptors(),
+			p.extendedEvalCtx.Tracing.KVTracingEnabled(),
 			regionConfig,
 			tableDesc,
 			applyZoneConfigForMultiRegionTableOptionNewIndexes(indexIDs...),

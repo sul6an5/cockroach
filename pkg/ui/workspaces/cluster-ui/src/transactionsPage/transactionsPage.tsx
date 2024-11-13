@@ -24,18 +24,16 @@ import {
   SortSetting,
   updateSortSettingQueryParamsOnTab,
 } from "../sortedtable";
-import { Pagination } from "../pagination";
-import { TableStatistics } from "../tableStatistics";
+import { Pagination, ResultsPerPageLabel } from "../pagination";
 import { statisticsClasses } from "./transactionsPageClasses";
 import {
-  aggregateAcrossNodeIDs,
+  generateRegion,
   generateRegionNode,
   getTrxAppFilterOptions,
   searchTransactionsData,
   filterTransactions,
 } from "./utils";
-import Long from "long";
-import { merge } from "lodash";
+import { flatMap, merge } from "lodash";
 import { unique, syncHistory } from "src/util";
 import { EmptyTransactionsPlaceholder } from "./emptyTransactionsPlaceholder";
 import { Loading } from "../loading";
@@ -48,9 +46,15 @@ import {
   defaultFilters,
   handleFiltersFromQueryString,
   updateFiltersQueryParamsOnTab,
+  SelectedFilters,
 } from "../queryFilter";
 import { UIConfigState } from "../store";
-import { StatementsRequest } from "src/api/statementsApi";
+import {
+  SqlStatsSortType,
+  createCombinedStmtsRequest,
+  StatementsRequest,
+  SqlStatsSortOptions,
+} from "src/api/statementsApi";
 import ColumnsSelector from "../columnsSelector/columnsSelector";
 import { SelectOption } from "../multiSelectCheckbox/multiSelectCheckbox";
 import {
@@ -58,48 +62,69 @@ import {
   StatisticTableColumnKeys,
 } from "../statsTableUtil/statsTableUtil";
 import ClearStats from "../sqlActivity/clearStats";
-import SQLActivityError from "../sqlActivity/errorComponent";
+import LoadingError from "../sqlActivity/errorComponent";
 import { commonStyles } from "../common";
 import {
-  TimeScaleDropdown,
   TimeScale,
-  toDateRange,
-  timeScaleToString,
   timeScale1hMinOptions,
   getValidOption,
+  toRoundedDateRange,
 } from "../timeScaleDropdown";
 import { InlineAlert } from "@cockroachlabs/ui-components";
 import { TransactionViewType } from "./transactionsPageTypes";
 import { isSelectedColumn } from "../columnsSelector/utils";
-import moment from "moment";
+import moment from "moment-timezone";
+import {
+  STATS_LONG_LOADING_DURATION,
+  txnRequestSortOptions,
+  getSortLabel,
+  getSortColumn,
+  getSubsetWarning,
+  getReqSortColumn,
+} from "src/util/sqlActivityConstants";
+import { SearchCriteria } from "src/searchCriteria/searchCriteria";
+import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
+import { FormattedTimescale } from "../timeScaleDropdown/formattedTimeScale";
 
 type IStatementsResponse = protos.cockroach.server.serverpb.IStatementsResponse;
 
 const cx = classNames.bind(styles);
+const timeScaleStylesCx = classNames.bind(timeScaleStyles);
 
 interface TState {
   filters?: Filters;
   pagination: ISortedTablePagination;
+  timeScale: TimeScale;
+  limit: number;
+  reqSortSetting: SqlStatsSortType;
 }
 
 export interface TransactionsPageStateProps {
   columns: string[];
   data: IStatementsResponse;
+  isDataValid: boolean;
+  isReqInFlight: boolean;
   lastUpdated: moment.Moment | null;
   timeScale: TimeScale;
+  limit: number;
+  reqSortSetting: SqlStatsSortType;
   error?: Error | null;
   filters: Filters;
   isTenant?: UIConfigState["isTenant"];
   nodeRegions: { [nodeId: string]: string };
-  pageSize?: number;
   search: string;
   sortSetting: SortSetting;
+  hasAdminRole?: UIConfigState["hasAdminRole"];
 }
 
 export interface TransactionsPageDispatchProps {
   refreshData: (req: StatementsRequest) => void;
-  resetSQLStats: (req: StatementsRequest) => void;
+  refreshNodes: () => void;
+  refreshUserSQLRoles: () => void;
+  resetSQLStats: () => void;
   onTimeScaleChange?: (ts: TimeScale) => void;
+  onChangeLimit: (limit: number) => void;
+  onChangeReqSort: (sort: SqlStatsSortType) => void;
   onColumnsChange?: (selectedColumns: string[]) => void;
   onFilterChange?: (value: Filters) => void;
   onSearchComplete?: (query: string) => void;
@@ -108,46 +133,42 @@ export interface TransactionsPageDispatchProps {
     columnTitle: string,
     ascending: boolean,
   ) => void;
+  onApplySearchCriteria: (ts: TimeScale, limit: number, sort: string) => void;
 }
 
 export type TransactionsPageProps = TransactionsPageStateProps &
   TransactionsPageDispatchProps &
   RouteComponentProps;
 
-function statementsRequestFromProps(
-  props: TransactionsPageProps,
-): protos.cockroach.server.serverpb.StatementsRequest {
-  const [start, end] = toDateRange(props.timeScale);
-  return new protos.cockroach.server.serverpb.StatementsRequest({
-    combined: true,
-    start: Long.fromNumber(start.unix()),
-    end: Long.fromNumber(end.unix()),
+type RequestParams = Pick<TState, "timeScale" | "limit" | "reqSortSetting">;
+
+function stmtsRequestFromParams(params: RequestParams): StatementsRequest {
+  const [start, end] = toRoundedDateRange(params.timeScale);
+  return createCombinedStmtsRequest({
+    start,
+    end,
+    limit: params.limit,
+    sort: params.reqSortSetting,
   });
 }
 export class TransactionsPage extends React.Component<
   TransactionsPageProps,
   TState
 > {
-  refreshDataTimeout: NodeJS.Timeout;
-
   constructor(props: TransactionsPageProps) {
     super(props);
+
     this.state = {
+      limit: this.props.limit,
+      timeScale: this.props.timeScale,
+      reqSortSetting: this.props.reqSortSetting,
       pagination: {
-        pageSize: this.props.pageSize || 20,
+        pageSize: 50,
         current: 1,
       },
     };
     const stateFromHistory = this.getStateFromHistory();
     this.state = merge(this.state, stateFromHistory);
-
-    // In case the user selected a option not available on this page,
-    // force a selection of a valid option. This is necessary for the case
-    // where the value 10/30 min is selected on the Metrics page.
-    const ts = getValidOption(this.props.timeScale, timeScale1hMinOptions);
-    if (ts !== this.props.timeScale) {
-      this.changeTimeScale(ts);
-    }
   }
 
   getStateFromHistory = (): Partial<TState> => {
@@ -188,56 +209,35 @@ export class TransactionsPage extends React.Component<
     };
   };
 
-  clearRefreshDataTimeout(): void {
-    if (this.refreshDataTimeout != null) {
-      clearTimeout(this.refreshDataTimeout);
-    }
-  }
-
-  // Scheudle the next data request depending on the time
-  // range key.
-  resetPolling(key: string): void {
-    this.clearRefreshDataTimeout();
-    if (key !== "Custom") {
-      this.refreshDataTimeout = setTimeout(
-        this.refreshData,
-        300000, // 5 minutes
-      );
-    }
-  }
-
   refreshData = (): void => {
-    const req = statementsRequestFromProps(this.props);
+    const req = stmtsRequestFromParams(this.state);
     this.props.refreshData(req);
-    this.resetPolling(this.props.timeScale.key);
   };
 
   resetSQLStats = (): void => {
-    const req = statementsRequestFromProps(this.props);
-    this.props.resetSQLStats(req);
-    this.resetPolling(this.props.timeScale.key);
+    this.props.resetSQLStats();
   };
 
   componentDidMount(): void {
-    // For the first data fetch for this page, we refresh if there are:
-    // - Last updated is null (no statements fetched previously)
-    // - The time interval is not custom, i.e. we have a moving window
-    // in which case we poll every 5 minutes. For the first fetch we will
-    // calculate the next time to refresh based on when the data was last
-    // updated.
-    if (this.props.timeScale.key !== "Custom" || !this.props.lastUpdated) {
-      const now = moment();
-      const nextRefresh =
-        this.props.lastUpdated?.clone().add(5, "minutes") || now;
-      setTimeout(
-        this.refreshData,
-        Math.max(0, nextRefresh.diff(now, "milliseconds")),
-      );
+    // In case the user selected a option not available on this page,
+    // force a selection of a valid option. This is necessary for the case
+    // where the value 10/30 min is selected on the Metrics page.
+    const ts = getValidOption(this.props.timeScale, timeScale1hMinOptions);
+    if (ts !== this.props.timeScale) {
+      this.changeTimeScale(ts);
+    } else if (
+      !this.props.isDataValid ||
+      !this.props.data ||
+      !this.props.lastUpdated
+    ) {
+      this.refreshData();
     }
-  }
 
-  componentWillUnmount(): void {
-    this.clearRefreshDataTimeout();
+    if (!this.props.isTenant) {
+      this.props.refreshNodes();
+    }
+
+    this.props.refreshUserSQLRoles();
   }
 
   updateQueryParams(): void {
@@ -274,6 +274,9 @@ export class TransactionsPage extends React.Component<
 
   componentDidUpdate(): void {
     this.updateQueryParams();
+    if (!this.props.isTenant) {
+      this.props.refreshNodes();
+    }
   }
 
   onChangeSortSetting = (ss: SortSetting): void => {
@@ -287,6 +290,13 @@ export class TransactionsPage extends React.Component<
     if (this.props.onSortingChange) {
       this.props.onSortingChange("Transactions", ss.columnTitle, ss.ascending);
     }
+  };
+
+  isSortSettingSameAsReqSort = (): boolean => {
+    return (
+      getSortColumn(this.props.reqSortSetting) ==
+      this.props.sortSetting.columnTitle
+    );
   };
 
   onChangePage = (current: number): void => {
@@ -379,13 +389,67 @@ export class TransactionsPage extends React.Component<
   };
 
   changeTimeScale = (ts: TimeScale): void => {
-    if (this.props.onTimeScaleChange) {
-      this.props.onTimeScaleChange(ts);
-    }
-    this.resetPolling(ts.key);
+    this.setState(prevState => ({ ...prevState, timeScale: ts }));
   };
 
-  render(): React.ReactElement {
+  onChangeLimit = (newLimit: number): void => {
+    this.setState(prevState => ({ ...prevState, limit: newLimit }));
+  };
+
+  onChangeReqSort = (newSort: SqlStatsSortType): void => {
+    this.setState(prevState => ({ ...prevState, reqSortSetting: newSort }));
+  };
+
+  updateRequestParams = (): void => {
+    if (this.props.limit !== this.state.limit) {
+      this.props.onChangeLimit(this.state.limit);
+    }
+
+    if (this.props.reqSortSetting !== this.state.reqSortSetting) {
+      this.props.onChangeReqSort(this.state.reqSortSetting);
+    }
+
+    if (this.props.timeScale !== this.state.timeScale) {
+      this.props.onTimeScaleChange(this.state.timeScale);
+    }
+
+    if (this.props.onApplySearchCriteria) {
+      this.props.onApplySearchCriteria(
+        this.state.timeScale,
+        this.state.limit,
+        getSortLabel(this.state.reqSortSetting, "Transaction"),
+      );
+    }
+    this.refreshData();
+    const ss: SortSetting = {
+      ascending: false,
+      columnTitle: getSortColumn(this.state.reqSortSetting),
+    };
+    this.onChangeSortSetting(ss);
+  };
+
+  onUpdateSortSettingAndApply = (): void => {
+    this.setState(
+      {
+        reqSortSetting: getReqSortColumn(this.props.sortSetting.columnTitle),
+      },
+      () => {
+        this.updateRequestParams();
+      },
+    );
+  };
+
+  hasReqSortOption = (): boolean => {
+    let found = false;
+    Object.values(SqlStatsSortOptions).forEach((option: SqlStatsSortType) => {
+      if (getSortColumn(option) == this.props.sortSetting.columnTitle) {
+        found = true;
+      }
+    });
+    return found;
+  };
+
+  renderTransactions(): React.ReactElement {
     const {
       data,
       nodeRegions,
@@ -394,21 +458,12 @@ export class TransactionsPage extends React.Component<
       columns: userSelectedColumnsToShow,
       sortSetting,
       search,
+      hasAdminRole,
     } = this.props;
+    const { pagination, filters } = this.state;
     const internal_app_name_prefix = data?.internal_app_name_prefix || "";
     const statements = data?.statements || [];
-    const { filters } = this.state;
 
-    // If the cluster is a tenant cluster we don't show info
-    // about nodes/regions.
-    const nodes = isTenant
-      ? []
-      : Object.keys(nodeRegions)
-          .map(n => Number(n))
-          .sort();
-    const regions = isTenant
-      ? []
-      : unique(nodes.map(node => nodeRegions[node.toString()])).sort();
     // We apply the search filters and app name filters prior to aggregating across Node IDs
     // in order to match what's done on the Statements Page.
     //
@@ -428,8 +483,179 @@ export class TransactionsPage extends React.Component<
       data?.transactions || [],
       internal_app_name_prefix,
     );
-    const longLoadingMessage = !this.props?.data && (
-      <Delayed delay={moment.duration(2, "s")}>
+
+    const transactionsToDisplay: TransactionInfo[] = filteredTransactions.map(
+      t => ({
+        stats_data: t.stats_data,
+        regions: generateRegion(t, statements),
+        regionNodes: generateRegionNode(t, statements, nodeRegions),
+      }),
+    );
+    const { current, pageSize } = pagination;
+    const hasData = data?.transactions?.length > 0;
+    const isUsedFilter = search?.length > 0;
+
+    const nodes = Object.keys(nodeRegions)
+      .map(n => Number(n))
+      .sort();
+
+    const regions = unique(
+      isTenant
+        ? flatMap(statements, statement => statement.stats.regions)
+        : nodes.map(node => nodeRegions[node.toString()]),
+    ).sort();
+
+    // Creates a list of all possible columns,
+    // hiding nodeRegions if is not multi-region and
+    // hiding columns that won't be displayed for tenants.
+    const columns = makeTransactionsColumns(
+      transactionsToDisplay,
+      statements,
+      isTenant,
+      search,
+    )
+      .filter(c => !(c.name === "regions" && regions.length < 2))
+      .filter(c => !(c.name === "regionNodes" && regions.length < 2))
+      .filter(c => !(isTenant && c.hideIfTenant));
+
+    // Iterate over all available columns and create list of SelectOptions with initial selection
+    // values based on stored user selections in local storage and default column configs.
+    // Columns that are set to alwaysShow are filtered from the list.
+    const tableColumns = columns
+      .filter(c => !c.alwaysShow)
+      .map(
+        (c): SelectOption => ({
+          label: getLabel(c.name as StatisticTableColumnKeys, "transaction"),
+          value: c.name,
+          isSelected: isSelectedColumn(userSelectedColumnsToShow, c),
+        }),
+      );
+
+    // List of all columns that will be displayed based on the column selection.
+    const displayColumns = columns.filter(c =>
+      isSelectedColumn(userSelectedColumnsToShow, c),
+    );
+
+    const period = <FormattedTimescale ts={this.props.timeScale} />;
+    const sortSettingLabel = getSortLabel(
+      this.props.reqSortSetting,
+      "Transaction",
+    );
+    const showSortWarning =
+      !this.isSortSettingSameAsReqSort() &&
+      this.hasReqSortOption() &&
+      transactionsToDisplay.length == this.props.limit;
+
+    return (
+      <>
+        <h5 className={`${commonStyles("base-heading")} ${cx("margin-top")}`}>
+          {`Results - Top ${this.props.limit} Transaction Fingerprints by ${sortSettingLabel}`}
+        </h5>
+        <section className={cx("filter-area")}>
+          <PageConfig className={cx("float-left")}>
+            <PageConfigItem>
+              <Search
+                onSubmit={this.onSubmitSearchField}
+                onClear={this.onClearSearchField}
+                defaultValue={search}
+              />
+            </PageConfigItem>
+            <PageConfigItem>
+              <Filter
+                onSubmitFilters={this.onSubmitFilters}
+                appNames={appNames}
+                regions={regions}
+                timeLabel={"Transaction fingerprint"}
+                nodes={nodes.map(n => "n" + n)}
+                activeFilters={activeFilters}
+                filters={filters}
+                showRegions={regions.length > 1}
+                showNodes={!isTenant && nodes.length > 1}
+              />
+            </PageConfigItem>
+            <PageConfigItem>
+              <ColumnsSelector
+                options={tableColumns}
+                onSubmitColumns={onColumnsChange}
+              />
+            </PageConfigItem>
+          </PageConfig>
+          <PageConfig className={cx("float-right")}>
+            <PageConfigItem>
+              <p className={timeScaleStylesCx("time-label")}>
+                Showing aggregated stats from{" "}
+                <span className={timeScaleStylesCx("bold")}>{period}</span>
+                {", "}
+                <ResultsPerPageLabel
+                  pagination={{
+                    ...pagination,
+                    total: transactionsToDisplay.length,
+                  }}
+                  pageName={"Transactions"}
+                  search={search}
+                />
+              </p>
+            </PageConfigItem>
+            {hasAdminRole && (
+              <PageConfigItem
+                className={`${commonStyles("separator")} ${cx(
+                  "reset-btn-area",
+                )} `}
+              >
+                <ClearStats
+                  resetSQLStats={this.resetSQLStats}
+                  tooltipType="transaction"
+                />
+              </PageConfigItem>
+            )}
+          </PageConfig>
+        </section>
+        <section className={statisticsClasses.tableContainerClass}>
+          <SelectedFilters
+            filters={filters}
+            onRemoveFilter={this.onSubmitFilters}
+            onClearFilters={this.onClearFilters}
+          />
+          {showSortWarning && (
+            <InlineAlert
+              intent="warning"
+              title={getSubsetWarning(
+                "transaction",
+                this.props.limit,
+                sortSettingLabel,
+                this.props.sortSetting.columnTitle as StatisticTableColumnKeys,
+                this.onUpdateSortSettingAndApply,
+              )}
+              className={cx("margin-bottom")}
+            />
+          )}
+          <TransactionsTable
+            columns={displayColumns}
+            transactions={transactionsToDisplay}
+            sortSetting={sortSetting}
+            onChangeSortSetting={this.onChangeSortSetting}
+            pagination={pagination}
+            renderNoResult={
+              <EmptyTransactionsPlaceholder
+                transactionView={TransactionViewType.FINGERPRINTS}
+                isEmptySearchResults={hasData && isUsedFilter}
+              />
+            }
+          />
+        </section>
+        <Pagination
+          pageSize={pageSize}
+          current={current}
+          total={transactionsToDisplay.length}
+          onChange={this.onChangePage}
+        />
+      </>
+    );
+  }
+
+  render(): React.ReactElement {
+    const longLoadingMessage = (
+      <Delayed delay={STATS_LONG_LOADING_DURATION}>
         <InlineAlert
           intent="info"
           title="If the selected time interval contains a large amount of data, this page might take a few minutes to load."
@@ -439,138 +665,24 @@ export class TransactionsPage extends React.Component<
 
     return (
       <>
-        <PageConfig>
-          <PageConfigItem>
-            <Search
-              onSubmit={this.onSubmitSearchField}
-              onClear={this.onClearSearchField}
-              defaultValue={search}
-              placeholder={"Search Transactions"}
-            />
-          </PageConfigItem>
-          <PageConfigItem>
-            <Filter
-              onSubmitFilters={this.onSubmitFilters}
-              appNames={appNames}
-              regions={regions}
-              nodes={nodes.map(n => "n" + n)}
-              activeFilters={activeFilters}
-              filters={filters}
-              showRegions={regions.length > 1}
-              showNodes={nodes.length > 1}
-            />
-          </PageConfigItem>
-          <PageConfigItem className={commonStyles("separator")}>
-            <TimeScaleDropdown
-              options={timeScale1hMinOptions}
-              currentScale={this.props.timeScale}
-              setTimeScale={this.changeTimeScale}
-            />
-          </PageConfigItem>
-          <PageConfigItem className={commonStyles("separator")}>
-            <ClearStats
-              resetSQLStats={this.resetSQLStats}
-              tooltipType="transaction"
-            />
-          </PageConfigItem>
-        </PageConfig>
+        <SearchCriteria
+          sortOptions={txnRequestSortOptions}
+          topValue={this.state.limit}
+          byValue={this.state.reqSortSetting}
+          currentScale={this.state.timeScale}
+          onChangeTop={this.onChangeLimit}
+          onChangeBy={this.onChangeReqSort}
+          onChangeTimeScale={this.changeTimeScale}
+          onApply={this.updateRequestParams}
+        />
         <div className={cx("table-area")}>
           <Loading
-            loading={!this.props?.data}
+            loading={this.props.isReqInFlight}
             page={"transactions"}
             error={this.props?.error}
-            render={() => {
-              const { pagination } = this.state;
-              const transactionsToDisplay: TransactionInfo[] =
-                aggregateAcrossNodeIDs(filteredTransactions, statements).map(
-                  t => ({
-                    stats_data: t.stats_data,
-                    node_id: t.node_id,
-                    regionNodes: isTenant
-                      ? []
-                      : generateRegionNode(t, statements, nodeRegions),
-                  }),
-                );
-              const { current, pageSize } = pagination;
-              const hasData = data.transactions?.length > 0;
-              const isUsedFilter = search?.length > 0;
-
-              // Creates a list of all possible columns,
-              // hiding nodeRegions if is not multi-region and
-              // hiding columns that won't be displayed for tenants.
-              const columns = makeTransactionsColumns(
-                transactionsToDisplay,
-                statements,
-                isTenant,
-                search,
-              )
-                .filter(c => !(c.name === "regionNodes" && regions.length < 2))
-                .filter(c => !(isTenant && c.hideIfTenant));
-
-              // Iterate over all available columns and create list of SelectOptions with initial selection
-              // values based on stored user selections in local storage and default column configs.
-              // Columns that are set to alwaysShow are filtered from the list.
-              const tableColumns = columns
-                .filter(c => !c.alwaysShow)
-                .map(
-                  (c): SelectOption => ({
-                    label: getLabel(
-                      c.name as StatisticTableColumnKeys,
-                      "transaction",
-                    ),
-                    value: c.name,
-                    isSelected: isSelectedColumn(userSelectedColumnsToShow, c),
-                  }),
-                );
-
-              // List of all columns that will be displayed based on the column selection.
-              const displayColumns = columns.filter(c =>
-                isSelectedColumn(userSelectedColumnsToShow, c),
-              );
-
-              const period = timeScaleToString(this.props.timeScale);
-
-              return (
-                <>
-                  <section className={statisticsClasses.tableContainerClass}>
-                    <ColumnsSelector
-                      options={tableColumns}
-                      onSubmitColumns={onColumnsChange}
-                    />
-                    <TableStatistics
-                      pagination={pagination}
-                      search={search}
-                      totalCount={transactionsToDisplay.length}
-                      arrayItemName="transactions"
-                      activeFilters={activeFilters}
-                      period={period}
-                      onClearFilters={this.onClearFilters}
-                    />
-                    <TransactionsTable
-                      columns={displayColumns}
-                      transactions={transactionsToDisplay}
-                      sortSetting={sortSetting}
-                      onChangeSortSetting={this.onChangeSortSetting}
-                      pagination={pagination}
-                      renderNoResult={
-                        <EmptyTransactionsPlaceholder
-                          transactionView={TransactionViewType.FINGERPRINTS}
-                          isEmptySearchResults={hasData && isUsedFilter}
-                        />
-                      }
-                    />
-                  </section>
-                  <Pagination
-                    pageSize={pageSize}
-                    current={current}
-                    total={transactionsToDisplay.length}
-                    onChange={this.onChangePage}
-                  />
-                </>
-              );
-            }}
+            render={() => this.renderTransactions()}
             renderError={() =>
-              SQLActivityError({
+              LoadingError({
                 statsType: "transactions",
                 timeout: this.props?.error?.name
                   ?.toLowerCase()
@@ -578,7 +690,7 @@ export class TransactionsPage extends React.Component<
               })
             }
           />
-          {longLoadingMessage}
+          {this.props.isReqInFlight && longLoadingMessage}
         </div>
       </>
     );

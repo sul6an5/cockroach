@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -29,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -44,6 +45,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type schemaChangeTestCase struct {
+	// Test identifier.
+	name string
+	// Job status when the job is intercepted while transitioning to the intercepted status.
+	query string
+	// Whether the schema-change job should wait for the migration to restart
+	// after failure before proceeding.
+	waitForMigrationRestart bool
+	// Cancel the intercepted schema-change to inject a failure during migration.
+	cancelSchemaJob bool
+	// Expected number of schema-changes that are skipped during migration.
+	expectedSkipped int
+}
 
 // TestMigrationWithFailures tests modification of a table during
 // migration with different failures. It tests the system behavior with failure
@@ -54,49 +69,6 @@ import (
 // exponential backoff to the system.jobs table, but was retrofitted to prevent
 // regressions.
 func TestMigrationWithFailures(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	skip.UnderRace(t, "very slow")
-
-	// We're going to be migrating from startCV to endCV.
-	startCV := clusterversion.ClusterVersion{Version: roachpb.Version{Major: 2041}}
-	endCV := clusterversion.ClusterVersion{Version: roachpb.Version{Major: 2042}}
-
-	// The tests follows the following procedure.
-	//
-	// Inject the old table descriptor and ensure that the system is using the
-	// deprecated jobs-table.
-	//
-	// Start migration, which initiates two schema-change jobs one by one. Test
-	// the system for each schema-change job separately. Later on, we inject
-	// failure in this migration, causing it to fail.
-	//
-	// Depending on the test setting, intercept the target schema-change job,
-	// preventing the job from progressing. We may cancel this schema-change or
-	// let it succeed to test different scenarios.
-	//
-	// Cancel the migration, causing the migration to revert and fail.
-	//
-	// Wait for the canceled migration-job to finish, expecting its failure. The
-	// schema-change job is still not progressing to control what the restarted
-	// migration will observe.
-	//
-	// Restart the migration, expecting it to succeed. Depending on the test setting,
-	// the intercepted schema-change job may wail for the migration job to resume.
-	// If it does, the migration job is expected to observe the ongoing schema-change.
-	// The ongoing schema-change is canceled or not, depending on the test case.
-	// In either case, we expect the correct number of mutations to be skipped
-	// during the migration.
-	//
-	// If we canceled the schema-job, expect it to rerun
-	// as part of the migration. Otherwise, expect the schema-change to be ignored
-	// during the migration.
-	//
-	// Finally, we validate that the schema changes are in effect by reading the new
-	// columns and the index, and by running a job that is failed and retried to
-	// practice exponential-backoff machinery.
-
 	const createTableBefore = `
 CREATE TABLE test.test_table (
 	id                INT8      DEFAULT unique_rowid() PRIMARY KEY,
@@ -142,19 +114,7 @@ CREATE TABLE test.test_table (
 );
 `
 
-	for _, test := range []struct {
-		// Test identifier.
-		name string
-		// Job status when the job is intercepted while transitioning to the intercepted status.
-		query string
-		// Whether the schema-change job should wait for the migration to restart
-		// after failure before proceeding.
-		waitForMigrationRestart bool
-		// Cancel the intercepted schema-change to inject a failure during migration.
-		cancelSchemaJob bool
-		// Expected number of schema-changes that are skipped during migration.
-		expectedSkipped int
-	}{
+	testCases := []schemaChangeTestCase{
 		{
 			name:                    "adding columns",
 			query:                   upgrades.TestingAddColsQuery,
@@ -204,7 +164,127 @@ CREATE TABLE test.test_table (
 			cancelSchemaJob:         false, // To fail adding index and skip adding column.
 			expectedSkipped:         2,     // Both columns and index must not be added again.
 		},
-	} {
+	}
+
+	testMigrationWithFailures(t, createTableBefore, createTableAfter, upgrades.MakeFakeMigrationForTestMigrationWithFailures, testCases)
+}
+
+// TestMigrationWithFailuresMultipleAltersOnSameColumn tests a migration that
+// alters a column in a table multiple times with failures at different stages
+// of the migration.
+func TestMigrationWithFailuresMultipleAltersOnSameColumn(t *testing.T) {
+
+	const createTableBefore = `
+CREATE TABLE test.test_table (
+   username STRING NOT NULL
+);
+`
+
+	const createTableAfter = `
+CREATE TABLE test.test_table (
+	username STRING NOT NULL,
+	user_id OID NOT NULL
+);
+`
+
+	testCases := []schemaChangeTestCase{
+		{
+			name:                    "add column",
+			query:                   upgrades.TestingAddNewColStmt,
+			waitForMigrationRestart: false,
+			cancelSchemaJob:         false,
+			expectedSkipped:         0,
+		},
+		{
+			name:                    "alter column",
+			query:                   upgrades.TestingAlterNewColStmt,
+			waitForMigrationRestart: false,
+			cancelSchemaJob:         false,
+			expectedSkipped:         0,
+		},
+		{
+			name:                    "skip none",
+			query:                   upgrades.TestingAddNewColStmt,
+			waitForMigrationRestart: true,
+			cancelSchemaJob:         true,
+			expectedSkipped:         0,
+		},
+		{
+			name:                    "skip adding column",
+			query:                   upgrades.TestingAlterNewColStmt,
+			waitForMigrationRestart: true,
+			cancelSchemaJob:         true,
+			expectedSkipped:         1,
+		},
+		{
+			name:                    "skip adding column and altering column",
+			query:                   upgrades.TestingAlterNewColStmt,
+			waitForMigrationRestart: true,
+			cancelSchemaJob:         false,
+			expectedSkipped:         2,
+		},
+	}
+
+	testMigrationWithFailures(t, createTableBefore, createTableAfter, upgrades.MakeFakeMigrationForTestMigrationWithFailuresMultipleAltersOnSameColumn, testCases)
+}
+
+// testMigrationWithFailures tests a migration that alters the schema of a
+// table with failures injected at multiple points within the migration.
+// The table should be named test.test_table.
+func testMigrationWithFailures(
+	t *testing.T,
+	createTableBefore string,
+	createTableAfter string,
+	testMigrationFunc upgrades.SchemaChangeTestMigrationFunc,
+	testCases []schemaChangeTestCase,
+) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t, "very slow")
+
+	// We're going to be migrating from the minimum supported version to the
+	// "next" version. We'll be injecting the migration for the next version.
+	startKey := clusterversion.BinaryMinSupportedVersionKey
+	startCV := clusterversion.ByKey(startKey)
+	endCV := startCV
+	endCV.Internal += 2
+
+	// The tests follows the following procedure.
+	//
+	// Inject the old table descriptor and ensure that the system is using the
+	// deprecated jobs-table.
+	//
+	// Start migration, which initiates two schema-change jobs one by one. Test
+	// the system for each schema-change job separately. Later on, we inject
+	// failure in this migration, causing it to fail.
+	//
+	// Depending on the test setting, intercept the target schema-change job,
+	// preventing the job from progressing. We may cancel this schema-change or
+	// let it succeed to test different scenarios.
+	//
+	// Cancel the migration, causing the migration to revert and fail.
+	//
+	// Wait for the canceled migration-job to finish, expecting its failure. The
+	// schema-change job is still not progressing to control what the restarted
+	// migration will observe.
+	//
+	// Restart the migration, expecting it to succeed. Depending on the test setting,
+	// the intercepted schema-change job may wail for the migration job to resume.
+	// If it does, the migration job is expected to observe the ongoing schema-change.
+	// The ongoing schema-change is canceled or not, depending on the test case.
+	// In either case, we expect the correct number of mutations to be skipped
+	// during the migration.
+	//
+	// If we canceled the schema-job, expect it to rerun
+	// as part of the migration. Otherwise, expect the schema-change to be ignored
+	// during the migration.
+	//
+	// Finally, we validate that the schema changes are in effect by reading the new
+	// columns and the index, and by running a job that is failed and retried to
+	// practice exponential-backoff machinery.
+
+	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
 			scope := log.Scope(t)
 			defer scope.Close(t)
@@ -246,26 +326,26 @@ CREATE TABLE test.test_table (
 
 			// Number of schema-change jobs that are skipped.
 			settings := cluster.MakeTestingClusterSettingsWithVersions(
-				endCV.Version, startCV.Version, false, /* initializeVersion */
+				endCV, startCV, false, /* initializeVersion */
 			)
 			require.NoError(t, clusterversion.Initialize(
-				ctx, startCV.Version, &settings.SV,
+				ctx, startCV, &settings.SV,
 			))
 			jobsKnobs := jobs.NewTestingKnobsWithShortIntervals()
 			jobsKnobs.BeforeUpdate = beforeUpdate
-			migrationFunc, expectedDescriptor := upgrades.
-				MakeFakeMigrationForTestMigrationWithFailures()
+			migrationFunc, expectedDescriptor := testMigrationFunc()
 			clusterArgs := base.TestClusterArgs{
 				ServerArgs: base.TestServerArgs{
 					Settings: settings,
 					Knobs: base.TestingKnobs{
 						Server: &server.TestingKnobs{
 							DisableAutomaticVersionUpgrade: make(chan struct{}),
-							BinaryVersionOverride:          startCV.Version,
+							BinaryVersionOverride:          startCV,
+							BootstrapVersionKeyOverride:    startKey,
 						},
 						JobsTestingKnobs: jobsKnobs,
 						SQLExecutor: &sql.ExecutorTestingKnobs{
-							BeforeExecute: func(ctx context.Context, stmt string) {
+							BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
 								if stmt == upgrades.WaitForJobStatement {
 									select {
 									case migrationWaitCh <- struct{}{}:
@@ -274,17 +354,17 @@ CREATE TABLE test.test_table (
 								}
 							},
 						},
-						UpgradeManager: &upgrade.TestingKnobs{
-							ListBetweenOverride: func(from, to clusterversion.ClusterVersion) []clusterversion.ClusterVersion {
-								return []clusterversion.ClusterVersion{
+						UpgradeManager: &upgradebase.TestingKnobs{
+							ListBetweenOverride: func(from, to roachpb.Version) []roachpb.Version {
+								return []roachpb.Version{
 									endCV,
 								}
 							},
-							RegistryOverride: func(cv clusterversion.ClusterVersion) (upgrade.Upgrade, bool) {
+							RegistryOverride: func(cv roachpb.Version) (upgradebase.Upgrade, bool) {
 								if cv.Equal(endCV) {
 									return upgrade.NewTenantUpgrade("testing",
 										endCV,
-										upgrades.NoPrecondition,
+										upgrade.NoPrecondition,
 										migrationFunc,
 									), true
 								}
@@ -306,16 +386,11 @@ CREATE TABLE test.test_table (
 			tdb.Exec(t, "CREATE DATABASE test")
 			tdb.Exec(t, createTableAfter)
 			var desc catalog.TableDescriptor
-			require.NoError(t, s.CollectionFactory().(*descs.CollectionFactory).Txn(ctx, s.DB(), func(
-				ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+			require.NoError(t, s.InternalDB().(descs.DB).DescsTxn(ctx, func(
+				ctx context.Context, txn descs.Txn,
 			) (err error) {
 				tn := tree.MakeTableNameWithSchema("test", "public", "test_table")
-				_, desc, err = descriptors.GetImmutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlags{
-					CommonLookupFlags: tree.CommonLookupFlags{
-						Required:    true,
-						AvoidLeased: true,
-					},
-				})
+				_, desc, err = descs.PrefixAndTable(ctx, txn.Descriptors().ByName(txn.KV()).Get(), &tn)
 				return err
 			}))
 			tdb.Exec(t, "DROP TABLE test.test_table")
@@ -328,7 +403,7 @@ CREATE TABLE test.test_table (
 			// Channel to wait for the migration job to complete.
 			finishChan := make(chan struct{})
 			go upgrades.UpgradeToVersion(
-				t, sqlDB, endCV.Version, finishChan, true, /* expectError */
+				t, sqlDB, endCV, finishChan, true, /* expectError */
 			)
 
 			var migJobID jobspb.JobID
@@ -391,7 +466,7 @@ CREATE TABLE test.test_table (
 
 			// Restart the migration job.
 			t.Log("retrying migration, expecting to succeed")
-			go upgrades.UpgradeToVersion(t, sqlDB, endCV.Version, finishChan, false /* expectError */)
+			go upgrades.UpgradeToVersion(t, sqlDB, endCV, finishChan, false /* expectError */)
 
 			// Wait until the new migration job observes an existing mutation job.
 			if test.waitForMigrationRestart {
@@ -453,11 +528,12 @@ CREATE TABLE test.test_table (
 func cancelJob(
 	t *testing.T, ctx context.Context, s serverutils.TestServerInterface, jobID jobspb.JobID,
 ) {
-	err := s.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	err := s.InternalDB().(isql.DB).Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// Using this way of canceling because the migration job us non-cancelable.
 		// Canceling in this way skips the check.
 		return s.JobRegistry().(*jobs.Registry).UpdateJobWithTxn(
-			ctx, jobID, txn, false /* useReadLock */, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+			ctx, jobID, txn, false /* useReadLock */, func(
+				txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
 			) error {
 				ju.UpdateStatus(jobs.StatusCancelRequested)
 				return nil

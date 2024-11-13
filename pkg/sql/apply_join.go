@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -114,7 +115,7 @@ func (a *applyJoinNode) startExec(params runParams) error {
 		}
 	}
 	a.run.out = make(tree.Datums, len(a.columns))
-	a.run.rightRows.Init(a.rightTypes, params.extendedEvalCtx, "apply-join" /* opName */)
+	a.run.rightRows.Init(params.ctx, a.rightTypes, params.extendedEvalCtx, "apply-join" /* opName */)
 	return nil
 }
 
@@ -138,7 +139,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 					break
 				}
 				// Compute join.
-				predMatched, err := a.pred.eval(params.EvalContext(), a.run.leftRow, rrow)
+				predMatched, err := a.pred.eval(params.ctx, params.EvalContext(), a.run.leftRow, rrow)
 				if err != nil {
 					return false, err
 				}
@@ -228,7 +229,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 }
 
 // clearRightRows clears rightRows and resets rightRowsIterator. This function
-// must be called before reusing rightRows and rightRowIterator.
+// must be called before reusing rightRows and rightRowsIterator.
 func (a *applyJoinNode) clearRightRows(params runParams) error {
 	if err := a.run.rightRows.Clear(params.ctx); err != nil {
 		return err
@@ -247,7 +248,7 @@ func (a *applyJoinNode) runNextRightSideIteration(params runParams, leftRow tree
 	opName := "apply-join-iteration-" + strconv.Itoa(a.iterationCount)
 	ctx, sp := tracing.ChildSpan(params.ctx, opName)
 	defer sp.Finish()
-	p, err := a.planRightSideFn(ctx, newExecFactory(params.p), leftRow)
+	p, err := a.planRightSideFn(ctx, newExecFactory(ctx, params.p), leftRow)
 	if err != nil {
 		return err
 	}
@@ -256,7 +257,7 @@ func (a *applyJoinNode) runNextRightSideIteration(params runParams, leftRow tree
 	if err := runPlanInsidePlan(ctx, params, plan, rowResultWriter); err != nil {
 		return err
 	}
-	a.run.rightRowsIterator = newRowContainerIterator(ctx, a.run.rightRows, a.rightTypes)
+	a.run.rightRowsIterator = newRowContainerIterator(ctx, a.run.rightRows)
 	return nil
 }
 
@@ -265,14 +266,14 @@ func (a *applyJoinNode) runNextRightSideIteration(params runParams, leftRow tree
 func runPlanInsidePlan(
 	ctx context.Context, params runParams, plan *planComponents, resultWriter rowResultWriter,
 ) error {
+	defer plan.close(ctx)
+	execCfg := params.ExecCfg()
 	recv := MakeDistSQLReceiver(
 		ctx, resultWriter, tree.Rows,
-		params.ExecCfg().RangeDescriptorCache,
+		execCfg.RangeDescriptorCache,
 		params.p.Txn(),
-		params.ExecCfg().Clock,
+		execCfg.Clock,
 		params.p.extendedEvalCtx.Tracing,
-		params.p.ExecCfg().ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
@@ -280,8 +281,9 @@ func runPlanInsidePlan(
 		// We currently don't support cases when both the "inner" and the
 		// "outer" plans have subqueries due to limitations of how we're
 		// propagating the results of the subqueries.
-		// TODO(mgartner): Fix error message for routines so that it doesn't say
-		// "apply joins".
+		// TODO(mgartner): We should be able to lift this restriction for
+		// apply-joins, similarly to how subqueries within UDFs are planned - as
+		// routines instead of subqueries.
 		if len(params.p.curPlan.subqueryPlans) != 0 {
 			return unimplemented.NewWithIssue(66447, `apply joins with subqueries in the "inner" and "outer" contexts are not supported`)
 		}
@@ -299,9 +301,9 @@ func runPlanInsidePlan(
 		// Create a separate memory account for the results of the subqueries.
 		// Note that we intentionally defer the closure of the account until we
 		// return from this method (after the main query is executed).
-		subqueryResultMemAcc := params.p.EvalContext().Mon.MakeBoundAccount()
+		subqueryResultMemAcc := params.p.Mon().MakeBoundAccount()
 		defer subqueryResultMemAcc.Close(ctx)
-		if !params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.PlanAndRunSubqueries(
+		if !execCfg.DistSQLPlanner.PlanAndRunSubqueries(
 			ctx,
 			params.p,
 			params.extendedEvalCtx.copy,
@@ -309,6 +311,7 @@ func runPlanInsidePlan(
 			recv,
 			&subqueryResultMemAcc,
 			false, /* skipDistSQLDiagramGeneration */
+			atomic.LoadUint32(&params.p.atomic.innerPlansMustUseLeafTxn) == 1,
 		) {
 			return resultWriter.Err()
 		}
@@ -317,22 +320,30 @@ func runPlanInsidePlan(
 	// Make a copy of the EvalContext so it can be safely modified.
 	evalCtx := params.p.ExtendedEvalContextCopy()
 	plannerCopy := *params.p
+	// If we reach this part when re-executing a pausable portal, we won't want to
+	// resume the flow bound to it. The inner-plan should have its own lifecycle
+	// for its flow.
+	plannerCopy.pausablePortal = nil
 	distributePlan := getPlanDistribution(
-		ctx, &plannerCopy, plannerCopy.execCfg.NodeInfo.NodeID, plannerCopy.SessionData().DistSQLMode, plan.main,
+		ctx, plannerCopy.Descriptors().HasUncommittedTypes(),
+		plannerCopy.SessionData().DistSQLMode, plan.main,
 	)
 	distributeType := DistributionType(DistributionTypeNone)
 	if distributePlan.WillDistribute() {
 		distributeType = DistributionTypeAlways
 	}
-	planCtx := params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.NewPlanningCtx(
-		ctx, evalCtx, &plannerCopy, params.p.txn, distributeType)
+	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, &plannerCopy, plannerCopy.txn, distributeType)
 	planCtx.planner.curPlan.planComponents = *plan
 	planCtx.ExtendedEvalCtx.Planner = &plannerCopy
+	planCtx.ExtendedEvalCtx.StreamManagerFactory = &plannerCopy
 	planCtx.stmtType = recv.stmtType
+	planCtx.mustUseLeafTxn = atomic.LoadUint32(&params.p.atomic.innerPlansMustUseLeafTxn) == 1
 
-	params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.PlanAndRun(
-		ctx, evalCtx, planCtx, params.p.Txn(), plan.main, recv,
-	)()
+	finishedSetupFn, cleanup := getFinishedSetupFn(&plannerCopy)
+	defer cleanup()
+	execCfg.DistSQLPlanner.PlanAndRun(
+		ctx, evalCtx, planCtx, plannerCopy.Txn(), plan.main, recv, finishedSetupFn,
+	)
 	return resultWriter.Err()
 }
 

@@ -15,15 +15,20 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -33,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 )
 
@@ -43,7 +47,7 @@ var GCInterval = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"server.sqlliveness.gc_interval",
 	"duration between attempts to delete extant sessions that have expired",
-	20*time.Second,
+	time.Hour,
 	settings.NonNegativeDuration,
 )
 
@@ -76,23 +80,26 @@ var CacheSize = settings.RegisterIntSetting(
 	"number of session entries to store in the LRU",
 	1024)
 
-// Storage implements sqlliveness.Storage.
+// Storage deals with reading and writing session records. It implements the
+// sqlliveness.Storage interface, and the slinstace.Writer interface.
 type Storage struct {
-	log.AmbientContext
-
-	settings   *cluster.Settings
-	stopper    *stop.Stopper
-	clock      *hlc.Clock
-	db         *kv.DB
-	codec      keys.SQLCodec
-	metrics    Metrics
-	gcInterval func() time.Duration
-	g          singleflight.Group
-	newTimer   func() timeutil.TimerI
-	tableID    descpb.ID
+	settings        *cluster.Settings
+	settingsWatcher *settingswatcher.SettingsWatcher
+	stopper         *stop.Stopper
+	clock           *hlc.Clock
+	db              *kv.DB
+	codec           keys.SQLCodec
+	metrics         Metrics
+	gcInterval      func() time.Duration
+	newTimer        func() timeutil.TimerI
+	newKeyCodec     keyCodec
+	oldKeyCodec     keyCodec
 
 	mu struct {
 		syncutil.Mutex
+
+		g *singleflight.Group
+
 		started bool
 		// liveSessions caches the current view of expirations of live sessions.
 		liveSessions *cache.UnorderedCache
@@ -105,6 +112,8 @@ type Storage struct {
 	}
 }
 
+var _ sqlliveness.StorageReader = &Storage{}
+
 // NewTestingStorage constructs a new storage with control for the database
 // in which the `sqlliveness` table should exist.
 func NewTestingStorage(
@@ -114,19 +123,21 @@ func NewTestingStorage(
 	db *kv.DB,
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
-	sqllivenessTableID descpb.ID,
+	settingsWatcher *settingswatcher.SettingsWatcher,
+	table catalog.TableDescriptor,
 	newTimer func() timeutil.TimerI,
 ) *Storage {
+	const rbtIndexID = 1
 	s := &Storage{
-		AmbientContext: ambientCtx,
-
-		settings: settings,
-		stopper:  stopper,
-		clock:    clock,
-		db:       db,
-		codec:    codec,
-		tableID:  sqllivenessTableID,
-		newTimer: newTimer,
+		settings:        settings,
+		settingsWatcher: settingsWatcher,
+		stopper:         stopper,
+		clock:           clock,
+		db:              db,
+		codec:           codec,
+		newKeyCodec:     &rbrEncoder{codec.IndexPrefix(uint32(table.GetID()), uint32(table.GetPrimaryIndexID()))},
+		oldKeyCodec:     &rbtEncoder{codec.IndexPrefix(uint32(table.GetID()), rbtIndexID)},
+		newTimer:        newTimer,
 		gcInterval: func() time.Duration {
 			baseInterval := GCInterval.Get(&settings.SV)
 			jitter := GCJitter.Get(&settings.SV)
@@ -143,6 +154,7 @@ func NewTestingStorage(
 	}
 	s.mu.liveSessions = cache.NewUnorderedCache(cacheConfig)
 	s.mu.deadSessions = cache.NewUnorderedCache(cacheConfig)
+	s.mu.g = singleflight.NewGroup("is-alive", "session ID")
 	return s
 }
 
@@ -154,9 +166,13 @@ func NewStorage(
 	db *kv.DB,
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
+	settingsWatcher *settingswatcher.SettingsWatcher,
 ) *Storage {
-	return NewTestingStorage(ambientCtx, stopper, clock, db, codec, settings, keys.SqllivenessID,
-		timeutil.DefaultTimeSource{}.NewTimer)
+	return NewTestingStorage(
+		ambientCtx, stopper, clock, db, codec, settings, settingsWatcher,
+		systemschema.SqllivenessTable(),
+		timeutil.DefaultTimeSource{}.NewTimer,
+	)
 }
 
 // Metrics returns the associated metrics struct.
@@ -173,13 +189,6 @@ func (s *Storage) Start(ctx context.Context) {
 	}
 	_ = s.stopper.RunAsyncTask(ctx, "slstorage", s.deleteSessionsLoop)
 	s.mu.started = true
-}
-
-// IsAlive determines whether a given session is alive. If this method returns
-// true, the session may no longer be alive, but if it returns false, the
-// session definitely is not alive.
-func (s *Storage) IsAlive(ctx context.Context, sid sqlliveness.SessionID) (alive bool, err error) {
-	return s.isAlive(ctx, sid, sync)
 }
 
 type readType byte
@@ -203,7 +212,6 @@ func (s *Storage) isAlive(
 		s.metrics.IsAliveCacheHits.Inc(1)
 		return false, nil
 	}
-	var prevExpiration hlc.Timestamp
 	if expiration, ok := s.mu.liveSessions.Get(sid); ok {
 		expiration := expiration.(hlc.Timestamp)
 		// The record exists and is valid.
@@ -212,46 +220,14 @@ func (s *Storage) isAlive(
 			s.metrics.IsAliveCacheHits.Inc(1)
 			return true, nil
 		}
-		// The record exists in the cache but seems expired according to our clock.
-		// If we returned that the session was alive regardless of the expiration
-		// then we'd never update the cache. Go fetch the session and pass in the
-		// current view of the expiration. If the expiration has not changed, then
-		// the session is expired and should be deleted. If it has, get the new
-		// expiration for the cache.
-		prevExpiration = expiration
 	}
 
-	// Launch singleflight to go read from the database and maybe delete the
-	// entry. If it is found, we can add it and its expiration to the liveSessions
-	// cache. If it isn't found, we know it's dead and we can add that to the
-	// deadSessions cache.
-	resChan, _ := s.g.DoChan(string(sid), func() (interface{}, error) {
+	// We think that the session is expired; check, and maybe delete it.
+	future := s.deleteOrFetchSessionSingleFlightLocked(ctx, sid)
 
-		// Note that we use a new `context` here to avoid a situation where a cancellation
-		// of the first context cancels other callers to the `acquireNodeLease()` method,
-		// because of its use of `singleflight.Group`. See issue #41780 for how this has
-		// happened.
-		bgCtx := s.AnnotateCtx(context.Background())
-		bgCtx = logtags.AddTags(bgCtx, logtags.FromContext(ctx))
-		newCtx, cancel := s.stopper.WithCancelOnQuiesce(bgCtx)
-		defer cancel()
-
-		// store the result underneath the singleflight to avoid the need
-		// for additional synchronization.
-		live, expiration, err := s.deleteOrFetchSession(newCtx, sid, prevExpiration)
-		if err != nil {
-			return nil, err
-		}
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if live {
-			s.mu.liveSessions.Add(sid, expiration)
-		} else {
-			s.mu.deadSessions.Del(sid)
-			s.mu.deadSessions.Add(sid, nil)
-		}
-		return live, nil
-	})
+	// At this point, we know that the singleflight goroutine has been launched.
+	// Releasing the lock here ensures that callers will either join the single-
+	// flight or see the result.
 	s.mu.Unlock()
 	s.metrics.IsAliveCacheMisses.Inc(1)
 
@@ -260,31 +236,120 @@ func (s *Storage) isAlive(
 	if syncOrAsync == async {
 		return true, nil
 	}
-	select {
-	case res := <-resChan:
-		if res.Err != nil {
-			return false, res.Err
-		}
-		return res.Val.(bool), nil
-	case <-ctx.Done():
-		return false, ctx.Err()
+	res := future.WaitForResult(ctx)
+	if res.Err != nil {
+		return false, res.Err
+	}
+	return res.Val.(bool), nil
+}
+
+func (s *Storage) getReadCodec(version *settingswatcher.VersionGuard) keyCodec {
+	if version.IsActive(clusterversion.V23_1_SystemRbrReadNew) {
+		return s.newKeyCodec
+	}
+	return s.oldKeyCodec
+}
+
+func (s *Storage) getDualWriteCodec(version *settingswatcher.VersionGuard) keyCodec {
+	switch {
+	case version.IsActive(clusterversion.V23_1_SystemRbrSingleWrite):
+		return nil
+	case version.IsActive(clusterversion.V23_1_SystemRbrReadNew):
+		return s.oldKeyCodec
+	case version.IsActive(clusterversion.V23_1_SystemRbrDualWrite):
+		return s.newKeyCodec
+	default:
+		return nil
 	}
 }
 
+func (s *Storage) versionGuard(
+	ctx context.Context, txn *kv.Txn,
+) (settingswatcher.VersionGuard, error) {
+	return s.settingsWatcher.MakeVersionGuard(ctx, txn, clusterversion.V23_1_SystemRbrCleanup)
+}
+
+// This function will launch a singleflight goroutine for the session which
+// will populate its result into the caches underneath the mutex. The result
+// value will be a bool. The singleflight goroutine does not cancel its work
+// in the face of cancellation of ctx.
+//
+// This method assumes that s.mu is held.
+func (s *Storage) deleteOrFetchSessionSingleFlightLocked(
+	ctx context.Context, sid sqlliveness.SessionID,
+) singleflight.Future {
+	s.mu.AssertHeld()
+
+	// If it is found, we can add it and its expiration to the liveSessions
+	// cache. If it isn't found, we know it's dead, and we can add that to the
+	// deadSessions cache.
+	resChan, _ := s.mu.g.DoChan(ctx, string(sid), singleflight.DoOpts{
+		Stop:               s.stopper,
+		InheritCancelation: false,
+	},
+		func(ctx context.Context) (interface{}, error) {
+			// store the result underneath the singleflight to avoid the need
+			// for additional synchronization. Also, use a stopper task to ensure
+			// the goroutine is tracked during shutdown.
+			var live bool
+			var expiration hlc.Timestamp
+			live, expiration, err := s.deleteOrFetchSession(ctx, sid)
+			if err != nil {
+				return nil, err
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if live {
+				s.mu.liveSessions.Add(sid, expiration)
+			} else {
+				s.mu.deadSessions.Add(sid, nil)
+			}
+			return live, nil
+		})
+	return resChan
+}
+
+// txn wraps around s.db.TxnWithAdmissionControl, annotating it with the
+// appropriate AC metadata for SQL liveness work.
+func (s *Storage) txn(ctx context.Context, retryable func(context.Context, *kv.Txn) error) error {
+	// We use AdmissionHeader_OTHER to bypass AC if we're the system tenant
+	// (only system tenants are allowed to bypass it altogether,
+	// AdmissionHeader_OTHER is ignored for non-system tenants further down the
+	// stack), and admissionpb.HighPri for secondary tenants to avoid the kind
+	// of starvation we see in #97448.
+	return s.db.TxnWithAdmissionControl(
+		ctx,
+		kvpb.AdmissionHeader_OTHER,
+		admissionpb.HighPri,
+		kv.SteppingDisabled,
+		retryable,
+	)
+}
+
 // deleteOrFetchSession returns whether the query session currently exists by
-// reading from the database. If passed expiration is non-zero and the existing
-// record has the same expiration, the record will be deleted and false will
-// be returning, indicating that it no longer exists. If the record exists and
-// has a differring expiration timestamp, true and the associated expiration
-// will be returned.
+// reading from the database. If the record exists but is expired, this method
+// will delete the record transactionally, moving it to from alive to dead. The
+// returned expiration will be non-zero only if the session is alive.
 func (s *Storage) deleteOrFetchSession(
-	ctx context.Context, sid sqlliveness.SessionID, prevExpiration hlc.Timestamp,
+	ctx context.Context, sid sqlliveness.SessionID,
 ) (alive bool, expiration hlc.Timestamp, err error) {
 	var deleted bool
+	var prevExpiration hlc.Timestamp
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
-	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		deleted = false
-		k := s.makeSessionKey(sid)
+	if err := s.txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		// Reset captured variable in case of retry.
+		deleted, expiration, prevExpiration = false, hlc.Timestamp{}, hlc.Timestamp{}
+
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+
+		readCodec := s.getReadCodec(&version)
+		k, err := readCodec.encode(sid)
+		if err != nil {
+			return err
+		}
 		kv, err := txn.Get(ctx, k)
 		if err != nil {
 			return err
@@ -298,16 +363,25 @@ func (s *Storage) deleteOrFetchSession(
 			return errors.Wrapf(err, "failed to decode expiration for %s",
 				redact.SafeString(sid.String()))
 		}
-		if !expiration.Equal(prevExpiration) {
+		prevExpiration = expiration
+		if !expiration.Less(s.clock.Now()) {
 			alive = true
 			return nil
 		}
 
 		// The session is expired and needs to be deleted.
-		deleted = true
-		expiration = hlc.Timestamp{}
-		_, err = txn.Del(ctx, k)
-		return err
+		deleted, expiration = true, hlc.Timestamp{}
+		ba := txn.NewBatch()
+		ba.Del(k)
+		if dualCodec := s.getDualWriteCodec(&version); dualCodec != nil {
+			dualKey, err := dualCodec.encode(sid)
+			if err != nil {
+				return err
+			}
+			ba.Del(dualKey)
+		}
+
+		return txn.CommitInBatch(ctx, ba)
 	}); err != nil {
 		return false, hlc.Timestamp{}, errors.Wrapf(err,
 			"could not query session id: %s", sid)
@@ -344,50 +418,86 @@ func (s *Storage) deleteSessionsLoop(ctx context.Context) {
 // which has been added should be sufficient to delete expired sessions which
 // matter. This would closer align with the behavior in node-liveness.
 func (s *Storage) deleteExpiredSessions(ctx context.Context) {
-	now := s.clock.Now()
-	var deleted int64
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
-	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		deleted = 0 // reset for restarts
-		start := s.makeTablePrefix()
+	toCheck, err := s.fetchExpiredSessionIDs(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Errorf(ctx, "could not delete expired sessions: %v", err)
+		}
+		return
+	}
+	launchSessionCheck := func(id sqlliveness.SessionID) singleflight.Future {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// We have evidence that the session is expired, so remove any cached
+		// fact that it might be alive and launch the goroutine to determine its
+		// true state.
+		s.mu.liveSessions.Del(id)
+		return s.deleteOrFetchSessionSingleFlightLocked(ctx, id)
+	}
+	checkSession := func(id sqlliveness.SessionID) error {
+		future := launchSessionCheck(id)
+		return future.WaitForResult(ctx).Err
+	}
+	for _, id := range toCheck {
+		if err := checkSession(id); err != nil {
+			log.Warningf(ctx, "failed to check on expired session %v: %v", id, err)
+		}
+	}
+	s.metrics.SessionDeletionsRuns.Inc(1)
+}
+
+func (s *Storage) fetchExpiredSessionIDs(ctx context.Context) ([]sqlliveness.SessionID, error) {
+	findRows := func(ctx context.Context, txn *kv.Txn, keyCodec keyCodec) ([]sqlliveness.SessionID, error) {
+		start := keyCodec.indexPrefix()
 		end := start.PrefixEnd()
+		now := s.clock.Now()
+
+		var toCheck []sqlliveness.SessionID
+
 		const maxRows = 1024 // arbitrary but plenty
 		for {
 			rows, err := txn.Scan(ctx, start, end, maxRows)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if len(rows) == 0 {
-				return nil
+				return nil, nil
 			}
-			var toDel []interface{}
 			for i := range rows {
 				exp, err := decodeValue(rows[i])
 				if err != nil {
-					log.Warningf(ctx, "failed to decode row %s: %v", rows[i].Key.String(), err)
+					log.Warningf(ctx, "failed to decode row %s expiration: %v", rows[i].Key.String(), err)
+					continue
 				}
 				if exp.Less(now) {
-					toDel = append(toDel, rows[i].Key)
-					deleted++
+					id, err := keyCodec.decode(rows[i].Key)
+					if err != nil {
+						log.Warningf(ctx, "failed to decode row %s session: %v", rows[i].Key.String(), err)
+					}
+					toCheck = append(toCheck, id)
 				}
 			}
-			if _, err := txn.Del(ctx, toDel...); err != nil {
-				return err
+			if len(rows) < maxRows {
+				return toCheck, nil
 			}
 			start = rows[len(rows)-1].Key.Next()
 		}
-	}); err != nil {
-		if ctx.Err() == nil {
-			log.Errorf(ctx, "could not delete expired sessions: %+v", err)
-		}
-		return
 	}
 
-	s.metrics.SessionDeletionsRuns.Inc(1)
-	s.metrics.SessionsDeleted.Inc(deleted)
-	if log.V(2) || deleted > 0 {
-		log.Infof(ctx, "deleted %d expired SQL liveness sessions", deleted)
+	var result []sqlliveness.SessionID
+	if err := s.txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+		result, err = findRows(ctx, txn, s.getReadCodec(&version))
+		return err
+	}); err != nil {
+		return nil, err
 	}
+
+	return result, nil
 }
 
 // Insert inserts the input Session in table `system.sqlliveness`.
@@ -397,10 +507,33 @@ func (s *Storage) deleteExpiredSessions(ctx context.Context) {
 func (s *Storage) Insert(
 	ctx context.Context, sid sqlliveness.SessionID, expiration hlc.Timestamp,
 ) (err error) {
-	k := s.makeSessionKey(sid)
-	v := encodeValue(expiration)
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
-	if err := s.db.InitPut(ctx, k, &v, true); err != nil {
+	if err := s.txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		batch := txn.NewBatch()
+
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+		readCodec := s.getReadCodec(&version)
+		k, err := readCodec.encode(sid)
+		if err != nil {
+			return err
+		}
+		v := encodeValue(expiration)
+		batch.InitPut(k, &v, true)
+
+		if dualCodec := s.getDualWriteCodec(&version); dualCodec != nil {
+			dualKey, err := dualCodec.encode(sid)
+			if err != nil {
+				return err
+			}
+			dualValue := encodeValue(expiration)
+			batch.InitPut(dualKey, &dualValue, true)
+		}
+
+		return txn.CommitInBatch(ctx, batch)
+	}); err != nil {
 		s.metrics.WriteFailures.Inc(1)
 		return errors.Wrapf(err, "could not insert session %s", sid)
 	}
@@ -415,8 +548,18 @@ func (s *Storage) Update(
 	ctx context.Context, sid sqlliveness.SessionID, expiration hlc.Timestamp,
 ) (sessionExists bool, err error) {
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
-	err = s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		k := s.makeSessionKey(sid)
+	err = s.txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+
+		readCodec := s.getReadCodec(&version)
+
+		k, err := readCodec.encode(sid)
+		if err != nil {
+			return err
+		}
 		kv, err := txn.Get(ctx, k)
 		if err != nil {
 			return err
@@ -425,7 +568,17 @@ func (s *Storage) Update(
 			return nil
 		}
 		v := encodeValue(expiration)
-		return txn.Put(ctx, k, &v)
+		ba := txn.NewBatch()
+		ba.Put(k, &v)
+		if dualCodec := s.getDualWriteCodec(&version); dualCodec != nil {
+			dualKey, err := dualCodec.encode(sid)
+			if err != nil {
+				return err
+			}
+			dualValue := encodeValue(expiration)
+			ba.Put(dualKey, &dualValue)
+		}
+		return txn.CommitInBatch(ctx, ba)
 	})
 	if err != nil || !sessionExists {
 		s.metrics.WriteFailures.Inc(1)
@@ -437,30 +590,69 @@ func (s *Storage) Update(
 	return sessionExists, nil
 }
 
+// Delete removes the session from the sqlliveness table without checking the
+// expiration. This is only safe to call during the shutdown process after all
+// tasks using the session have stopped.
+func (s *Storage) Delete(ctx context.Context, session sqlliveness.SessionID) error {
+	return s.txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+
+		batch := txn.NewBatch()
+
+		readCodec := s.getReadCodec(&version)
+		key, err := readCodec.encode(session)
+		if err != nil {
+			return err
+		}
+		batch.Del(key)
+
+		if dualCodec := s.getDualWriteCodec(&version); dualCodec != nil {
+			dualKey, err := dualCodec.encode(session)
+			if err != nil {
+				return err
+			}
+			batch.Del(dualKey)
+		}
+		return txn.CommitInBatch(ctx, batch)
+	})
+}
+
 // CachedReader returns an implementation of sqlliveness.Reader which does
 // not synchronously read from the store. Calls to IsAlive will return the
 // currently known state of the session, but will trigger an asynchronous
 // refresh of the state of the session if it is not known.
 func (s *Storage) CachedReader() sqlliveness.Reader {
-	return (*cachedStorage)(s)
+	return (*cachedReader)(s)
 }
 
-// cachedStorage implements sqlliveness.Storage but does not read from the
-// underlying store synchronously during IsAlive.
-type cachedStorage Storage
+// BlockingReader reader returns an implementation of sqlliveness.Reader which
+// will cache results of previous reads but will synchronously block to
+// determine the status of a session which it does not know about or thinks
+// might be expired.
+func (s *Storage) BlockingReader() sqlliveness.Reader {
+	return (*blockingReader)(s)
+}
 
-func (s *cachedStorage) IsAlive(
+type blockingReader Storage
+
+func (s *blockingReader) IsAlive(
+	ctx context.Context, sid sqlliveness.SessionID,
+) (alive bool, err error) {
+	return (*Storage)(s).isAlive(ctx, sid, sync)
+}
+
+// cachedReader implements the sqlliveness.Reader interface, and the
+// slinstace.Writer interface, but does not read from the underlying store
+// synchronously during IsAlive.
+type cachedReader Storage
+
+func (s *cachedReader) IsAlive(
 	ctx context.Context, sid sqlliveness.SessionID,
 ) (alive bool, err error) {
 	return (*Storage)(s).isAlive(ctx, sid, async)
-}
-
-func (s *Storage) makeTablePrefix() roachpb.Key {
-	return s.codec.IndexPrefix(uint32(s.tableID), 1)
-}
-
-func (s *Storage) makeSessionKey(id sqlliveness.SessionID) roachpb.Key {
-	return keys.MakeFamilyKey(encoding.EncodeBytesAscending(s.makeTablePrefix(), id.UnsafeBytes()), 0)
 }
 
 func decodeValue(kv kv.KeyValue) (hlc.Timestamp, error) {

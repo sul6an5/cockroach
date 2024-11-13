@@ -16,15 +16,17 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
@@ -72,33 +74,35 @@ func (r *Registry) maybeDumpTrace(
 	// could have been canceled at this point.
 	dumpCtx, _ := r.makeCtx()
 
+	ieNotBoundToTxn := r.db.Executor()
+
 	// If the job has failed, and the dump mode is set to anything
 	// except noDump, then we should dump the trace.
 	// The string comparison is unfortunate but is used to differentiate a job
 	// that has failed from a job that has been canceled.
 	if jobErr != nil && !HasErrJobCanceled(jobErr) && resumerCtx.Err() == nil {
-		r.td.Dump(dumpCtx, strconv.Itoa(int(jobID)), traceID, r.ex)
+		r.td.Dump(dumpCtx, strconv.Itoa(int(jobID)), traceID, ieNotBoundToTxn)
 		return
 	}
 
 	// If the dump mode is set to `dumpOnStop` then we should dump the
 	// trace when the job is any of paused, canceled, succeeded or failed state.
 	if dumpMode == int64(dumpOnStop) {
-		r.td.Dump(dumpCtx, strconv.Itoa(int(jobID)), traceID, r.ex)
+		r.td.Dump(dumpCtx, strconv.Itoa(int(jobID)), traceID, ieNotBoundToTxn)
 	}
 }
 
 // claimJobs places a claim with the given SessionID to job rows that are
 // available.
 func (r *Registry) claimJobs(ctx context.Context, s sqlliveness.Session) error {
-	return r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	return r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// Run the claim transaction at low priority to ensure that it does not
 		// contend with foreground reads.
-		if err := txn.SetUserPriority(roachpb.MinUserPriority); err != nil {
+		if err := txn.KV().SetUserPriority(roachpb.MinUserPriority); err != nil {
 			return errors.WithAssertionFailure(err)
 		}
-		numRows, err := r.ex.Exec(
-			ctx, "claim-jobs", txn, claimQuery,
+		numRows, err := txn.Exec(
+			ctx, "claim-jobs", txn.KV(), claimQuery,
 			s.ID().UnsafeBytes(), r.ID(), maxAdoptionsPerLoop)
 		if err != nil {
 			return errors.Wrap(err, "could not query jobs table")
@@ -142,9 +146,21 @@ COALESCE(last_run, created) + least(
 	processQueryWithBackoff = processQueryBase + ", " + canRunArgs +
 		" WHERE " + processQueryWhereBase + " AND " + canRunClause
 
-	resumeQueryBaseCols    = "status, payload, progress, crdb_internal.sql_liveness_is_alive(claim_session_id)"
-	resumeQueryWhereBase   = `id = $1 AND claim_session_id = $2`
+	// resumeQueryBaseCols selects NULL values for the payload and progress that
+	// will be read from the system.job_info table. This allows us to get results
+	// aligned with deprecatedResumeQueryBaseCols below.
+	resumeQueryBaseCols    = "status, NULL, NULL, crdb_internal.sql_liveness_is_alive(claim_session_id)"
 	resumeQueryWithBackoff = `SELECT ` + resumeQueryBaseCols + `, ` + canRunClause + ` AS can_run,` +
+		` created_by_type, created_by_id  FROM system.jobs, ` + canRunArgs + " WHERE " + resumeQueryWhereBase
+
+	// deprecatedResumeQueryBaseCols loads the payload and progress from
+	// system.jobs instead of the system.job_info table.
+	//
+	// TODO(adityamaru): Remove the deprecated queries once we are outside the
+	// compatability window for 22.2.
+	deprecatedResumeQueryBaseCols    = "status, payload, progress, crdb_internal.sql_liveness_is_alive(claim_session_id)"
+	resumeQueryWhereBase             = `id = $1 AND claim_session_id = $2`
+	deprecatedResumeQueryWithBackoff = `SELECT ` + deprecatedResumeQueryBaseCols + `, ` + canRunClause + ` AS can_run,` +
 		` created_by_type, created_by_id  FROM system.jobs, ` + canRunArgs + " WHERE " + resumeQueryWhereBase
 )
 
@@ -165,9 +181,9 @@ func getProcessQuery(
 func (r *Registry) processClaimedJobs(ctx context.Context, s sqlliveness.Session) error {
 	query, args := getProcessQuery(ctx, s, r)
 
-	it, err := r.ex.QueryIteratorEx(
+	it, err := r.db.Executor().QueryIteratorEx(
 		ctx, "select-running/get-claimed-jobs", nil,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()}, query, args...,
+		sessiondata.NodeUserSessionDataOverride, query, args...,
 	)
 	if err != nil {
 		return errors.Wrapf(err, "could not query for claimed jobs")
@@ -239,14 +255,23 @@ func (r *Registry) filterAlreadyRunningAndCancelFromPreviousSessions(
 }
 
 // resumeJob resumes a claimed job.
-func (r *Registry) resumeJob(ctx context.Context, jobID jobspb.JobID, s sqlliveness.Session) error {
+func (r *Registry) resumeJob(
+	ctx context.Context, jobID jobspb.JobID, s sqlliveness.Session,
+) (retErr error) {
 	log.Infof(ctx, "job %d: resuming execution", jobID)
-	resumeQuery := resumeQueryWithBackoff
+
+	readPayloadAndProgressFromJobInfo := r.settings.Version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled)
+	var resumeQuery string
+	if readPayloadAndProgressFromJobInfo {
+		resumeQuery = resumeQueryWithBackoff
+	} else {
+		resumeQuery = deprecatedResumeQueryWithBackoff
+	}
 	args := []interface{}{jobID, s.ID().UnsafeBytes(),
 		r.clock.Now().GoTime(), r.RetryInitialDelay(), r.RetryMaxDelay()}
-	row, err := r.ex.QueryRowEx(
+	row, err := r.db.Executor().QueryRowEx(
 		ctx, "get-job-row", nil,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()}, resumeQuery, args...,
+		sessiondata.NodeUserSessionDataOverride, resumeQuery, args...,
 	)
 	if err != nil {
 		return errors.Wrapf(err, "job %d: could not query job table row", jobID)
@@ -287,22 +312,51 @@ func (r *Registry) resumeJob(ctx context.Context, jobID jobspb.JobID, s sqlliven
 		return nil
 	}
 
-	payload, err := UnmarshalPayload(row[1])
-	if err != nil {
-		return err
-	}
-
-	progress, err := UnmarshalProgress(row[2])
-	if err != nil {
-		return err
-	}
-
 	createdBy, err := unmarshalCreatedBy(row[5], row[6])
 	if err != nil {
 		return err
 	}
-
 	job := &Job{id: jobID, registry: r, createdBy: createdBy}
+
+	payload := &jobspb.Payload{}
+	progress := &jobspb.Progress{}
+	if readPayloadAndProgressFromJobInfo {
+		if err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			infoStorage := job.InfoStorage(txn)
+			payloadBytes, exists, err := infoStorage.GetLegacyPayload(ctx)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return errors.Wrap(&JobNotFoundError{jobID: jobID}, "job payload not found in system.job_info")
+			}
+			if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
+				return err
+			}
+
+			progressBytes, exists, err := infoStorage.GetLegacyProgress(ctx)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return errors.Wrap(&JobNotFoundError{jobID: jobID}, "job progress not found in system.job_info")
+			}
+			return protoutil.Unmarshal(progressBytes, progress)
+		}); err != nil {
+			return err
+		}
+	} else {
+		payload, err = UnmarshalPayload(row[1])
+		if err != nil {
+			return err
+		}
+
+		progress, err = UnmarshalProgress(row[2])
+		if err != nil {
+			return err
+		}
+	}
+
 	job.mu.payload = *payload
 	job.mu.progress = *progress
 	job.session = s
@@ -315,21 +369,27 @@ func (r *Registry) resumeJob(ctx context.Context, jobID jobspb.JobID, s sqlliven
 
 	// If the job's type was registered to disable tenant cost control, then
 	// exclude the job's costs from tenant accounting.
-	if opts, ok := options[payload.Type()]; ok && opts.disableTenantCostControl {
+	if opts, ok := getRegisterOptions(payload.Type()); ok && opts.disableTenantCostControl {
 		resumeCtx = multitenant.WithTenantCostControlExemption(resumeCtx)
 	}
-
 	if alreadyAdopted := r.addAdoptedJob(jobID, s, cancel); alreadyAdopted {
+		// Not needing the context after all. Avoid leaking resources.
+		cancel()
 		return nil
 	}
 
 	r.metrics.ResumedJobs.Inc(1)
-	if err := r.stopper.RunAsyncTask(ctx, job.taskName(), func(ctx context.Context) {
+	if err := r.stopper.RunAsyncTask(resumeCtx, job.taskName(), func(ctx context.Context) {
 		// Wait for the job to finish. No need to print the error because if there
 		// was one it's been set in the job status already.
-		_ = r.runJob(resumeCtx, resumer, job, status, job.taskName())
+		var cleanup func()
+		ctx, cleanup = r.stopper.WithCancelOnQuiesce(ctx)
+		defer cleanup()
+		_ = r.runJob(ctx, resumer, job, status, job.taskName())
 	}); err != nil {
 		r.unregister(jobID)
+		// Also avoid leaking a goroutine in this case.
+		cancel()
 		return err
 	}
 	return nil
@@ -362,6 +422,10 @@ func (r *Registry) addAdoptedJob(
 func (r *Registry) runJob(
 	ctx context.Context, resumer Resumer, job *Job, status Status, taskName string,
 ) error {
+	if r.IsDraining() {
+		return errors.Newf("refusing to start %q; job registry is draining", taskName)
+	}
+
 	job.mu.Lock()
 	var finalResumeError error
 	if job.mu.payload.FinalResumeError != nil {
@@ -395,7 +459,7 @@ func (r *Registry) runJob(
 	span.SetTag("job-id", attribute.Int64Value(int64(job.ID())))
 	defer span.Finish()
 	if span.TraceID() != 0 {
-		if err := job.Update(ctx, nil /* txn */, func(txn *kv.Txn, md JobMetadata,
+		if err := job.NoTxn().Update(ctx, func(txn isql.Txn, md JobMetadata,
 			ju *JobUpdater) error {
 			progress := *md.Progress
 			progress.TraceID = span.TraceID()
@@ -415,17 +479,52 @@ func (r *Registry) runJob(
 		log.Errorf(ctx, "job %d: adoption completed with error %v", job.ID(), err)
 	}
 
-	r.maybeDumpTrace(ctx, resumer, int64(job.ID()), int64(span.TraceID()), err)
 	r.maybeRecordExecutionFailure(ctx, err, job)
+	// NB: After this point, the job may no longer have the claim
+	// and further updates to the job record from this node may
+	// fail.
+	r.maybeClearLease(job, err)
+	r.maybeDumpTrace(ctx, resumer, int64(job.ID()), int64(span.TraceID()), err)
 	if r.knobs.AfterJobStateMachine != nil {
 		r.knobs.AfterJobStateMachine()
 	}
 	return err
 }
 
+const clearClaimQuery = `
+   UPDATE system.jobs
+      SET claim_session_id = NULL, claim_instance_id = NULL
+    WHERE id = $1
+      AND claim_session_id = $2
+      AND claim_instance_id = $3`
+
+// maybeClearLease clears the claim on the given job, provided that
+// the current lease matches our liveness Session.
+func (r *Registry) maybeClearLease(job *Job, jobErr error) {
+	if jobErr == nil {
+		return
+	}
+	r.clearLeaseForJobID(job.ID(), r.db.Executor(), nil /* txn */)
+}
+
+func (r *Registry) clearLeaseForJobID(jobID jobspb.JobID, ex isql.Executor, txn *kv.Txn) {
+	// We use the serverCtx here rather than the context from the
+	// caller since the caller's context may have been canceled.
+	r.withSession(r.serverCtx, func(ctx context.Context, s sqlliveness.Session) {
+		n, err := ex.ExecEx(ctx, "clear-job-claim", txn,
+			sessiondata.NodeUserSessionDataOverride,
+			clearClaimQuery, jobID, s.ID().UnsafeBytes(), r.ID())
+		if err != nil {
+			log.Warningf(ctx, "could not clear job claim: %s", err.Error())
+			return
+		}
+		log.VEventf(ctx, 2, "cleared leases for %d jobs", n)
+	})
+}
+
 const pauseAndCancelUpdate = `
    UPDATE system.jobs
-      SET status = 
+      SET status =
           CASE
 						 WHEN status = '` + string(StatusPauseRequested) + `' THEN '` + string(StatusPaused) + `'
 						 WHEN status = '` + string(StatusCancelRequested) + `' THEN '` + string(StatusReverting) + `'
@@ -439,18 +538,18 @@ RETURNING id, status
 `
 
 func (r *Registry) servePauseAndCancelRequests(ctx context.Context, s sqlliveness.Session) error {
-	return r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	return r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// Run the claim transaction at low priority to ensure that it does not
 		// contend with foreground reads.
-		if err := txn.SetUserPriority(roachpb.MinUserPriority); err != nil {
+		if err := txn.KV().SetUserPriority(roachpb.MinUserPriority); err != nil {
 			return errors.WithAssertionFailure(err)
 		}
 		// Note that we have to buffer all rows first - before processing each
 		// job - because we have to make sure that the query executes without an
 		// error (otherwise, the system.jobs table might diverge from the jobs
 		// registry).
-		rows, err := r.ex.QueryBufferedEx(
-			ctx, "cancel/pause-requested", txn, sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+		rows, err := txn.QueryBufferedEx(
+			ctx, "cancel/pause-requested", txn.KV(), sessiondata.NodeUserSessionDataOverride,
 			pauseAndCancelUpdate, s.ID().UnsafeBytes(), r.ID(),
 		)
 		if err != nil {
@@ -462,12 +561,32 @@ func (r *Registry) servePauseAndCancelRequests(ctx context.Context, s sqllivenes
 			statusString := *row[1].(*tree.DString)
 			switch Status(statusString) {
 			case StatusPaused:
-				r.cancelRegisteredJobContext(id)
+				if !r.cancelRegisteredJobContext(id) {
+					// If we didn't already have a running job for this lease,
+					// clear out the lease here since it won't be cleared be
+					// cleared out on Resume exit.
+					r.clearLeaseForJobID(id, txn, txn.KV())
+				}
 				log.Infof(ctx, "job %d, session %s: paused", id, s.ID())
 			case StatusReverting:
-				if err := job.Update(ctx, txn, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
-					r.cancelRegisteredJobContext(id)
-					md.Payload.Error = errJobCanceled.Error()
+				if err := job.WithTxn(txn).Update(ctx, func(
+					txn isql.Txn, md JobMetadata, ju *JobUpdater,
+				) error {
+					if !r.cancelRegisteredJobContext(id) {
+						// If we didn't already have a running job for this
+						// lease, clear out the lease here since it won't be
+						// cleared be cleared out on Resume exit.
+						//
+						// NB: This working as part of the update depends on
+						// the fact that the job struct does not have a
+						// claim set and thus won't validate the claim on
+						// update.
+						r.clearLeaseForJobID(id, txn, txn.KV())
+					}
+					if md.Payload.Error == "" {
+						// Set default cancellation reason.
+						md.Payload.Error = errJobCanceled.Error()
+					}
 					encodedErr := errors.EncodeError(ctx, errJobCanceled)
 					md.Payload.FinalResumeError = &encodedErr
 					ju.UpdatePayload(md.Payload)

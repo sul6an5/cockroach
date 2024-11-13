@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -38,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -94,7 +96,7 @@ type ColIndexJoin struct {
 
 		// Fields that deal with variable-size types.
 		hasVarSizeCols bool
-		varSizeVecIdxs util.FastIntSet
+		varSizeVecIdxs intsets.Fast
 		byteLikeCols   []*coldata.Bytes
 		decimalCols    []coldata.Decimals
 		datumCols      []coldata.DatumVec
@@ -399,8 +401,13 @@ func (s *ColIndexJoin) GetBatchRequestsIssued() int64 {
 	return s.cf.getBatchRequestsIssued()
 }
 
-// GetCumulativeContentionTime is part of the colexecop.KVReader interface.
-func (s *ColIndexJoin) GetCumulativeContentionTime() time.Duration {
+// GetKVCPUTime is part of the colexecop.KVReader interface.
+func (s *ColIndexJoin) GetKVCPUTime() time.Duration {
+	return s.cf.cpuStopWatch.Elapsed()
+}
+
+// GetContentionInfo is part of the colexecop.KVReader interface.
+func (s *ColIndexJoin) GetContentionInfo() (time.Duration, []kvpb.ContentionEvent) {
 	return execstats.GetCumulativeContentionTime(s.Ctx, nil /* recording */)
 }
 
@@ -496,7 +503,7 @@ func NewColIndexJoin(
 		return nil, errors.AssertionFailedf("non-empty ON expressions are not supported for index joins")
 	}
 
-	tableArgs, err := populateTableArgs(ctx, &spec.FetchSpec, typeResolver)
+	tableArgs, err := populateTableArgs(ctx, &spec.FetchSpec, typeResolver, false /* allowUnhydratedEnums */)
 	if err != nil {
 		return nil, err
 	}
@@ -560,6 +567,8 @@ func NewColIndexJoin(
 		0, /* estimatedRowCount */
 		flowCtx.TraceKV,
 		false, /* singleUse */
+		execstats.ShouldCollectStats(ctx, flowCtx.CollectStats),
+		false, /* alwaysReallocate */
 	}
 	if err = fetcher.Init(
 		fetcherAllocator, kvFetcher, tableArgs,
@@ -682,9 +691,6 @@ func (s *ColIndexJoin) closeInternal() {
 	// span.
 	ctx := s.EnsureCtx()
 	s.cf.Close(ctx)
-	if s.spanAssembler != nil {
-		// spanAssembler can be nil if Release() has already been called.
-		s.spanAssembler.Close()
-	}
+	s.spanAssembler.Close()
 	s.batch = nil
 }

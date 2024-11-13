@@ -19,7 +19,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
@@ -122,7 +122,10 @@ func TestNewExternalSSTReader(t *testing.T) {
 			clusterSettings,
 			blobs.TestBlobServiceClient(tempDir),
 			username.RootUserName(),
-			tc.Servers[0].InternalExecutor().(*sql.InternalExecutor), tc.Servers[0].DB(), nil)
+			tc.Servers[0].InternalDB().(isql.DB),
+			nil, /* limiters */
+			cloud.NilMetrics,
+		)
 		require.NoError(t, err)
 		fileStores[i].Store = store
 

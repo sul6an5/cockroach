@@ -14,6 +14,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -72,7 +73,7 @@ func TestInsightsIntegration(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "expect:0, actual:%d, queries:%s", count, queryText)
 
-	queryDelayInSeconds := 2 * latencyThreshold.Seconds()
+	queryDelayInSeconds := latencyThreshold.Seconds()
 	// Execute a "long-running" statement, running longer than our latencyThreshold.
 	_, err = conn.ExecContext(ctx, "SELECT pg_sleep($1)", queryDelayInSeconds)
 	require.NoError(t, err)
@@ -97,14 +98,20 @@ func TestInsightsIntegration(t *testing.T) {
 			"status, "+
 			"start_time, "+
 			"end_time, "+
-			"full_scan "+
+			"full_scan, "+
+			"implicit_txn, "+
+			"cpu_sql_nanos, "+
+			"COALESCE(error_code, '') error_code "+
 			"FROM crdb_internal.node_execution_insights where "+
 			"query = $1 and app_name = $2 ", "SELECT pg_sleep($1)", appName)
 
 		var query, status string
 		var startInsights, endInsights time.Time
 		var fullScan bool
-		err = row.Scan(&query, &status, &startInsights, &endInsights, &fullScan)
+		var implicitTxn bool
+		var cpuSQLNanos int64
+		var errorCode string
+		err = row.Scan(&query, &status, &startInsights, &endInsights, &fullScan, &implicitTxn, &cpuSQLNanos, &errorCode)
 
 		if err != nil {
 			return err
@@ -114,13 +121,252 @@ func TestInsightsIntegration(t *testing.T) {
 			return fmt.Errorf("expected 'Completed', but was %s", status)
 		}
 
+		if errorCode != "" {
+			return fmt.Errorf("expected error code to be '' but was %s", errorCode)
+		}
+
 		delayFromTable := endInsights.Sub(startInsights).Seconds()
 		if delayFromTable < queryDelayInSeconds {
 			return fmt.Errorf("expected at least %f, but was %f", delayFromTable, queryDelayInSeconds)
 		}
 
+		// Add an extra margin of 10ms to the total size of CPU Time.
+		maxCPUMs := delayFromTable*1e3 + 10
+		if cpuSQLNanos < 0 || (cpuSQLNanos > (int64(maxCPUMs) * 1e6)) {
+			return fmt.Errorf("expected cpuSQLNanos to be between zero and %f ms, but was %d", maxCPUMs, cpuSQLNanos)
+		}
+
 		return nil
 	}, 1*time.Second)
+
+	// TODO (xzhang) Turn this into a datadriven test
+	// https://github.com/cockroachdb/cockroach/issues/95010
+	// Verify the txn table content is valid.
+	testutils.SucceedsWithin(t, func() error {
+		row = conn.QueryRowContext(ctx, "SELECT "+
+			"query, "+
+			"start_time, "+
+			"end_time, "+
+			"implicit_txn, "+
+			"cpu_sql_nanos, "+
+			"COALESCE(last_error_code, '') last_error_code "+
+			"FROM crdb_internal.cluster_txn_execution_insights WHERE "+
+			"query = $1 and app_name = $2 ", "SELECT pg_sleep($1)", appName)
+
+		var query string
+		var startInsights, endInsights time.Time
+		var implicitTxn bool
+		var cpuSQLNanos int64
+		var lastErrorCode string
+		err = row.Scan(&query, &startInsights, &endInsights, &implicitTxn, &cpuSQLNanos, &lastErrorCode)
+
+		if err != nil {
+			return err
+		}
+
+		if lastErrorCode != "" {
+			return fmt.Errorf("expected last error code to be '' but was %s", lastErrorCode)
+		}
+
+		if !implicitTxn {
+			return fmt.Errorf("expected implictTxn to be true")
+		}
+
+		delayFromTable := endInsights.Sub(startInsights).Seconds()
+		if delayFromTable < queryDelayInSeconds {
+			return fmt.Errorf("expected at least %f, but was %f", delayFromTable, queryDelayInSeconds)
+		}
+
+		// Add an extra margin of 10ms to the total size of CPU Time.
+		maxCPUMs := delayFromTable*1e3 + 10
+		if cpuSQLNanos < 0 || (cpuSQLNanos > (int64(maxCPUMs) * 1e6)) {
+			return fmt.Errorf("expected cpuSQLNanos to be between zero and %f ms, but was %d", maxCPUMs, cpuSQLNanos)
+		}
+
+		return nil
+	}, 1*time.Second)
+}
+
+func TestFailedInsights(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const appName = "TestFailedInsights"
+
+	// Start the cluster. (One node is sufficient; the outliers system is currently in-memory only.)
+	ctx := context.Background()
+	settings := cluster.MakeTestingClusterSettings()
+	args := base.TestClusterArgs{ServerArgs: base.TestServerArgs{Settings: settings}}
+	tc := testcluster.StartTestCluster(t, 1, args)
+	defer tc.Stopper().Stop(ctx)
+	conn := tc.ServerConn(0)
+
+	// Enable detection by setting a latencyThreshold > 0.
+	latencyThreshold := 100 * time.Millisecond
+	insights.LatencyThreshold.Override(ctx, &settings.SV, latencyThreshold)
+
+	_, err := conn.ExecContext(ctx, "SET SESSION application_name=$1", appName)
+	require.NoError(t, err)
+
+	testCases := []struct {
+		stmt        string
+		fingerprint string
+		status      string
+		problem     string
+		errorCode   string
+	}{
+		// Test case 1: a query that will result in FailedExecution.
+		{
+			stmt:        "CREATE TABLE crdb_internal.example (abc INT8)",
+			fingerprint: "CREATE TABLE crdb_internal.example (abc INT8)",
+			status:      "Failed",
+			problem:     "FailedExecution",
+			errorCode:   "42501",
+		},
+		// Test case 2: a slow query that will result in FailedExecution.
+		{
+			stmt:        "SELECT (pg_sleep(0.1), 2/0)",
+			fingerprint: "SELECT (pg_sleep(_), _ / _)",
+			status:      "Failed",
+			problem:     "FailedExecution",
+			errorCode:   "22012",
+		},
+		// Test case 3: a slow query that will result in CompletedExecution.
+		{
+			stmt:        "SELECT (pg_sleep(0.1), 2/1, 0)",
+			fingerprint: "SELECT (pg_sleep(_), _ / _, _)",
+			status:      "Completed",
+			problem:     "SlowExecution",
+			errorCode:   "",
+		},
+	}
+
+	for _, tc := range testCases {
+		_, _ = conn.ExecContext(ctx, tc.stmt)
+
+		testutils.SucceedsWithin(t, func() error {
+			var row *gosql.Row
+			var query, status, problem, errorCode string
+
+			// Query the node execution insights table.
+			row = conn.QueryRowContext(ctx, "SELECT "+
+				"query, "+
+				"status, "+
+				"problem, "+
+				"COALESCE(error_code, '') error_code "+
+				"FROM crdb_internal.node_execution_insights "+
+				"WHERE query = $1 AND app_name = $2 ", tc.fingerprint, appName)
+
+			err = row.Scan(&query, &status, &problem, &errorCode)
+
+			if err != nil {
+				return err
+			}
+
+			if status != tc.status {
+				return fmt.Errorf("expected status to be '%s', but was '%s'", tc.status, status)
+			}
+
+			if problem != tc.problem {
+				return fmt.Errorf("expected problem to be '%s', but was '%s'", tc.problem, problem)
+			}
+
+			if errorCode != tc.errorCode {
+				return fmt.Errorf("expected error code to be '%s', but was '%s'", tc.errorCode, errorCode)
+			}
+
+			return nil
+		}, 1*time.Second)
+
+	}
+
+	txnTestCases := []struct {
+		stmts       string
+		fingerprint string
+		problems    string
+		errorCode   string
+		endTxn      bool
+		txnStatus   string
+	}{
+		{
+			// Single-statement txn that will fail.
+			stmts:       "BEGIN; CREATE TABLE crdb_internal.example2 (abc INT8);",
+			fingerprint: "CREATE TABLE crdb_internal.example2 (abc INT8)",
+			problems:    "{FailedExecution}",
+			errorCode:   "42501",
+			endTxn:      true,
+			txnStatus:   "Failed",
+		},
+		{
+			// Multi-statement txn that will fail.
+			stmts:       "BEGIN; SHOW DATABASES; SELECT (2/0);",
+			fingerprint: "SHOW DATABASES ; SELECT (_ / _)",
+			problems:    "{FailedExecution}",
+			errorCode:   "22012",
+			endTxn:      true,
+			txnStatus:   "Failed",
+		},
+		{
+			// Multi-statement txn with a slow stmt and then a failed execution.
+			stmts:       "BEGIN; SELECT (pg_sleep(0.1)); CREATE TABLE exists(); CREATE TABLE exists();",
+			fingerprint: "SELECT (pg_sleep(_)) ; CREATE TABLE \"exists\" () ; CREATE TABLE \"exists\" ()",
+			problems:    "{SlowExecution,FailedExecution}",
+			errorCode:   "42P07",
+			endTxn:      true,
+			txnStatus:   "Failed",
+		},
+		{
+			// Multi-statement txn with a slow stmt but no failures.
+			stmts:       "BEGIN; SELECT (pg_sleep(0.1)); SELECT 0; COMMIT;",
+			fingerprint: "SELECT (pg_sleep(_)) ; SELECT _",
+			problems:    "{SlowExecution}",
+			errorCode:   "",
+			endTxn:      false,
+			txnStatus:   "Completed",
+		},
+	}
+
+	for _, tc := range txnTestCases {
+		_, _ = conn.ExecContext(ctx, tc.stmts)
+		if tc.endTxn {
+			_, _ = conn.ExecContext(ctx, "END;")
+		}
+
+		testutils.SucceedsWithin(t, func() error {
+			var row *gosql.Row
+			var query, problems, status, errorCode string
+
+			// Query the node txn execution insights table.
+			row = conn.QueryRowContext(ctx, "SELECT "+
+				"query, "+
+				"problems, "+
+				"status, "+
+				"COALESCE(last_error_code, '') last_error_code "+
+				"FROM crdb_internal.node_txn_execution_insights "+
+				"WHERE query = $1 AND app_name = $2 ", tc.fingerprint, appName)
+
+			err = row.Scan(&query, &problems, &status, &errorCode)
+
+			if err != nil {
+				return err
+			}
+
+			if problems != tc.problems {
+				return fmt.Errorf("expected problems to be '%s', but was '%s'. stmts: %s", tc.problems, problems, tc.stmts)
+			}
+
+			if status != tc.txnStatus {
+				return fmt.Errorf("expected status to be '%s', but was '%s'. stmts: %s", tc.txnStatus, status, tc.stmts)
+			}
+
+			if errorCode != tc.errorCode {
+				return fmt.Errorf("expected error code to be '%s', but was '%s'. stmts: %s", tc.errorCode, errorCode, tc.stmts)
+			}
+
+			return nil
+		}, 1*time.Second)
+	}
+
 }
 
 func TestInsightsPriorityIntegration(t *testing.T) {
@@ -147,10 +393,28 @@ func TestInsightsPriorityIntegration(t *testing.T) {
 	_, err = conn.Exec("CREATE TABLE t (id string, s string);")
 	require.NoError(t, err)
 
-	queryDelayInSeconds := 2 * latencyThreshold.Seconds()
-	// Execute a "long-running" statement, running longer than our latencyThreshold.
-	_, err = conn.ExecContext(ctx, "SELECT pg_sleep($1)", queryDelayInSeconds)
+	// Execute a "long-running" statement, running longer than our latencyThreshold (100ms).
+	_, err = conn.ExecContext(ctx, "SELECT pg_sleep(.11)")
 	require.NoError(t, err)
+
+	testutils.SucceedsWithin(t, func() error {
+		row := conn.QueryRowContext(ctx, "SELECT "+
+			"implicit_txn "+
+			"FROM crdb_internal.node_execution_insights where "+
+			"app_name = $1 and query = $2 ", appName, "SELECT pg_sleep(_)")
+
+		var implicitTxn bool
+		err = row.Scan(&implicitTxn)
+		if err != nil {
+			return err
+		}
+
+		if implicitTxn != true {
+			return fmt.Errorf("expected implicit_txn '%v', but was %v", true, implicitTxn)
+		}
+
+		return nil
+	}, 2*time.Second)
 
 	var priorities = []struct {
 		setPriorityQuery      string
@@ -205,23 +469,29 @@ func TestInsightsPriorityIntegration(t *testing.T) {
 		testutils.SucceedsWithin(t, func() error {
 			row := conn.QueryRowContext(ctx, "SELECT "+
 				"query, "+
-				"priority "+
+				"priority, "+
+				"implicit_txn "+
 				"FROM crdb_internal.node_execution_insights where "+
 				"app_name = $1 and query = $2  ", appName, p.queryNoValues)
 
 			var query, priority string
-			err = row.Scan(&query, &priority)
+			var implicitTxn bool
+			err = row.Scan(&query, &priority, &implicitTxn)
 
 			if err != nil {
 				return err
 			}
 
 			if query != p.queryNoValues {
-				return fmt.Errorf("expected '%s', but was %s", p.queryNoValues, query)
+				return fmt.Errorf("expected query '%s', but was %s", p.queryNoValues, query)
 			}
 
 			if priority != p.expectedPriorityValue {
-				return fmt.Errorf("expected '%s', but was %s", p.expectedPriorityValue, priority)
+				return fmt.Errorf("expected priority '%s', but was %s", p.expectedPriorityValue, priority)
+			}
+
+			if implicitTxn != false {
+				return fmt.Errorf("expected implicit_txn '%v', but was %v", false, implicitTxn)
 			}
 
 			return nil
@@ -245,7 +515,11 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 	require.NoError(t, err)
 	_, err = conn.Exec("SET cluster setting sql.txn_stats.sample_rate  = 1;")
 	require.NoError(t, err)
-	_, err = conn.Exec("CREATE TABLE t (id string, s string);")
+	// Reduce the resolution interval to speed up the test.
+	_, err = conn.Exec(
+		`SET CLUSTER SETTING sql.contention.event_store.resolution_interval = '100ms'`)
+	require.NoError(t, err)
+	_, err = conn.Exec("CREATE TABLE t (id string PRIMARY KEY, s string);")
 	require.NoError(t, err)
 
 	// Enable detection by setting a latencyThreshold > 0.
@@ -290,10 +564,19 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 
 	// Verify the table content is valid.
 	testutils.SucceedsWithin(t, func() error {
-		rows, err := conn.QueryContext(ctx, "SELECT "+
-			"query, "+
-			"contention::FLOAT "+
-			"FROM crdb_internal.node_execution_insights where query like 'UPDATE t SET s =%'")
+		rows, err := conn.QueryContext(ctx, `SELECT
+		query,
+		insight.contention::FLOAT,
+		sum(txn_contention.contention_duration)::FLOAT AS durationMs,
+		txn_contention.schema_name,
+		txn_contention.database_name,
+		txn_contention.table_name,
+		txn_contention.index_name,
+		txn_contention.waiting_txn_fingerprint_id
+		FROM crdb_internal.cluster_execution_insights insight
+		left join crdb_internal.transaction_contention_events txn_contention on  insight.stmt_id = txn_contention.waiting_stmt_id
+																		 where query like 'UPDATE t SET s =%'
+		group by query, insight.contention, txn_contention.schema_name, txn_contention.database_name, txn_contention.table_name, txn_contention.index_name, waiting_txn_fingerprint_id;`)
 		if err != nil {
 			return err
 		}
@@ -305,15 +588,41 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 				return err
 			}
 
-			var contentionFromQuery float64
-			var queryText string
-			err = rows.Scan(&queryText, &contentionFromQuery)
+			var totalContentionFromQueryMs, contentionFromEventMs float64
+			var queryText, schemaName, dbName, tableName, indexName string
+			var blockingTxnFingerprintID gosql.NullString
+			err = rows.Scan(&queryText, &totalContentionFromQueryMs, &contentionFromEventMs, &schemaName, &dbName, &tableName, &indexName, &blockingTxnFingerprintID)
 			if err != nil {
 				return err
 			}
 
-			if contentionFromQuery < .2 {
-				return fmt.Errorf("contention time is %f should be greater than .2 since block is delayed by .5 seconds", contentionFromQuery)
+			if totalContentionFromQueryMs < .2 {
+				return fmt.Errorf("contention time is %f should be greater than .2 since block is delayed by .5 seconds", totalContentionFromQueryMs)
+			}
+
+			diff := totalContentionFromQueryMs - contentionFromEventMs
+			if math.Abs(diff) > .1 {
+				return fmt.Errorf("contention time from column: %f should be the same as event value %f", totalContentionFromQueryMs, contentionFromEventMs)
+			}
+
+			if schemaName != "public" {
+				return fmt.Errorf("schema names do not match 'public', %s", schemaName)
+			}
+
+			if dbName != "defaultdb" {
+				return fmt.Errorf("db names do not match 'defaultdb', %s", dbName)
+			}
+
+			if tableName != "t" {
+				return fmt.Errorf("table names do not match 't', %s", tableName)
+			}
+
+			if indexName != "t_pkey" {
+				return fmt.Errorf("index names do not match 't_pkey', %s", indexName)
+			}
+
+			if !blockingTxnFingerprintID.Valid {
+				return fmt.Errorf("blockingTxnFingerprintId is null")
 			}
 		}
 
@@ -322,7 +631,7 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 		}
 
 		return nil
-	}, 1*time.Second)
+	}, 5*time.Second)
 }
 
 // Testing that the index recommendation is included

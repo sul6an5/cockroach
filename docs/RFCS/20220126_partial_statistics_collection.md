@@ -83,7 +83,7 @@ columns.
 For example (exact syntax subject to change):
 
 ```sql
-CREATE PARTIAL STATISTICS my_stat ON a FROM t AT EXTREMES
+CREATE STATISTICS my_stat ON a FROM t USING EXTREMES
 ```
 
 This specifies that the database should use an index on `a` to collect statistics
@@ -100,7 +100,7 @@ Users can also collect partial stats without specifying columns. To collect
 partial stats on the extreme values of all indexes, users can run:
 
 ```sql
-CREATE PARTIAL STATISTICS my_stat FROM t AT EXTREMES
+CREATE STATISTICS my_stat FROM t USING EXTREMES
 ```
 
 In this case, the database will automatically collect partial stats on all
@@ -109,7 +109,7 @@ column prefixes of the index(es).
 In phase 2, users will also be able to specify an explicit range:
 
 ```sql
-CREATE PARTIAL STATISTICS my_stat ON a FROM t
+CREATE STATISTICS my_stat ON a FROM t
 WHERE a > 1 AND a < 10
 ```
 
@@ -117,9 +117,26 @@ If users want to specify a range without specifying columns, they must specify
 an index. For example:
 
 ```sql
-CREATE PARTIAL STATISTICS my_stat FROM t@a_b_idx
+CREATE STATISTICS my_stat FROM t@a_b_idx
 WHERE a > 1 AND a < 10
 ```
+
+Partial statistics options should still work with current create statistics options.
+For example, with the `THROTTLING` option:
+```sql
+CREATE STATISTICS my_stat FROM t WITH OPTIONS THROTTLING 0.3 USING EXTREMES
+```
+
+Or with the `AS OF SYSTEM TIME` option:
+```sql
+CREATE STATISTICS my_stat FROM t AS OF SYSTEM TIME '2015-02-01'
+WHERE a > 1 AND a < 10
+```
+
+The partial statistics options can be included as the part of the production rule
+that contains all the create statistics options and hence the list of options
+can be specified in any order, with `WITH OPTIONS` optionally preceding the
+list.
 
 Similar to the example above without specified columns, the database will
 automatically collect partial stats on all column prefixes of the index.
@@ -139,11 +156,12 @@ scans.
 
 The change to the existing logic will come when writing the new statistic in the
 database and updating the stats cache. When inserting the new statistic into
-`system.table_statistics`, we will need to explicitly mark it as partial. This
-will require adding a new boolean column to `system.table_statistics` called
-`partial`. When updating the stats cache, we will need to combine the most
-recent full statistic for the given table with all subsequent partial statistics
-(details on this below).
+`system.table_statistics`, we will need to explicitly mark it as partial and 
+indicate its domain. This will require adding a new column to `system.table_statistics` 
+called `partialPredicate` which will contain a predicate for a partial statistic, and 
+`NULL` for a full table statistic. When updating the stats cache, we will need to 
+combine the most recent full statistic for the given table with all subsequent partial 
+statistics (details on this below).
 
 How exactly to combine the full and partial stats depends on whether or not a
 histogram exists. Currently, all single column stats include a histogram, while
@@ -281,7 +299,7 @@ have changed. This will be equivalent to running the following manual stats
 request (see Syntax section above):
 
 ```sql
-CREATE PARTIAL STATISTICS __auto__ FROM t AT EXTREMES
+CREATE STATISTICS __auto__ FROM t AT EXTREMES
 ```
 
 Similar to automatic full refreshes, we will also want to use options `AS OF
@@ -320,7 +338,7 @@ specific index that was scanned. It will be equivalent to running the following
 manual stats request (see Syntax section above):
 
 ```sql
-CREATE PARTIAL STATISTICS __auto__ FROM t@idx WHERE <predicate>
+CREATE STATISTICS __auto__ FROM t@idx WHERE <predicate>
 ```
 
 ## Drawbacks

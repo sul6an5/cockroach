@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -230,7 +230,7 @@ func constructVirtualScan(
 	delayedNodeCallback func(*delayedNode) (exec.Node, error),
 ) (exec.Node, error) {
 	tn := &table.(*optVirtualTable).name
-	virtual, err := p.getVirtualTabler().getVirtualTableEntry(tn)
+	virtual, err := p.getVirtualTabler().getVirtualTableEntry(tn, p)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +309,7 @@ func constructOpaque(metadata opt.OpaqueMetadata) (planNode, error) {
 	return o.plan, nil
 }
 
-func convertFastIntSetToUint32Slice(colIdxs util.FastIntSet) []uint32 {
+func convertFastIntSetToUint32Slice(colIdxs intsets.Fast) []uint32 {
 	cols := make([]uint32, 0, colIdxs.Len())
 	for i, ok := colIdxs.Next(0); ok; i, ok = colIdxs.Next(i + 1) {
 		cols = append(cols, uint32(i))

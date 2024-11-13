@@ -60,14 +60,15 @@ const (
 )
 
 type decommissionBenchSpec struct {
-	nodes            int
-	cpus             int
-	warehouses       int
-	load             bool
-	admissionControl bool
-	multistore       bool
-	snapshotRate     int
-	duration         time.Duration
+	nodes        int
+	warehouses   int
+	noLoad       bool
+	multistore   bool
+	snapshotRate int
+	duration     time.Duration
+
+	// Whether the test cluster nodes are in multiple regions.
+	multiregion bool
 
 	// When true, the test will attempt to stop the node prior to decommission.
 	whileDown bool
@@ -86,6 +87,10 @@ type decommissionBenchSpec struct {
 	// An override for the default timeout, if needed.
 	timeout time.Duration
 
+	// An override for the decommission node to make it choose a predictable node
+	// instead of a random node.
+	decommissionNode int
+
 	skip string
 }
 
@@ -95,34 +100,22 @@ func registerDecommissionBench(r registry.Registry) {
 	for _, benchSpec := range []decommissionBenchSpec{
 		// Basic benchmark configurations, to be run nightly.
 		{
-			nodes:            4,
-			cpus:             16,
-			warehouses:       1000,
-			load:             true,
-			admissionControl: true,
+			nodes:      4,
+			warehouses: 1000,
 		},
 		{
-			nodes:            4,
-			cpus:             16,
-			warehouses:       1000,
-			load:             true,
-			admissionControl: true,
-			duration:         1 * time.Hour,
+			nodes:      4,
+			warehouses: 1000,
+			duration:   1 * time.Hour,
 		},
 		{
-			nodes:            4,
-			cpus:             16,
-			warehouses:       1000,
-			load:             true,
-			admissionControl: true,
-			whileDown:        true,
+			nodes:      4,
+			warehouses: 1000,
+			whileDown:  true,
 		},
 		{
-			nodes:            8,
-			cpus:             16,
-			warehouses:       3000,
-			load:             true,
-			admissionControl: true,
+			nodes:      8,
+			warehouses: 3000,
 			// This test can take nearly an hour to import and achieve balance, so
 			// we extend the timeout to let it complete.
 			timeout: 4 * time.Hour,
@@ -131,10 +124,7 @@ func registerDecommissionBench(r registry.Registry) {
 		{
 			// Add a new node during decommission (no drain).
 			nodes:              8,
-			cpus:               16,
 			warehouses:         3000,
-			load:               true,
-			admissionControl:   true,
 			whileUpreplicating: true,
 			// This test can take nearly an hour to import and achieve balance, so
 			// we extend the timeout to let it complete.
@@ -143,12 +133,9 @@ func registerDecommissionBench(r registry.Registry) {
 		},
 		{
 			// Drain before decommission, without adding a new node.
-			nodes:            8,
-			cpus:             16,
-			warehouses:       3000,
-			load:             true,
-			admissionControl: true,
-			drainFirst:       true,
+			nodes:      8,
+			warehouses: 3000,
+			drainFirst: true,
 			// This test can take nearly an hour to import and achieve balance, so
 			// we extend the timeout to let it complete.
 			timeout: 4 * time.Hour,
@@ -157,10 +144,7 @@ func registerDecommissionBench(r registry.Registry) {
 		{
 			// Drain before decommission, and add a new node.
 			nodes:              8,
-			cpus:               16,
 			warehouses:         3000,
-			load:               true,
-			admissionControl:   true,
 			whileUpreplicating: true,
 			drainFirst:         true,
 			// This test can take nearly an hour to import and achieve balance, so
@@ -169,27 +153,20 @@ func registerDecommissionBench(r registry.Registry) {
 			skip:    manualBenchmarkingOnly,
 		},
 		{
-			nodes:            4,
-			cpus:             16,
-			warehouses:       1000,
-			load:             true,
-			admissionControl: true,
-			drainFirst:       true,
-			skip:             manualBenchmarkingOnly,
+			nodes:      4,
+			warehouses: 1000,
+			drainFirst: true,
+			skip:       manualBenchmarkingOnly,
 		},
 		{
 			nodes:      4,
-			cpus:       16,
 			warehouses: 1000,
-			load:       true,
 			slowWrites: true,
 			skip:       manualBenchmarkingOnly,
 		},
 		{
 			nodes:      8,
-			cpus:       16,
 			warehouses: 3000,
-			load:       true,
 			slowWrites: true,
 			// This test can take nearly an hour to import and achieve balance, so
 			// we extend the timeout to let it complete.
@@ -197,12 +174,9 @@ func registerDecommissionBench(r registry.Registry) {
 			skip:    manualBenchmarkingOnly,
 		},
 		{
-			nodes:            12,
-			cpus:             16,
-			warehouses:       3000,
-			load:             true,
-			admissionControl: true,
-			multistore:       true,
+			nodes:      12,
+			warehouses: 3000,
+			multistore: true,
 			// This test can take nearly an hour to import and achieve balance, so
 			// we extend the timeout to let it complete.
 			timeout: 3 * time.Hour,
@@ -210,15 +184,30 @@ func registerDecommissionBench(r registry.Registry) {
 		},
 		{
 			// Test to compare 12 4-store nodes vs 48 single-store nodes
-			nodes:            48,
-			cpus:             16,
-			warehouses:       3000,
-			load:             true,
-			admissionControl: true,
+			nodes:      48,
+			warehouses: 3000,
 			// This test can take nearly an hour to import and achieve balance, so
 			// we extend the timeout to let it complete.
 			timeout: 3 * time.Hour,
 			skip:    manualBenchmarkingOnly,
+		},
+		{
+			// Multiregion decommission, and add a new node in the same region.
+			nodes:              6,
+			warehouses:         1000,
+			whileUpreplicating: true,
+			drainFirst:         true,
+			multiregion:        true,
+			decommissionNode:   2,
+		},
+		{
+			// Multiregion decommission, and add a new node in a different region.
+			nodes:              6,
+			warehouses:         1000,
+			whileUpreplicating: true,
+			drainFirst:         true,
+			multiregion:        true,
+			decommissionNode:   3,
 		},
 	} {
 		registerDecommissionBenchSpec(r, benchSpec)
@@ -234,7 +223,7 @@ func registerDecommissionBenchSpec(r registry.Registry, benchSpec decommissionBe
 	}
 	extraNameParts := []string{""}
 	addlNodeCount := 0
-	specOptions := []spec.Option{spec.CPU(benchSpec.cpus)}
+	specOptions := []spec.Option{spec.CPU(16)}
 
 	if benchSpec.snapshotRate != 0 {
 		extraNameParts = append(extraNameParts,
@@ -262,19 +251,29 @@ func registerDecommissionBenchSpec(r registry.Registry, benchSpec decommissionBe
 		extraNameParts = append(extraNameParts, "while-upreplicating")
 	}
 
-	if !benchSpec.load {
+	if benchSpec.noLoad {
 		extraNameParts = append(extraNameParts, "no-load")
 	}
 
 	if benchSpec.slowWrites {
 		extraNameParts = append(extraNameParts, "hi-read-amp")
-	} else if !benchSpec.admissionControl {
-		extraNameParts = append(extraNameParts, "no-admission")
+	}
+
+	if benchSpec.decommissionNode != 0 {
+		extraNameParts = append(extraNameParts,
+			fmt.Sprintf("target=%d", benchSpec.decommissionNode))
 	}
 
 	if benchSpec.duration > 0 {
 		timeout = benchSpec.duration * 3
 		extraNameParts = append(extraNameParts, fmt.Sprintf("duration=%s", benchSpec.duration))
+	}
+
+	if benchSpec.multiregion {
+		geoZones := []string{regionUsEast, regionUsWest, regionUsCentral}
+		specOptions = append(specOptions, spec.Zones(strings.Join(geoZones, ",")))
+		specOptions = append(specOptions, spec.Geo())
+		extraNameParts = append(extraNameParts, "multi-region")
 	}
 
 	// If run with ROACHTEST_DECOMMISSION_NOSKIP=1, roachtest will enable all specs.
@@ -286,8 +285,8 @@ func registerDecommissionBenchSpec(r registry.Registry, benchSpec decommissionBe
 	extraName := strings.Join(extraNameParts, "/")
 
 	r.Add(registry.TestSpec{
-		Name: fmt.Sprintf("decommissionBench/nodes=%d/cpu=%d/warehouses=%d%s",
-			benchSpec.nodes, benchSpec.cpus, benchSpec.warehouses, extraName),
+		Name: fmt.Sprintf("decommissionBench/nodes=%d/warehouses=%d%s",
+			benchSpec.nodes, benchSpec.warehouses, extraName),
 		Owner: registry.OwnerKV,
 		Cluster: r.MakeClusterSpec(
 			benchSpec.nodes+addlNodeCount+1,
@@ -372,7 +371,8 @@ func setupDecommissionBench(
 	c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(workloadNode))
 	for i := 1; i <= benchSpec.nodes; i++ {
-		startOpts := option.DefaultStartOpts()
+		// Don't start a scheduled backup as this roachtest reports to roachperf.
+		startOpts := option.DefaultStartOptsNoBackups()
 		startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs,
 			fmt.Sprintf("--attrs=node%d", i),
 			"--vmodule=store_rebalancer=5,allocator=5,allocator_scorer=5,replicate_queue=5")
@@ -382,7 +382,6 @@ func setupDecommissionBench(
 	t.Status(fmt.Sprintf("initializing cluster with %d warehouses", benchSpec.warehouses))
 	c.Run(ctx, c.Node(pinnedNode), importCmd)
 
-	SetAdmissionControl(ctx, t, c, benchSpec.admissionControl)
 	{
 		db := c.Conn(ctx, t.L(), pinnedNode)
 		defer db.Close()
@@ -485,7 +484,7 @@ func uploadPerfArtifacts(
 
 	// Get the workload perf artifacts and move them to the pinned node, so that
 	// they can be used to display the workload operation rates during decommission.
-	if benchSpec.load {
+	if !benchSpec.noLoad {
 		workloadStatsSrc := filepath.Join(t.PerfArtifactsDir(), "stats.json")
 		localWorkloadStatsPath := filepath.Join(t.ArtifactsDir(), "workload_stats.json")
 		workloadStatsDest := filepath.Join(t.PerfArtifactsDir(), "workload_stats.json")
@@ -609,7 +608,7 @@ func runDecommissionBench(
 	workloadCtx, workloadCancel := context.WithCancel(ctx)
 	m := c.NewMonitor(workloadCtx, crdbNodes)
 
-	if benchSpec.load {
+	if !benchSpec.noLoad {
 		m.Go(
 			func(ctx context.Context) error {
 				close(rampStarted)
@@ -656,7 +655,7 @@ func runDecommissionBench(
 
 		// If we are running a workload, wait until it has started and completed its
 		// ramp time before initiating a decommission.
-		if benchSpec.load {
+		if !benchSpec.noLoad {
 			<-rampStarted
 			t.Status("Waiting for workload to ramp up...")
 			select {
@@ -680,7 +679,7 @@ func runDecommissionBench(
 
 		m.ExpectDeath()
 		defer m.ResetDeaths()
-		err := runSingleDecommission(ctx, h, pinnedNode, &targetNodeAtomic, benchSpec.snapshotRate,
+		err := runSingleDecommission(ctx, h, pinnedNode, benchSpec.decommissionNode, &targetNodeAtomic, benchSpec.snapshotRate,
 			benchSpec.whileDown, benchSpec.drainFirst, false /* reuse */, benchSpec.whileUpreplicating,
 			true /* estimateDuration */, benchSpec.slowWrites, tickByName,
 		)
@@ -743,7 +742,7 @@ func runDecommissionBenchLong(
 	workloadCtx, workloadCancel := context.WithCancel(ctx)
 	m := c.NewMonitor(workloadCtx, crdbNodes)
 
-	if benchSpec.load {
+	if !benchSpec.noLoad {
 		m.Go(
 			func(ctx context.Context) error {
 				close(rampStarted)
@@ -787,7 +786,7 @@ func runDecommissionBenchLong(
 
 		// If we are running a workload, wait until it has started and completed its
 		// ramp time before initiating a decommission.
-		if benchSpec.load {
+		if !benchSpec.noLoad {
 			<-rampStarted
 			t.Status("Waiting for workload to ramp up...")
 			select {
@@ -800,7 +799,7 @@ func runDecommissionBenchLong(
 
 		for tBegin := timeutil.Now(); timeutil.Since(tBegin) <= benchSpec.duration; {
 			m.ExpectDeath()
-			err := runSingleDecommission(ctx, h, pinnedNode, &targetNodeAtomic, benchSpec.snapshotRate,
+			err := runSingleDecommission(ctx, h, pinnedNode, benchSpec.decommissionNode, &targetNodeAtomic, benchSpec.snapshotRate,
 				benchSpec.whileDown, benchSpec.drainFirst, true /* reuse */, benchSpec.whileUpreplicating,
 				true /* estimateDuration */, benchSpec.slowWrites, tickByName,
 			)
@@ -841,12 +840,15 @@ func runSingleDecommission(
 	ctx context.Context,
 	h *decommTestHelper,
 	pinnedNode int,
+	target int,
 	targetLogicalNodeAtomic *uint32,
 	snapshotRateMb int,
 	stopFirst, drainFirst, reuse, noBalanceWait, estimateDuration, slowWrites bool,
 	tickByName func(name string),
 ) error {
-	target := h.getRandNodeOtherThan(pinnedNode)
+	if target == 0 {
+		target = h.getRandNodeOtherThan(pinnedNode)
+	}
 	targetLogicalNodeID, err := h.getLogicalNodeID(ctx, target)
 	if err != nil {
 		return err
@@ -1003,11 +1005,11 @@ func runSingleDecommission(
 		atomic.StoreUint32(targetLogicalNodeAtomic, uint32(newLogicalNodeID))
 
 		tickByName(upreplicateMetric)
-		h.t.Status("waiting for replica counts to balance across nodes")
 		{
 			dbNode := h.c.Conn(ctx, h.t.L(), pinnedNode)
 			defer dbNode.Close()
 
+			h.t.Status("waiting for new node to become active")
 			for {
 				var membership string
 				select {
@@ -1034,6 +1036,29 @@ func runSingleDecommission(
 				return err
 			}
 
+			// Before checking for balance, ensure we have started upreplication to
+			// the new node.
+			h.t.Status("waiting for new node to have >1 replicas")
+			for {
+				var count int
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+					if err := dbNode.QueryRow(
+						"SELECT count(*) FROM crdb_internal.ranges WHERE array_position(replicas, $1) IS NOT NULL",
+						newLogicalNodeID,
+					).Scan(&count); err != nil {
+						return err
+					}
+				}
+
+				if count > 1 {
+					break
+				}
+			}
+
+			h.t.Status("waiting for replica counts to balance across nodes")
 			if err := waitForRebalance(
 				ctx, h.t.L(), dbNode, float64(totalRanges)/3.0, 60, /* stableSeconds */
 			); err != nil {

@@ -24,15 +24,21 @@ fi
 artifacts=$PWD/artifacts/$(date +"%%Y%%m%%d")-${TC_BUILD_ID}
 mkdir -p "$artifacts"
 
-bucket="${BUCKET-cockroach-builds}"
+if [[ ${FIPS_ENABLED:-0} == 1 ]]; then
+  tarball_platform="linux-amd64-fips"
+  fips_flag="--fips"
+else
+  tarball_platform="linux-amd64"
+  fips_flag=""
+fi
 
 release_version=$(echo $TC_BUILD_BRANCH | sed -e 's/provisional_[[:digit:]]*_//')
-curl -f -s -S -o- "https://${bucket}.s3.amazonaws.com/cockroach-${release_version}.linux-amd64.tgz" | tar ixfz - --strip-components 1
+curl -f -s -S -o- "https://storage.googleapis.com/cockroach-builds-artifacts-prod/cockroach-${release_version}.${tarball_platform}.tgz" | tar ixfz - --strip-components 1
 chmod +x cockroach
 
 run_bazel <<'EOF'
 bazel build --config ci --config crosslinux //pkg/cmd/workload //pkg/cmd/roachtest //pkg/cmd/roachprod
-BAZEL_BIN=$(bazel info bazel-bin --config crosslinux --config ci --config with_ui -c opt)
+BAZEL_BIN=$(bazel info bazel-bin --config ci --config crosslinux)
 cp $BAZEL_BIN/pkg/cmd/roachprod/roachprod_/roachprod bin
 cp $BAZEL_BIN/pkg/cmd/roachtest/roachtest_/roachtest bin
 cp $BAZEL_BIN/pkg/cmd/workload/workload_/workload    bin
@@ -50,7 +56,6 @@ EOF
 # by manually created clusters.
 timeout -s INT $((7800*60)) bin/roachtest run \
   tag:release_qualification \
-  --build-tag "${release_version}" \
   --cluster-id "${TC_BUILD_ID}" \
   --zones "us-central1-b,us-west1-b,europe-west2-b" \
   --cockroach "$PWD/cockroach" \
@@ -58,4 +63,5 @@ timeout -s INT $((7800*60)) bin/roachtest run \
   --workload "$PWD/bin/workload" \
   --artifacts "$artifacts" \
   --parallelism 5 \
+  $fips_flag \
   --teamcity

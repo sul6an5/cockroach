@@ -11,6 +11,7 @@
 package invertedidx_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -47,7 +48,7 @@ func TestTryJoinJsonOrArrayIndex(t *testing.T) {
 	}
 
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 	tn1 := tree.NewUnqualifiedTableName("t1")
 	tn2 := tree.NewUnqualifiedTableName("t2")
@@ -196,7 +197,7 @@ func TestTryJoinJsonOrArrayIndex(t *testing.T) {
 		}
 
 		actInvertedExpr := invertedidx.TryJoinInvertedIndex(
-			evalCtx.Context, &f, filters, tab2, md.Table(tab2).Index(tc.indexOrd), inputCols,
+			context.Background(), &f, filters, tab2, md.Table(tab2).Index(tc.indexOrd), inputCols,
 		)
 
 		if actInvertedExpr == nil {
@@ -229,7 +230,7 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 	tn := tree.NewUnqualifiedTableName("t")
 	tab := md.AddTable(tc.Table(tn), tn)
@@ -460,10 +461,12 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			unique:   true,
 		},
 		{
-			// Integer indexes are not yet supported.
-			filters:  "j->0 = '1'",
-			indexOrd: jsonOrd,
-			ok:       false,
+			filters:          "j->0 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->0 = '1'",
 		},
 		{
 			// Arrays on the right side of the equality are supported.
@@ -504,10 +507,92 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			unique:   true,
 		},
 		{
-			// Integer indexes are not yet supported.
-			filters:  "j->0->'b' = '1'",
-			indexOrd: jsonOrd,
-			ok:       false,
+			filters:          "j->0->'b' = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->0->'b' = '1'",
+		},
+		{
+			filters:          "j->'b'->0->'a'->1 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->'b'->0->'a'->1 = '1'",
+		},
+		{
+			filters:          "j->'a'->0->1 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->'a'->0->1 = '1'",
+		},
+		{
+			filters:          "j->'a'->0 = '1' AND j->'a'->1 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->'a'->0 = '1' AND j->'a'->1 = '1'",
+		},
+		{
+			filters:          "j->'a'->0 = '1' OR j->'a'->1 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->'a'->0 = '1' OR j->'a'->1 = '1'",
+		},
+		{
+			filters:          "j->0 @> '2'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->0 @> '2'",
+		},
+		{
+			filters:          "j->0 <@ '2'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->0 <@ '2'",
+		},
+		{
+			filters:          "j->0 @> '[1,2]'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->0 @> '[1,2]'",
+		},
+		{
+			filters:          "j->0 <@ '[1,2]'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->0 <@ '[1,2]'",
+		},
+		{
+			filters:          `j->0 <@ '{"b": "c"}'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->0 <@ '{"b": "c"}'`,
+		},
+		{
+			filters:          `j->0 @> '{"b": "c"}'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j->0 @> '{"b": "c"}'`,
 		},
 		{
 			// The inner most expression is not a fetch val expression with an
@@ -848,6 +933,104 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			unique:           true,
 			remainingFilters: "str <@ '{hello}' AND str @> '{hello}'",
 		},
+		{
+			// Testing the IN operator with the fetch value as a string
+			filters:          "j->'a' IN ('1', '2', '3')",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			filters:          `j->'a' IN ('"a"', '"b"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			filters:          `j->'a' IN ('{"a": "b"}', '"a"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->'a' IN ('{"a": "b"}', '"a"')`,
+		},
+		{
+			filters:          `j->'a' IN ('[1,2,3]', '[1]')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->'a' IN ('[1,2,3]', '[1]')`,
+		},
+		{
+			filters:          `j->'a' IN ('[1,2,3]', '{"a": "b"}', '"a"', 'null')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->'a' IN ('[1,2,3]', '{"a": "b"}', '"a"', 'null')`,
+		},
+		{
+			// Testing the IN operator with the fetch value as an integer
+			filters:          "j->0->1 IN ('1', '2', '3')",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->0->1 IN ('1', '2', '3')",
+		},
+		{
+			filters:          `j->0 IN ('"a"', '"b"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->0 IN ('"a"', '"b"')`,
+		},
+		{
+			filters:          `j->0->'a' IN ('{"a": "b"}', '"a"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->0->'a' IN ('{"a": "b"}', '"a"')`,
+		},
+		{
+			filters:          `j->'a'->0 IN ('[1,2,3]', '[1]')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->'a'->0 IN ('[1,2,3]', '[1]')`,
+		},
+		{
+			filters:          `j->0 IN ('[1,2,3]', '{"a": "b"}', '"a"', 'null')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->0 IN ('[1,2,3]', '{"a": "b"}', '"a"', 'null')`,
+		},
+		{
+			// Testing the IN operator with non-constant JSON values inside the
+			// enclosing tuple.
+			filters:  `j->0 IN (j->0, j->1)`,
+			indexOrd: jsonOrd,
+			ok:       false,
+			tight:    false,
+			unique:   false,
+		},
+		{
+			filters:  `j->0 IN (j->0, '[1, 2, 3]')`,
+			indexOrd: jsonOrd,
+			ok:       false,
+			tight:    false,
+			unique:   false,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -859,6 +1042,7 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 		// the index when we expect to and we have the correct values for tight,
 		// unique, and remainingFilters.
 		spanExpr, _, remainingFilters, _, ok := invertedidx.TryFilterInvertedIndex(
+			context.Background(),
 			evalCtx,
 			&f,
 			filters,

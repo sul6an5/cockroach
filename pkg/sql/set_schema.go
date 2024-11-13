@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -42,11 +43,7 @@ func (p *planner) prepareSetSchema(
 	}
 
 	// Lookup the schema we want to set to.
-	res, err := p.Descriptors().GetMutableSchemaByName(
-		ctx, p.txn, db, schema, tree.SchemaLookupFlags{
-			Required:       true,
-			RequireMutable: true,
-		})
+	res, err := p.Descriptors().ByName(p.txn).Get().Schema(ctx, db, schema)
 	if err != nil {
 		return 0, err
 	}
@@ -78,7 +75,9 @@ func (p *planner) prepareSetSchema(
 		return desiredSchemaID, nil
 	}
 
-	err = p.Descriptors().Direct().CheckObjectCollision(ctx, p.txn, db.GetID(), desiredSchemaID, objectName)
+	err = descs.CheckObjectNameCollision(
+		ctx, p.Descriptors(), p.txn, db.GetID(), desiredSchemaID, objectName,
+	)
 	if err != nil {
 		return descpb.InvalidID, err
 	}

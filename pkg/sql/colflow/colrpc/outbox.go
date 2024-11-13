@@ -13,7 +13,6 @@ package colrpc
 import (
 	"bytes"
 	"context"
-	"io"
 	"sync/atomic"
 	"time"
 
@@ -26,8 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -73,7 +74,7 @@ type Outbox struct {
 	// operators that are in the same tree as this Outbox. The stats will be
 	// added into the span as Structured payload and returned to the gateway as
 	// execinfrapb.ProducerMetadata.
-	getStats func() []*execinfrapb.ComponentStats
+	getStats func(context.Context) []*execinfrapb.ComponentStats
 
 	// A copy of Run's caller ctx, with no StreamID tag.
 	// Used to pass a clean context to the input.Next.
@@ -85,11 +86,12 @@ type Outbox struct {
 //     operators that are in the same tree as this Outbox.
 func NewOutbox(
 	unlimitedAllocator *colmem.Allocator,
+	converterMemAcc *mon.BoundAccount,
 	input colexecargs.OpWithMetaInfo,
 	typs []*types.T,
-	getStats func() []*execinfrapb.ComponentStats,
+	getStats func(context.Context) []*execinfrapb.ComponentStats,
 ) (*Outbox, error) {
-	c, err := colserde.NewArrowBatchConverter(typs)
+	c, err := colserde.NewArrowBatchConverter(typs, colserde.BatchToArrowOnly, converterMemAcc)
 	if err != nil {
 		return nil, err
 	}
@@ -116,13 +118,13 @@ func NewOutbox(
 func (o *Outbox) close(ctx context.Context) {
 	o.scratch.buf = nil
 	o.scratch.msg = nil
+	o.converter.Release(ctx)
 	// Unset the input (which is a deselector operator) so that its output batch
 	// could be garbage collected. This allows us to release all memory
 	// registered with the allocator (the allocator is shared by the outbox and
 	// the deselector).
 	o.Input = nil
 	o.unlimitedAllocator.ReleaseAll()
-	o.inputMetaInfo.ToClose.CloseAndLogOnErr(ctx, "outbox")
 }
 
 // Run starts an outbox by connecting to the provided node and pushing
@@ -202,6 +204,8 @@ func (o *Outbox) Run(
 			return err
 		}
 
+		// TODO(yuzefovich): the row-based outbox sends the header as part of
+		// the first message with data, consider doing that here too.
 		log.VEvent(ctx, 2, "Outbox sending header")
 		// Send header message to establish the remote server (consumer).
 		if err := stream.Send(
@@ -216,7 +220,9 @@ func (o *Outbox) Run(
 		}
 		return nil
 	}(); err != nil {
-		// error during stream set up.
+		// An error during stream setup - the whole query will fail, so we might
+		// as well proactively cancel the flow on this node.
+		flowCtxCancel()
 		o.close(ctx)
 		return
 	}
@@ -224,25 +230,6 @@ func (o *Outbox) Run(
 	log.VEvent(ctx, 2, "Outbox starting normal operation")
 	o.runWithStream(ctx, stream, flowCtxCancel, outboxCtxCancel)
 	log.VEvent(ctx, 2, "Outbox exiting")
-}
-
-// handleStreamErr is a utility method used to handle an error when calling
-// a method on a flowStreamClient. If err is an io.EOF, outboxCtxCancel is
-// called, for all other errors flowCtxCancel is. The given error is logged with
-// the associated opName.
-func handleStreamErr(
-	ctx context.Context,
-	opName redact.SafeString,
-	err error,
-	flowCtxCancel, outboxCtxCancel context.CancelFunc,
-) {
-	if err == io.EOF {
-		log.VEventf(ctx, 2, "Outbox calling outboxCtxCancel after %s EOF", opName)
-		outboxCtxCancel()
-	} else {
-		log.VEventf(ctx, 1, "Outbox calling flowCtxCancel after %s connection error: %+v", opName, err)
-		flowCtxCancel()
-	}
 }
 
 func (o *Outbox) moveToDraining(ctx context.Context, reason redact.RedactableString) {
@@ -301,7 +288,7 @@ func (o *Outbox) sendBatches(
 			// to perform the conversion, and we consciously choose to ignore it
 			// for the purposes of the memory accounting because the references
 			// to those slices are lost in Serialize call below.
-			d, err := o.converter.BatchToArrow(batch)
+			d, err := o.converter.BatchToArrow(ctx, batch)
 			if err != nil {
 				colexecerror.InternalError(errors.Wrap(err, "Outbox BatchToArrow data serialization error"))
 			}
@@ -322,7 +309,7 @@ func (o *Outbox) sendBatches(
 			// soon as the message is written to the control buffer. The message is
 			// marshaled (bytes are copied) before writing.
 			if err := stream.Send(o.scratch.msg); err != nil {
-				handleStreamErr(ctx, "Send (batches)", err, flowCtxCancel, outboxCtxCancel)
+				flowinfra.HandleStreamErr(ctx, "Send (batches)", err, flowCtxCancel, outboxCtxCancel)
 				return
 			}
 		}
@@ -345,7 +332,7 @@ func (o *Outbox) sendMetadata(ctx context.Context, stream flowStreamClient, errT
 		// Retrieving stats and draining the metadata is only safe if the input
 		// to the outbox was properly initialized.
 		if o.span != nil && o.getStats != nil {
-			for _, s := range o.getStats() {
+			for _, s := range o.getStats(ctx) {
 				o.span.RecordStructured(s)
 			}
 		}
@@ -400,12 +387,12 @@ func (o *Outbox) runWithStream(
 		for {
 			msg, err := stream.Recv()
 			if err != nil {
-				handleStreamErr(ctx, "watchdog Recv", err, flowCtxCancel, outboxCtxCancel)
+				flowinfra.HandleStreamErr(ctx, "watchdog Recv", err, flowCtxCancel, outboxCtxCancel)
 				break
 			}
 			switch {
 			case msg.Handshake != nil:
-				log.VEventf(ctx, 2, "Outbox received handshake: %v", msg.Handshake)
+				log.VEventf(ctx, 2, "Outbox received handshake: %s", msg.Handshake)
 			case msg.DrainRequest != nil:
 				log.VEventf(ctx, 2, "Outbox received drain request")
 				o.moveToDraining(ctx, "consumer requested draining" /* reason */)
@@ -424,14 +411,14 @@ func (o *Outbox) runWithStream(
 		}
 		o.moveToDraining(ctx, reason)
 		if err := o.sendMetadata(ctx, stream, errToSend); err != nil {
-			handleStreamErr(ctx, "Send (metadata)", err, flowCtxCancel, outboxCtxCancel)
+			flowinfra.HandleStreamErr(ctx, "Send (metadata)", err, flowCtxCancel, outboxCtxCancel)
 		} else {
 			// Close the stream. Note that if this block isn't reached, the stream
 			// is unusable.
 			// The receiver goroutine will read from the stream until any error
 			// is returned (most likely an io.EOF).
 			if err := stream.CloseSend(); err != nil {
-				handleStreamErr(ctx, "CloseSend", err, flowCtxCancel, outboxCtxCancel)
+				flowinfra.HandleStreamErr(ctx, "CloseSend", err, flowCtxCancel, outboxCtxCancel)
 			}
 		}
 	}

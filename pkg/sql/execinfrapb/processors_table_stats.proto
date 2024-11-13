@@ -17,7 +17,7 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
 import "sql/catalog/descpb/structured.proto";
 import "gogoproto/gogo.proto";
@@ -50,6 +50,23 @@ message SketchSpec {
   // Index is needed by some types (for example the geo types) when generating
   // inverted index entries, since it may contain configuration.
   optional sqlbase.IndexDescriptor index = 6 [(gogoproto.nullable) = true];
+
+  // PartialPredicate is a string representing the predicate for a partial statistic,
+  // and is the empty string for a full table statistic.
+  optional string partial_predicate = 7 [(gogoproto.nullable) = false];
+
+  // FullStatisticID is non-zero for partial statistics and 0 for full
+  // statistics. It is the statistic id of the full statistic that this partial
+  // statistic was derived from.
+  optional uint64 full_statistic_id = 8 [(gogoproto.customname) = "FullStatisticID", (gogoproto.nullable) = false];
+
+  // PrevLowerBound is a tree.Datum serialized into a string representing
+  // the minimum bucket value of the previous full statistic histogram.
+  // It is used as the boundary between the lower extreme histogram and
+  // the upper extreme histogram when partial statistics USING EXTREMES
+  // are collected and the histogram is constructed. For full table
+  // statistics, it is the empty string.
+  optional string prev_lower_bound = 9 [(gogoproto.nullable) = false];
 }
 
 // SamplerSpec is the specification of a "sampler" processor which
@@ -173,4 +190,8 @@ message SampleAggregatorSpec {
 
   // If true, delete old stats for columns not included in this message.
   optional bool delete_other_stats = 10 [(gogoproto.nullable) = false];
+
+  // If true, calculate partial table statistics on the extreme values of
+  // the previous full table stat.
+  optional bool using_extremes = 11 [(gogoproto.nullable) = false];
 }

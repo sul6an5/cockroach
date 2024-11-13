@@ -11,6 +11,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"io/fs"
 	"math/rand"
@@ -37,7 +38,7 @@ func TestPebbleIterator_Corruption(t *testing.T) {
 	// Create a Pebble DB that can be used to back a pebbleIterator.
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
-	p, err := Open(context.Background(), Filesystem(dataDir))
+	p, err := Open(context.Background(), Filesystem(dataDir), cluster.MakeClusterSettings())
 	require.NoError(t, err)
 	defer p.Close()
 
@@ -72,7 +73,7 @@ func TestPebbleIterator_Corruption(t *testing.T) {
 		LowerBound: []byte("a"),
 		UpperBound: []byte("z"),
 	}
-	iter := newPebbleIterator(p.db, iterOpts, StandardDurability, false /* range keys */)
+	iter := newPebbleIterator(p.db, iterOpts, StandardDurability, noopStatsReporter)
 
 	// Seeking into the table catches the corruption.
 	ok, err := iter.SeekEngineKeyGE(ek)
@@ -94,12 +95,12 @@ func randStr(fill []byte, rng *rand.Rand) {
 func TestPebbleIterator_ExternalCorruption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	version := clusterversion.ByKey(clusterversion.EnsurePebbleFormatVersionRangeKeys)
+	version := clusterversion.ByKey(clusterversion.V22_2)
 	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
-	f := &MemFile{}
-	w := MakeBackupSSTWriter(ctx, st, f)
+	var f bytes.Buffer
+	w := MakeBackupSSTWriter(ctx, st, &f)
 
 	// Create an example sstable.
 	var rawValue [64]byte
@@ -118,7 +119,7 @@ func TestPebbleIterator_ExternalCorruption(t *testing.T) {
 	b := f.Bytes()
 	b[rng.Intn(len(b))]++
 
-	it, err := NewPebbleSSTIterator([][]sstable.ReadableFile{{vfs.NewMemFile(b)}},
+	it, err := NewSSTIterator([][]sstable.ReadableFile{{vfs.NewMemFile(b)}},
 		IterOptions{UpperBound: roachpb.KeyMax}, false)
 
 	// We may error early, while opening the iterator.

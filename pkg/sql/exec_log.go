@@ -16,8 +16,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
 
@@ -157,33 +158,39 @@ func (p *planner) maybeLogStatement(
 	execType executorType,
 	isCopy bool,
 	numRetries, txnCounter, rows int,
+	bulkJobId uint64,
 	err error,
 	queryReceived time.Time,
 	hasAdminRoleCache *HasAdminRoleCache,
 	telemetryLoggingMetrics *TelemetryLoggingMetrics,
-	stmtFingerprintID roachpb.StmtFingerprintID,
+	stmtFingerprintID appstatspb.StmtFingerprintID,
 	queryStats *topLevelQueryStats,
 ) {
-	p.maybeLogStatementInternal(ctx, execType, isCopy, numRetries, txnCounter, rows, err, queryReceived, hasAdminRoleCache, telemetryLoggingMetrics, stmtFingerprintID, queryStats)
+	p.maybeLogStatementInternal(ctx, execType, isCopy, numRetries, txnCounter,
+		rows, bulkJobId, err, queryReceived, hasAdminRoleCache,
+		telemetryLoggingMetrics, stmtFingerprintID, queryStats,
+	)
 }
+
+var errTxnIsNotOpen = errors.New("txn is already committed or rolled back")
 
 func (p *planner) maybeLogStatementInternal(
 	ctx context.Context,
 	execType executorType,
 	isCopy bool,
 	numRetries, txnCounter, rows int,
+	bulkJobId uint64,
 	err error,
 	startTime time.Time,
 	hasAdminRoleCache *HasAdminRoleCache,
 	telemetryMetrics *TelemetryLoggingMetrics,
-	stmtFingerprintID roachpb.StmtFingerprintID,
+	stmtFingerprintID appstatspb.StmtFingerprintID,
 	queryStats *topLevelQueryStats,
 ) {
 	// Note: if you find the code below crashing because p.execCfg == nil,
 	// do not add a test "if p.execCfg == nil { do nothing }" !
 	// Instead, make the logger work. This is critical for auditing - we
 	// can't miss any statement.
-
 	logV := log.V(2)
 	logExecuteEnabled := logStatementsExecuteEnabled.Get(&p.execCfg.Settings.SV)
 	slowLogThreshold := slowQueryLogThreshold.Get(&p.execCfg.Settings.SV)
@@ -191,7 +198,7 @@ func (p *planner) maybeLogStatementInternal(
 	slowQueryLogEnabled := slowLogThreshold != 0
 	slowInternalQueryLogEnabled := slowInternalQueryLogEnabled.Get(&p.execCfg.Settings.SV)
 	auditEventsDetected := len(p.curPlan.auditEvents) != 0
-	maxEventFrequency := telemetryMaxEventFrequency.Get(&p.execCfg.Settings.SV)
+	maxEventFrequency := TelemetryMaxEventFrequency.Get(&p.execCfg.Settings.SV)
 
 	// We only consider non-internal SQL statements for telemetry logging.
 	telemetryLoggingEnabled := telemetryLoggingEnabled.Get(&p.execCfg.Settings.SV) && execType != executorTypeInternal
@@ -304,7 +311,6 @@ func (p *planner) maybeLogStatementInternal(
 		// Note: the current statement, application name, etc, are
 		// automatically populated by the shared logic in event_log.go.
 		ExecMode:      lbl,
-		NumRows:       uint64(rows),
 		SQLSTATE:      sqlErrState,
 		ErrorText:     execErrStr,
 		Age:           age,
@@ -312,6 +318,16 @@ func (p *planner) maybeLogStatementInternal(
 		FullTableScan: p.curPlan.flags.IsSet(planFlagContainsFullTableScan),
 		FullIndexScan: p.curPlan.flags.IsSet(planFlagContainsFullIndexScan),
 		TxnCounter:    uint32(txnCounter),
+	}
+
+	// Note that for bulk job query (IMPORT, BACKUP and RESTORE), we don't
+	// print out the number of changed rows along with the sampled query event.
+	// We emit it when the job succeeds in a recovery_event.
+	switch p.stmt.AST.(type) {
+	case *tree.Import, *tree.Restore, *tree.Backup:
+		execDetails.BulkJobId = bulkJobId
+	default:
+		execDetails.NumRows = int64(rows)
 	}
 
 	if auditEventsDetected {
@@ -323,13 +339,19 @@ func (p *planner) maybeLogStatementInternal(
 				mode = "rw"
 			}
 			tableName := ""
+			var tn *tree.TableName
 			// We only have a valid *table* name if the object being
 			// audited is table-like (includes view, sequence etc). For
 			// now, this is sufficient because the auditing feature can
 			// only audit tables. If/when the mechanisms are extended to
 			// audit databases and schema, we need more logic here to
 			// extract a name to include in the logging events.
-			tn, err := p.getQualifiedTableName(ctx, ev.desc)
+			if p.txn != nil && p.txn.IsOpen() {
+				// Only open txn accepts further commands.
+				tn, err = p.getQualifiedTableName(ctx, ev.desc)
+			} else {
+				err = errTxnIsNotOpen
+			}
 			if err != nil {
 				log.Warningf(ctx, "name for audited table ID %d not found: %v", ev.desc.GetID(), err)
 			} else {
@@ -344,7 +366,7 @@ func (p *planner) maybeLogStatementInternal(
 				AccessMode:           mode,
 			}
 		}
-		p.logEventsOnlyExternally(ctx, entries...)
+		p.logEventsOnlyExternally(ctx, isCopy, entries...)
 	}
 
 	if slowQueryLogEnabled && (
@@ -356,12 +378,12 @@ func (p *planner) maybeLogStatementInternal(
 		switch {
 		case execType == executorTypeExec:
 			// Non-internal queries are always logged to the slow query log.
-			p.logEventsOnlyExternally(ctx, &eventpb.SlowQuery{CommonSQLExecDetails: execDetails})
+			p.logEventsOnlyExternally(ctx, isCopy, &eventpb.SlowQuery{CommonSQLExecDetails: execDetails})
 
 		case execType == executorTypeInternal && slowInternalQueryLogEnabled:
 			// Internal queries that surpass the slow query log threshold should only
 			// be logged to the slow-internal-only log if the cluster setting dictates.
-			p.logEventsOnlyExternally(ctx, &eventpb.SlowQueryInternal{CommonSQLExecDetails: execDetails})
+			p.logEventsOnlyExternally(ctx, isCopy, &eventpb.SlowQueryInternal{CommonSQLExecDetails: execDetails})
 		}
 	}
 
@@ -382,7 +404,7 @@ func (p *planner) maybeLogStatementInternal(
 	}
 
 	if shouldLogToAdminAuditLog {
-		p.logEventsOnlyExternally(ctx, &eventpb.AdminQuery{CommonSQLExecDetails: execDetails})
+		p.logEventsOnlyExternally(ctx, isCopy, &eventpb.AdminQuery{CommonSQLExecDetails: execDetails})
 	}
 
 	if telemetryLoggingEnabled && !p.SessionData().TroubleshootingMode {
@@ -396,70 +418,89 @@ func (p *planner) maybeLogStatementInternal(
 			requiredTimeElapsed = 0
 		}
 		if telemetryMetrics.maybeUpdateLastEmittedTime(telemetryMetrics.timeNow(), requiredTimeElapsed) {
+			var txnID string
+			// p.txn can be nil for COPY.
+			if p.txn != nil {
+				txnID = p.txn.ID().String()
+			}
+
 			var stats execstats.QueryLevelStats
 			if queryLevelStats, ok := p.instrumentation.GetQueryLevelStats(); ok {
 				stats = *queryLevelStats
 			}
 
 			stats = telemetryMetrics.getQueryLevelStats(stats)
+			indexRecs := make([]string, 0, len(p.curPlan.instrumentation.indexRecs))
+			for _, rec := range p.curPlan.instrumentation.indexRecs {
+				indexRecs = append(indexRecs, rec.SQL)
+			}
 
 			skippedQueries := telemetryMetrics.resetSkippedQueryCount()
 			sampledQuery := eventpb.SampledQuery{
-				CommonSQLExecDetails:     execDetails,
-				SkippedQueries:           skippedQueries,
-				CostEstimate:             p.curPlan.instrumentation.costEstimate,
-				Distribution:             p.curPlan.instrumentation.distribution.String(),
-				PlanGist:                 p.curPlan.instrumentation.planGist.String(),
-				SessionID:                p.extendedEvalCtx.SessionID.String(),
-				Database:                 p.CurrentDatabase(),
-				StatementID:              p.stmt.QueryID.String(),
-				TransactionID:            p.txn.ID().String(),
-				StatementFingerprintID:   uint64(stmtFingerprintID),
-				MaxFullScanRowsEstimate:  p.curPlan.instrumentation.maxFullScanRows,
-				TotalScanRowsEstimate:    p.curPlan.instrumentation.totalScanRows,
-				OutputRowsEstimate:       p.curPlan.instrumentation.outputRows,
-				StatsAvailable:           p.curPlan.instrumentation.statsAvailable,
-				NanosSinceStatsCollected: int64(p.curPlan.instrumentation.nanosSinceStatsCollected),
-				BytesRead:                queryStats.bytesRead,
-				RowsRead:                 queryStats.rowsRead,
-				RowsWritten:              queryStats.rowsWritten,
-				InnerJoinCount:           int64(p.curPlan.instrumentation.joinTypeCounts[descpb.InnerJoin]),
-				LeftOuterJoinCount:       int64(p.curPlan.instrumentation.joinTypeCounts[descpb.LeftOuterJoin]),
-				FullOuterJoinCount:       int64(p.curPlan.instrumentation.joinTypeCounts[descpb.FullOuterJoin]),
-				SemiJoinCount:            int64(p.curPlan.instrumentation.joinTypeCounts[descpb.LeftSemiJoin]),
-				AntiJoinCount:            int64(p.curPlan.instrumentation.joinTypeCounts[descpb.LeftAntiJoin]),
-				IntersectAllJoinCount:    int64(p.curPlan.instrumentation.joinTypeCounts[descpb.IntersectAllJoin]),
-				ExceptAllJoinCount:       int64(p.curPlan.instrumentation.joinTypeCounts[descpb.ExceptAllJoin]),
-				HashJoinCount:            int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.HashJoin]),
-				CrossJoinCount:           int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.CrossJoin]),
-				IndexJoinCount:           int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.IndexJoin]),
-				LookupJoinCount:          int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.LookupJoin]),
-				MergeJoinCount:           int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.MergeJoin]),
-				InvertedJoinCount:        int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.InvertedJoin]),
-				ApplyJoinCount:           int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ApplyJoin]),
-				ZigZagJoinCount:          int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ZigZagJoin]),
-				ContentionNanos:          stats.ContentionTime.Nanoseconds(),
-				Regions:                  p.curPlan.instrumentation.regions,
-				NetworkBytesSent:         stats.NetworkBytesSent,
-				MaxMemUsage:              stats.MaxMemUsage,
-				MaxDiskUsage:             stats.MaxDiskUsage,
-				KVBytesRead:              stats.KVBytesRead,
-				KVRowsRead:               stats.KVRowsRead,
-				NetworkMessages:          stats.NetworkMessages,
+				CommonSQLExecDetails:                  execDetails,
+				SkippedQueries:                        skippedQueries,
+				CostEstimate:                          p.curPlan.instrumentation.costEstimate,
+				Distribution:                          p.curPlan.instrumentation.distribution.String(),
+				PlanGist:                              p.curPlan.instrumentation.planGist.String(),
+				SessionID:                             p.extendedEvalCtx.SessionID.String(),
+				Database:                              p.CurrentDatabase(),
+				StatementID:                           p.stmt.QueryID.String(),
+				TransactionID:                         txnID,
+				StatementFingerprintID:                uint64(stmtFingerprintID),
+				MaxFullScanRowsEstimate:               p.curPlan.instrumentation.maxFullScanRows,
+				TotalScanRowsEstimate:                 p.curPlan.instrumentation.totalScanRows,
+				OutputRowsEstimate:                    p.curPlan.instrumentation.outputRows,
+				StatsAvailable:                        p.curPlan.instrumentation.statsAvailable,
+				NanosSinceStatsCollected:              int64(p.curPlan.instrumentation.nanosSinceStatsCollected),
+				BytesRead:                             queryStats.bytesRead,
+				RowsRead:                              queryStats.rowsRead,
+				RowsWritten:                           queryStats.rowsWritten,
+				InnerJoinCount:                        int64(p.curPlan.instrumentation.joinTypeCounts[descpb.InnerJoin]),
+				LeftOuterJoinCount:                    int64(p.curPlan.instrumentation.joinTypeCounts[descpb.LeftOuterJoin]),
+				FullOuterJoinCount:                    int64(p.curPlan.instrumentation.joinTypeCounts[descpb.FullOuterJoin]),
+				SemiJoinCount:                         int64(p.curPlan.instrumentation.joinTypeCounts[descpb.LeftSemiJoin]),
+				AntiJoinCount:                         int64(p.curPlan.instrumentation.joinTypeCounts[descpb.LeftAntiJoin]),
+				IntersectAllJoinCount:                 int64(p.curPlan.instrumentation.joinTypeCounts[descpb.IntersectAllJoin]),
+				ExceptAllJoinCount:                    int64(p.curPlan.instrumentation.joinTypeCounts[descpb.ExceptAllJoin]),
+				HashJoinCount:                         int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.HashJoin]),
+				CrossJoinCount:                        int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.CrossJoin]),
+				IndexJoinCount:                        int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.IndexJoin]),
+				LookupJoinCount:                       int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.LookupJoin]),
+				MergeJoinCount:                        int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.MergeJoin]),
+				InvertedJoinCount:                     int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.InvertedJoin]),
+				ApplyJoinCount:                        int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ApplyJoin]),
+				ZigZagJoinCount:                       int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ZigZagJoin]),
+				ContentionNanos:                       stats.ContentionTime.Nanoseconds(),
+				Regions:                               p.curPlan.instrumentation.regions,
+				NetworkBytesSent:                      stats.NetworkBytesSent,
+				MaxMemUsage:                           stats.MaxMemUsage,
+				MaxDiskUsage:                          stats.MaxDiskUsage,
+				KVBytesRead:                           stats.KVBytesRead,
+				KVRowsRead:                            stats.KVRowsRead,
+				NetworkMessages:                       stats.NetworkMessages,
+				IndexRecommendations:                  indexRecs,
+				Indexes:                               p.curPlan.instrumentation.indexesUsed,
+				ScanCount:                             int64(p.curPlan.instrumentation.scanCounts[exec.ScanCount]),
+				ScanWithStatsCount:                    int64(p.curPlan.instrumentation.scanCounts[exec.ScanWithStatsCount]),
+				ScanWithStatsForecastCount:            int64(p.curPlan.instrumentation.scanCounts[exec.ScanWithStatsForecastCount]),
+				TotalScanRowsWithoutForecastsEstimate: p.curPlan.instrumentation.totalScanRowsWithoutForecasts,
+				NanosSinceStatsForecasted:             int64(p.curPlan.instrumentation.nanosSinceStatsForecasted),
 			}
-			p.logOperationalEventsOnlyExternally(ctx, &sampledQuery)
+			p.logOperationalEventsOnlyExternally(ctx, isCopy, &sampledQuery)
 		} else {
 			telemetryMetrics.incSkippedQueryCount()
 		}
 	}
 }
 
-func (p *planner) logEventsOnlyExternally(ctx context.Context, entries ...logpb.EventPayload) {
+func (p *planner) logEventsOnlyExternally(
+	ctx context.Context, isCopy bool, entries ...logpb.EventPayload,
+) {
 	// The API contract for logEventsWithOptions() is that it returns
 	// no error when system.eventlog is not written to.
 	_ = p.logEventsWithOptions(ctx,
 		2, /* depth: we want to use the caller location */
-		eventLogOptions{dst: LogExternally},
+		eventLogOptions{dst: LogExternally, isCopy: isCopy},
 		entries...)
 }
 
@@ -467,13 +508,13 @@ func (p *planner) logEventsOnlyExternally(ctx context.Context, entries ...logpb.
 // options to omit SQL Name redaction. This is used when logging to
 // the telemetry channel when we want additional metadata available.
 func (p *planner) logOperationalEventsOnlyExternally(
-	ctx context.Context, entries ...logpb.EventPayload,
+	ctx context.Context, isCopy bool, entries ...logpb.EventPayload,
 ) {
 	// The API contract for logEventsWithOptions() is that it returns
 	// no error when system.eventlog is not written to.
 	_ = p.logEventsWithOptions(ctx,
 		2, /* depth: we want to use the caller location */
-		eventLogOptions{dst: LogExternally, rOpts: redactionOptions{omitSQLNameRedaction: true}},
+		eventLogOptions{dst: LogExternally, isCopy: isCopy, rOpts: redactionOptions{omitSQLNameRedaction: true}},
 		entries...)
 }
 
@@ -488,7 +529,7 @@ func (p *planner) logOperationalEventsOnlyExternally(
 // call to this method elsewhere must find a way to ensure that
 // contributors who later add features do not have to remember to call
 // this to get it right.
-func (p *planner) maybeAudit(privilegeObject catalog.PrivilegeObject, priv privilege.Kind) {
+func (p *planner) maybeAudit(privilegeObject privilege.Object, priv privilege.Kind) {
 	tableDesc, ok := privilegeObject.(catalog.TableDescriptor)
 	if !ok || tableDesc.GetAuditMode() == descpb.TableDescriptor_DISABLED {
 		return

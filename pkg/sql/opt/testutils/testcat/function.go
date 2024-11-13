@@ -51,8 +51,8 @@ func (tc *Catalog) ResolveFunction(
 // ResolveFunctionByOID part of the tree.FunctionReferenceResolver interface.
 func (tc *Catalog) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (string, *tree.Overload, error) {
-	return "", nil, errors.AssertionFailedf("ResolveFunctionByOID not supported in test catalog")
+) (*tree.FunctionName, *tree.Overload, error) {
+	return nil, nil, errors.AssertionFailedf("ResolveFunctionByOID not supported in test catalog")
 }
 
 // CreateFunction handles the CREATE FUNCTION statement.
@@ -62,21 +62,23 @@ func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
 		panic(fmt.Errorf("built-in function with name %q already exists", name))
 	}
 	if _, ok := tc.udfs[name]; ok {
+		// TODO(mgartner): The test catalog should support multiple overloads
+		// with the same name if their arguments are different.
 		panic(fmt.Errorf("user-defined function with name %q already exists", name))
 	}
 	if c.RoutineBody != nil {
 		panic(fmt.Errorf("routine body of BEGIN ATOMIC is not supported"))
 	}
 
-	// Resolve the argument names and types.
-	argTypes := make(tree.ArgTypes, len(c.Args))
-	for i := range c.Args {
-		arg := &c.Args[i]
-		typ, err := tree.ResolveType(context.Background(), arg.Type, tc)
+	// Resolve the parameter names and types.
+	paramTypes := make(tree.ParamTypes, len(c.Params))
+	for i := range c.Params {
+		param := &c.Params[i]
+		typ, err := tree.ResolveType(context.Background(), param.Type, tc)
 		if err != nil {
 			panic(err)
 		}
-		argTypes.SetAt(i, string(arg.Name), typ)
+		paramTypes.SetAt(i, string(param.Name), typ)
 	}
 
 	// Resolve the return type.
@@ -93,11 +95,15 @@ func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
 	}
 
 	overload := &tree.Overload{
-		Types:             argTypes,
+		Types:             paramTypes,
 		ReturnType:        tree.FixedReturnType(retType),
+		IsUDF:             true,
 		Body:              body,
 		Volatility:        v,
 		CalledOnNullInput: calledOnNullInput,
+	}
+	if c.ReturnType.IsSet {
+		overload.Class = tree.GeneratorClass
 	}
 	prefixedOverload := tree.MakeQualifiedOverload("public", overload)
 	def := &tree.ResolvedFunctionDefinition{
@@ -145,8 +151,8 @@ func collectFuncOptions(
 			}
 
 		case tree.FunctionLanguage:
-			if t != tree.FunctionLangSQL {
-				panic(fmt.Errorf("LANGUAGE must be SQL"))
+			if t != tree.FunctionLangSQL && t != tree.FunctionLangPLpgSQL {
+				panic(fmt.Errorf("LANGUAGE must be SQL or plpgsql"))
 			}
 
 		default:

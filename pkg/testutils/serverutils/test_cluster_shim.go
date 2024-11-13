@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -41,6 +42,9 @@ type TestClusterInterface interface {
 
 	// Server returns the TestServerInterface corresponding to a specific node.
 	Server(idx int) TestServerInterface
+
+	// NodeIDs returns the IDs of the nodes in the cluster.
+	NodeIDs() []roachpb.NodeID
 
 	// ServerConn returns a gosql.DB connection to a specific node.
 	ServerConn(idx int) *gosql.DB
@@ -205,6 +209,10 @@ type TestClusterInterface interface {
 	// range is lazily split off on the first call to ScratchRange.
 	ScratchRange(t testing.TB) roachpb.Key
 
+	// ScratchRangeWithExpirationLease is like ScratchRange, but returns a system
+	// range with an expiration lease.
+	ScratchRangeWithExpirationLease(t testing.TB) roachpb.Key
+
 	// WaitForFullReplication waits until all stores in the cluster
 	// have no ranges with replication pending.
 	WaitForFullReplication() error
@@ -227,6 +235,16 @@ type TestClusterInterface interface {
 	// TODO(radu): we should verify that the queries in tests using SplitTable
 	// are indeed distributed as intended.
 	SplitTable(t *testing.T, desc catalog.TableDescriptor, sps []SplitPoint)
+
+	// WaitForTenantCapabilities waits until all servers have the specified
+	// tenant capabilities for the specified tenant ID.
+	// Only boolean capabilities are currently supported as we wait for the
+	// specified capabilities to have a "true" value.
+	WaitForTenantCapabilities(*testing.T, roachpb.TenantID, map[tenantcapabilities.ID]string)
+
+	// ToggleReplicateQueues activates or deactivates the replication queues on all
+	// the stores on all the nodes.
+	ToggleReplicateQueues(active bool)
 }
 
 // SplitPoint describes a split point that is passed to SplitTable.
@@ -261,6 +279,13 @@ func StartNewTestCluster(
 ) TestClusterInterface {
 	cluster := NewTestCluster(t, numNodes, args)
 	cluster.Start(t)
+	for i := 0; i < cluster.NumServers(); i++ {
+		sysconfigProvider := cluster.Server(i).SystemConfigProvider()
+		sysconfig := sysconfigProvider.GetSystemConfig()
+		if sysconfig != nil {
+			sysconfig.PurgeZoneConfigCache()
+		}
+	}
 	return cluster
 }
 

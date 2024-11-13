@@ -22,9 +22,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
@@ -108,6 +112,7 @@ func (cb *ColumnBackfiller) initCols(desc catalog.TableDescriptor) {
 //
 // txn might be nil, in which case it will need to be set on the fetcher later.
 func (cb *ColumnBackfiller) init(
+	ctx context.Context,
 	txn *kv.Txn,
 	evalCtx *eval.Context,
 	defaultExprs []tree.TypedExpr,
@@ -145,7 +150,7 @@ func (cb *ColumnBackfiller) init(
 	}
 
 	cb.colIdxMap = catalog.ColumnIDToOrdinalMap(desc.PublicColumns())
-	var spec descpb.IndexFetchSpec
+	var spec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(&spec, evalCtx.Codec, desc, desc.GetPrimaryIndex(), cb.fetcherCols); err != nil {
 		return err
 	}
@@ -158,7 +163,7 @@ func (cb *ColumnBackfiller) init(
 	cb.rowMetrics = rowMetrics
 
 	return cb.fetcher.Init(
-		evalCtx.Context,
+		ctx,
 		row.FetcherInitArgs{
 			Txn:        txn,
 			Alloc:      &cb.alloc,
@@ -201,7 +206,7 @@ func (cb *ColumnBackfiller) InitForLocalUse(
 	if err != nil {
 		return err
 	}
-	return cb.init(txn, evalCtx, defaultExprs, computedExprs, desc, mon, rowMetrics, traceKV)
+	return cb.init(ctx, txn, evalCtx, defaultExprs, computedExprs, desc, mon, rowMetrics, traceKV)
 }
 
 // InitForDistributedUse initializes a ColumnBackfiller for use as part of a
@@ -220,10 +225,10 @@ func (cb *ColumnBackfiller) InitForDistributedUse(
 	var defaultExprs, computedExprs []tree.TypedExpr
 	// Install type metadata in the target descriptors, as well as resolve any
 	// user defined types in the column expressions.
-	if err := flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		resolver := flowCtx.NewTypeResolver(txn)
+	if err := flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		resolver := flowCtx.NewTypeResolver(txn.KV())
 		// Hydrate all the types present in the table.
-		if err := typedesc.HydrateTypesInTableDescriptor(ctx, desc.TableDesc(), &resolver); err != nil {
+		if err := typedesc.HydrateTypesInDescriptor(ctx, desc, &resolver); err != nil {
 			return err
 		}
 		// Set up a SemaContext to type check the default and computed expressions.
@@ -259,7 +264,7 @@ func (cb *ColumnBackfiller) InitForDistributedUse(
 
 	rowMetrics := flowCtx.GetRowMetrics()
 	// The txn will be set on the fetcher in RunColumnBackfillChunk.
-	return cb.init(nil /* txn */, evalCtx, defaultExprs, computedExprs, desc, mon, rowMetrics, flowCtx.TraceKV)
+	return cb.init(ctx, nil /* txn */, evalCtx, defaultExprs, computedExprs, desc, mon, rowMetrics, flowCtx.TraceKV)
 }
 
 // Close frees the resources used by the ColumnBackfiller.
@@ -367,8 +372,13 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 		// Evaluate the new values. This must be done separately for
 		// each row so as to handle impure functions correctly.
 		for j, e := range cb.updateExprs {
-			val, err := eval.Expr(cb.evalCtx, e)
+			val, err := eval.Expr(ctx, cb.evalCtx, e)
 			if err != nil {
+				if errors.Is(err, eval.ErrNilTxnInClusterContext) {
+					// Cannot use expressions that depend on the transaction of the
+					// evaluation context as the default value for backfill.
+					return roachpb.Key{}, pgerror.WithCandidateCode(err, pgcode.FeatureNotSupported)
+				}
 				return roachpb.Key{}, sqlerrors.NewInvalidSchemaDefinitionError(err)
 			}
 			if j < len(cb.added) && !cb.added[j].IsNullable() && val == tree.DNull {
@@ -601,9 +611,9 @@ func constructExprs(
 			if addedColSet.Contains(colID) {
 				continue
 			}
-			col, err := desc.FindColumnWithID(colID)
+			col, err := catalog.MustFindColumnByID(desc, colID)
 			if err != nil {
-				return errors.AssertionFailedf("column %d does not exist", colID)
+				return errors.HandleAsAssertionFailure(err)
 			}
 			if col.IsVirtual() {
 				continue
@@ -648,12 +658,10 @@ func (ib *IndexBackfiller) InitForDistributedUse(
 
 	// Install type metadata in the target descriptors, as well as resolve any
 	// user defined types in partial index predicate expressions.
-	if err := flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-		resolver := flowCtx.NewTypeResolver(txn)
+	if err := flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) (err error) {
+		resolver := flowCtx.NewTypeResolver(txn.KV())
 		// Hydrate all the types present in the table.
-		if err = typedesc.HydrateTypesInTableDescriptor(
-			ctx, desc.TableDesc(), &resolver,
-		); err != nil {
+		if err = typedesc.HydrateTypesInDescriptor(ctx, desc, &resolver); err != nil {
 			return err
 		}
 		// Set up a SemaContext to type check the default and computed expressions.
@@ -824,7 +832,7 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 	// during the scan. Index entries in the new index are being
 	// populated and deleted by the OLTP commands but not otherwise
 	// read or used
-	var spec descpb.IndexFetchSpec
+	var spec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(
 		&spec, ib.evalCtx.Codec, tableDesc, tableDesc.GetPrimaryIndex(), fetcherCols,
 	); err != nil {
@@ -832,7 +840,7 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 	}
 	var fetcher row.Fetcher
 	if err := fetcher.Init(
-		ib.evalCtx.Context,
+		ctx,
 		row.FetcherInitArgs{
 			Txn:        txn,
 			Alloc:      &ib.alloc,
@@ -873,8 +881,13 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 			if !ok {
 				continue
 			}
-			val, err := eval.Expr(ib.evalCtx, texpr)
+			val, err := eval.Expr(ctx, ib.evalCtx, texpr)
 			if err != nil {
+				if errors.Is(err, eval.ErrNilTxnInClusterContext) {
+					// Cannot use expressions that depend on the transaction of the
+					// evaluation context as the default value for backfill.
+					err = pgerror.WithCandidateCode(err, pgcode.FeatureNotSupported)
+				}
 				return err
 			}
 			colIdx, ok := ib.colIdxMap.Get(colID)
@@ -930,7 +943,7 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 				// predicate expression evaluates to true.
 				texpr := ib.predicates[idx.GetID()]
 
-				val, err := eval.Expr(ib.evalCtx, texpr)
+				val, err := eval.Expr(ctx, ib.evalCtx, texpr)
 				if err != nil {
 					return nil, nil, 0, err
 				}

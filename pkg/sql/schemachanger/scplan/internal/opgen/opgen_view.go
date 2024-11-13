@@ -11,6 +11,7 @@
 package opgen
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 )
@@ -19,8 +20,7 @@ func init() {
 	opRegistry.register((*scpb.View)(nil),
 		toPublic(
 			scpb.Status_ABSENT,
-			equiv(scpb.Status_DROPPED),
-			to(scpb.Status_TXN_DROPPED,
+			to(scpb.Status_DROPPED,
 				emit(func(this *scpb.View) *scop.NotImplemented {
 					return notImplemented(this)
 				}),
@@ -28,25 +28,18 @@ func init() {
 			to(scpb.Status_PUBLIC,
 				emit(func(this *scpb.View) *scop.MarkDescriptorAsPublic {
 					return &scop.MarkDescriptorAsPublic{
-						DescID: this.ViewID,
+						DescriptorID: this.ViewID,
 					}
 				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
-			to(scpb.Status_TXN_DROPPED,
-				emit(func(this *scpb.View, md *targetsWithElementMap) *scop.MarkDescriptorAsSyntheticallyDropped {
-					return &scop.MarkDescriptorAsSyntheticallyDropped{
-						DescID: this.ViewID,
-					}
-				}),
-			),
 			to(scpb.Status_DROPPED,
 				revertible(false),
 				emit(func(this *scpb.View) *scop.MarkDescriptorAsDropped {
 					return &scop.MarkDescriptorAsDropped{
-						DescID: this.ViewID,
+						DescriptorID: this.ViewID,
 					}
 				}),
 				emit(func(this *scpb.View) *scop.RemoveBackReferenceInTypes {
@@ -54,46 +47,38 @@ func init() {
 						return nil
 					}
 					return &scop.RemoveBackReferenceInTypes{
-						BackReferencedDescID: this.ViewID,
-						TypeIDs:              this.UsesTypeIDs,
+						BackReferencedDescriptorID: this.ViewID,
+						TypeIDs:                    this.UsesTypeIDs,
 					}
 				}),
-				emit(func(this *scpb.View) *scop.RemoveViewBackReferencesInRelations {
+				emit(func(this *scpb.View) *scop.RemoveBackReferencesInRelations {
 					if len(this.UsesRelationIDs) == 0 {
 						return nil
 					}
-					return &scop.RemoveViewBackReferencesInRelations{
-						BackReferencedViewID: this.ViewID,
-						RelationIDs:          this.UsesRelationIDs,
-					}
-				}),
-				emit(func(this *scpb.View) *scop.RemoveAllTableComments {
-					return &scop.RemoveAllTableComments{
-						TableID: this.ViewID,
+					return &scop.RemoveBackReferencesInRelations{
+						BackReferencedID: this.ViewID,
+						RelationIDs:      this.UsesRelationIDs,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.View, md *targetsWithElementMap) *scop.LogEvent {
-					return newLogEventOp(this, md)
-				}),
-				emit(func(this *scpb.View, md *targetsWithElementMap) *scop.CreateGcJobForTable {
-					if !this.IsMaterialized {
-						return nil
-
-					}
-					return &scop.CreateGcJobForTable{
-						TableID:             this.ViewID,
-						StatementForDropJob: statementForDropJob(this, md),
-					}
-				}),
-				emit(func(this *scpb.View) *scop.DeleteDescriptor {
-					if !this.IsMaterialized {
-						return &scop.DeleteDescriptor{
-							DescriptorID: this.ViewID,
+				emit(func(this *scpb.View, md *opGenContext) *scop.CreateGCJobForTable {
+					if this.IsMaterialized && !md.ActiveVersion.IsActive(clusterversion.V23_1) {
+						return &scop.CreateGCJobForTable{
+							TableID:             this.ViewID,
+							DatabaseID:          databaseIDFromDroppedNamespaceTarget(md, this.ViewID),
+							StatementForDropJob: statementForDropJob(this, md),
 						}
 					}
 					return nil
+				}),
+				emit(func(this *scpb.View) *scop.DeleteDescriptor {
+					if this.IsMaterialized {
+						return nil
+					}
+					return &scop.DeleteDescriptor{
+						DescriptorID: this.ViewID,
+					}
 				}),
 			),
 		),

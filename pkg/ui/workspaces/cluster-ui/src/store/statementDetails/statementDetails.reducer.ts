@@ -17,26 +17,24 @@ import {
   StatementDetailsResponseWithKey,
 } from "src/api/statementsApi";
 import { generateStmtDetailsToID } from "../../util";
+import moment from "moment-timezone";
 
 export type SQLDetailsStatsState = {
   data: StatementDetailsResponse;
   lastError: Error;
   valid: boolean;
   inFlight: boolean;
+  lastUpdated: moment.Moment | null;
 };
 
 export type SQLDetailsStatsReducerState = {
   cachedData: {
     [id: string]: SQLDetailsStatsState;
   };
-  latestQuery: string;
-  latestFormattedQuery: string;
 };
 
 const initialState: SQLDetailsStatsReducerState = {
   cachedData: {},
-  latestQuery: "",
-  latestFormattedQuery: "",
 };
 
 const sqlDetailsStatsSlice = createSlice({
@@ -52,6 +50,7 @@ const sqlDetailsStatsSlice = createSlice({
         valid: true,
         lastError: null,
         inFlight: false,
+        lastUpdated: moment.utc(),
       };
     },
     failed: (state, action: PayloadAction<ErrorWithKey>) => {
@@ -60,6 +59,7 @@ const sqlDetailsStatsSlice = createSlice({
         valid: false,
         lastError: action.payload.err,
         inFlight: false,
+        lastUpdated: moment.utc(),
       };
     },
     invalidated: (state, action: PayloadAction<{ key: string }>) => {
@@ -85,6 +85,7 @@ const sqlDetailsStatsSlice = createSlice({
         valid: false,
         lastError: null,
         inFlight: true,
+        lastUpdated: null,
       };
     },
     request: (state, action: PayloadAction<StatementDetailsRequest>) => {
@@ -101,13 +102,8 @@ const sqlDetailsStatsSlice = createSlice({
         valid: false,
         lastError: null,
         inFlight: true,
+        lastUpdated: null,
       };
-    },
-    setLatestQuery: (state, action: PayloadAction<string>) => {
-      state.latestQuery = action.payload;
-    },
-    setLatestFormattedQuery: (state, action: PayloadAction<string>) => {
-      state.latestFormattedQuery = action.payload;
     },
   },
 });

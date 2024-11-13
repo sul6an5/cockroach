@@ -24,6 +24,7 @@ import (
 
 	"github.com/alessio/shellescape"
 	bazelutil "github.com/cockroachdb/cockroach/pkg/build/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/spf13/cobra"
 )
 
@@ -64,6 +65,7 @@ func makeBuildCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Com
 	buildCmd.Flags().String(volumeFlag, "bzlhome", "the Docker volume to use as the container home directory (only used for cross builds)")
 	buildCmd.Flags().String(crossFlag, "", "cross-compiles using the builder image (options: linux, linuxarm, macos, macosarm, windows)")
 	buildCmd.Flags().Lookup(crossFlag).NoOptDefVal = "linux"
+	buildCmd.Flags().StringArray(dockerArgsFlag, []string{}, "additional arguments to pass to Docker (only used for cross builds)")
 	addCommonBuildFlags(buildCmd)
 	return buildCmd
 }
@@ -72,41 +74,42 @@ func makeBuildCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Com
 
 // buildTargetMapping maintains shorthands that map 1:1 with bazel targets.
 var buildTargetMapping = map[string]string{
-	"bazel-remote":     bazelRemoteTarget,
-	"buildifier":       "@com_github_bazelbuild_buildtools//buildifier:buildifier",
-	"buildozer":        "@com_github_bazelbuild_buildtools//buildozer:buildozer",
-	"cockroach":        "//pkg/cmd/cockroach:cockroach",
-	"cockroach-sql":    "//pkg/cmd/cockroach-sql:cockroach-sql",
-	"cockroach-oss":    "//pkg/cmd/cockroach-oss:cockroach-oss",
-	"cockroach-short":  "//pkg/cmd/cockroach-short:cockroach-short",
-	"crlfmt":           "@com_github_cockroachdb_crlfmt//:crlfmt",
-	"dev":              devTarget,
-	"docgen":           "//pkg/cmd/docgen:docgen",
-	"docs-issue-gen":   "//pkg/cmd/docs-issue-generation:docs-issue-generation",
-	"execgen":          "//pkg/sql/colexec/execgen/cmd/execgen:execgen",
-	"gofmt":            "@com_github_cockroachdb_gostdlib//cmd/gofmt:gofmt",
-	"goimports":        "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports:goimports",
-	"label-merged-pr":  "//pkg/cmd/label-merged-pr:label-merged-pr",
-	"geos":             geosTarget,
-	"langgen":          "//pkg/sql/opt/optgen/cmd/langgen:langgen",
-	"libgeos":          geosTarget,
-	"obsservice":       "//pkg/obsservice/cmd/obsservice:obsservice",
-	"optgen":           "//pkg/sql/opt/optgen/cmd/optgen:optgen",
-	"optfmt":           "//pkg/sql/opt/optgen/cmd/optfmt:optfmt",
-	"oss":              "//pkg/cmd/cockroach-oss:cockroach-oss",
-	"reduce":           "//pkg/cmd/reduce:reduce",
-	"roachprod":        "//pkg/cmd/roachprod:roachprod",
-	"roachprod-stress": "//pkg/cmd/roachprod-stress:roachprod-stress",
-	"roachtest":        "//pkg/cmd/roachtest:roachtest",
-	"short":            "//pkg/cmd/cockroach-short:cockroach-short",
-	"smith":            "//pkg/cmd/smith:smith",
-	"smithcmp":         "//pkg/cmd/smithcmp:smithcmp",
-	"smithtest":        "//pkg/cmd/smithtest:smithtest",
-	"staticcheck":      "@co_honnef_go_tools//cmd/staticcheck:staticcheck",
-	"stress":           stressTarget,
-	"swagger":          "@com_github_go_swagger_go_swagger//cmd/swagger:swagger",
-	"tests":            "//pkg:all_tests",
-	"workload":         "//pkg/cmd/workload:workload",
+	"bazel-remote":         bazelRemoteTarget,
+	"buildifier":           "@com_github_bazelbuild_buildtools//buildifier:buildifier",
+	"buildozer":            "@com_github_bazelbuild_buildtools//buildozer:buildozer",
+	"cockroach":            "//pkg/cmd/cockroach:cockroach",
+	"cockroach-sql":        "//pkg/cmd/cockroach-sql:cockroach-sql",
+	"cockroach-oss":        "//pkg/cmd/cockroach-oss:cockroach-oss",
+	"cockroach-short":      "//pkg/cmd/cockroach-short:cockroach-short",
+	"crlfmt":               "@com_github_cockroachdb_crlfmt//:crlfmt",
+	"dev":                  devTarget,
+	"docgen":               "//pkg/cmd/docgen:docgen",
+	"docs-issue-gen":       "//pkg/cmd/docs-issue-generation:docs-issue-generation",
+	"execgen":              "//pkg/sql/colexec/execgen/cmd/execgen:execgen",
+	"gofmt":                "@com_github_cockroachdb_gostdlib//cmd/gofmt:gofmt",
+	"goimports":            "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports:goimports",
+	"label-merged-pr":      "//pkg/cmd/label-merged-pr:label-merged-pr",
+	"geos":                 geosTarget,
+	"langgen":              "//pkg/sql/opt/optgen/cmd/langgen:langgen",
+	"libgeos":              geosTarget,
+	"obsservice":           "//pkg/obsservice/cmd/obsservice:obsservice",
+	"optgen":               "//pkg/sql/opt/optgen/cmd/optgen:optgen",
+	"optfmt":               "//pkg/sql/opt/optgen/cmd/optfmt:optfmt",
+	"oss":                  "//pkg/cmd/cockroach-oss:cockroach-oss",
+	"reduce":               "//pkg/cmd/reduce:reduce",
+	"roachprod":            "//pkg/cmd/roachprod:roachprod",
+	"roachprod-stress":     "//pkg/cmd/roachprod-stress:roachprod-stress",
+	"roachprod-microbench": "//pkg/cmd/roachprod-microbench:roachprod-microbench",
+	"roachtest":            "//pkg/cmd/roachtest:roachtest",
+	"short":                "//pkg/cmd/cockroach-short:cockroach-short",
+	"smith":                "//pkg/cmd/smith:smith",
+	"smithcmp":             "//pkg/cmd/smithcmp:smithcmp",
+	"smithtest":            "//pkg/cmd/smithtest:smithtest",
+	"staticcheck":          "@co_honnef_go_tools//cmd/staticcheck:staticcheck",
+	"stress":               stressTarget,
+	"swagger":              "@com_github_go_swagger_go_swagger//cmd/swagger:swagger",
+	"tests":                "//pkg:all_tests",
+	"workload":             "//pkg/cmd/workload:workload",
 }
 
 // allBuildTargets is a sorted list of all the available build targets.
@@ -120,9 +123,30 @@ var allBuildTargets = func() []string {
 }()
 
 func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
+	var tmpDir string
+	if !buildutil.CrdbTestBuild {
+		// tmpDir will contain the build event binary file if produced.
+		var err error
+		tmpDir, err = os.MkdirTemp("", "")
+		if err != nil {
+			return err
+		}
+	}
+	defer func() {
+		if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil {
+			// Retry.
+			if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil {
+				log.Printf("Internal Error: Sending BEP file to beaver hub failed - %v", err)
+			}
+		}
+		if !buildutil.CrdbTestBuild {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
 	targets, additionalBazelArgs := splitArgsAtDash(cmd, commandLine)
 	ctx := cmd.Context()
 	cross := mustGetFlagString(cmd, crossFlag)
+	dockerArgs := mustGetFlagStringArray(cmd, dockerArgsFlag)
 
 	// Set up dev cache unless it's disabled via the environment variable or the
 	// testing knob.
@@ -148,7 +172,14 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 	args = append(args, additionalBazelArgs...)
 
 	if cross == "" {
+		// Do not log --build_event_binary_file=... because it is not relevant to the actual call
+		// from the user perspective.
 		logCommand("bazel", args...)
+		if buildutil.CrdbTestBuild {
+			args = append(args, "--build_event_binary_file=/tmp/path")
+		} else {
+			args = append(args, fmt.Sprintf("--build_event_binary_file=%s", filepath.Join(tmpDir, bepFileBasename)))
+		}
 		if err := d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...); err != nil {
 			return err
 		}
@@ -156,15 +187,20 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 	}
 	volume := mustGetFlagString(cmd, volumeFlag)
 	cross = "cross" + cross
-	return d.crossBuild(ctx, args, buildTargets, cross, volume)
+	return d.crossBuild(ctx, args, buildTargets, cross, volume, dockerArgs)
 }
 
 func (d *dev) crossBuild(
-	ctx context.Context, bazelArgs []string, targets []buildTarget, crossConfig string, volume string,
+	ctx context.Context,
+	bazelArgs []string,
+	targets []buildTarget,
+	crossConfig string,
+	volume string,
+	dockerArgs []string,
 ) error {
 	bazelArgs = append(bazelArgs, fmt.Sprintf("--config=%s", crossConfig), "--config=ci")
 	configArgs := getConfigArgs(bazelArgs)
-	dockerArgs, err := d.getDockerRunArgs(ctx, volume, false)
+	dockerArgs, err := d.getDockerRunArgs(ctx, volume, false, dockerArgs)
 	if err != nil {
 		return err
 	}

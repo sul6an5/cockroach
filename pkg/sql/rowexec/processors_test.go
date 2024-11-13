@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -191,7 +192,7 @@ func TestPostProcess(t *testing.T) {
 			semaCtx := tree.MakeSemaContext()
 			evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer evalCtx.Stop(context.Background())
-			if err := out.Init(&tc.post, inBuf.OutputTypes(), &semaCtx, evalCtx); err != nil {
+			if err := out.Init(context.Background(), &tc.post, inBuf.OutputTypes(), &semaCtx, evalCtx); err != nil {
 				t.Fatal(err)
 			}
 
@@ -315,7 +316,8 @@ func TestAggregatorSpecAggregationEquals(t *testing.T) {
 func TestProcessorBaseContext(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.Background()
+	// Use a custom context to distinguish it from the background one.
+	ctx := context.WithValue(context.Background(), struct{}{}, struct{}{})
 	st := cluster.MakeTestingClusterSettings()
 
 	runTest := func(t *testing.T, f func(noop *noopProcessor)) {
@@ -323,26 +325,31 @@ func TestProcessorBaseContext(t *testing.T) {
 		flowCtx := &execinfra.FlowCtx{
 			Cfg:     &execinfra.ServerConfig{Settings: st},
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 		}
 		defer flowCtx.EvalCtx.Stop(ctx)
 
 		input := execinfra.NewRepeatableRowSource(types.OneIntCol, randgen.MakeIntRows(10, 1))
-		noop, err := newNoopProcessor(flowCtx, 0 /* processorID */, input, &execinfrapb.PostProcessSpec{}, &rowDisposer{})
+		noop, err := newNoopProcessor(ctx, flowCtx, 0 /* processorID */, input, &execinfrapb.PostProcessSpec{})
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Before Start we should get the background context.
+		if noop.Ctx() != context.Background() {
+			t.Fatalf("ProcessorBase.Ctx() didn't return the background context before Start")
+		}
 		noop.Start(ctx)
-		origCtx := noop.Ctx
+		origCtx := noop.Ctx()
 
 		// The context should be valid after Start but before Next is called in case
 		// ConsumerDone or ConsumerClosed are called without calling Next.
-		if noop.Ctx == nil {
+		if noop.Ctx() == context.Background() {
 			t.Fatalf("ProcessorBase.ctx not initialized")
 		}
 		f(noop)
 		// The context should be reset after ConsumerClosed is called so that any
 		// subsequent logging calls will not operate on closed spans.
-		if noop.Ctx != origCtx {
+		if noop.Ctx() != origCtx {
 			t.Fatalf("ProcessorBase.ctx not reset on close")
 		}
 	}
@@ -458,29 +465,30 @@ func TestDrainingProcessorSwallowsUncertaintyError(t *testing.T) {
 				0: {
 					Knobs: base.TestingKnobs{
 						Store: &kvserver.StoreTestingKnobs{
-							TestingRequestFilter: func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+							TestingRequestFilter: func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 								if atomic.LoadInt64(&trapRead) == 0 {
 									return nil
 								}
 								// We're going to trap a read for the rows [1,5].
-								req, ok := ba.GetArg(roachpb.Scan)
+								req, ok := ba.GetArg(kvpb.Scan)
 								if !ok {
 									return nil
 								}
-								key := req.(*roachpb.ScanRequest).Key.String()
-								endKey := req.(*roachpb.ScanRequest).EndKey.String()
+								key := req.(*kvpb.ScanRequest).Key.String()
+								endKey := req.(*kvpb.ScanRequest).EndKey.String()
 								if strings.Contains(key, "/1") && strings.Contains(endKey, "/6") {
 									blockedRead.Lock()
 									for !blockedRead.shouldUnblock {
 										blockedRead.unblockCond.Wait()
 									}
 									blockedRead.Unlock()
-									return roachpb.NewError(
-										roachpb.NewReadWithinUncertaintyIntervalError(
+									return kvpb.NewError(
+										kvpb.NewReadWithinUncertaintyIntervalError(
 											ba.Timestamp,           /* readTs */
-											ba.Timestamp.Add(1, 0), /* existingTs */
-											hlc.Timestamp{},        /* localUncertaintyLimit */
-											ba.Txn))
+											hlc.ClockTimestamp{},   /* localUncertaintyLimit */
+											ba.Txn,                 /* txn */
+											ba.Timestamp.Add(1, 0), /* valueTS */
+											hlc.ClockTimestamp{} /* localTS */))
 								}
 								return nil
 							},
@@ -633,7 +641,7 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 			testClusterArgs.ServerArgsPerNode[node] = base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						TestingRequestFilter: func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+						TestingRequestFilter: func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 							if atomic.LoadInt64(&trapRead) == 0 {
 								return nil
 							}
@@ -645,19 +653,20 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 								return nil
 							}
 
-							req, ok := ba.GetArg(roachpb.Scan)
+							req, ok := ba.GetArg(kvpb.Scan)
 							if !ok {
 								return nil
 							}
-							if !bytes.HasPrefix(req.(*roachpb.ScanRequest).Key, keyPrefix) {
+							if !bytes.HasPrefix(req.(*kvpb.ScanRequest).Key, keyPrefix) {
 								return nil
 							}
-							return roachpb.NewError(
-								roachpb.NewReadWithinUncertaintyIntervalError(
+							return kvpb.NewError(
+								kvpb.NewReadWithinUncertaintyIntervalError(
 									ba.Timestamp,
-									ba.Timestamp.Add(1, 0),
-									hlc.Timestamp{},
+									hlc.ClockTimestamp{},
 									ba.Txn,
+									ba.Timestamp.Add(1, 0),
+									hlc.ClockTimestamp{},
 								),
 							)
 						},
@@ -810,14 +819,14 @@ func TestFlowConcurrentTxnUse(t *testing.T) {
 
 	t.Run("TestSingleGoroutine", func(t *testing.T) {
 		flow := &flowinfra.FlowBase{}
-		flow.SetProcessors([]execinfra.Processor{
+		require.NoError(t, flow.SetProcessorsAndOutputs([]execinfra.Processor{
 			// samplerProcessor is used here and the other subtests because it does
 			// not implement RowSource and so must be run in a separate goroutine (it
 			// cannot be fused).
 			&samplerProcessor{
 				input: &tableReader{},
 			},
-		})
+		}, []execinfra.RowReceiver{nil}))
 		require.False(t, flow.ConcurrentTxnUse(), "expected no concurrent txn use because there is only one goroutine")
 	})
 	t.Run("TestMultipleGoroutinesWithNoConcurrentTxnUse", func(t *testing.T) {
@@ -825,28 +834,28 @@ func TestFlowConcurrentTxnUse(t *testing.T) {
 		// This is a common plan for stats collection. Neither processor implements
 		// RowSource, so the sampleAggregator must be run in a separate goroutine
 		// with a RowChannel connecting the two.
-		flow.SetProcessors([]execinfra.Processor{
+		require.NoError(t, flow.SetProcessorsAndOutputs([]execinfra.Processor{
 			&samplerProcessor{
 				input: &tableReader{},
 			},
 			&sampleAggregator{
 				input: &execinfra.RowChannel{},
 			},
-		})
+		}, []execinfra.RowReceiver{nil, nil}))
 		require.False(t, flow.ConcurrentTxnUse(), "expected no concurrent txn use because the tableReader should be the only txn user")
 	})
 	t.Run("TestMultipleGoroutinesWithConcurrentTxnUse", func(t *testing.T) {
 		flow := &flowinfra.FlowBase{}
 		// This is a scenario that should never happen, but is useful for testing
 		// (multiple concurrent samplerProcessors).
-		flow.SetProcessors([]execinfra.Processor{
+		require.NoError(t, flow.SetProcessorsAndOutputs([]execinfra.Processor{
 			&samplerProcessor{
 				input: &tableReader{},
 			},
 			&samplerProcessor{
 				input: &tableReader{},
 			},
-		})
+		}, []execinfra.RowReceiver{nil, nil}))
 		require.True(t, flow.ConcurrentTxnUse(), "expected concurrent txn use given that there are two tableReaders each in a separate goroutine")
 	})
 }
@@ -857,20 +866,18 @@ func TestFlowConcurrentTxnUse(t *testing.T) {
 // responsibility to set up all the necessary infrastructure. This method is
 // intended to be used by "reader" processors - those that read data from disk.
 func testReaderProcessorDrain(
-	ctx context.Context,
-	t *testing.T,
-	processorConstructor func(out execinfra.RowReceiver) (execinfra.Processor, error),
+	ctx context.Context, t *testing.T, processorConstructor func() (execinfra.Processor, error),
 ) {
 	// ConsumerClosed verifies that when a processor's consumer is closed, the
 	// processor finishes gracefully.
 	t.Run("ConsumerClosed", func(t *testing.T) {
 		out := &distsqlutils.RowBuffer{}
 		out.ConsumerClosed()
-		p, err := processorConstructor(out)
+		p, err := processorConstructor()
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Run(ctx)
+		p.Run(ctx, out)
 	})
 
 	// ConsumerDone verifies that the producer drains properly by checking that
@@ -879,11 +886,11 @@ func testReaderProcessorDrain(
 	t.Run("ConsumerDone", func(t *testing.T) {
 		out := &distsqlutils.RowBuffer{}
 		out.ConsumerDone()
-		p, err := processorConstructor(out)
+		p, err := processorConstructor()
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Run(ctx)
+		p.Run(ctx, out)
 		var traceSeen, txnFinalStateSeen bool
 		for {
 			row, meta := out.Next()

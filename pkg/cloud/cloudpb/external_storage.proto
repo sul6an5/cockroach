@@ -10,7 +10,7 @@
 
 syntax = "proto3";
 package cockroach.cloud.cloudpb;
-option go_package = "cloudpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/cloud/cloudpb";
 
 import "gogoproto/gogo.proto";
 
@@ -27,6 +27,12 @@ enum ExternalStorageProvider {
   external = 9;
 }
 
+enum AzureAuth {
+  LEGACY = 0;  // Storage account key
+  EXPLICIT = 1;  // App Registration + RBAC
+  IMPLICIT = 2;  // Environment Credentials or Managed Service
+}
+
 message ExternalStorage {
   ExternalStorageProvider provider = 1;
 
@@ -37,6 +43,21 @@ message ExternalStorage {
   }
   message Http {
     string baseUri = 1;
+  }
+  // AssumeRoleProvider contains fields about the role that needs to be assumed
+  // in order to access the external storage.
+  message AssumeRoleProvider {
+    // Role, if non-empty, is the ARN of the AWS Role or the email address of
+    // the GCP Service Account that is being assumed.
+    string role = 1;
+    // ExternalID, if non-empty, is the external ID that must be passed along
+    // with the role in order to assume it. Some additional information about
+    // the issues that external IDs can address can be found on the AWS docs:
+    // https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-user_externalid.html
+    //
+    // Currently only AWS supports external ID, there is an open issue tracker
+    // for support in GCP: https://issuetracker.google.com/issues/217037003
+    string external_id = 2  [(gogoproto.customname) = "ExternalID"];
   }
   message S3 {
     string bucket = 1;
@@ -54,12 +75,26 @@ message ExternalStorage {
 
     // RoleARN if non-empty, is the ARN of the role that should be assumed in
     // order to access this storage.
+    // TODO(rui): this field is currently kept for mixed-version state, remove
+    // in 23.2 in favor of AssumeRoleProvider.
     string role_arn = 12 [(gogoproto.customname) = "RoleARN"];
 
     // DelegateRoleARNs are the ARNs of intermediate roles in an assume role
     // chain. These roles will be assumed in the order they appear in the list
     // so that the role specified by RoleARN can be assumed.
+    // TODO(rui): this field is currently kept for mixed-version state, remove
+    // in 23.2 in favor of DelegateRoleProviders.
     repeated string delegate_role_arns = 13 [(gogoproto.customname) = "DelegateRoleARNs"];
+
+    // AssumeRoleProvider, if the role is non-empty, contains the ARN of the
+    // role that should be assumed in order to access this storage, as well as
+    // an optional external ID.
+    AssumeRoleProvider assume_role_provider = 14 [(gogoproto.nullable) = false];
+
+    // DelegateRoleProviders contain the ARNs of intermediate roles in an assume
+    // role chain. These roles will be assumed in the order they appear in the
+    // list so that the role specified in AssumeRoleProvider can be assumed.
+    repeated AssumeRoleProvider delegate_role_providers = 15 [(gogoproto.nullable) = false];
   }
   message GCS {
     string bucket = 1;
@@ -97,6 +132,12 @@ message ExternalStorage {
     string account_name = 3;
     string account_key = 4;
     string environment = 5;
+
+    string client_id = 6 [(gogoproto.customname) = "ClientID"];
+    string client_secret = 7;
+    string tenant_id = 8 [(gogoproto.customname) = "TenantID"];
+
+    AzureAuth auth = 9;
   }
   message FileTable {
     // User interacting with the external storage. This is used to check access

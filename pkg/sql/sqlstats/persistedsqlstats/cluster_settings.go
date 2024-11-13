@@ -24,7 +24,7 @@ var SQLStatsFlushInterval = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"sql.stats.flush.interval",
 	"the interval at which SQL execution statistics are flushed to disk, "+
-		"this value must be less than or equal to sql.stats.aggregation.interval",
+		"this value must be less than or equal to 1 hour",
 	time.Minute*10,
 	settings.NonNegativeDurationWithMaximum(time.Hour*24),
 ).WithPublic()
@@ -126,6 +126,6 @@ var CompactionJobRowsToDeletePerTxn = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"sql.stats.cleanup.rows_to_delete_per_txn",
 	"number of rows the compaction job deletes from system table per iteration",
-	1024,
+	10000,
 	settings.NonNegativeInt,
 )

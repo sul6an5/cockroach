@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
@@ -64,7 +65,7 @@ const (
 type invertedJoiner struct {
 	execinfra.ProcessorBase
 
-	fetchSpec descpb.IndexFetchSpec
+	fetchSpec fetchpb.IndexFetchSpec
 
 	runningState invertedJoinerState
 	diskMonitor  *mon.BytesMonitor
@@ -162,13 +163,13 @@ const invertedJoinerProcName = "inverted joiner"
 // argument is non-nil only for tests. When nil, the invertedJoiner uses
 // the spec to construct an implementation of DatumsToInvertedExpr.
 func newInvertedJoiner(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.InvertedJoinerSpec,
 	datumsToInvertedExpr invertedexpr.DatumsToInvertedExpr,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.RowSourcedProcessor, error) {
 	switch spec.Type {
 	case descpb.InnerJoin, descpb.LeftOuterJoin, descpb.LeftSemiJoin, descpb.LeftAntiJoin:
@@ -226,14 +227,14 @@ func newInvertedJoiner(
 	resolver := flowCtx.NewTypeResolver(flowCtx.Txn)
 	for i := range spec.FetchSpec.KeyAndSuffixColumns {
 		if err := typedesc.EnsureTypeIsHydrated(
-			flowCtx.EvalCtx.Ctx(), spec.FetchSpec.KeyAndSuffixColumns[i].Type, &resolver,
+			ctx, spec.FetchSpec.KeyAndSuffixColumns[i].Type, &resolver,
 		); err != nil {
 			return nil, err
 		}
 	}
 
 	if err := ij.ProcessorBase.Init(
-		ij, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
+		ctx, ij, post, outputColTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ij.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -261,7 +262,7 @@ func newInvertedJoiner(
 	// execbuilder.Builder.buildInvertedJoin.
 	onExprColTypes[len(ij.inputTypes)+ij.invertedFetchedColOrdinal] = spec.InvertedColumnOriginalType
 
-	if err := ij.onExprHelper.Init(spec.OnExpr, onExprColTypes, semaCtx, ij.EvalCtx); err != nil {
+	if err := ij.onExprHelper.Init(ctx, spec.OnExpr, onExprColTypes, semaCtx, ij.EvalCtx); err != nil {
 		return nil, err
 	}
 	combinedRowLen := len(onExprColTypes)
@@ -272,11 +273,11 @@ func newInvertedJoiner(
 
 	if ij.datumsToInvertedExpr == nil {
 		var invertedExprHelper execinfrapb.ExprHelper
-		if err := invertedExprHelper.Init(spec.InvertedExpr, onExprColTypes, semaCtx, ij.EvalCtx); err != nil {
+		if err := invertedExprHelper.Init(ctx, spec.InvertedExpr, onExprColTypes, semaCtx, ij.EvalCtx); err != nil {
 			return nil, err
 		}
 		ij.datumsToInvertedExpr, err = invertedidx.NewDatumsToInvertedExpr(
-			ij.EvalCtx, onExprColTypes, invertedExprHelper.Expr, ij.fetchSpec.GeoConfig,
+			ctx, ij.EvalCtx, onExprColTypes, invertedExprHelper.Expr, ij.fetchSpec.GeoConfig,
 		)
 		if err != nil {
 			return nil, err
@@ -289,14 +290,14 @@ func newInvertedJoiner(
 
 	var fetcher row.Fetcher
 	if err := fetcher.Init(
-		flowCtx.EvalCtx.Context,
+		ctx,
 		row.FetcherInitArgs{
 			Txn:                        flowCtx.Txn,
 			LockStrength:               spec.LockingStrength,
 			LockWaitPolicy:             spec.LockingWaitPolicy,
 			LockTimeout:                flowCtx.EvalCtx.SessionData().LockTimeout,
 			Alloc:                      &ij.alloc,
-			MemMonitor:                 flowCtx.EvalCtx.Mon,
+			MemMonitor:                 flowCtx.Mon,
 			Spec:                       &spec.FetchSpec,
 			TraceKV:                    flowCtx.TraceKV,
 			ForceProductionKVBatchSize: flowCtx.EvalCtx.TestingKnobs.ForceProductionValues,
@@ -305,7 +306,7 @@ func newInvertedJoiner(
 		return nil, err
 	}
 
-	if execstats.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx.CollectStats) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		ij.input = newInputStatCollector(ij.input)
 		ij.fetcher = newRowFetcherStatCollector(&fetcher)
 		ij.ExecStatsForTrace = ij.execStatsForTrace
@@ -316,8 +317,7 @@ func newInvertedJoiner(
 	ij.spanBuilder.InitWithFetchSpec(flowCtx.EvalCtx, flowCtx.Codec(), &ij.fetchSpec)
 
 	// Initialize memory monitors and row container for index rows.
-	ctx := flowCtx.EvalCtx.Ctx()
-	ij.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "invertedjoiner-limited")
+	ij.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "invertedjoiner-limited")
 	ij.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "invertedjoiner-disk")
 	ij.indexRows = rowcontainer.NewDiskBackedNumberedRowContainer(
 		true, /* deDup */
@@ -336,7 +336,7 @@ func newInvertedJoiner(
 // findFetchedColOrdinal finds the ordinal into fetchSpec.FetchedColumns for the
 // column with the given ID.
 func findFetchedColOrdinal(
-	fetchSpec *descpb.IndexFetchSpec, id descpb.ColumnID,
+	fetchSpec *fetchpb.IndexFetchSpec, id descpb.ColumnID,
 ) (ordinal int, _ error) {
 	for i := range fetchSpec.FetchedColumns {
 		if fetchSpec.FetchedColumns[i].ColumnID == id {
@@ -348,7 +348,7 @@ func findFetchedColOrdinal(
 
 // findInvertedFetchedColOrdinal finds the ordinal into fetchSpec.FetchedColumns for the
 // inverted key column.
-func findInvertedFetchedColOrdinal(fetchSpec *descpb.IndexFetchSpec) (ordinal int, _ error) {
+func findInvertedFetchedColOrdinal(fetchSpec *fetchpb.IndexFetchSpec) (ordinal int, _ error) {
 	for i := range fetchSpec.KeyAndSuffixColumns {
 		if c := &fetchSpec.KeyAndSuffixColumns[i]; c.IsInverted {
 			return findFetchedColOrdinal(fetchSpec, c.ColumnID)
@@ -385,7 +385,7 @@ func (ij *invertedJoiner) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetad
 		case ijEmittingRows:
 			ij.runningState, row, meta = ij.emitRow()
 		default:
-			log.Fatalf(ij.Ctx, "unsupported state: %d", ij.runningState)
+			log.Fatalf(ij.Ctx(), "unsupported state: %d", ij.runningState)
 		}
 		if row == nil && meta == nil {
 			continue
@@ -416,7 +416,7 @@ func (ij *invertedJoiner) readInput() (invertedJoinerState, *execinfrapb.Produce
 			break
 		}
 
-		expr, preFilterState, err := ij.datumsToInvertedExpr.Convert(ij.Ctx, row)
+		expr, preFilterState, err := ij.datumsToInvertedExpr.Convert(ij.Ctx(), row)
 		if err != nil {
 			ij.MoveToDraining(err)
 			return ijStateUnknown, ij.DrainHelper()
@@ -466,12 +466,12 @@ func (ij *invertedJoiner) readInput() (invertedJoinerState, *execinfrapb.Produce
 	}
 
 	if len(ij.inputRows) == 0 {
-		log.VEventf(ij.Ctx, 1, "no more input rows")
+		log.VEventf(ij.Ctx(), 1, "no more input rows")
 		// We're done.
 		ij.MoveToDraining(nil)
 		return ijStateUnknown, ij.DrainHelper()
 	}
-	log.VEventf(ij.Ctx, 1, "read %d input rows", len(ij.inputRows))
+	log.VEventf(ij.Ctx(), 1, "read %d input rows", len(ij.inputRows))
 
 	spans, err := ij.batchedExprEval.init()
 	if err != nil {
@@ -495,9 +495,9 @@ func (ij *invertedJoiner) readInput() (invertedJoinerState, *execinfrapb.Produce
 		return ijStateUnknown, ij.DrainHelper()
 	}
 
-	log.VEventf(ij.Ctx, 1, "scanning %d spans", len(ij.indexSpans))
+	log.VEventf(ij.Ctx(), 1, "scanning %d spans", len(ij.indexSpans))
 	if err = ij.fetcher.StartScan(
-		ij.Ctx, ij.indexSpans, nil, /* spanIDs */
+		ij.Ctx(), ij.indexSpans, nil, /* spanIDs */
 		rowinfra.NoBytesLimit, rowinfra.NoRowLimit,
 	); err != nil {
 		ij.MoveToDraining(err)
@@ -508,11 +508,11 @@ func (ij *invertedJoiner) readInput() (invertedJoinerState, *execinfrapb.Produce
 }
 
 func (ij *invertedJoiner) performScan() (invertedJoinerState, *execinfrapb.ProducerMetadata) {
-	log.VEventf(ij.Ctx, 1, "joining rows")
+	log.VEventf(ij.Ctx(), 1, "joining rows")
 	// Read the entire set of rows that are part of the scan.
 	for {
 		// Fetch the next row and copy it into the row container.
-		fetchedRow, _, err := ij.fetcher.NextRow(ij.Ctx)
+		fetchedRow, _, err := ij.fetcher.NextRow(ij.Ctx())
 		if err != nil {
 			ij.MoveToDraining(scrub.UnwrapScrubError(err))
 			return ijStateUnknown, ij.DrainHelper()
@@ -557,7 +557,7 @@ func (ij *invertedJoiner) performScan() (invertedJoinerState, *execinfrapb.Produ
 			return ijStateUnknown, ij.DrainHelper()
 		}
 		if shouldAdd {
-			rowIdx, err := ij.indexRows.AddRow(ij.Ctx, fetchedRow)
+			rowIdx, err := ij.indexRows.AddRow(ij.Ctx(), fetchedRow)
 			if err != nil {
 				ij.MoveToDraining(err)
 				return ijStateUnknown, ij.DrainHelper()
@@ -569,8 +569,8 @@ func (ij *invertedJoiner) performScan() (invertedJoinerState, *execinfrapb.Produ
 		}
 	}
 	ij.joinedRowIdx = ij.batchedExprEval.evaluate()
-	ij.indexRows.SetupForRead(ij.Ctx, ij.joinedRowIdx)
-	log.VEventf(ij.Ctx, 1, "done evaluating expressions")
+	ij.indexRows.SetupForRead(ij.Ctx(), ij.joinedRowIdx)
+	log.VEventf(ij.Ctx(), 1, "done evaluating expressions")
 
 	return ijEmittingRows, nil
 }
@@ -587,7 +587,7 @@ func (ij *invertedJoiner) emitRow() (
 ) {
 	// Finished processing the batch.
 	if ij.emitCursor.inputRowIdx >= len(ij.joinedRowIdx) {
-		log.VEventf(ij.Ctx, 1, "done emitting rows")
+		log.VEventf(ij.Ctx(), 1, "done emitting rows")
 		// Ready for another input batch. Reset state.
 		ij.inputRows = ij.inputRows[:0]
 		ij.batchedExprEval.reset()
@@ -595,7 +595,7 @@ func (ij *invertedJoiner) emitRow() (
 		ij.emitCursor.outputRowIdx = 0
 		ij.emitCursor.inputRowIdx = 0
 		ij.emitCursor.seenMatch = false
-		if err := ij.indexRows.UnsafeReset(ij.Ctx); err != nil {
+		if err := ij.indexRows.UnsafeReset(ij.Ctx()); err != nil {
 			ij.MoveToDraining(err)
 			return ijStateUnknown, nil, ij.DrainHelper()
 		}
@@ -625,7 +625,7 @@ func (ij *invertedJoiner) emitRow() (
 
 	inputRow := ij.inputRows[ij.emitCursor.inputRowIdx]
 	joinedRowIdx := ij.joinedRowIdx[ij.emitCursor.inputRowIdx][ij.emitCursor.outputRowIdx]
-	indexedRow, err := ij.indexRows.GetRow(ij.Ctx, joinedRowIdx, false /* skip */)
+	indexedRow, err := ij.indexRows.GetRow(ij.Ctx(), joinedRowIdx, false /* skip */)
 	if err != nil {
 		ij.MoveToDraining(err)
 		return ijStateUnknown, nil, ij.DrainHelper()
@@ -639,7 +639,7 @@ func (ij *invertedJoiner) emitRow() (
 	skipRemaining := func() error {
 		for ; ij.emitCursor.outputRowIdx < len(ij.joinedRowIdx[ij.emitCursor.inputRowIdx]); ij.emitCursor.outputRowIdx++ {
 			idx := ij.joinedRowIdx[ij.emitCursor.inputRowIdx][ij.emitCursor.outputRowIdx]
-			if _, err := ij.indexRows.GetRow(ij.Ctx, idx, true /* skip */); err != nil {
+			if _, err := ij.indexRows.GetRow(ij.Ctx(), idx, true /* skip */); err != nil {
 				return err
 			}
 		}
@@ -689,7 +689,7 @@ func (ij *invertedJoiner) render(lrow, rrow rowenc.EncDatumRow) (rowenc.EncDatum
 	ij.combinedRow = append(ij.combinedRow[:0], lrow...)
 	ij.combinedRow = append(ij.combinedRow, rrow...)
 	if ij.onExprHelper.Expr != nil {
-		res, err := ij.onExprHelper.EvalFilter(ij.combinedRow)
+		res, err := ij.onExprHelper.EvalFilter(ij.Ctx(), ij.combinedRow)
 		if !res || err != nil {
 			return nil, err
 		}
@@ -717,7 +717,7 @@ func (ij *invertedJoiner) renderUnmatchedRow(row rowenc.EncDatumRow) {
 // appendPrefixColumn encodes a datum corresponding to an index prefix column
 // and appends it to ij.prefixKey.
 func (ij *invertedJoiner) appendPrefixColumn(
-	keyCol *descpb.IndexFetchSpec_KeyColumn, encDatum rowenc.EncDatum,
+	keyCol *fetchpb.IndexFetchSpec_KeyColumn, encDatum rowenc.EncDatum,
 ) error {
 	var err error
 	ij.prefixKey, err = encDatum.Encode(keyCol.Type, &ij.alloc, keyCol.DatumEncoding(), ij.prefixKey)
@@ -740,14 +740,14 @@ func (ij *invertedJoiner) ConsumerClosed() {
 func (ij *invertedJoiner) close() {
 	if ij.InternalClose() {
 		if ij.fetcher != nil {
-			ij.fetcher.Close(ij.Ctx)
+			ij.fetcher.Close(ij.Ctx())
 		}
 		if ij.indexRows != nil {
-			ij.indexRows.Close(ij.Ctx)
+			ij.indexRows.Close(ij.Ctx())
 		}
-		ij.MemMonitor.Stop(ij.Ctx)
+		ij.MemMonitor.Stop(ij.Ctx())
 		if ij.diskMonitor != nil {
-			ij.diskMonitor.Stop(ij.Ctx)
+			ij.diskMonitor.Stop(ij.Ctx())
 		}
 	}
 }
@@ -762,15 +762,18 @@ func (ij *invertedJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 	if !ok {
 		return nil
 	}
-	ij.scanStats = execstats.GetScanStats(ij.Ctx, ij.ExecStatsTrace)
+	ij.scanStats = execstats.GetScanStats(ij.Ctx(), ij.ExecStatsTrace)
+	contentionTime, contentionEvents := execstats.GetCumulativeContentionTime(ij.Ctx(), ij.ExecStatsTrace)
 	ret := execinfrapb.ComponentStats{
 		Inputs: []execinfrapb.InputStats{is},
 		KV: execinfrapb.KVStats{
 			BytesRead:           optional.MakeUint(uint64(ij.fetcher.GetBytesRead())),
 			TuplesRead:          fis.NumTuples,
 			KVTime:              fis.WaitTime,
-			ContentionTime:      optional.MakeTimeValue(execstats.GetCumulativeContentionTime(ij.Ctx, ij.ExecStatsTrace)),
+			ContentionTime:      optional.MakeTimeValue(contentionTime),
+			ContentionEvents:    contentionEvents,
 			BatchRequestsIssued: optional.MakeUint(uint64(ij.fetcher.GetBatchRequestsIssued())),
+			KVCPUTime:           optional.MakeTimeValue(fis.kvCPUTime),
 		},
 		Exec: execinfrapb.ExecStats{
 			MaxAllocatedMem:  optional.MakeUint(uint64(ij.MemMonitor.MaximumBytes())),
@@ -778,6 +781,7 @@ func (ij *invertedJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 		},
 		Output: ij.OutputHelper.Stats(),
 	}
+	ret.Exec.ConsumedRU = optional.MakeUint(ij.scanStats.ConsumedRU)
 	execstats.PopulateKVMVCCStats(&ret.KV, &ij.scanStats)
 	return &ret
 }
@@ -788,7 +792,7 @@ func (ij *invertedJoiner) generateMeta() []execinfrapb.ProducerMetadata {
 	meta.Metrics = execinfrapb.GetMetricsMeta()
 	meta.Metrics.BytesRead = ij.fetcher.GetBytesRead()
 	meta.Metrics.RowsRead = ij.rowsRead
-	if tfs := execinfra.GetLeafTxnFinalState(ij.Ctx, ij.FlowCtx.Txn); tfs != nil {
+	if tfs := execinfra.GetLeafTxnFinalState(ij.Ctx(), ij.FlowCtx.Txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
 	return trailingMeta

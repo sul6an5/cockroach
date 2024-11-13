@@ -70,3 +70,18 @@ func IsErrConnectionReset(err error) bool {
 func IsErrConnectionRefused(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED)
 }
+
+// IsErrTimedOut returns true if an error is an ETIMEDOUT error.
+func IsErrTimedOut(err error) bool {
+	return errors.Is(err, syscall.ETIMEDOUT)
+}
+
+// InterruptSelf sends Interrupt to the process itself.
+func InterruptSelf() error {
+	pr, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		// No-op.
+		return nil //nolint:returnerrcheck
+	}
+	return pr.Signal(os.Interrupt)
+}

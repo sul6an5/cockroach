@@ -16,36 +16,36 @@ package persistedsqlstats
 import (
 	"context"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // Config is a configuration struct for the persisted SQL stats subsystem.
 type Config struct {
 	Settings                *cluster.Settings
-	InternalExecutor        sqlutil.InternalExecutor
 	InternalExecutorMonitor *mon.BytesMonitor
-	KvDB                    *kv.DB
+	DB                      isql.DB
 	SQLIDContainer          *base.SQLIDContainer
 	JobRegistry             *jobs.Registry
 
 	// Metrics.
 	FlushCounter   *metric.Counter
-	FlushDuration  *metric.Histogram
+	FlushDuration  metric.IHistogram
 	FailureCounter *metric.Counter
 
 	// Testing knobs.
@@ -68,12 +68,23 @@ type PersistedSQLStats struct {
 	// exceeded.
 	memoryPressureSignal chan struct{}
 
+	// Used to signal the flush completed.
+	flushDoneMu struct {
+		syncutil.Mutex
+		signalCh chan<- struct{}
+	}
+
 	lastFlushStarted time.Time
 	jobMonitor       jobMonitor
-
-	atomic struct {
+	atomic           struct {
 		nextFlushAt atomic.Value
 	}
+
+	// drain is closed when a graceful drain is initiated.
+	drain       chan struct{}
+	setDraining sync.Once
+	// tasksDoneWG is used to wait for all background tasks to finish.
+	tasksDoneWG sync.WaitGroup
 }
 
 var _ sqlstats.Provider = &PersistedSQLStats{}
@@ -84,14 +95,17 @@ func New(cfg *Config, memSQLStats *sslocal.SQLStats) *PersistedSQLStats {
 		SQLStats:             memSQLStats,
 		cfg:                  cfg,
 		memoryPressureSignal: make(chan struct{}),
+		drain:                make(chan struct{}),
 	}
 
 	p.jobMonitor = jobMonitor{
 		st:           cfg.Settings,
-		ie:           cfg.InternalExecutor,
-		db:           cfg.KvDB,
+		db:           cfg.DB,
 		scanInterval: defaultScanInterval,
 		jitterFn:     p.jitterInterval,
+	}
+	if cfg.Knobs != nil {
+		p.jobMonitor.testingKnobs.updateCheckInterval = cfg.Knobs.JobMonitorUpdateCheckInterval
 	}
 
 	return p
@@ -100,19 +114,43 @@ func New(cfg *Config, memSQLStats *sslocal.SQLStats) *PersistedSQLStats {
 // Start implements sqlstats.Provider interface.
 func (s *PersistedSQLStats) Start(ctx context.Context, stopper *stop.Stopper) {
 	s.startSQLStatsFlushLoop(ctx, stopper)
-	s.jobMonitor.start(ctx, stopper)
+	s.jobMonitor.start(ctx, stopper, s.drain, &s.tasksDoneWG)
 	stopper.AddCloser(stop.CloserFn(func() {
-		s.cfg.InternalExecutorMonitor.Stop(ctx)
+		// TODO(knz,yahor): This really should be just Stop(), but there
+		// is a leak somewhere and would cause a panic when a hard stop
+		// catches up with a graceful drain.
+		// See: https://github.com/cockroachdb/cockroach/issues/101297
+		s.cfg.InternalExecutorMonitor.EmergencyStop(ctx)
 	}))
+}
+
+// Stop stops the background tasks. This is used during graceful drain
+// to quiesce just the SQL activity.
+func (s *PersistedSQLStats) Stop(ctx context.Context) {
+	log.Infof(ctx, "stopping persisted SQL stats tasks")
+	defer log.Infof(ctx, "persisted SQL stats tasks successfully shut down")
+	s.setDraining.Do(func() {
+		close(s.drain)
+	})
+	s.tasksDoneWG.Wait()
+}
+
+// SetFlushDoneSignalCh sets the channel to signal each time a flush has been completed.
+func (s *PersistedSQLStats) SetFlushDoneSignalCh(sigCh chan<- struct{}) {
+	s.flushDoneMu.Lock()
+	defer s.flushDoneMu.Unlock()
+	s.flushDoneMu.signalCh = sigCh
 }
 
 // GetController returns the controller of the PersistedSQLStats.
 func (s *PersistedSQLStats) GetController(server serverpb.SQLStatusServer) *Controller {
-	return NewController(s, server, s.cfg.KvDB, s.cfg.InternalExecutor)
+	return NewController(s, server, s.cfg.DB)
 }
 
 func (s *PersistedSQLStats) startSQLStatsFlushLoop(ctx context.Context, stopper *stop.Stopper) {
-	_ = stopper.RunAsyncTask(ctx, "sql-stats-worker", func(ctx context.Context) {
+	s.tasksDoneWG.Add(1)
+	err := stopper.RunAsyncTask(ctx, "sql-stats-worker", func(ctx context.Context) {
+		defer s.tasksDoneWG.Done()
 		var resetIntervalChanged = make(chan struct{}, 1)
 
 		SQLStatsFlushInterval.SetOnChange(&s.cfg.Settings.SV, func(ctx context.Context) {
@@ -137,18 +175,40 @@ func (s *PersistedSQLStats) startSQLStatsFlushLoop(ctx context.Context, stopper 
 			case <-s.memoryPressureSignal:
 				// We are experiencing memory pressure, so we flush SQL stats to disk
 				// immediately, rather than waiting the full flush interval, in an
-				// attempt to relieve some of that pressure
+				// attempt to relieve some of that pressure.
 			case <-resetIntervalChanged:
 				// In this case, we would restart the loop without performing any flush
 				// and recalculate the flush interval in the for-loop's post statement.
 				continue
+			case <-s.drain:
+				return
 			case <-stopper.ShouldQuiesce():
 				return
 			}
 
 			s.Flush(ctx)
+
+			// Tell the local activity translator job, if any, that we've
+			// performed a round of flush.
+			if sigCh := func() chan<- struct{} {
+				s.flushDoneMu.Lock()
+				defer s.flushDoneMu.Unlock()
+				return s.flushDoneMu.signalCh
+			}(); sigCh != nil {
+				select {
+				case sigCh <- struct{}{}:
+				case <-stopper.ShouldQuiesce():
+					return
+				case <-s.drain:
+					return
+				}
+			}
 		}
 	})
+	if err != nil {
+		s.tasksDoneWG.Done()
+		log.Warningf(ctx, "failed to start sql-stats-worker: %v", err)
+	}
 }
 
 // GetLocalMemProvider returns a sqlstats.Provider that can only be used to
@@ -160,6 +220,20 @@ func (s *PersistedSQLStats) GetLocalMemProvider() sqlstats.Provider {
 // GetNextFlushAt returns the time next flush is going to happen.
 func (s *PersistedSQLStats) GetNextFlushAt() time.Time {
 	return s.atomic.nextFlushAt.Load().(time.Time)
+}
+
+// GetSQLInstanceID returns the SQLInstanceID.
+func (s *PersistedSQLStats) GetSQLInstanceID() base.SQLInstanceID {
+	return s.cfg.SQLIDContainer.SQLInstanceID()
+}
+
+// GetEnabledSQLInstanceID returns the SQLInstanceID when gateway node is enabled,
+// and zero otherwise.
+func (s *PersistedSQLStats) GetEnabledSQLInstanceID() base.SQLInstanceID {
+	if sqlstats.GatewayNodeEnabled.Get(&s.cfg.Settings.SV) {
+		return s.cfg.SQLIDContainer.SQLInstanceID()
+	}
+	return 0
 }
 
 // nextFlushInterval calculates the wait interval that is between:
@@ -185,8 +259,10 @@ func (s *PersistedSQLStats) jitterInterval(interval time.Duration) time.Duration
 }
 
 // GetApplicationStats implements sqlstats.Provider interface.
-func (s *PersistedSQLStats) GetApplicationStats(appName string) sqlstats.ApplicationStats {
-	appStats := s.SQLStats.GetApplicationStats(appName)
+func (s *PersistedSQLStats) GetApplicationStats(
+	appName string, internal bool,
+) sqlstats.ApplicationStats {
+	appStats := s.SQLStats.GetApplicationStats(appName, internal)
 	return &ApplicationStats{
 		ApplicationStats:     appStats,
 		memoryPressureSignal: s.memoryPressureSignal,

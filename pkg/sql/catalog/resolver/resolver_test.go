@@ -16,7 +16,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -26,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
@@ -541,23 +541,6 @@ CREATE TABLE b (a INT, INDEX idx2(a));
 CREATE TABLE c (a INT, INDEX idx2(a));`,
 	)
 
-	makeTableIndexName := func(db, sc, tbl, idx string) *tree.TableIndexName {
-		name := &tree.TableIndexName{
-			Index: tree.UnrestrictedName(idx),
-			Table: tree.TableName{},
-		}
-		name.Table.ObjectName = tree.Name(tbl)
-		name.Table.CatalogName = tree.Name(db)
-		name.Table.SchemaName = tree.Name(sc)
-		if db != "" {
-			name.Table.ExplicitCatalog = true
-		}
-		if sc != "" {
-			name.Table.ExplicitSchema = true
-		}
-		return name
-	}
-
 	testCases := []struct {
 		testName         string
 		name             *tree.TableIndexName
@@ -567,57 +550,57 @@ CREATE TABLE c (a INT, INDEX idx2(a));`,
 		// Both table name and index are set.
 		{
 			testName: "both table name and index are set",
-			name:     makeTableIndexName("defaultdb", "public", "a", "idx1"),
+			name:     newTableIndexName("defaultdb", "public", "a", "idx1"),
 			expected: `defaultdb.public.a@idx1`,
 		},
 		{
 			testName: "both table name and index are set, but no index",
-			name:     makeTableIndexName("defaultdb", "public", "a", "idx2"),
+			name:     newTableIndexName("defaultdb", "public", "a", "idx2"),
 			expected: `error: index "idx2" does not exist`,
 		},
 
 		// Only table name is set.
 		{
 			testName: "only table name is set",
-			name:     makeTableIndexName("defaultdb", "public", "a", ""),
+			name:     newTableIndexName("defaultdb", "public", "a", ""),
 			expected: `defaultdb.public.a@a_pkey`,
 		},
 		{
 			testName: "only table name is set, but bad db",
-			name:     makeTableIndexName("z", "public", "a", ""),
+			name:     newTableIndexName("z", "public", "a", ""),
 			expected: `error: database "z" does not exist`,
 		},
 		{
 			testName: "only table name is set, but bad table",
-			name:     makeTableIndexName("defaultdb", "public", "z", ""),
+			name:     newTableIndexName("defaultdb", "public", "z", ""),
 			expected: `error: relation "defaultdb.public.z" does not exist`,
 		},
 
 		// Only index name is set.
 		{
 			testName: "only index name is set",
-			name:     makeTableIndexName("", "", "", "idx1"),
+			name:     newTableIndexName("", "", "", "idx1"),
 			expected: `defaultdb.public.a@idx1`,
 		},
 		{
 			testName: "only index name is set with db and schema",
-			name:     makeTableIndexName("defaultdb", "public", "", "idx1"),
+			name:     newTableIndexName("defaultdb", "public", "", "idx1"),
 			expected: `defaultdb.public.a@idx1`,
 		},
 		{
 			testName: "only index name is set with schema",
-			name:     makeTableIndexName("", "public", "", "idx1"),
+			name:     newTableIndexName("", "public", "", "idx1"),
 			expected: `defaultdb.public.a@idx1`,
 		},
 		{
 			testName:         "only index name is set with bad db",
-			name:             makeTableIndexName("z", "public", "", "idx2"),
+			name:             newTableIndexName("z", "public", "", "idx2"),
 			expected:         `error: target database or schema does not exist`,
 			errIfNotRequired: true,
 		},
 		{
 			testName:         "ambiguous index name",
-			name:             makeTableIndexName("", "", "", "idx2"),
+			name:             newTableIndexName("", "", "", "idx2"),
 			expected:         `error: index name "idx2" is ambiguous (found in defaultdb.public.c and defaultdb.public.b)`,
 			errIfNotRequired: true,
 		},
@@ -630,10 +613,10 @@ CREATE TABLE c (a INT, INDEX idx2(a));`,
 		require.NoError(t, protoutil.Unmarshal(sessionSerialized, &sessionData))
 	}
 
-	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
+	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn, username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
+			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
 		)
 		defer cleanup()
 
@@ -644,7 +627,7 @@ CREATE TABLE c (a INT, INDEX idx2(a));`,
 		searchPath := ec.SessionData().SearchPath.GetPathArray()
 		ec.SessionData().SearchPath = ec.SessionData().SearchPath.UpdatePaths(append([]string{"test_sc"}, searchPath...))
 		schemaResolver := sql.NewSkippingCacheSchemaResolver(
-			col, ec.SessionDataStack, txn, planner.(scbuild.AuthorizationAccessor),
+			col, ec.SessionDataStack, txn.KV(), planner.(scbuild.AuthorizationAccessor),
 		)
 
 		// Make sure we're looking at correct default db and search path.
@@ -654,7 +637,7 @@ CREATE TABLE c (a INT, INDEX idx2(a));`,
 		for _, tc := range testCases {
 			t.Run(tc.testName, func(t *testing.T) {
 				_, prefix, tblDesc, idxDesc, err := resolver.ResolveIndex(
-					ctx, schemaResolver, tc.name, txn, execCfg.Codec, true, false)
+					ctx, schemaResolver, tc.name, tree.IndexLookupFlags{Required: true, IncludeNonActiveIndex: true})
 				var res string
 				if err != nil {
 					res = fmt.Sprintf("error: %s", err.Error())
@@ -664,7 +647,7 @@ CREATE TABLE c (a INT, INDEX idx2(a));`,
 				require.Equal(t, tc.expected, res)
 
 				_, _, _, _, err = resolver.ResolveIndex(
-					ctx, schemaResolver, tc.name, txn, execCfg.Codec, false, false)
+					ctx, schemaResolver, tc.name, tree.IndexLookupFlags{Required: false, IncludeNonActiveIndex: true})
 				if tc.errIfNotRequired {
 					require.Error(t, err)
 				} else {
@@ -675,4 +658,123 @@ CREATE TABLE c (a INT, INDEX idx2(a));`,
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func TestResolveIndexWithOfflineTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	tDB := sqlutils.MakeSQLRunner(sqlDB)
+
+	tDB.Exec(t, `
+CREATE TABLE foo (i INT PRIMARY KEY, s STRING);
+CREATE INDEX foo_idx ON foo (s);
+CREATE TABLE baz (i INT PRIMARY KEY, s STRING);
+CREATE INDEX baz_idx ON baz (s);
+`)
+
+	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		tn := tree.NewTableNameWithSchema("defaultdb", "public", "baz")
+		_, tbl, err := descs.PrefixAndMutableTable(ctx, col.MutableByName(txn.KV()), tn)
+		require.NoError(t, err)
+		tbl.SetOffline("testing-index-resolving")
+		err = col.WriteDesc(ctx, false, tbl, txn.KV())
+		require.NoError(t, err)
+		return nil
+	})
+	require.NoError(t, err)
+
+	var sessionData sessiondatapb.SessionData
+	{
+		var sessionSerialized []byte
+		tDB.QueryRow(t, "SELECT crdb_internal.serialize_session()").Scan(&sessionSerialized)
+		require.NoError(t, protoutil.Unmarshal(sessionSerialized, &sessionData))
+	}
+
+	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+		planner, cleanup := sql.NewInternalPlanner(
+			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
+		)
+		defer cleanup()
+
+		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
+		// Set "defaultdb" as current database.
+		ec.SessionData().Database = "defaultdb"
+		schemaResolver := sql.NewSkippingCacheSchemaResolver(
+			col, ec.SessionDataStack, txn.KV(), planner.(scbuild.AuthorizationAccessor),
+		)
+		// Make sure we're looking at correct default db and search path.
+		require.Equal(t, "defaultdb", schemaResolver.CurrentDatabase())
+		require.Equal(t, []string{"$user", "public"}, schemaResolver.CurrentSearchPath().GetPathArray())
+
+		// Make sure that baz table is skipped when `IncludeOfflineTable` flag is
+		// false, so that index baz_idx cannot be found.
+		found, _, _, _, err := resolver.ResolveIndex(
+			ctx,
+			schemaResolver,
+			newTableIndexName("", "", "", "baz_idx"),
+			tree.IndexLookupFlags{
+				Required:              false,
+				IncludeNonActiveIndex: false,
+				IncludeOfflineTable:   false,
+			},
+		)
+		require.NoError(t, err)
+		require.False(t, found)
+
+		// Make sure that baz table is considered when `IncludeOfflineTable` flag is
+		// true, so that index baz_idx can be found.
+		found, _, _, _, err = resolver.ResolveIndex(
+			ctx,
+			schemaResolver,
+			newTableIndexName("", "", "", "baz_idx"),
+			tree.IndexLookupFlags{
+				Required:              true,
+				IncludeNonActiveIndex: true,
+				IncludeOfflineTable:   true,
+			},
+		)
+		require.NoError(t, err)
+		require.True(t, found)
+
+		// Make sure that baz table is taken care of so that it does not error out
+		// when resolving index on other tables. Note that because table name is not
+		// given, all tables on current search path are searched.
+		found, _, _, _, err = resolver.ResolveIndex(
+			ctx,
+			schemaResolver,
+			newTableIndexName("", "", "", "foo_idx"),
+			tree.IndexLookupFlags{
+				Required:              true,
+				IncludeNonActiveIndex: false,
+				IncludeOfflineTable:   false,
+			},
+		)
+		require.NoError(t, err)
+		require.True(t, found)
+
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func newTableIndexName(db, sc, tbl, idx string) *tree.TableIndexName {
+	name := &tree.TableIndexName{
+		Index: tree.UnrestrictedName(idx),
+		Table: tree.TableName{},
+	}
+	name.Table.ObjectName = tree.Name(tbl)
+	name.Table.CatalogName = tree.Name(db)
+	name.Table.SchemaName = tree.Name(sc)
+	if db != "" {
+		name.Table.ExplicitCatalog = true
+	}
+	if sc != "" {
+		name.Table.ExplicitSchema = true
+	}
+	return name
 }

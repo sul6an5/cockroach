@@ -14,10 +14,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -80,11 +80,8 @@ func (p *planner) CreateType(ctx context.Context, n *tree.CreateType) (planNode,
 
 func (n *createTypeNode) startExec(params runParams) error {
 	// Check if a type with the same name exists already.
-	flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
-		Required:    false,
-		AvoidLeased: true,
-	}}
-	found, _, err := params.p.Descriptors().GetImmutableTypeByName(params.ctx, params.p.Txn(), n.typeName, flags)
+	g := params.p.Descriptors().ByName(params.p.Txn()).MaybeGet()
+	_, typ, err := descs.PrefixAndType(params.ctx, g, n.typeName)
 	if err != nil {
 		return err
 	}
@@ -96,7 +93,7 @@ func (n *createTypeNode) startExec(params runParams) error {
 	// handle this case in CREATE TABLE IF NOT EXISTS by checking the return code
 	// (pgcode.DuplicateRelation) of getCreateTableParams. However, there isn't
 	// a pgcode for duplicate types, only the more general pgcode.DuplicateObject.
-	if found && n.n.IfNotExists {
+	if typ != nil && n.n.IfNotExists {
 		params.p.BufferClientNotice(
 			params.ctx,
 			pgnotice.Newf("type %q already exists, skipping", n.typeName),
@@ -104,12 +101,7 @@ func (n *createTypeNode) startExec(params runParams) error {
 		return nil
 	}
 
-	switch n.n.Variety {
-	case tree.Enum:
-		return params.p.createUserDefinedEnum(params, n)
-	default:
-		return unimplemented.NewWithIssue(25123, "CREATE TYPE")
-	}
+	return params.p.createUserDefinedType(params, n)
 }
 
 func resolveNewTypeName(
@@ -165,8 +157,9 @@ func getCreateTypeParams(
 		sqltelemetry.IncrementUserDefinedSchemaCounter(sqltelemetry.UserDefinedSchemaUsedByObject)
 	}
 
-	err = params.p.Descriptors().Direct().CheckObjectCollision(
+	err = descs.CheckObjectNameCollision(
 		params.ctx,
+		params.p.Descriptors(),
 		params.p.txn,
 		db.GetID(),
 		schema.GetID(),
@@ -193,7 +186,7 @@ func findFreeArrayTypeName(
 	arrayName := "_" + name
 	for {
 		// See if there is a collision with the current name.
-		objectID, err := col.Direct().LookupObjectID(ctx, txn, parentID, schemaID, arrayName)
+		objectID, err := col.LookupObjectID(ctx, txn, parentID, schemaID, arrayName)
 		if err != nil {
 			return "", err
 		}
@@ -207,9 +200,9 @@ func findFreeArrayTypeName(
 	return arrayName, nil
 }
 
-// CreateEnumArrayTypeDesc creates a type descriptor for the array of the
-// given enum.
-func CreateEnumArrayTypeDesc(
+// CreateUserDefinedArrayTypeDesc creates a type descriptor for the array of the
+// given user-defined type.
+func CreateUserDefinedArrayTypeDesc(
 	params runParams,
 	typDesc *typedesc.Mutable,
 	db catalog.DatabaseDescriptor,
@@ -223,6 +216,24 @@ func CreateEnumArrayTypeDesc(
 	switch t := typDesc.Kind; t {
 	case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
 		elemTyp = types.MakeEnum(catid.TypeIDToOID(typDesc.GetID()), catid.TypeIDToOID(id))
+	case descpb.TypeDescriptor_COMPOSITE:
+		for _, e := range typDesc.Composite.Elements {
+			if e.ElementType.UserDefined() {
+				return nil, unimplemented.NewWithIssue(91779,
+					"composite types that reference user-defined types not yet supported")
+			}
+			if e.ElementType.TypeMeta.ImplicitRecordType {
+				return nil, unimplemented.NewWithIssue(70099,
+					"cannot use table record type as part of composite type")
+			}
+		}
+		contents := make([]*types.T, len(typDesc.Composite.Elements))
+		labels := make([]string, len(typDesc.Composite.Elements))
+		for i, e := range typDesc.Composite.Elements {
+			contents[i] = e.ElementType
+			labels[i] = e.ElementLabel
+		}
+		elemTyp = types.NewCompositeType(catid.TypeIDToOID(typDesc.GetID()), catid.TypeIDToOID(id), contents, labels)
 	default:
 		return nil, errors.AssertionFailedf("cannot make array type for kind %s", t.String())
 	}
@@ -264,7 +275,6 @@ func (p *planner) createArrayType(
 	if err != nil {
 		return 0, err
 	}
-	arrayTypeKey := catalogkeys.MakeObjectNameKey(params.ExecCfg().Codec, db.GetID(), schemaID, arrayTypeName)
 
 	// Generate the stable ID for the array type.
 	id, err := params.EvalContext().DescIDGenerator.GenerateUniqueDescID(params.ctx)
@@ -272,7 +282,7 @@ func (p *planner) createArrayType(
 		return 0, err
 	}
 
-	arrayTypDesc, err := CreateEnumArrayTypeDesc(
+	arrayTypDesc, err := CreateUserDefinedArrayTypeDesc(
 		params,
 		typDesc,
 		db,
@@ -283,29 +293,35 @@ func (p *planner) createArrayType(
 	if err != nil {
 		return 0, err
 	}
-
 	jobStr := fmt.Sprintf("implicit array type creation for %s", typ)
-	if err := p.createDescriptorWithID(
-		params.ctx,
-		arrayTypeKey,
-		id,
-		arrayTypDesc,
-		jobStr,
-	); err != nil {
+	if err := p.createDescriptor(params.ctx, arrayTypDesc, jobStr); err != nil {
 		return 0, err
 	}
 	return id, nil
 }
 
-func (p *planner) createUserDefinedEnum(params runParams, n *createTypeNode) error {
+func (p *planner) createUserDefinedType(params runParams, n *createTypeNode) error {
 	// Generate a stable ID for the new type.
 	id, err := params.EvalContext().DescIDGenerator.GenerateUniqueDescID(params.ctx)
 	if err != nil {
 		return err
 	}
-	return params.p.createEnumWithID(
-		params, id, n.n.EnumLabels, n.dbDesc, n.typeName, EnumTypeUserDefined,
-	)
+	switch n.n.Variety {
+	case tree.Enum:
+		return params.p.createEnumWithID(
+			params, id, n.n.EnumLabels, n.dbDesc, n.typeName, EnumTypeUserDefined,
+		)
+	case tree.Composite:
+		if !p.execCfg.Settings.Version.IsActive(params.ctx, clusterversion.V23_1) {
+			return pgerror.Newf(pgcode.FeatureNotSupported,
+				"version %v must be finalized to create composite types",
+				clusterversion.ByKey(clusterversion.V23_1))
+		}
+		return params.p.createCompositeWithID(
+			params, id, n.n.CompositeTypeList, n.dbDesc, n.typeName,
+		)
+	}
+	return unimplemented.NewWithIssue(25123, "CREATE TYPE")
 }
 
 // CreateEnumTypeDesc creates a new enum type descriptor.
@@ -339,14 +355,16 @@ func CreateEnumTypeDesc(
 		}
 	}
 
-	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
 		dbDesc.GetDefaultPrivilegeDescriptor(),
 		schema.GetDefaultPrivilegeDescriptor(),
 		dbDesc.GetID(),
 		params.SessionData().User(),
 		privilege.Types,
-		dbDesc.GetPrivileges(),
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	enumKind := descpb.TypeDescriptor_ENUM
 	var regionConfig *descpb.TypeDescriptor_RegionConfig
@@ -379,6 +397,66 @@ func CreateEnumTypeDesc(
 	}).BuildCreatedMutableType(), nil
 }
 
+// CreateCompositeTypeDesc creates a new composite type descriptor.
+func CreateCompositeTypeDesc(
+	params runParams,
+	id descpb.ID,
+	compositeTypeList []tree.CompositeTypeElem,
+	dbDesc catalog.DatabaseDescriptor,
+	schema catalog.SchemaDescriptor,
+	typeName *tree.TypeName,
+) (*typedesc.Mutable, error) {
+	// Ensure there are no duplicates in the input enum values.
+	seenLabels := make(map[tree.Name]struct{})
+	elts := make([]descpb.TypeDescriptor_Composite_CompositeElement, len(compositeTypeList))
+	for i, value := range compositeTypeList {
+		_, ok := seenLabels[value.Label]
+		if ok {
+			return nil, pgerror.Newf(pgcode.InvalidObjectDefinition,
+				"composite type definition contains duplicate label %q", value)
+		}
+		elts[i].ElementLabel = string(value.Label)
+		typ, err := tree.ResolveType(params.ctx, value.Type, params.p.semaCtx.TypeResolver)
+		if err != nil {
+			return nil, err
+		}
+		if typ.UserDefined() {
+			return nil, unimplemented.NewWithIssue(91779,
+				"composite types that reference user-defined types not yet supported")
+		}
+		if typ.TypeMeta.ImplicitRecordType {
+			return nil, unimplemented.NewWithIssue(70099,
+				"cannot use table record type as part of composite type")
+		}
+		elts[i].ElementType = typ
+		seenLabels[value.Label] = struct{}{}
+	}
+
+	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		dbDesc.GetDefaultPrivilegeDescriptor(),
+		schema.GetDefaultPrivilegeDescriptor(),
+		dbDesc.GetID(),
+		params.SessionData().User(),
+		privilege.Types,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return typedesc.NewBuilder(&descpb.TypeDescriptor{
+		Name:           typeName.Type(),
+		ID:             id,
+		ParentID:       dbDesc.GetID(),
+		ParentSchemaID: schema.GetID(),
+		Kind:           descpb.TypeDescriptor_COMPOSITE,
+		Composite: &descpb.TypeDescriptor_Composite{
+			Elements: elts,
+		},
+		Version:    1,
+		Privileges: privs,
+	}).BuildCreatedMutableType(), nil
+}
+
 func (p *planner) createEnumWithID(
 	params runParams,
 	id descpb.ID,
@@ -400,6 +478,45 @@ func (p *planner) createEnumWithID(
 		return err
 	}
 
+	return p.finishCreateType(params, id, typeName, typeDesc, dbDesc, schema)
+}
+
+func (p *planner) createCompositeWithID(
+	params runParams,
+	id descpb.ID,
+	compositeTypeList []tree.CompositeTypeElem,
+	dbDesc catalog.DatabaseDescriptor,
+	typeName *tree.TypeName,
+) error {
+	// Generate a key in the namespace table and a new id for this type.
+	schema, err := getCreateTypeParams(params, typeName, dbDesc)
+	if err != nil {
+		return err
+	}
+
+	typeDesc, err := CreateCompositeTypeDesc(params, id, compositeTypeList, dbDesc, schema, typeName)
+	if err != nil {
+		return err
+	}
+
+	if err := p.finishCreateType(params, id, typeName, typeDesc, dbDesc, schema); err != nil {
+		return err
+	}
+	// Install back references to types used by this type.
+	if err := params.p.addBackRefsFromAllTypesInType(params.ctx, typeDesc); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *planner) finishCreateType(
+	params runParams,
+	id descpb.ID,
+	typeName *tree.TypeName,
+	typeDesc *typedesc.Mutable,
+	dbDesc catalog.DatabaseDescriptor,
+	schema catalog.SchemaDescriptor,
+) error {
 	// Create the implicit array type for this type before finishing the type.
 	arrayTypeID, err := p.createArrayType(params, typeName, typeDesc, dbDesc, schema.GetID())
 	if err != nil {
@@ -410,13 +527,7 @@ func (p *planner) createEnumWithID(
 	typeDesc.ArrayTypeID = arrayTypeID
 
 	// Now create the type after the implicit array type as been created.
-	if err := p.createDescriptorWithID(
-		params.ctx,
-		catalogkeys.MakeObjectNameKey(params.ExecCfg().Codec, dbDesc.GetID(), schema.GetID(), typeName.Type()),
-		id,
-		typeDesc,
-		typeName.String(),
-	); err != nil {
+	if err := p.createDescriptor(params.ctx, typeDesc, typeName.String()); err != nil {
 		return err
 	}
 

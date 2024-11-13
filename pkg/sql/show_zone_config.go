@@ -103,12 +103,7 @@ func getShowZoneConfigRow(
 			return nil, err
 		}
 	} else if zoneSpecifier.Database != "" {
-		database, err := p.Descriptors().GetImmutableDatabaseByName(
-			ctx,
-			p.txn,
-			string(zoneSpecifier.Database),
-			tree.DatabaseLookupFlags{Required: true},
-		)
+		database, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, string(zoneSpecifier.Database))
 		if err != nil {
 			return nil, err
 		}
@@ -129,7 +124,7 @@ func getShowZoneConfigRow(
 
 	subZoneIdx := uint32(0)
 	zoneID, zone, subzone, err := GetZoneConfigInTxn(
-		ctx, p.txn, p.ExecCfg().Codec, targetID, index, partition, false, /* getInheritedDefault */
+		ctx, p.txn, p.Descriptors(), targetID, index, partition, false, /* getInheritedDefault */
 	)
 	if errors.Is(err, errNoZoneConfigApplies) {
 		// TODO(benesch): This shouldn't be the caller's responsibility;

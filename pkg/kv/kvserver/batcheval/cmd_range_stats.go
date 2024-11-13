@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -22,13 +23,13 @@ import (
 )
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.RangeStats, declareKeysRangeStats, RangeStats)
+	RegisterReadOnlyCommand(kvpb.RangeStats, declareKeysRangeStats, RangeStats)
 }
 
 func declareKeysRangeStats(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
-	req roachpb.Request,
+	header *kvpb.Header,
+	req kvpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 	maxOffset time.Duration,
 ) {
@@ -40,17 +41,24 @@ func declareKeysRangeStats(
 
 // RangeStats returns the MVCC statistics for a range.
 func RangeStats(
-	ctx context.Context, _ storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, _ storage.Reader, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	reply := resp.(*roachpb.RangeStatsResponse)
+	reply := resp.(*kvpb.RangeStatsResponse)
 	reply.MVCCStats = cArgs.EvalCtx.GetMVCCStats()
-	reply.DeprecatedLastQueriesPerSecond = cArgs.EvalCtx.GetLastSplitQPS()
-	if qps, ok := cArgs.EvalCtx.GetMaxSplitQPS(); ok {
-		reply.MaxQueriesPerSecond = qps
-	} else {
-		// See comment on MaxQueriesPerSecond. -1 means !ok.
-		reply.MaxQueriesPerSecond = -1
+
+	maxQPS, qpsOK := cArgs.EvalCtx.GetMaxSplitQPS(ctx)
+	maxCPU, cpuOK := cArgs.EvalCtx.GetMaxSplitCPU(ctx)
+	// See comment on MaxQueriesPerSecond and MaxCPUPerSecond. -1 means !ok.
+	reply.MaxCPUPerSecond, reply.MaxQueriesPerSecond = -1, -1
+	// NB: We don't expect both cpuOk and qpsOK to be true, however we don't
+	// prevent both being set.
+	if qpsOK {
+		reply.MaxQueriesPerSecond = maxQPS
 	}
+	if cpuOK {
+		reply.MaxCPUPerSecond = maxCPU
+	}
+
 	reply.MaxQueriesPerSecondSet = true
 	reply.RangeInfo = cArgs.EvalCtx.GetRangeInfo(ctx)
 	return result.Result{}, nil

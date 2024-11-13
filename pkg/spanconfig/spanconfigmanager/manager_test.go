@@ -22,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigmanager"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -69,9 +69,8 @@ func TestManagerConcurrentJobCreation(t *testing.T) {
 
 	ts := tc.Server(0)
 	manager := spanconfigmanager.New(
-		ts.DB(),
+		ts.InternalDB().(isql.DB),
 		ts.JobRegistry().(*jobs.Registry),
-		ts.InternalExecutor().(*sql.InternalExecutor),
 		ts.Stopper(),
 		ts.ClusterSettings(),
 		ts.SpanConfigReconciler().(spanconfig.Reconciler),
@@ -155,9 +154,8 @@ func TestManagerStartsJobIfFailed(t *testing.T) {
 
 	ts := tc.Server(0)
 	manager := spanconfigmanager.New(
-		ts.DB(),
+		ts.InternalDB().(isql.DB),
 		ts.JobRegistry().(*jobs.Registry),
-		ts.InternalExecutor().(*sql.InternalExecutor),
 		ts.Stopper(),
 		ts.ClusterSettings(),
 		ts.SpanConfigReconciler().(spanconfig.Reconciler),
@@ -174,9 +172,17 @@ func TestManagerStartsJobIfFailed(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	id := ts.JobRegistry().(*jobs.Registry).MakeJobID()
 	_, err = tc.ServerConn(0).Exec(
-		`INSERT INTO system.jobs (status, payload) VALUES ($1, $2)`,
+		`INSERT INTO system.jobs (id, status) VALUES ($1, $2)`,
+		id,
 		jobs.StatusFailed,
+	)
+	require.NoError(t, err)
+	_, err = tc.ServerConn(0).Exec(
+		`INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`,
+		id,
+		jobs.GetLegacyPayloadKey(),
 		payload,
 	)
 	require.NoError(t, err)
@@ -218,9 +224,8 @@ func TestManagerCheckJobConditions(t *testing.T) {
 		return currentCount
 	}
 	manager := spanconfigmanager.New(
-		ts.DB(),
+		ts.InternalDB().(isql.DB),
 		ts.JobRegistry().(*jobs.Registry),
-		ts.InternalExecutor().(*sql.InternalExecutor),
 		ts.Stopper(),
 		ts.ClusterSettings(),
 		ts.SpanConfigReconciler().(spanconfig.Reconciler),
@@ -318,9 +323,8 @@ func TestReconciliationJobErrorAndRecovery(t *testing.T) {
 	var jobID jobspb.JobID
 	ts := tc.Server(0)
 	manager := spanconfigmanager.New(
-		ts.DB(),
+		ts.InternalDB().(isql.DB),
 		ts.JobRegistry().(*jobs.Registry),
-		ts.InternalExecutor().(*sql.InternalExecutor),
 		ts.Stopper(),
 		ts.ClusterSettings(),
 		ts.SpanConfigReconciler().(spanconfig.Reconciler),
@@ -412,9 +416,8 @@ func TestReconciliationUsesRightCheckpoint(t *testing.T) {
 
 	ts := tc.Server(0)
 	manager := spanconfigmanager.New(
-		ts.DB(),
+		ts.InternalDB().(isql.DB),
 		ts.JobRegistry().(*jobs.Registry),
-		ts.InternalExecutor().(*sql.InternalExecutor),
 		ts.Stopper(),
 		ts.ClusterSettings(),
 		ts.SpanConfigReconciler().(spanconfig.Reconciler),
@@ -475,7 +478,7 @@ func waitForJobCheckpoint(t *testing.T, tdb *sqlutils.SQLRunner) {
 	testutils.SucceedsSoon(t, func() error {
 		var progressBytes []byte
 		tdb.QueryRow(t, `
-SELECT progress FROM system.jobs
+SELECT progress FROM crdb_internal.system_jobs
   WHERE id = (SELECT job_id FROM [SHOW AUTOMATIC JOBS] WHERE job_type = 'AUTO SPAN CONFIG RECONCILIATION')
 `).Scan(&progressBytes)
 

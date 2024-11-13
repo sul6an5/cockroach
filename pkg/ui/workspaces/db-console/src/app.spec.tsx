@@ -9,6 +9,9 @@
 // licenses/APL.txt.
 
 import { stubComponentInModule } from "./test-utils/mockComponent";
+stubComponentInModule("src/views/cluster/containers/nodeGraphs", "default");
+stubComponentInModule("src/views/cluster/containers/events", "EventPage");
+stubComponentInModule("src/views/databases/databasesPage", "DatabasesPage");
 stubComponentInModule(
   "src/views/databases/databaseDetailsPage",
   "DatabaseDetailsPage",
@@ -22,33 +25,30 @@ stubComponentInModule(
   "default",
 );
 stubComponentInModule("src/views/statements/statementsPage", "default");
+stubComponentInModule("src/views/statements/statementDetails", "default");
 stubComponentInModule("src/views/transactions/transactionsPage", "default");
+stubComponentInModule("src/views/transactions/transactionDetails", "default");
 stubComponentInModule(
-  "src/views/statements/activeStatementDetailsConnected",
+  "src/views/statements/recentStatementDetailsConnected",
   "default",
 );
 stubComponentInModule(
-  "src/views/transactions/activeTransactionDetailsConnected",
+  "src/views/transactions/recentTransactionDetailsConnected",
+  "default",
+);
+stubComponentInModule("src/views/insights/workloadInsightsPage", "default");
+stubComponentInModule(
+  "src/views/insights/transactionInsightDetailsPage",
   "default",
 );
 stubComponentInModule(
-  "src/views/insights/workloadInsightsPageConnected",
+  "src/views/insights/statementInsightDetailsPage",
   "default",
 );
-stubComponentInModule(
-  "src/views/insights/transactionInsightDetailsPageConnected",
-  "default",
-);
-stubComponentInModule(
-  "src/views/insights/statementInsightDetailsPageConnected",
-  "default",
-);
-stubComponentInModule(
-  "src/views/insights/schemaInsightsPageConnected",
-  "default",
-);
+stubComponentInModule("src/views/insights/schemaInsightsPage", "default");
 stubComponentInModule("src/views/schedules/schedulesPage", "default");
 stubComponentInModule("src/views/schedules/scheduleDetails", "default");
+stubComponentInModule("src/views/tracez_v2/snapshotPage", "default");
 
 import React from "react";
 import { Action, Store } from "redux";
@@ -60,17 +60,12 @@ import { AdminUIState, createAdminUIStore } from "src/redux/state";
 
 const CLUSTER_OVERVIEW_CAPACITY_LABEL = "Capacity Usage";
 const CLUSTER_VIZ_NODE_MAP_LABEL = "Node Map";
-const METRICS_HEADER = "Metrics";
 const NODE_LIST_LABEL = /Nodes \([\d]\)/;
 const LOADING_CLUSTER_STATUS = /Loading cluster status.*/;
 const NODE_LOG_HEADER = /Logs Node.*/;
-const EVENTS_HEADER = "Events";
 const JOBS_HEADER = "Jobs";
-const DATABASES_HEADER = "Databases";
 const SQL_ACTIVITY_HEADER = "SQL Activity";
-const STATEMENTS_DETAILS_HEADER = "Statement Fingerprint";
-const TRANSACTION_DETAILS_HEADER = "Transaction Details";
-const ADVANCED_DEBUG_HEADER = "Advanced Debugging";
+const ADVANCED_DEBUG_HEADER = "Advanced Debug";
 const REDUX_DEBUG_HEADER = "Redux State";
 const CUSTOM_METRICS_CHART_HEADER = "Custom Chart";
 const ENQUEUE_RANGE_HEADER = "Manually enqueue range in a replica queue";
@@ -80,7 +75,7 @@ const PROBLEM_RANGES_HEADER = "Problem Ranges Report";
 const LOCALITIES_REPORT_HEADER = "Localities";
 const NODE_DIAGNOSTICS_REPORT_HEADER = "Node Diagnostics";
 const DECOMMISSIONED_HISTORY_REPORT = "Decommissioned Node History";
-const NETWORK_DIAGNOSTICS_REPORT_HEADER = "Network Diagnostics";
+const NETWORK_DIAGNOSTICS_REPORT_HEADER = "Network";
 const CLUSTER_SETTINGS_REPORT = "Cluster Settings";
 const CERTIFICATES_REPORT_HEADER = "Certificates";
 const RANGE_REPORT_HEADER = /Range Report for.*/;
@@ -147,7 +142,7 @@ describe("Routing to", () => {
   describe("'/metrics' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
 
     test("redirected to '/metrics/overview/cluster'", () => {
@@ -159,21 +154,21 @@ describe("Routing to", () => {
   describe("'/metrics/overview/cluster' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/overview/cluster");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
   });
 
   describe("'/metrics/overview/node' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/overview/node");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
   });
 
   describe("'/metrics/:dashboardNameAttr' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/some-dashboard");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
 
     test("redirected to '/metrics/:${dashboardNameAttr}/cluster'", () => {
@@ -185,14 +180,14 @@ describe("Routing to", () => {
   describe("'/metrics/:dashboardNameAttr/cluster' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/some-dashboard/cluster");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
   });
 
   describe("'/metrics/:dashboardNameAttr/node' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/some-dashboard/node");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
 
     test("redirected to '/metrics/:${dashboardNameAttr}/cluster'", () => {
@@ -204,7 +199,7 @@ describe("Routing to", () => {
   describe("'/metrics/:dashboardNameAttr/node/:nodeIDAttr' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/some-dashboard/node/123");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
   });
 
@@ -243,7 +238,7 @@ describe("Routing to", () => {
   describe("'/events' path", () => {
     test("routes to <EventPageUnconnected> component", () => {
       navigateToPath("/events");
-      screen.getByText(EVENTS_HEADER, { selector: "h1" });
+      screen.getByTestId("EventPage");
     });
   });
 
@@ -274,7 +269,7 @@ describe("Routing to", () => {
   describe("'/databases' path", () => {
     test("routes to <DatabasesPage> component", () => {
       navigateToPath("/databases");
-      screen.getByText(DATABASES_HEADER, { selector: "h3" });
+      screen.getByTestId("DatabasesPage");
     });
   });
 
@@ -361,14 +356,14 @@ describe("Routing to", () => {
   describe("'/statements/:${appAttr}/:${statementAttr}' path", () => {
     test("routes to <StatementDetails> component", () => {
       navigateToPath("/statements/%24+internal/true");
-      screen.getByText(STATEMENTS_DETAILS_HEADER, { selector: "h3" });
+      screen.getByTestId("statementDetails");
     });
   });
 
   describe("'/statements/:${implicitTxnAttr}/:${statementAttr}' path", () => {
     test("routes to <StatementDetails> component", () => {
       navigateToPath("/statements/implicit-txn-attr/statement-attr");
-      screen.getByText(STATEMENTS_DETAILS_HEADER, { selector: "h3" });
+      screen.getByTestId("statementDetails");
     });
   });
 
@@ -384,7 +379,7 @@ describe("Routing to", () => {
   describe("'/statement/:${implicitTxnAttr}/:${statementAttr}' path", () => {
     test("routes to <StatementDetails> component", () => {
       navigateToPath("/statement/implicit-attr/statement-attr/");
-      screen.getByText(STATEMENTS_DETAILS_HEADER, { selector: "h3" });
+      screen.getByTestId("statementDetails");
     });
   });
 
@@ -399,7 +394,7 @@ describe("Routing to", () => {
       screen.getByRole("tab", { name: "Statements", selected: true });
     });
 
-    test("routes to <ActiveStatementsView> component with view=active", () => {
+    test("routes to <RecentStatementsView> component with view=active", () => {
       navigateToPath("/sql-activity?tab=Statements&view=active");
       screen.getByRole("tab", { name: "Statements", selected: true });
     });
@@ -419,7 +414,7 @@ describe("Routing to", () => {
       screen.getByRole("tab", { name: "Transactions", selected: true });
     });
 
-    test("routes to <ActiveTransactionsView> component with view=active", () => {
+    test("routes to <RecentTransactionsView> component with view=active", () => {
       navigateToPath("/sql-activity?tab=Transactions&view=active");
       screen.getByRole("tab", { name: "Transactions", selected: true });
     });
@@ -428,21 +423,21 @@ describe("Routing to", () => {
   describe("'/transaction/:aggregated_ts/:txn_fingerprint_id' path", () => {
     test("routes to <TransactionDetails> component", () => {
       navigateToPath("/transaction/1637877600/4948941983164833719");
-      screen.getByText(TRANSACTION_DETAILS_HEADER, { selector: "h3" });
+      screen.getByTestId("transactionDetails");
     });
   });
 
   // Active execution details.
 
   describe("'/execution' path", () => {
-    test("'/execution/statement/statementID' routes to <ActiveStatementDetails>", () => {
+    test("'/execution/statement/statementID' routes to <RecentStatementDetails>", () => {
       navigateToPath("/execution/statement/stmtID");
-      screen.getByTestId("activeStatementDetailsConnected");
+      screen.getByTestId("recentStatementDetailsConnected");
     });
 
-    test("'/execution/transaction/transactionID' routes to <ActiveTransactionDetails>", () => {
+    test("'/execution/transaction/transactionID' routes to <RecentTransactionDetails>", () => {
       navigateToPath("/execution/transaction/transactionID");
-      screen.getByTestId("activeTransactionDetailsConnected");
+      screen.getByTestId("recentTransactionDetailsConnected");
     });
   });
   {
@@ -451,23 +446,23 @@ describe("Routing to", () => {
   describe("'/insights' path", () => {
     test("routes to <InsightsOverviewPage> component - workload insights page", () => {
       navigateToPath("/insights");
-      screen.getByTestId("workloadInsightsPageConnected");
+      screen.getByTestId("workloadInsightsPage");
     });
     test("routes to <InsightsOverviewPage> component - schema insights page", () => {
       navigateToPath("/insights?tab=Schema+Insights");
-      screen.getByTestId("schemaInsightsPageConnected");
+      screen.getByTestId("schemaInsightsPage");
     });
   });
   describe("'/insights/transaction/insightID' path", () => {
-    test("routes to <TransactionInsightDetailsPageConnected> component", () => {
+    test("routes to <TransactionInsightDetailsPage> component", () => {
       navigateToPath("/insights/transaction/insightID");
-      screen.getByTestId("transactionInsightDetailsPageConnected");
+      screen.getByTestId("transactionInsightDetailsPage");
     });
   });
   describe("'/insights/statement/insightID' path", () => {
-    test("routes to <StatementInsightDetailsPageConnected> component", () => {
+    test("routes to <StatementInsightDetailsPage> component", () => {
       navigateToPath("/insights/statement/insightID");
-      screen.getByTestId("statementInsightDetailsPageConnected");
+      screen.getByTestId("statementInsightDetailsPage");
     });
   });
   {
@@ -476,7 +471,9 @@ describe("Routing to", () => {
   describe("'/debug' path", () => {
     test("routes to <Debug> component", () => {
       navigateToPath("/debug");
-      screen.getByText(ADVANCED_DEBUG_HEADER);
+      screen.getByText(ADVANCED_DEBUG_HEADER, {
+        selector: "h3",
+      });
     });
   });
 
@@ -500,6 +497,13 @@ describe("Routing to", () => {
       screen.getByText(ENQUEUE_RANGE_HEADER, {
         selector: "h1",
       });
+    });
+  });
+
+  describe("'/debug/tracez/node/:nodeID/snapshot/:snapshotID' path", () => {
+    test("routes to <SnapshotPage> component", () => {
+      navigateToPath("/debug/tracez/node/1/snapshot/12345");
+      screen.getByTestId("snapshotPage");
     });
   });
 
@@ -578,14 +582,18 @@ describe("Routing to", () => {
   describe("'/reports/network' path", () => {
     test("routes to <Network> component", () => {
       navigateToPath("/reports/network");
-      screen.getByText(NETWORK_DIAGNOSTICS_REPORT_HEADER);
+      screen.getByText(NETWORK_DIAGNOSTICS_REPORT_HEADER, {
+        selector: "h3",
+      });
     });
   });
 
   describe("'/reports/network/:nodeIDAttr' path", () => {
     test("routes to <Network> component", () => {
       navigateToPath("/reports/network/1");
-      screen.getByText(NETWORK_DIAGNOSTICS_REPORT_HEADER);
+      screen.getByText(NETWORK_DIAGNOSTICS_REPORT_HEADER, {
+        selector: "h3",
+      });
     });
   });
 

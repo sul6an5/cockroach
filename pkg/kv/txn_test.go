@@ -16,8 +16,8 @@ import (
 	"reflect"
 	"regexp"
 	"testing"
-	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	testPutResp = roachpb.PutResponse{}
+	testPutResp = kvpb.PutResponse{}
 )
 
 // An example of verbose tracing being used to dump a trace around a
@@ -47,7 +47,7 @@ func TestTxnVerboseTrace(t *testing.T) {
 	ctx, sp := tracer.StartSpanCtx(context.Background(), "test-txn", tracing.WithRecording(tracingpb.RecordingVerbose))
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 
 	if err := db.Txn(ctx, func(ctx context.Context, txn *Txn) error {
@@ -81,18 +81,18 @@ func TestTxnVerboseTrace(t *testing.T) {
 }
 
 func newTestTxnFactory(
-	createReply func(roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error),
+	createReply func(*kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error),
 ) TxnSenderFactory {
 	return MakeMockTxnSenderFactory(
 		func(
-			ctx context.Context, txn *roachpb.Transaction, ba roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
+			ctx context.Context, txn *roachpb.Transaction, ba *kvpb.BatchRequest,
+		) (*kvpb.BatchResponse, *kvpb.Error) {
 			if ba.UserPriority == 0 {
 				ba.UserPriority = 1
 			}
 
-			var br *roachpb.BatchResponse
-			var pErr *roachpb.Error
+			var br *kvpb.BatchResponse
+			var pErr *kvpb.Error
 
 			ba.Txn = txn
 
@@ -107,14 +107,14 @@ func newTestTxnFactory(
 			status := roachpb.PENDING
 			for i, req := range ba.Requests {
 				args := req.GetInner()
-				if _, ok := args.(*roachpb.PutRequest); ok {
+				if _, ok := args.(*kvpb.PutRequest); ok {
 					testPutRespCopy := testPutResp
 					union := &br.Responses[i] // avoid operating on copy
 					union.MustSetInner(&testPutRespCopy)
 				}
 			}
-			if args, ok := ba.GetArg(roachpb.EndTxn); ok {
-				et := args.(*roachpb.EndTxnRequest)
+			if args, ok := ba.GetArg(kvpb.EndTxn); ok {
+				et := args.(*kvpb.EndTxnRequest)
 				if et.Commit {
 					status = roachpb.COMMITTED
 				} else {
@@ -142,8 +142,8 @@ func TestInitPut(t *testing.T) {
 	// This test is mostly an excuse to exercise otherwise unused code.
 	// TODO(vivekmenezes): update test or remove when InitPut is being
 	// considered sufficiently tested and this path exercised.
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
-	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	clock := hlc.NewClockForTesting(nil)
+	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 		br := ba.CreateReply()
 		return br, nil
 	}), clock, stopper)
@@ -164,26 +164,26 @@ func TestTransactionConfig(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	dbCtx := DefaultDBContext(stopper)
 	dbCtx.UserPriority = 101
 	db := NewDBWithContext(
 		log.MakeTestingAmbientCtxWithNewTracer(),
-		newTestTxnFactory(nil), clock, dbCtx,ctx)
+		newTestTxnFactory(nil), clock, dbCtx)
 	for _, tc := range []struct {
 		label               string
 		txnCreator          func(context.Context, func(context.Context, *Txn) error) error
-		wantAdmissionHeader roachpb.AdmissionHeader_Source
+		wantAdmissionHeader kvpb.AdmissionHeader_Source
 	}{
 		{
 			label:               "source is other",
 			txnCreator:          db.Txn,
-			wantAdmissionHeader: roachpb.AdmissionHeader_OTHER,
+			wantAdmissionHeader: kvpb.AdmissionHeader_OTHER,
 		},
 		{
 			label:               "source is root kv",
 			txnCreator:          db.TxnRootKV,
-			wantAdmissionHeader: roachpb.AdmissionHeader_ROOT_KV,
+			wantAdmissionHeader: kvpb.AdmissionHeader_ROOT_KV,
 		},
 	} {
 		if err := tc.txnCreator(context.Background(), func(ctx context.Context, txn *Txn) error {
@@ -210,9 +210,9 @@ func TestCommitTransactionOnce(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	count := 0
-	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 		count++
 		return ba.CreateReply(), nil
 	}), clock, stopper)
@@ -236,11 +236,11 @@ func TestAbortMutatingTransaction(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
-	var calls []roachpb.Method
-	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	clock := hlc.NewClockForTesting(nil)
+	var calls []kvpb.Method
+	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 		calls = append(calls, ba.Methods()...)
-		if et, ok := ba.GetArg(roachpb.EndTxn); ok && et.(*roachpb.EndTxnRequest).Commit {
+		if et, ok := ba.GetArg(kvpb.EndTxn); ok && et.(*kvpb.EndTxnRequest).Commit {
 			t.Errorf("expected commit to be false")
 		}
 		return ba.CreateReply(), nil
@@ -254,7 +254,7 @@ func TestAbortMutatingTransaction(t *testing.T) {
 	}); err == nil {
 		t.Error("expected error on abort")
 	}
-	expectedCalls := []roachpb.Method{roachpb.Put, roachpb.EndTxn}
+	expectedCalls := []kvpb.Method{kvpb.Put, kvpb.EndTxn}
 	if !reflect.DeepEqual(expectedCalls, calls) {
 		t.Errorf("expected %s, got %s", expectedCalls, calls)
 	}
@@ -269,19 +269,19 @@ func TestAbortMutatingTransaction(t *testing.T) {
 func TestRunTransactionRetryOnErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	testCases := []struct {
 		err   error
 		retry bool // Expect retry?
 	}{
-		{roachpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.Timestamp{}, hlc.Timestamp{}, nil), true},
-		{&roachpb.TransactionAbortedError{}, true},
-		{&roachpb.TransactionPushError{}, true},
-		{&roachpb.TransactionRetryError{}, true},
-		{&roachpb.WriteTooOldError{}, true},
-		{&roachpb.RangeNotFoundError{}, false},
-		{&roachpb.RangeKeyMismatchError{}, false},
-		{&roachpb.TransactionStatusError{}, false},
+		{kvpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, hlc.Timestamp{}, hlc.ClockTimestamp{}), true},
+		{&kvpb.TransactionAbortedError{}, true},
+		{&kvpb.TransactionPushError{}, true},
+		{&kvpb.TransactionRetryError{}, true},
+		{&kvpb.WriteTooOldError{}, true},
+		{&kvpb.RangeNotFoundError{}, false},
+		{&kvpb.RangeKeyMismatchError{}, false},
+		{&kvpb.TransactionStatusError{}, false},
 	}
 
 	for _, test := range testCases {
@@ -291,26 +291,26 @@ func TestRunTransactionRetryOnErrors(t *testing.T) {
 			defer stopper.Stop(ctx)
 			count := 0
 			db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(
-				func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+				func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 
-					if _, ok := ba.GetArg(roachpb.Put); ok {
+					if _, ok := ba.GetArg(kvpb.Put); ok {
 						count++
 						if count == 1 {
-							var pErr *roachpb.Error
-							if errors.HasType(test.err, (*roachpb.ReadWithinUncertaintyIntervalError)(nil)) {
+							var pErr *kvpb.Error
+							if errors.HasType(test.err, (*kvpb.ReadWithinUncertaintyIntervalError)(nil)) {
 								// This error requires an observed timestamp to have been
 								// recorded on the origin node.
 								ba.Txn.UpdateObservedTimestamp(1, hlc.ClockTimestamp{WallTime: 1, Logical: 1})
-								pErr = roachpb.NewErrorWithTxn(test.err, ba.Txn)
+								pErr = kvpb.NewErrorWithTxn(test.err, ba.Txn)
 								pErr.OriginNode = 1
 							} else {
-								pErr = roachpb.NewErrorWithTxn(test.err, ba.Txn)
+								pErr = kvpb.NewErrorWithTxn(test.err, ba.Txn)
 							}
 
-							if pErr.TransactionRestart() != roachpb.TransactionRestart_NONE {
+							if pErr.TransactionRestart() != kvpb.TransactionRestart_NONE {
 								// HACK ALERT: to do without a TxnCoordSender, we jump through
 								// hoops to get the retryable error expected by db.Txn().
-								return nil, roachpb.NewError(roachpb.NewTransactionRetryWithProtoRefreshError(
+								return nil, kvpb.NewError(kvpb.NewTransactionRetryWithProtoRefreshError(
 									"foo", ba.Txn.ID, *ba.Txn))
 							}
 							return nil, pErr
@@ -349,7 +349,7 @@ func TestTransactionStatus(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 	for _, write := range []bool{true, false} {
 		for _, commit := range []bool{true, false} {
@@ -364,9 +364,7 @@ func TestTransactionStatus(t *testing.T) {
 				}
 			}
 			if commit {
-				if pErr := txn.CommitOrCleanup(ctx); pErr != nil {
-					t.Fatal(pErr)
-				}
+				require.NoError(t, txn.Commit(ctx))
 				if a, e := txn.TestingCloneTxn().Status, roachpb.COMMITTED; a != e {
 					t.Errorf("write: %t, commit: %t transaction expected to have status %q but had %q", write, commit, e, a)
 				}
@@ -389,7 +387,7 @@ func TestCommitInBatchWrongTxn(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
@@ -413,17 +411,17 @@ func TestSetPriority(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	var expected roachpb.UserPriority
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(
-		func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 			if ba.UserPriority != expected {
-				pErr := roachpb.NewErrorf("Priority not set correctly in the batch! "+
+				pErr := kvpb.NewErrorf("Priority not set correctly in the batch! "+
 					"(expected: %s, value: %s)", expected, ba.UserPriority)
 				return nil, pErr
 			}
 
-			br := &roachpb.BatchResponse{}
+			br := &kvpb.BatchResponse{}
 			br.Txn.Update(ba.Txn) // copy
 			return br, nil
 		}), clock, stopper)
@@ -434,7 +432,7 @@ func TestSetPriority(t *testing.T) {
 	if err := txn.SetUserPriority(expected); err != nil {
 		t.Fatal(err)
 	}
-	if _, pErr := txn.Send(ctx, roachpb.BatchRequest{}); pErr != nil {
+	if _, pErr := txn.Send(ctx, &kvpb.BatchRequest{}); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -442,7 +440,7 @@ func TestSetPriority(t *testing.T) {
 	expected = roachpb.UserPriority(-13)
 	txn = NewTxn(ctx, db, 0 /* gatewayNodeID */)
 	txn.TestingSetPriority(13)
-	if _, pErr := txn.Send(ctx, roachpb.BatchRequest{}); pErr != nil {
+	if _, pErr := txn.Send(ctx, &kvpb.BatchRequest{}); pErr != nil {
 		t.Fatal(pErr)
 	}
 }
@@ -455,7 +453,7 @@ func TestWrongTxnRetry(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 
 	var retries int
@@ -467,7 +465,7 @@ func TestWrongTxnRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Simulate an inner txn by generating an error with a bogus txn id.
-		return roachpb.NewTransactionRetryWithProtoRefreshError("test error", uuid.MakeV4(), roachpb.Transaction{})
+		return kvpb.NewTransactionRetryWithProtoRefreshError("test error", uuid.MakeV4(), roachpb.Transaction{})
 	}
 
 	if err := db.Txn(context.Background(), txnClosure); !testutils.IsError(err, "test error") {
@@ -485,11 +483,11 @@ func TestBatchMixRawRequest(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 
 	b := &Batch{}
-	b.AddRawRequest(&roachpb.EndTxnRequest{})
+	b.AddRawRequest(&kvpb.EndTxnRequest{})
 	b.Put("x", "y")
 	if err := db.Run(context.Background(), b); !testutils.IsError(err, "non-raw operations") {
 		t.Fatal(err)
@@ -503,10 +501,10 @@ func TestUpdateDeadlineMaybe(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 1)), time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 1)))
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), MakeMockTxnSenderFactory(
-		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
+		func(context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+		) (*kvpb.BatchResponse, *kvpb.Error) {
 			return nil, nil
 		}), clock, stopper)
 	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
@@ -552,17 +550,17 @@ func TestTxnNegotiateAndSend(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "fast-path", func(t *testing.T, fastPath bool) {
 		ts10 := hlc.Timestamp{WallTime: 10}
 		ts20 := hlc.Timestamp{WallTime: 20}
-		clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 1)), time.Nanosecond /* maxOffset */)
+		clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 1)))
 		txnSender := MakeMockTxnSenderFactoryWithNonTxnSender(nil /* senderFunc */, func(
-			_ context.Context, ba roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
+			_ context.Context, ba *kvpb.BatchRequest,
+		) (*kvpb.BatchResponse, *kvpb.Error) {
 			require.NotNil(t, ba.BoundedStaleness)
 			require.Equal(t, ts10, ba.BoundedStaleness.MinTimestampBound)
 			require.False(t, ba.BoundedStaleness.MinTimestampBoundStrict)
 			require.Zero(t, ba.BoundedStaleness.MaxTimestampBound)
 
 			if !fastPath {
-				return nil, roachpb.NewError(&roachpb.OpRequiresTxnError{})
+				return nil, kvpb.NewError(&kvpb.OpRequiresTxnError{})
 			}
 			br := ba.CreateReply()
 			br.Timestamp = ts20
@@ -571,12 +569,12 @@ func TestTxnNegotiateAndSend(t *testing.T) {
 		db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), txnSender, clock, stopper)
 		txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
-		var ba roachpb.BatchRequest
-		ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
+		ba := &kvpb.BatchRequest{}
+		ba.BoundedStaleness = &kvpb.BoundedStalenessHeader{
 			MinTimestampBound: ts10,
 		}
-		ba.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
-		ba.Add(roachpb.NewGet(roachpb.Key("a"), false))
+		ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
+		ba.Add(kvpb.NewGet(roachpb.Key("a"), false))
 		br, pErr := txn.NegotiateAndSend(ctx, ba)
 
 		if fastPath {
@@ -664,10 +662,10 @@ func TestTxnNegotiateAndSendWithDeadline(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 1)), time.Nanosecond /* maxOffset */)
+			clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 1)))
 			txnSender := MakeMockTxnSenderFactoryWithNonTxnSender(nil /* senderFunc */, func(
-				_ context.Context, ba roachpb.BatchRequest,
-			) (*roachpb.BatchResponse, *roachpb.Error) {
+				_ context.Context, ba *kvpb.BatchRequest,
+			) (*kvpb.BatchResponse, *kvpb.Error) {
 				require.NotNil(t, ba.BoundedStaleness)
 				require.Equal(t, minTSBound, ba.BoundedStaleness.MinTimestampBound)
 				require.False(t, ba.BoundedStaleness.MinTimestampBoundStrict)
@@ -681,13 +679,13 @@ func TestTxnNegotiateAndSendWithDeadline(t *testing.T) {
 			txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 			require.NoError(t, txn.UpdateDeadline(ctx, test.txnDeadline))
 
-			var ba roachpb.BatchRequest
-			ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
+			ba := &kvpb.BatchRequest{}
+			ba.BoundedStaleness = &kvpb.BoundedStalenessHeader{
 				MinTimestampBound: minTSBound,
 				MaxTimestampBound: test.maxTSBound,
 			}
-			ba.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
-			ba.Add(roachpb.NewGet(roachpb.Key("a"), false))
+			ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
+			ba.Add(kvpb.NewGet(roachpb.Key("a"), false))
 			br, pErr := txn.NegotiateAndSend(ctx, ba)
 
 			if test.expErr == "" {
@@ -721,10 +719,10 @@ func TestTxnNegotiateAndSendWithResumeSpan(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "fast-path", func(t *testing.T, fastPath bool) {
 		ts10 := hlc.Timestamp{WallTime: 10}
 		ts20 := hlc.Timestamp{WallTime: 20}
-		clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 1)), time.Nanosecond /* maxOffset */)
+		clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 1)))
 		txnSender := MakeMockTxnSenderFactoryWithNonTxnSender(nil /* senderFunc */, func(
-			_ context.Context, ba roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
+			_ context.Context, ba *kvpb.BatchRequest,
+		) (*kvpb.BatchResponse, *kvpb.Error) {
 			require.NotNil(t, ba.BoundedStaleness)
 			require.Equal(t, ts10, ba.BoundedStaleness.MinTimestampBound)
 			require.False(t, ba.BoundedStaleness.MinTimestampBoundStrict)
@@ -732,7 +730,7 @@ func TestTxnNegotiateAndSendWithResumeSpan(t *testing.T) {
 			require.Equal(t, int64(2), ba.MaxSpanRequestKeys)
 
 			if !fastPath {
-				return nil, roachpb.NewError(&roachpb.OpRequiresTxnError{})
+				return nil, kvpb.NewError(&kvpb.OpRequiresTxnError{})
 			}
 			br := ba.CreateReply()
 			br.Timestamp = ts20
@@ -745,19 +743,19 @@ func TestTxnNegotiateAndSendWithResumeSpan(t *testing.T) {
 				Key:    roachpb.Key("c"),
 				EndKey: roachpb.Key("d"),
 			}
-			scanResp.ResumeReason = roachpb.RESUME_KEY_LIMIT
+			scanResp.ResumeReason = kvpb.RESUME_KEY_LIMIT
 			return br, nil
 		})
 		db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), txnSender, clock, stopper)
 		txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
-		var ba roachpb.BatchRequest
-		ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
+		ba := &kvpb.BatchRequest{}
+		ba.BoundedStaleness = &kvpb.BoundedStalenessHeader{
 			MinTimestampBound: ts10,
 		}
-		ba.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
+		ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
 		ba.MaxSpanRequestKeys = 2
-		ba.Add(roachpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false /* forUpdate */))
+		ba.Add(kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false /* forUpdate */))
 		br, pErr := txn.NegotiateAndSend(ctx, ba)
 
 		if fastPath {
@@ -774,7 +772,7 @@ func TestTxnNegotiateAndSendWithResumeSpan(t *testing.T) {
 			require.NotNil(t, scanResp.ResumeSpan)
 			require.Equal(t, roachpb.Key("c"), scanResp.ResumeSpan.Key)
 			require.Equal(t, roachpb.Key("d"), scanResp.ResumeSpan.EndKey)
-			require.Equal(t, roachpb.RESUME_KEY_LIMIT, scanResp.ResumeReason)
+			require.Equal(t, kvpb.RESUME_KEY_LIMIT, scanResp.ResumeReason)
 		} else {
 			require.Nil(t, br)
 			require.NotNil(t, pErr)

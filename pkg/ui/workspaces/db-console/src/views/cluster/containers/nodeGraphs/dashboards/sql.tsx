@@ -11,7 +11,7 @@
 import React from "react";
 import _ from "lodash";
 
-import { LineGraph } from "src/views/cluster/components/linegraph";
+import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
 import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
@@ -22,11 +22,12 @@ import {
 } from "src/views/cluster/containers/nodeGraphs/dashboards/graphTooltips";
 
 export default function (props: GraphDashboardProps) {
-  const { nodeIDs, nodesSummary, nodeSources, tooltipSelection } = props;
+  const { nodeIDs, nodeSources, tooltipSelection, nodeDisplayNameByID } = props;
 
   return [
     <LineGraph
       title="Open SQL Sessions"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`The total number of open SQL Sessions ${tooltipSelection}.`}
     >
@@ -35,7 +36,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.conns"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -45,6 +46,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Open SQL Transactions"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`The total number of open SQL transactions  ${tooltipSelection}.`}
     >
@@ -59,6 +61,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Active SQL Statements"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`The total number of running SQL statements ${tooltipSelection}.`}
     >
@@ -73,6 +76,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="SQL Byte Traffic"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`The total amount of SQL client network traffic in bytes per second ${tooltipSelection}.`}
     >
@@ -84,6 +88,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="SQL Statements"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`A ten-second moving average of the # of SELECT, INSERT, UPDATE, and DELETE statements
         successfully executed per second ${tooltipSelection}.`}
@@ -114,9 +119,10 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="SQL Statement Errors"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={
-        "The number of statements which returned a planning or runtime error."
+        "The number of statements which returned a planning, runtime, or client-side retry error."
       }
     >
       <Axis label="errors">
@@ -130,6 +136,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="SQL Statement Contention"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`The total number of SQL statements that experienced contention ${tooltipSelection}.`}
     >
@@ -144,6 +151,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Full Table/Index Scans"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`The total number of full table/index scans ${tooltipSelection}.`}
     >
@@ -152,7 +160,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.full.scan.count"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -162,6 +170,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Active Flows for Distributed SQL Statements"
+      isKvGraph={false}
       tooltip="The number of flows on each node contributing to currently running distributed SQL statements."
     >
       <Axis label="flows">
@@ -169,7 +178,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.distsql.flows.active"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
           />
         ))}
@@ -178,6 +187,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Connection Latency: 99th percentile"
+      isKvGraph={false}
       tooltip={`Over the last minute, this node established and authenticated 99% of connections within this time.`}
     >
       <Axis units={AxisUnits.Duration} label="latency">
@@ -185,7 +195,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.conn.latency-p99"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -195,6 +205,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Connection Latency: 90th percentile"
+      isKvGraph={false}
       tooltip={`Over the last minute, this node established and authenticated 90% of connections within this time.`}
     >
       <Axis units={AxisUnits.Duration} label="latency">
@@ -202,7 +213,61 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.conn.latency-p90"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
+            sources={[node]}
+            downsampleMax
+          />
+        ))}
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Service Latency: SQL Statements, 99.99th percentile"
+      isKvGraph={false}
+      tooltip={
+        <div>
+          Over the last minute, this node executed 99.99% of SQL statements
+          within this time.&nbsp;
+          <em>
+            This time only includes SELECT, INSERT, UPDATE and DELETE statements
+            and does not include network latency between the node and client.
+          </em>
+        </div>
+      }
+    >
+      <Axis units={AxisUnits.Duration} label="latency">
+        {_.map(nodeIDs, node => (
+          <Metric
+            key={node}
+            name="cr.node.sql.service.latency-p99.99"
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
+            sources={[node]}
+            downsampleMax
+          />
+        ))}
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Service Latency: SQL Statements, 99.9th percentile"
+      isKvGraph={false}
+      tooltip={
+        <div>
+          Over the last minute, this node executed 99.9% of SQL statements
+          within this time.&nbsp;
+          <em>
+            This time only includes SELECT, INSERT, UPDATE and DELETE statements
+            and does not include network latency between the node and client.
+          </em>
+        </div>
+      }
+    >
+      <Axis units={AxisUnits.Duration} label="latency">
+        {_.map(nodeIDs, node => (
+          <Metric
+            key={node}
+            name="cr.node.sql.service.latency-p99.9"
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -212,6 +277,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Service Latency: SQL Statements, 99th percentile"
+      isKvGraph={false}
       tooltip={
         <div>
           Over the last minute, this node executed 99% of SQL statements within
@@ -228,7 +294,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.service.latency-p99"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -238,6 +304,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Service Latency: SQL Statements, 90th percentile"
+      isKvGraph={false}
       tooltip={
         <div>
           Over the last minute, this node executed 90% of SQL statements within
@@ -254,7 +321,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.service.latency-p90"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -264,6 +331,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="KV Execution Latency: 99th percentile"
+      isKvGraph={true}
       tooltip={`The 99th percentile of latency between query requests and responses over a
           1 minute period. Values are displayed individually for each node.`}
     >
@@ -272,7 +340,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.exec.latency-p99"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -282,6 +350,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="KV Execution Latency: 90th percentile"
+      isKvGraph={true}
       tooltip={`The 90th percentile of latency between query requests and responses over a
            1 minute period. Values are displayed individually for each node.`}
     >
@@ -290,7 +359,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.exec.latency-p90"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -300,6 +369,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Transactions"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`The total number of transactions initiated, committed, rolled back,
            or aborted per second ${tooltipSelection}.`}
@@ -330,6 +400,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Transaction Restarts"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={
         <TransactionRestartsToolTip tooltipSelection={tooltipSelection} />
@@ -381,6 +452,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Transaction Latency: 99th percentile"
+      isKvGraph={false}
       tooltip={
         <div>
           Over the last minute, this node executed 99% of transactions within
@@ -397,7 +469,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.txn.latency-p99"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -407,6 +479,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Transaction Latency: 90th percentile"
+      isKvGraph={false}
       tooltip={
         <div>
           Over the last minute, this node executed 90% of transactions within
@@ -423,7 +496,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.txn.latency-p90"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -433,6 +506,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="SQL Memory"
+      isKvGraph={false}
       tooltip={`The current amount of allocated SQL memory. This amount is
          compared against the node's --max-sql-memory flag.`}
     >
@@ -441,7 +515,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.mem.root.current"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -451,6 +525,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Schema Changes"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`The total number of DDL statements per second ${tooltipSelection}.`}
     >
@@ -465,6 +540,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Statement Denials: Cluster Settings"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={
         <StatementDenialsClusterSettingsTooltip

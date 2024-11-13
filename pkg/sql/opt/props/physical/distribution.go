@@ -12,6 +12,7 @@ package physical
 
 import (
 	"bytes"
+	"context"
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -21,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 )
 
 // Distribution represents the physical distribution of data for a relational
@@ -33,7 +35,7 @@ type Distribution struct {
 	// TODO(rytaft): Consider abstracting this to a list of "neighborhoods" to
 	// support more different types of localities.
 	// TODO(rytaft): Consider mapping the region strings to integers and storing
-	// this as a FastIntSet.
+	// this as a intsets.Fast.
 	Regions []string
 }
 
@@ -110,7 +112,11 @@ func (d *Distribution) FromLocality(locality roachpb.Locality) {
 // FromIndexScan sets the Distribution that results from scanning the given
 // index with the given constraint c (c can be nil).
 func (d *Distribution) FromIndexScan(
-	evalCtx *eval.Context, tabMeta *opt.TableMeta, ord cat.IndexOrdinal, c *constraint.Constraint,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	tabMeta *opt.TableMeta,
+	ord cat.IndexOrdinal,
+	c *constraint.Constraint,
 ) {
 	tab := tabMeta.Table
 	index := tab.Index(ord)
@@ -183,10 +189,11 @@ func (d *Distribution) FromIndexScan(
 		if !regionsPopulated {
 			// If the above methods failed to find a distribution, then the
 			// distribution is all regions in the database.
-			regionsNames, ok := tabMeta.GetRegionsInDatabase(evalCtx.Planner)
-			if !ok && evalCtx.SessionData().EnforceHomeRegion {
-				err := pgerror.New(pgcode.QueryHasNoHomeRegion,
-					"Query has no home region. Try accessing only tables defined in multi-region databases.")
+			regionsNames, ok := tabMeta.GetRegionsInDatabase(ctx, evalCtx.Planner)
+			if !ok && evalCtx.Planner != nil && evalCtx.Planner.EnforceHomeRegion() {
+				err := pgerror.Newf(pgcode.QueryHasNoHomeRegion,
+					"Query has no home region. Try accessing only tables defined in multi-region databases. %s",
+					sqlerrors.EnforceHomeRegionFurtherInfo)
 				panic(err)
 			}
 			if ok {

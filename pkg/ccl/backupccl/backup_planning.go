@@ -24,24 +24,27 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudprivilege"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -54,24 +57,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	pbtypes "github.com/gogo/protobuf/types"
 )
 
 const (
-	backupOptRevisionHistory  = "revision_history"
-	backupOptWithPrivileges   = "privileges"
-	backupOptAsJSON           = "as_json"
-	backupOptWithDebugIDs     = "debug_ids"
-	backupOptIncStorage       = "incremental_location"
-	backupOptDebugMetadataSST = "debug_dump_metadata_sst"
-	backupOptEncDir           = "encryption_info_dir"
-	backupOptCheckFiles       = "check_files"
 	// backupPartitionDescriptorPrefix is the file name prefix for serialized
 	// BackupPartitionDescriptor protos.
 	backupPartitionDescriptorPrefix = "BACKUP_PART"
 
-	deprecatedPrivilegesPreamble = "The existing privileges are being deprecated " +
-		"in favour of a fine-grained privilege model explained here <link>. In a future release, to run"
+	deprecatedPrivilegesBackupPreamble = "The existing privileges are being deprecated " +
+		"in favour of a fine-grained privilege model explained here " +
+		"https://www.cockroachlabs.com/docs/stable/backup.html#required-privileges. In a future release, to run"
+
+	deprecatedPrivilegesRestorePreamble = "The existing privileges are being deprecated " +
+		"in favour of a fine-grained privilege model explained here " +
+		"https://www.cockroachlabs.com/docs/stable/restore.html#required-privileges. In a future release, to run"
 )
 
 type tableAndIndex struct {
@@ -87,6 +88,21 @@ var featureBackupEnabled = settings.RegisterBoolSetting(
 	featureflag.FeatureFlagEnabledDefault,
 ).WithPublic()
 
+// includeTableSpans returns true if the backup should include spans for the
+// given table descriptor.
+func includeTableSpans(table *descpb.TableDescriptor) bool {
+	// We do not backup spans for views here as they do not contain data.
+	//
+	// Additionally, because we do not split ranges at view boundaries, it is
+	// possible that the range the view span belongs to is shared by another
+	// object in the cluster (that we may or may not be backing up) that might
+	// have its own bespoke zone configurations, namely one with a short GC TTL.
+	// This could lead to a situation where the short GC TTL on the range we are
+	// not backing up causes our protectedts verification to fail when attempting
+	// to backup the view span.
+	return table.IsPhysicalTable()
+}
+
 // forEachPublicIndexTableSpan constructs a span for each public index of the
 // provided table and runs the given function on each of them. The added map is
 // used to track duplicates. Duplicate indexes are not passed to the provided
@@ -97,16 +113,7 @@ func forEachPublicIndexTableSpan(
 	codec keys.SQLCodec,
 	f func(span roachpb.Span),
 ) {
-	// We do not backup spans for views here as they do not contain data.
-	//
-	// Additionally, because we do not split ranges at view boundaries, it is
-	// possible that the range the view span belongs to is shared by another
-	// object in the cluster (that we may or may not be backing up) that might
-	// have its own bespoke zone configurations, namely one with a short GC TTL.
-	// This could lead to a situation where the short GC TTL on the range we are
-	// not backing up causes our protectedts verification to fail when attempting
-	// to backup the view span.
-	if !table.IsPhysicalTable() {
+	if !includeTableSpans(table) {
 		return
 	}
 
@@ -151,7 +158,7 @@ func spansForAllTableIndexes(
 		// at least 2 revisions, and the first one should have the table in a PUBLIC
 		// state. We want (and do) ignore tables that have been dropped for the
 		// entire interval. DROPPED tables should never later become PUBLIC.
-		rawTbl, _, _, _, _ := descpb.FromDescriptor(rev.Desc)
+		rawTbl, _, _, _, _ := descpb.GetDescriptors(rev.Desc)
 		if rawTbl != nil && rawTbl.Public() {
 			forEachPublicIndexTableSpan(rawTbl, added, execCfg.Codec, insertSpan)
 		}
@@ -190,6 +197,7 @@ func resolveOptionsForBackupJobDescription(
 	newOpts := tree.BackupOptions{
 		CaptureRevisionHistory: opts.CaptureRevisionHistory,
 		Detached:               opts.Detached,
+		ExecutionLocality:      opts.ExecutionLocality,
 	}
 
 	if opts.EncryptionPassphrase != nil {
@@ -335,7 +343,7 @@ func backupPrivilegesDeprecationNotice(
 
 		notice = fmt.Sprintf("%s BACKUP DATABASE, user %s will exclusively require the "+
 			"BACKUP privilege on database %s.",
-			deprecatedPrivilegesPreamble, p.User().Normalized(), strings.Join(dbsRequireBackupPrivilege, ", "))
+			deprecatedPrivilegesBackupPreamble, p.User().Normalized(), strings.Join(dbsRequireBackupPrivilege, ", "))
 	} else if backupStmt.Targets.Tables.TablePatterns != nil {
 		// If a user is running `BACKUP TABLE` buffer all the tables that will require the `BACKUP` privilege.
 		tablesRequireBackupPrivilege := make([]string, 0)
@@ -348,7 +356,7 @@ func backupPrivilegesDeprecationNotice(
 
 		notice = fmt.Sprintf("%s BACKUP TABLE, user %s will exclusively require the "+
 			"BACKUP privilege on tables: %s.",
-			deprecatedPrivilegesPreamble,
+			deprecatedPrivilegesBackupPreamble,
 			p.User().Normalized(),
 			strings.Join(tablesRequireBackupPrivilege, ", "))
 	}
@@ -381,19 +389,16 @@ func checkPrivilegesForBackup(
 		requiresBackupSystemPrivilege := backupStmt.Coverage() == tree.AllDescriptors ||
 			(backupStmt.Targets != nil && backupStmt.Targets.TenantID.IsSet())
 
-		var hasBackupSystemPrivilege bool
-		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-			err := p.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject,
-				privilege.BACKUP, p.User())
-			hasBackupSystemPrivilege = err == nil
-		}
-
-		if requiresBackupSystemPrivilege && hasBackupSystemPrivilege {
+		if requiresBackupSystemPrivilege {
+			if err := p.CheckPrivilegeForUser(
+				ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.BACKUP, p.User(),
+			); err != nil {
+				return pgerror.Wrapf(
+					err,
+					pgcode.InsufficientPrivilege,
+					"only users with the admin role or the BACKUP system privilege are allowed to perform full cluster backups")
+			}
 			return cloudprivilege.CheckDestinationPrivileges(ctx, p, to)
-		} else if requiresBackupSystemPrivilege && !hasBackupSystemPrivilege {
-			return pgerror.Newf(
-				pgcode.InsufficientPrivilege,
-				"only users with the admin role or the BACKUP system privilege are allowed to perform full cluster backups")
 		}
 	}
 
@@ -415,8 +420,13 @@ func checkPrivilegesForBackup(
 		for _, desc := range targetDescs {
 			switch desc := desc.(type) {
 			case catalog.DatabaseDescriptor:
-				hasRequiredBackupPrivileges = hasRequiredBackupPrivileges &&
-					p.CheckPrivilegeForUser(ctx, desc, privilege.BACKUP, p.User()) == nil
+				if hasRequiredBackupPrivileges {
+					if ok, err := p.HasPrivilege(ctx, desc, privilege.BACKUP, p.User()); err != nil {
+						return err
+					} else {
+						hasRequiredBackupPrivileges = ok
+					}
+				}
 			}
 		}
 	} else if backupStmt.Targets.Tables.TablePatterns != nil {
@@ -429,8 +439,13 @@ func checkPrivilegesForBackup(
 		for _, desc := range targetDescs {
 			switch desc := desc.(type) {
 			case catalog.TableDescriptor:
-				hasRequiredBackupPrivileges = hasRequiredBackupPrivileges &&
-					p.CheckPrivilegeForUser(ctx, desc, privilege.BACKUP, p.User()) == nil
+				if hasRequiredBackupPrivileges {
+					if ok, err := p.HasPrivilege(ctx, desc, privilege.BACKUP, p.User()); err != nil {
+						return err
+					} else {
+						hasRequiredBackupPrivileges = ok
+					}
+				}
 			}
 		}
 	} else {
@@ -467,6 +482,10 @@ func checkPrivilegesForBackup(
 			if err := p.CheckPrivilege(ctx, desc, privilege.USAGE); err != nil {
 				return errors.WithHint(err, notice)
 			}
+		case catalog.FunctionDescriptor:
+			if err := p.CheckPrivilege(ctx, desc, privilege.EXECUTE); err != nil {
+				return errors.WithHint(err, notice)
+			}
 		}
 	}
 
@@ -475,12 +494,47 @@ func checkPrivilegesForBackup(
 
 func requireEnterprise(execCfg *sql.ExecutorConfig, feature string) error {
 	if err := utilccl.CheckEnterpriseEnabled(
-		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), execCfg.Organization(),
+		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(),
 		fmt.Sprintf("BACKUP with %s", feature),
 	); err != nil {
 		return err
 	}
 	return nil
+}
+
+func backupTypeCheck(
+	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
+) (matched bool, header colinfo.ResultColumns, _ error) {
+	backupStmt := getBackupStatement(stmt)
+	if backupStmt == nil {
+		return false, nil, nil
+	}
+	detached := backupStmt.Options.Detached == tree.DBoolTrue
+	if detached {
+		header = jobs.DetachedJobExecutionResultHeader
+	} else {
+		header = jobs.BulkJobExecutionResultHeader
+	}
+	if err := exprutil.TypeCheck(
+		ctx, "BACKUP", p.SemaCtx(),
+		exprutil.Strings{
+			backupStmt.Subdir,
+			backupStmt.Options.EncryptionPassphrase,
+			backupStmt.Options.ExecutionLocality,
+		},
+		exprutil.StringArrays{
+			tree.Exprs(backupStmt.To),
+			backupStmt.IncrementalFrom,
+			tree.Exprs(backupStmt.Options.IncrementalStorage),
+			tree.Exprs(backupStmt.Options.EncryptionKMSURI),
+		},
+		exprutil.Bools{
+			backupStmt.Options.CaptureRevisionHistory,
+			backupStmt.Options.IncludeAllSecondaryTenants,
+		}); err != nil {
+		return false, nil, err
+	}
+	return true, header, nil
 }
 
 // backupPlanHook implements PlanHookFn.
@@ -491,7 +545,6 @@ func backupPlanHook(
 	if backupStmt == nil {
 		return nil, nil, nil, false, nil
 	}
-
 	if err := featureflag.CheckEnabled(
 		ctx,
 		p.ExecCfg(),
@@ -500,6 +553,8 @@ func backupPlanHook(
 	); err != nil {
 		return nil, nil, nil, false, err
 	}
+
+	detached := backupStmt.Options.Detached == tree.DBoolTrue
 
 	// Deprecation notice for `BACKUP TO` syntax. Remove this once the syntax is
 	// deleted in 22.2.
@@ -511,73 +566,95 @@ func backupPlanHook(
 				"https://www.cockroachlabs.com/docs/stable/backup.html#considerations"))
 	}
 
+	exprEval := p.ExprEvaluator("BACKUP")
+
 	var err error
-	subdirFn := func() (string, error) { return "", nil }
+	var subdir string
 	if backupStmt.Subdir != nil {
-		subdirFn, err = p.TypeAsString(ctx, backupStmt.Subdir, "BACKUP")
+		subdir, err = exprEval.String(ctx, backupStmt.Subdir)
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 	}
 
-	toFn, err := p.TypeAsStringArray(ctx, tree.Exprs(backupStmt.To), "BACKUP")
+	to, err := exprEval.StringArray(ctx, tree.Exprs(backupStmt.To))
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	incrementalFromFn, err := p.TypeAsStringArray(ctx, backupStmt.IncrementalFrom, "BACKUP")
-	if err != nil {
-		return nil, nil, nil, false, err
-	}
-
-	incToFn, err := p.TypeAsStringArray(ctx, tree.Exprs(backupStmt.Options.IncrementalStorage),
-		"BACKUP")
+	incrementalFrom, err := exprEval.StringArray(ctx, backupStmt.IncrementalFrom)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
 
-	detached := false
-	if backupStmt.Options.Detached == tree.DBoolTrue {
-		detached = true
+	incrementalStorage, err := exprEval.StringArray(
+		ctx, tree.Exprs(backupStmt.Options.IncrementalStorage),
+	)
+	if err != nil {
+		return nil, nil, nil, false, err
 	}
-	revisionHistoryFn := func() (bool, error) { return false, nil } // Defaults to false.
+
+	var revisionHistory bool
 	if backupStmt.Options.CaptureRevisionHistory != nil {
-		revisionHistoryFn, err = p.TypeAsBool(ctx, backupStmt.Options.CaptureRevisionHistory, "BACKUP")
+		revisionHistory, err = exprEval.Bool(
+			ctx, backupStmt.Options.CaptureRevisionHistory,
+		)
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 	}
 
-	encryptionParams := jobspb.BackupEncryptionOptions{Mode: jobspb.EncryptionMode_None}
-
-	var pwFn func() (string, error)
-	if backupStmt.Options.EncryptionPassphrase != nil {
-		fn, err := p.TypeAsString(ctx, backupStmt.Options.EncryptionPassphrase, "BACKUP")
+	var executionLocality roachpb.Locality
+	if backupStmt.Options.ExecutionLocality != nil {
+		s, err := exprEval.String(ctx, backupStmt.Options.ExecutionLocality)
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
-		pwFn = fn
+		if s != "" {
+			if err := executionLocality.Set(s); err != nil {
+				return nil, nil, nil, false, err
+			}
+		}
+	}
+
+	var includeAllSecondaryTenants bool
+	if backupStmt.Options.IncludeAllSecondaryTenants != nil {
+		includeAllSecondaryTenants, err = exprEval.Bool(
+			ctx, backupStmt.Options.IncludeAllSecondaryTenants,
+		)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+	}
+
+	encryptionParams := jobspb.BackupEncryptionOptions{
+		Mode: jobspb.EncryptionMode_None,
+	}
+
+	var pw string
+	if backupStmt.Options.EncryptionPassphrase != nil {
+		pw, err = exprEval.String(ctx, backupStmt.Options.EncryptionPassphrase)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
 		encryptionParams.Mode = jobspb.EncryptionMode_Passphrase
 	}
 
-	var kmsFn func() ([]string, error)
+	var kms []string
 	if backupStmt.Options.EncryptionKMSURI != nil {
 		if encryptionParams.Mode != jobspb.EncryptionMode_None {
 			return nil, nil, nil, false,
 				errors.New("cannot have both encryption_passphrase and kms option set")
 		}
-		fn, err := p.TypeAsStringArray(ctx, tree.Exprs(backupStmt.Options.EncryptionKMSURI),
-			"BACKUP")
+		kms, err = exprEval.StringArray(
+			ctx, tree.Exprs(backupStmt.Options.EncryptionKMSURI),
+		)
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
-		kmsFn = func() ([]string, error) {
-			res, err := fn()
-			if err == nil {
-				return res, nil
-			}
-			return nil, err
-		}
 		encryptionParams.Mode = jobspb.EncryptionMode_KMS
+		if err = logAndSanitizeKmsURIs(ctx, kms...); err != nil {
+			return nil, nil, nil, false, err
+		}
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -589,36 +666,22 @@ func backupPlanHook(
 			return errors.Errorf("BACKUP cannot be used inside a multi-statement transaction without DETACHED option")
 		}
 
-		subdir, err := subdirFn()
-		if err != nil {
-			return err
-		}
-
-		to, err := toFn()
-		if err != nil {
-			return err
-		}
 		if len(to) > 1 {
 			if err := requireEnterprise(p.ExecCfg(), "partitioned destinations"); err != nil {
 				return err
 			}
 		}
 
-		incrementalFrom, err := incrementalFromFn()
-		if err != nil {
-			return err
-		}
-
-		incrementalStorage, err := incToFn()
-		if err != nil {
-			return err
-		}
 		if !backupStmt.Nested && len(incrementalStorage) > 0 {
 			return errors.New("incremental_location option not supported with `BACKUP TO` syntax")
 		}
 		if len(incrementalStorage) > 0 && (len(incrementalStorage) != len(to)) {
 			return errors.New("the incremental_location option must contain the same number of locality" +
 				" aware URIs as the full backup destination")
+		}
+
+		if includeAllSecondaryTenants && backupStmt.Coverage() != tree.AllDescriptors {
+			return errors.New("the include_all_secondary_tenants option is only supported for full cluster backups")
 		}
 
 		var asOfInterval int64
@@ -634,28 +697,17 @@ func backupPlanHook(
 
 		switch encryptionParams.Mode {
 		case jobspb.EncryptionMode_Passphrase:
-			pw, err := pwFn()
-			if err != nil {
-				return err
-			}
 			if err := requireEnterprise(p.ExecCfg(), "encryption"); err != nil {
 				return err
 			}
-			encryptionParams.RawPassphrae = pw
+			encryptionParams.RawPassphrase = pw
 		case jobspb.EncryptionMode_KMS:
-			encryptionParams.RawKmsUris, err = kmsFn()
-			if err != nil {
-				return err
-			}
+			encryptionParams.RawKmsUris = kms
 			if err := requireEnterprise(p.ExecCfg(), "encryption"); err != nil {
 				return err
 			}
 		}
 
-		revisionHistory, err := revisionHistoryFn()
-		if err != nil {
-			return err
-		}
 		if revisionHistory {
 			if err := requireEnterprise(p.ExecCfg(), "revision_history"); err != nil {
 				return err
@@ -690,16 +742,26 @@ func backupPlanHook(
 			return err
 		}
 
+		// Check that a node will currently be able to run this before we create it.
+		if executionLocality.NonEmpty() {
+			if _, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, executionLocality); err != nil {
+				return err
+			}
+		}
+
 		initialDetails := jobspb.BackupDetails{
-			Destination:         jobspb.BackupDetails_Destination{To: to, IncrementalStorage: incrementalStorage},
-			EndTime:             endTime,
-			RevisionHistory:     revisionHistory,
-			IncrementalFrom:     incrementalFrom,
-			FullCluster:         backupStmt.Coverage() == tree.AllDescriptors,
-			ResolvedCompleteDbs: completeDBs,
-			EncryptionOptions:   &encryptionParams,
-			AsOfInterval:        asOfInterval,
-			Detached:            detached,
+			Destination:                jobspb.BackupDetails_Destination{To: to, IncrementalStorage: incrementalStorage},
+			EndTime:                    endTime,
+			RevisionHistory:            revisionHistory,
+			IncludeAllSecondaryTenants: includeAllSecondaryTenants,
+			IncrementalFrom:            incrementalFrom,
+			FullCluster:                backupStmt.Coverage() == tree.AllDescriptors,
+			ResolvedCompleteDbs:        completeDBs,
+			EncryptionOptions:          &encryptionParams,
+			AsOfInterval:               asOfInterval,
+			Detached:                   detached,
+			ApplicationName:            p.SessionData().ApplicationName,
+			ExecutionLocality:          executionLocality,
 		}
 		if backupStmt.CreatedByInfo != nil && backupStmt.CreatedByInfo.Name == jobs.CreatedByScheduledJobs {
 			initialDetails.ScheduleID = backupStmt.CreatedByInfo.ID
@@ -741,10 +803,14 @@ func backupPlanHook(
 			if !p.ExecCfg().Codec.ForSystemTenant() {
 				return pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can backup other tenants")
 			}
-			initialDetails.SpecificTenantIds = []roachpb.TenantID{roachpb.MakeTenantID(backupStmt.Targets.TenantID.ID)}
+			initialDetails.SpecificTenantIds = []roachpb.TenantID{roachpb.MustMakeTenantID(backupStmt.Targets.TenantID.ID)}
 		}
 
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
+
+		if err := logAndSanitizeBackupDestinations(ctx, append(to, incrementalFrom...)...); err != nil {
+			return errors.Wrap(err, "logging backup destinations")
+		}
 
 		description, err := backupJobDescription(p,
 			backupStmt.Backup, to, incrementalFrom,
@@ -774,7 +840,7 @@ func backupPlanHook(
 			// When running inside an explicit transaction, we simply create the job
 			// record. We do not wait for the job to finish.
 			_, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
-				ctx, jr, jobID, plannerTxn)
+				ctx, jr, jobID, p.InternalSQLTxn())
 			if err != nil {
 				return err
 			}
@@ -791,7 +857,9 @@ func backupPlanHook(
 					log.Errorf(ctx, "failed to cleanup job: %v", cleanupErr)
 				}
 			}()
-			if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, plannerTxn, jr); err != nil {
+			if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(
+				ctx, &sj, jobID, p.InternalSQLTxn(), jr,
+			); err != nil {
 				return err
 			}
 			// We commit the transaction here so that the job can be started. This
@@ -802,6 +870,16 @@ func backupPlanHook(
 		}(); err != nil {
 			return err
 		}
+		// Release all descriptor leases here. Note that we committed the
+		// underlying transaction in the above closure -- so we're not using any
+		// leases anymore, but we might be holding some because some sql queries
+		// might have been executed by this transaction (indeed some certainly
+		// were when we created the job we're going to run).
+		//
+		// This call is not strictly necessary, but it's parallel to the other
+		// locations where we commit a transaction and wait for a job; it seems
+		// best to release leases we don't need.
+		p.InternalSQLTxn().Descriptors().ReleaseAll(ctx)
 		if err := sj.Start(ctx); err != nil {
 			return err
 		}
@@ -817,9 +895,31 @@ func backupPlanHook(
 	return fn, jobs.BulkJobExecutionResultHeader, nil, false, nil
 }
 
+func logAndSanitizeKmsURIs(ctx context.Context, kmsURIs ...string) error {
+	for _, dest := range kmsURIs {
+		clean, err := cloud.RedactKMSURI(dest)
+		if err != nil {
+			return err
+		}
+		log.Ops.Infof(ctx, "backup planning to connect to KMS destination %v", redact.Safe(clean))
+	}
+	return nil
+}
+
+func logAndSanitizeBackupDestinations(ctx context.Context, backupDestinations ...string) error {
+	for _, dest := range backupDestinations {
+		clean, err := cloud.SanitizeExternalStorageURI(dest, nil)
+		if err != nil {
+			return err
+		}
+		log.Ops.Infof(ctx, "backup planning to connect to destination %v", redact.Safe(clean))
+	}
+	return nil
+}
+
 func collectTelemetry(
 	ctx context.Context,
-	backupManifest backuppb.BackupManifest,
+	backupManifest *backuppb.BackupManifest,
 	initialDetails, backupDetails jobspb.BackupDetails,
 	licensed bool,
 	jobID jobspb.JobID,
@@ -907,12 +1007,11 @@ func collectTelemetry(
 func getScheduledBackupExecutionArgsFromSchedule(
 	ctx context.Context,
 	env scheduledjobs.JobSchedulerEnv,
-	txn *kv.Txn,
-	ie *sql.InternalExecutor,
+	storage jobs.ScheduledJobStorage,
 	scheduleID int64,
 ) (*jobs.ScheduledJob, *backuppb.ScheduledBackupExecutionArgs, error) {
 	// Load the schedule that has spawned this job.
-	sj, err := jobs.LoadScheduledJob(ctx, env, scheduleID, ie, txn)
+	sj, err := storage.Load(ctx, env, scheduleID)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to load scheduled job %d", scheduleID)
 	}
@@ -932,16 +1031,14 @@ func getScheduledBackupExecutionArgsFromSchedule(
 // completion of the backup job.
 func planSchedulePTSChaining(
 	ctx context.Context,
-	execCfg *sql.ExecutorConfig,
-	txn *kv.Txn,
+	knobs *jobs.TestingKnobs,
+	txn isql.Txn,
 	backupDetails *jobspb.BackupDetails,
 	createdBy *jobs.CreatedByInfo,
 ) error {
 	env := scheduledjobs.ProdJobSchedulerEnv
-	if knobs, ok := execCfg.DistSQLSrv.TestingKnobs.JobsTestingKnobs.(*jobs.TestingKnobs); ok {
-		if knobs.JobSchedulerEnv != nil {
-			env = knobs.JobSchedulerEnv
-		}
+	if knobs != nil && knobs.JobSchedulerEnv != nil {
+		env = knobs.JobSchedulerEnv
 	}
 	// If this is not a scheduled backup, we do not chain pts records.
 	if createdBy == nil || createdBy.Name != jobs.CreatedByScheduledJobs {
@@ -949,7 +1046,8 @@ func planSchedulePTSChaining(
 	}
 
 	_, args, err := getScheduledBackupExecutionArgsFromSchedule(
-		ctx, env, txn, execCfg.InternalExecutor, createdBy.ID)
+		ctx, env, jobs.ScheduledJobTxn(txn), createdBy.ID,
+	)
 	if err != nil {
 		return err
 	}
@@ -971,7 +1069,8 @@ func planSchedulePTSChaining(
 		}
 
 		_, incArgs, err := getScheduledBackupExecutionArgsFromSchedule(
-			ctx, env, txn, execCfg.InternalExecutor, args.DependentScheduleID)
+			ctx, env, jobs.ScheduledJobTxn(txn), args.DependentScheduleID,
+		)
 		if err != nil {
 			// We should always be able to resolve the dependent schedule ID. If the
 			// incremental schedule was dropped then it would have unlinked itself
@@ -1012,18 +1111,76 @@ func getReintroducedSpans(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
 	prevBackups []backuppb.BackupManifest,
+	layerToIterFactory backupinfo.LayerToBackupManifestFileIterFactory,
 	tables []catalog.TableDescriptor,
 	revs []backuppb.BackupManifest_DescriptorRevision,
 	endTime hlc.Timestamp,
 ) ([]roachpb.Span, error) {
 	reintroducedTables := make(map[descpb.ID]struct{})
 
+	// First, create a map that indicates which tables from the previous backup
+	// were offline when the last backup was taken. To create this map, we must
+	// iterate two fields in the _last_ backup's manifest:
+	//
+	// 1. manifest.Descriptors contains a list of descriptors _explicitly_
+	// included in the backup, gathered at backup startTime. This includes all
+	// public descriptors, and in the case of cluster backups, offline
+	// descriptors.
+	//
+	// 2. manifest.DescriptorChanges contains a list of descriptor changes tracked
+	// in the backup. While investigating #88042, it was discovered that during
+	// revision history database and table.* backups, a table can get included in
+	// manifest.DescriptorChanges when it transitions from an online to offline
+	// state, causing its spans to get backed up. However, if this table was
+	// offline when the backup began, it's excluded from manifest.Descriptors.
+	// Therefore, to find all descriptors covered in the backup that were offline
+	// at backup time, we must find all tables in manifest.DescriptorChanges whose
+	// last change brought the table offline.
 	offlineInLastBackup := make(map[descpb.ID]struct{})
-	lastBackup := prevBackups[len(prevBackups)-1]
-	for _, desc := range lastBackup.Descriptors {
+	lastIterFactory := layerToIterFactory[len(prevBackups)-1]
+
+	descIt := lastIterFactory.NewDescIter(ctx)
+	defer descIt.Close()
+
+	for ; ; descIt.Next() {
+		if ok, err := descIt.Valid(); err != nil {
+			return nil, err
+		} else if !ok {
+			break
+		}
+
 		// TODO(pbardea): Also check that lastWriteTime is set once those are
 		// populated on the table descriptor.
-		if table, _, _, _, _ := descpb.FromDescriptor(&desc); table != nil && table.Offline() {
+		if table, _, _, _, _ := descpb.GetDescriptors(descIt.Value()); table != nil && table.Offline() {
+			offlineInLastBackup[table.GetID()] = struct{}{}
+		}
+	}
+
+	// Gather all the descriptors that were offline at the endTime of the last
+	// backup, according the backup's descriptor changes. If the last descriptor
+	// change in the previous backup interval put the table offline, then that
+	// backup was offline at the endTime of the last backup.
+	latestTableDescChangeInLastBackup := make(map[descpb.ID]*descpb.TableDescriptor)
+	descRevIt := lastIterFactory.NewDescriptorChangesIter(ctx)
+	defer descRevIt.Close()
+	for ; ; descRevIt.Next() {
+		if ok, err := descRevIt.Valid(); err != nil {
+			return nil, err
+		} else if !ok {
+			break
+		}
+
+		if table, _, _, _, _ := descpb.GetDescriptors(descRevIt.Value().Desc); table != nil {
+			if trackedRev, ok := latestTableDescChangeInLastBackup[table.GetID()]; !ok {
+				latestTableDescChangeInLastBackup[table.GetID()] = table
+			} else if trackedRev.Version < table.Version {
+				latestTableDescChangeInLastBackup[table.GetID()] = table
+			}
+		}
+	}
+
+	for _, table := range latestTableDescChangeInLastBackup {
+		if table.Offline() {
 			offlineInLastBackup[table.GetID()] = struct{}{}
 		}
 	}
@@ -1043,7 +1200,7 @@ func getReintroducedSpans(
 	// the time of the current backup, but may have been PUBLIC at some time in
 	// between.
 	for _, rev := range revs {
-		rawTable, _, _, _, _ := descpb.FromDescriptor(rev.Desc)
+		rawTable, _, _, _, _ := descpb.GetDescriptors(rev.Desc)
 		if rawTable == nil {
 			continue
 		}
@@ -1058,7 +1215,7 @@ func getReintroducedSpans(
 	// considered.
 	allRevs := make([]backuppb.BackupManifest_DescriptorRevision, 0, len(revs))
 	for _, rev := range revs {
-		rawTable, _, _, _, _ := descpb.FromDescriptor(rev.Desc)
+		rawTable, _, _, _, _ := descpb.GetDescriptors(rev.Desc)
 		if rawTable == nil {
 			continue
 		}
@@ -1074,7 +1231,7 @@ func getReintroducedSpans(
 	return tableSpans, nil
 }
 
-func getProtectedTimestampTargetForBackup(backupManifest backuppb.BackupManifest) *ptpb.Target {
+func getProtectedTimestampTargetForBackup(backupManifest *backuppb.BackupManifest) *ptpb.Target {
 	if backupManifest.DescriptorCoverage == tree.AllDescriptors {
 		return ptpb.MakeClusterTarget()
 	}
@@ -1082,7 +1239,7 @@ func getProtectedTimestampTargetForBackup(backupManifest backuppb.BackupManifest
 	if len(backupManifest.Tenants) > 0 {
 		tenantID := make([]roachpb.TenantID, 0)
 		for _, tenant := range backupManifest.Tenants {
-			tenantID = append(tenantID, roachpb.MakeTenantID(tenant.ID))
+			tenantID = append(tenantID, roachpb.MustMakeTenantID(tenant.ID))
 		}
 		return ptpb.MakeTenantsTarget(tenantID)
 	}
@@ -1100,7 +1257,7 @@ func getProtectedTimestampTargetForBackup(backupManifest backuppb.BackupManifest
 	// timestamp record on each table being backed up.
 	tableIDs := make(descpb.IDs, 0)
 	for _, desc := range backupManifest.Descriptors {
-		t, _, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, hlc.Timestamp{})
+		t, _, _, _, _ := descpb.GetDescriptors(&desc)
 		if t != nil {
 			tableIDs = append(tableIDs, t.GetID())
 		}
@@ -1110,10 +1267,9 @@ func getProtectedTimestampTargetForBackup(backupManifest backuppb.BackupManifest
 
 func protectTimestampForBackup(
 	ctx context.Context,
-	execCfg *sql.ExecutorConfig,
-	txn *kv.Txn,
 	jobID jobspb.JobID,
-	backupManifest backuppb.BackupManifest,
+	pts protectedts.Storage,
+	backupManifest *backuppb.BackupManifest,
 	backupDetails jobspb.BackupDetails,
 ) error {
 	tsToProtect := backupManifest.EndTime
@@ -1130,9 +1286,14 @@ func protectTimestampForBackup(
 	// `exclude_data_from_backup`. This ensures that the backup job does not
 	// holdup GC on that table span for the duration of execution.
 	target.IgnoreIfExcludedFromBackup = true
-	rec := jobsprotectedts.MakeRecord(*backupDetails.ProtectedTimestampRecord, int64(jobID),
-		tsToProtect, backupManifest.Spans, jobsprotectedts.Jobs, target)
-	return execCfg.ProtectedTimestampProvider.Protect(ctx, txn, rec)
+	return pts.Protect(ctx, jobsprotectedts.MakeRecord(
+		*backupDetails.ProtectedTimestampRecord,
+		int64(jobID),
+		tsToProtect,
+		backupManifest.Spans,
+		jobsprotectedts.Jobs,
+		target,
+	))
 }
 
 // checkForNewDatabases returns an error if any new complete databases were
@@ -1214,24 +1375,26 @@ func checkForNewTables(
 }
 
 func getTenantInfo(
-	ctx context.Context, execCfg *sql.ExecutorConfig, txn *kv.Txn, jobDetails jobspb.BackupDetails,
-) ([]roachpb.Span, []descpb.TenantInfoWithUsage, error) {
+	ctx context.Context,
+	settings *cluster.Settings,
+	codec keys.SQLCodec,
+	txn isql.Txn,
+	jobDetails jobspb.BackupDetails,
+) ([]roachpb.Span, []mtinfopb.TenantInfoWithUsage, error) {
 	var spans []roachpb.Span
-	var tenants []descpb.TenantInfoWithUsage
+	var tenants []mtinfopb.TenantInfoWithUsage
 	var err error
-	if jobDetails.FullCluster && execCfg.Codec.ForSystemTenant() {
+	if jobDetails.FullCluster && codec.ForSystemTenant() && jobDetails.IncludeAllSecondaryTenants {
 		// Include all tenants.
 		tenants, err = retrieveAllTenantsMetadata(
-			ctx, execCfg.InternalExecutor, txn,
+			ctx, txn, settings,
 		)
 		if err != nil {
 			return nil, nil, err
 		}
 	} else if len(jobDetails.SpecificTenantIds) > 0 {
 		for _, id := range jobDetails.SpecificTenantIds {
-			tenantInfo, err := retrieveSingleTenantMetadata(
-				ctx, execCfg.InternalExecutor, txn, id,
-			)
+			tenantInfo, err := retrieveSingleTenantMetadata(ctx, txn, id, settings)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1245,7 +1408,7 @@ func getTenantInfo(
 		)
 	}
 	for i := range tenants {
-		prefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(tenants[i].ID))
+		prefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenants[i].ID))
 		spans = append(spans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
 	}
 	return spans, tenants, nil
@@ -1257,9 +1420,10 @@ func getTenantInfo(
 func createBackupManifest(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
-	txn *kv.Txn,
+	txn isql.Txn,
 	jobDetails jobspb.BackupDetails,
 	prevBackups []backuppb.BackupManifest,
+	layerToIterFactory backupinfo.LayerToBackupManifestFileIterFactory,
 ) (backuppb.BackupManifest, error) {
 	mvccFilter := backuppb.MVCCFilter_Latest
 	if jobDetails.RevisionHistory {
@@ -1270,7 +1434,6 @@ func createBackupManifest(
 	var descriptorProtos []descpb.Descriptor
 	var err error
 	if jobDetails.FullCluster {
-		var err error
 		targetDescs, _, err = fullClusterTargetsBackup(ctx, execCfg, endTime)
 		if err != nil {
 			return backuppb.BackupManifest{}, err
@@ -1281,9 +1444,9 @@ func createBackupManifest(
 		}
 	} else {
 		descriptorProtos = jobDetails.ResolvedTargets
-		targetDescs = make([]catalog.Descriptor, len(descriptorProtos))
+		targetDescs = make([]catalog.Descriptor, 0, len(descriptorProtos))
 		for i := range descriptorProtos {
-			targetDescs[i] = descbuilder.NewBuilder(&descriptorProtos[i]).BuildExistingMutable()
+			targetDescs = append(targetDescs, backupinfo.NewDescriptorForManifest(&descriptorProtos[i]))
 		}
 	}
 
@@ -1301,7 +1464,7 @@ func createBackupManifest(
 		}
 	}
 
-	var newSpans roachpb.Spans
+	var newSpans, reintroducedSpans roachpb.Spans
 	var priorIDs map[descpb.ID]descpb.ID
 
 	var revs []backuppb.BackupManifest_DescriptorRevision
@@ -1315,9 +1478,9 @@ func createBackupManifest(
 	}
 
 	var spans []roachpb.Span
-	var tenants []descpb.TenantInfoWithUsage
+	var tenants []mtinfopb.TenantInfoWithUsage
 	tenantSpans, tenantInfos, err := getTenantInfo(
-		ctx, execCfg, txn, jobDetails,
+		ctx, execCfg.Settings, execCfg.Codec, txn, jobDetails,
 	)
 	if err != nil {
 		return backuppb.BackupManifest{}, err
@@ -1334,9 +1497,17 @@ func createBackupManifest(
 	if len(prevBackups) > 0 {
 		tablesInPrev := make(map[descpb.ID]struct{})
 		dbsInPrev := make(map[descpb.ID]struct{})
-		rawDescs := prevBackups[len(prevBackups)-1].Descriptors
-		for i := range rawDescs {
-			if t, _, _, _, _ := descpb.FromDescriptor(&rawDescs[i]); t != nil {
+
+		descIt := layerToIterFactory[len(prevBackups)-1].NewDescIter(ctx)
+		defer descIt.Close()
+		for ; ; descIt.Next() {
+			if ok, err := descIt.Valid(); err != nil {
+				return backuppb.BackupManifest{}, err
+			} else if !ok {
+				break
+			}
+
+			if t, _, _, _, _ := descpb.GetDescriptors(descIt.Value()); t != nil {
 				tablesInPrev[t.ID] = struct{}{}
 			}
 		}
@@ -1357,11 +1528,11 @@ func createBackupManifest(
 
 		newSpans = filterSpans(spans, prevBackups[len(prevBackups)-1].Spans)
 
-		tableSpans, err := getReintroducedSpans(ctx, execCfg, prevBackups, tables, revs, endTime)
+		reintroducedSpans, err = getReintroducedSpans(ctx, execCfg, prevBackups, layerToIterFactory, tables, revs, endTime)
 		if err != nil {
 			return backuppb.BackupManifest{}, err
 		}
-		newSpans = append(newSpans, tableSpans...)
+		newSpans = append(newSpans, reintroducedSpans...)
 	}
 
 	// if CompleteDbs is lost by a 1.x node, FormatDescriptorTrackingVersion
@@ -1438,5 +1609,9 @@ func updateBackupDetails(
 }
 
 func init() {
-	sql.AddPlanHook("backupccl.backupPlanHook", backupPlanHook)
+	sql.AddPlanHook(
+		"backupccl.backupPlanHook",
+		backupPlanHook,
+		backupTypeCheck,
+	)
 }

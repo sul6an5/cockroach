@@ -71,9 +71,19 @@ func (s *spanInner) RecordingType() tracingpb.RecordingType {
 
 func (s *spanInner) SetRecordingType(to tracingpb.RecordingType) {
 	if s.isNoop() {
-		panic(errors.AssertionFailedf("SetVerbose called on NoopSpan; use the WithForceRealSpan option for StartSpan"))
+		panic(errors.AssertionFailedf("SetRecordingType called on NoopSpan; use the WithForceRealSpan option for StartSpan"))
 	}
 	s.crdb.SetRecordingType(to)
+}
+
+// GetTraceRecording returns the span's recording as a Trace.
+//
+// See also GetRecording(), which returns it as a tracingpb.Recording.
+func (s *spanInner) GetTraceRecording(recType tracingpb.RecordingType, finishing bool) Trace {
+	if s.isNoop() {
+		return Trace{}
+	}
+	return s.crdb.GetRecording(recType, finishing)
 }
 
 // GetRecording returns the span's recording.
@@ -83,14 +93,46 @@ func (s *spanInner) SetRecordingType(to tracingpb.RecordingType) {
 func (s *spanInner) GetRecording(
 	recType tracingpb.RecordingType, finishing bool,
 ) tracingpb.Recording {
-	if s.isNoop() {
-		return nil
-	}
-	return s.crdb.GetRecording(recType, finishing)
+	trace := s.GetTraceRecording(recType, finishing)
+	return trace.ToRecording()
 }
 
-func (s *spanInner) ImportRemoteRecording(remoteRecording []tracingpb.RecordedSpan) {
-	s.crdb.recordFinishedChildren(remoteRecording)
+func (s *spanInner) ImportTrace(trace Trace) {
+	s.crdb.recordFinishedChildren(trace)
+}
+
+func treeifyRecording(rec tracingpb.Recording) Trace {
+	if len(rec) == 0 {
+		return Trace{}
+	}
+
+	byParent := make(map[tracingpb.SpanID][]*tracingpb.RecordedSpan)
+	for i := range rec {
+		s := &rec[i]
+		byParent[s.ParentSpanID] = append(byParent[s.ParentSpanID], s)
+	}
+	r := treeifyRecordingInner(rec[0], byParent)
+
+	// Include the orphans under the root.
+	orphans := rec.OrphanSpans()
+	traces := make([]Trace, len(orphans))
+	for i, sp := range orphans {
+		traces[i] = treeifyRecordingInner(sp, byParent)
+	}
+	r.addChildren(traces, 0 /* maxSpans */, 0 /* maxStructuredBytes */)
+	return r
+}
+
+func treeifyRecordingInner(
+	sp tracingpb.RecordedSpan, byParent map[tracingpb.SpanID][]*tracingpb.RecordedSpan,
+) Trace {
+	r := MakeTrace(sp)
+	children := make([]Trace, len(byParent[sp.SpanID]))
+	for i, s := range byParent[sp.SpanID] {
+		children[i] = treeifyRecordingInner(*s, byParent)
+	}
+	r.addChildren(children, 0 /* maxSpans */, 0 /* maxStructuredBytes */)
+	return r
 }
 
 func (s *spanInner) Finish() {

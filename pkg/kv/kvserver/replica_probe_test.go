@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -39,10 +40,10 @@ func TestReplicaProbeRequest(t *testing.T) {
 	var seen struct {
 		syncutil.Mutex
 		m           map[roachpb.StoreID]int
-		injectedErr *roachpb.Error
+		injectedErr *kvpb.Error
 	}
 	seen.m = map[roachpb.StoreID]int{}
-	filter := func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+	filter := func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 		if !args.IsProbe {
 			return 0, args.ForcedError
 		}
@@ -58,11 +59,46 @@ func TestReplicaProbeRequest(t *testing.T) {
 		}
 		return 0, args.ForcedError
 	}
+	// NB: At one point we tried to verify that the probe the tests sends below
+	// is seen in command application on *all* replicas.
+	//
+	// This was flaky[^1] due to snapshot application (g1 and g2 are the
+	// intertwined operations):
+	//
+	// - g1    | `tc.AddXOrFatal` begins
+	// - g1    | it calls into ChangeReplicas
+	// - g1    | Replica added to descriptor
+	//      g2 | leader sends first MsgApp
+	// -    g2 | follower gets MsgApp, rejects it, leader enqueues in Raft snapshot queue
+	// - g1    | block raft snapshots to follower
+	// - g1    | send INITIAL snapshot
+	// - g1    | unblock raft snapshots to follower
+	// - g1    | AddVoterOrWhatever returns to the test
+	// - g1    | test sends probe
+	// -    g2 | raft log queue processes the queued Replica (followers's
+	//           MsgAppResp following INITIAL snapshot not having reached leader yet)[^1]
+	// -    g2 | it sends another snap which includes the probe
+	// -    g2 | follower applies the probe via the snap.
+	// - g1    | times out waiting for the interceptor to see the probe on follower.
+	//
+	// We attempted to disable the raft snapshot queue. This caused deadlocks: if raft
+	// (erroneously or not) requests a snapshot, it will not replicate to the follower
+	// until it has been caught up. But the quorum size here is two, so this would cause
+	// a hanging test. We tried to work around this by marking snapshots as failed when
+	// the raft snapshot queue is disabled, but this then threw off other tests[^2] that
+	// wanted to observe this state.
+	//
+	// So we just check that the probe applies on at least one Replica, which
+	// always has to be true.
+	//
+	// [^1]: https://github.com/cockroachdb/cockroach/pull/92380
+	// [^2]: TestMigrateWithInflightSnapshot, TestSnapshotsToDrainingNodes, TestRaftSnapshotQueueSeesLearner
+
 	args.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		// We set an ApplyFilter even though the probe should never
 		// show up there (since it always catches a forced error),
 		// precisely to ensure that it doesn't.
-		TestingApplyFilter: filter,
+		TestingApplyCalledTwiceFilter: filter,
 		// This is the main workhorse that counts probes and injects
 		// errors.
 		TestingApplyForcedErrFilter: filter,
@@ -76,8 +112,8 @@ func TestReplicaProbeRequest(t *testing.T) {
 	tc.AddVotersOrFatal(t, k, tc.Target(1))
 	tc.AddNonVotersOrFatal(t, k, tc.Target(2))
 
-	probeReq := &roachpb.ProbeRequest{
-		RequestHeader: roachpb.RequestHeader{
+	probeReq := &kvpb.ProbeRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: k,
 		},
 	}
@@ -85,17 +121,26 @@ func TestReplicaProbeRequest(t *testing.T) {
 	// stack, with both routing policies.
 	for _, srv := range tc.Servers {
 		db := srv.DB()
-		{
-			var b kv.Batch
-			b.AddRawRequest(probeReq)
-			b.Header.RoutingPolicy = roachpb.RoutingPolicy_LEASEHOLDER
-			require.NoError(t, db.Run(ctx, &b))
-		}
-		{
-			var b kv.Batch
-			b.AddRawRequest(probeReq)
-			b.Header.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
-			require.NoError(t, db.Run(ctx, &b))
+		for _, policy := range []kvpb.RoutingPolicy{
+			kvpb.RoutingPolicy_LEASEHOLDER,
+			kvpb.RoutingPolicy_NEAREST,
+		} {
+			testutils.SucceedsSoon(t, func() error {
+				var b kv.Batch
+				b.AddRawRequest(probeReq)
+				b.Header.RoutingPolicy = policy
+				err := db.Run(ctx, &b)
+				if errors.HasType(err, (*kvpb.AmbiguousResultError)(nil)) {
+					// Rare but it can happen that we're proposing on a replica
+					// that is just about to get a snapshot. In that case we'll
+					// get:
+					//
+					// result is ambiguous: unable to determine whether command was applied via snapshot
+					return errors.Wrapf(err, "retrying")
+				}
+				require.NoError(t, err)
+				return nil
+			})
 		}
 	}
 	// Check expected number of probes seen on each Replica in the apply loop.
@@ -111,7 +156,10 @@ func TestReplicaProbeRequest(t *testing.T) {
 		if exp, act := len(seen.m), len(tc.Servers); exp != act {
 			return errors.Errorf("waiting for stores to apply command: %d/%d", act, exp)
 		}
-		n := 2 * len(tc.Servers) // sent two probes per server
+		// We'll usually see 2 * len(tc.Servers) probes since we sent two probes, but see
+		// the comment about errant snapshots above. We just want this test to be reliable
+		// so expect at least one probe in command application.
+		n := 1
 		for storeID, count := range seen.m {
 			if count < n {
 				return errors.Errorf("saw only %d probes on s%d", count, storeID)
@@ -125,7 +173,7 @@ func TestReplicaProbeRequest(t *testing.T) {
 	for _, srv := range tc.Servers {
 		repl, _, err := srv.Stores().GetReplicaForRangeID(ctx, desc.RangeID)
 		require.NoError(t, err)
-		var ba roachpb.BatchRequest
+		ba := &kvpb.BatchRequest{}
 		ba.Add(probeReq)
 		ba.Timestamp = srv.Clock().Now()
 		_, pErr := repl.Send(ctx, ba)
@@ -136,14 +184,14 @@ func TestReplicaProbeRequest(t *testing.T) {
 	// back. Not sure what other error might occur in practice, but checking this
 	// anyway gives us extra confidence in the implementation mechanics of this
 	// request.
-	injErr := roachpb.NewErrorf("bang")
+	injErr := kvpb.NewErrorf("bang")
 	seen.Lock()
 	seen.injectedErr = injErr
 	seen.Unlock()
 	for _, srv := range tc.Servers {
 		repl, _, err := srv.Stores().GetReplicaForRangeID(ctx, desc.RangeID)
 		require.NoError(t, err)
-		var ba roachpb.BatchRequest
+		ba := &kvpb.BatchRequest{}
 		ba.Timestamp = srv.Clock().Now()
 		ba.Add(probeReq)
 		_, pErr := repl.Send(ctx, ba)

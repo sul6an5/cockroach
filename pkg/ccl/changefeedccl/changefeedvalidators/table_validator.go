@@ -21,6 +21,17 @@ func ValidateTable(
 	tableDesc catalog.TableDescriptor,
 	canHandle changefeedbase.CanHandle,
 ) error {
+	if err := validateTable(targets, tableDesc, canHandle); err != nil {
+		return changefeedbase.WithTerminalError(err)
+	}
+	return nil
+}
+
+func validateTable(
+	targets changefeedbase.Targets,
+	tableDesc catalog.TableDescriptor,
+	canHandle changefeedbase.CanHandle,
+) error {
 	// Technically, the only non-user table known not to work is system.jobs
 	// (which creates a cycle since the resolved timestamp high-water mark is
 	// saved in it), but our philosophy currently is that any use case for
@@ -74,6 +85,11 @@ func ValidateTable(
 	})
 	if !found {
 		return errors.Errorf(`unwatched table: %s`, tableDesc.GetName())
+	}
+	for _, requiredColumn := range canHandle.RequiredColumns {
+		if catalog.FindColumnByName(tableDesc, requiredColumn) == nil {
+			return errors.Errorf("required column %s not present on table %s", requiredColumn, tableDesc.GetName())
+		}
 	}
 
 	return err

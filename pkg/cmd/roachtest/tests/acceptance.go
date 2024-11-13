@@ -24,7 +24,6 @@ func registerAcceptance(r registry.Registry) {
 		name              string
 		fn                func(ctx context.Context, t test.Test, c cluster.Cluster)
 		skip              string
-		minVersion        string
 		numNodes          int
 		timeout           time.Duration
 		encryptionSupport registry.EncryptionSupport
@@ -43,7 +42,6 @@ func registerAcceptance(r registry.Registry) {
 			{name: "reset-quorum", fn: runResetQuorum, numNodes: 8},
 			{
 				name: "many-splits", fn: runManySplits,
-				minVersion:        "v19.2.0", // SQL syntax unsupported on 19.1.x
 				encryptionSupport: registry.EncryptionMetamorphic,
 			},
 			{name: "cli/node-status", fn: runCLINodeStatus},
@@ -65,15 +63,16 @@ func registerAcceptance(r registry.Registry) {
 		},
 		registry.OwnerTestEng: {
 			{
-				name: "version-upgrade",
-				fn:   runVersionUpgrade,
-				// This test doesn't like running on old versions because it upgrades to
-				// the latest released version and then it tries to "head", where head is
-				// the cockroach binary built from the branch on which the test is
-				// running. If that branch corresponds to an older release, then upgrading
-				// to head after 19.2 fails.
-				minVersion: "v19.2.0",
-				timeout:    30 * time.Minute,
+				name:    "version-upgrade",
+				fn:      runVersionUpgrade,
+				timeout: 30 * time.Minute,
+			},
+		},
+		registry.OwnerDisasterRecovery: {
+			{
+				name:     "c2c",
+				fn:       runAcceptanceClusterReplication,
+				numNodes: 3,
 			},
 		},
 	}

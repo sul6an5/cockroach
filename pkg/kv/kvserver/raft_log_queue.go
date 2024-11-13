@@ -17,19 +17,21 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 // Overview of Raft log truncation:
@@ -137,10 +139,14 @@ const (
 	// when Raft log truncation usually occurs when using the number of entries
 	// as the sole criteria.
 	RaftLogQueueStaleSize = 64 << 10
-	// Allow a limited number of Raft log truncations to be processed
-	// concurrently.
-	raftLogQueueConcurrency = 4
 )
+
+// raftLogQueueConcurrency limits the number of Raft log truncations to be
+// processed concurrently. For a single Raft participant (range), it impacts the
+// latency between consecutive log truncations, and therefore the amount of Raft
+// log data flushed to disk when it wasn't truncated in memtable timely. Higher
+// concurrency may decrease truncation latency and reduce the amount of IO.
+var raftLogQueueConcurrency = envutil.EnvOrDefaultInt("COCKROACH_RAFT_LOG_QUEUE_CONCURRENCY", 16)
 
 // raftLogQueue manages a queue of replicas slated to have their raft logs
 // truncated by removing unneeded entries.
@@ -150,6 +156,8 @@ type raftLogQueue struct {
 
 	logSnapshots util.EveryN
 }
+
+var _ queueImpl = &raftLogQueue{}
 
 // newRaftLogQueue returns a new instance of raftLogQueue. Replicas are passed
 // to the queue both proactively (triggered by write load) and periodically
@@ -169,7 +177,7 @@ func newRaftLogQueue(store *Store, db *kv.DB) *raftLogQueue {
 			maxSize:              defaultQueueMaxSize,
 			maxConcurrency:       raftLogQueueConcurrency,
 			needsLease:           false,
-			needsSystemConfig:    false,
+			needsSpanConfigs:     false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.RaftLogQueueSuccesses,
 			failures:             store.metrics.RaftLogQueueFailures,
@@ -260,8 +268,8 @@ func newTruncateDecision(ctx context.Context, r *Replica) (truncateDecision, err
 	raftStatus := r.raftStatusRLocked()
 
 	const anyRecipientStore roachpb.StoreID = 0
-	pendingSnapshotIndex := r.getSnapshotLogTruncationConstraintsRLocked(anyRecipientStore)
-	lastIndex := r.mu.lastIndex
+	_, pendingSnapshotIndex := r.getSnapshotLogTruncationConstraintsRLocked(anyRecipientStore, false /* initialOnly */)
+	lastIndex := r.mu.lastIndexNotDurable
 	// NB: raftLogSize above adjusts for pending truncations that have already
 	// been successfully replicated via raft, but logSizeTrusted does not see if
 	// those pending truncations would cause a transition from trusted =>
@@ -297,7 +305,7 @@ func newTruncateDecision(ctx context.Context, r *Replica) (truncateDecision, err
 		ctx, raftStatus.Progress, r.descRLocked().Replicas().Descriptors(),
 		func(replicaID roachpb.ReplicaID) bool {
 			return r.mu.lastUpdateTimes.isFollowerActiveSince(
-				ctx, replicaID, now, r.store.cfg.RangeLeaseActiveDuration())
+				ctx, replicaID, now, r.store.cfg.RangeLeaseDuration)
 		},
 	)
 	log.Eventf(ctx, "raft status after lastUpdateTimes check: %+v", raftStatus.Progress)
@@ -682,7 +690,7 @@ func (rlq *raftLogQueue) process(
 		// make sure concurrent Raft activity doesn't foul up our update to the
 		// cached in-memory values.
 		r.raftMu.Lock()
-		n, err := ComputeRaftLogSize(ctx, r.RangeID, r.Engine(), r.raftMu.sideloaded)
+		n, err := ComputeRaftLogSize(ctx, r.RangeID, r.store.TODOEngine(), r.raftMu.sideloaded)
 		if err == nil {
 			r.mu.Lock()
 			r.mu.raftLogSize = n
@@ -717,8 +725,8 @@ func (rlq *raftLogQueue) process(
 		log.VEventf(ctx, 1, "%v", redact.Safe(decision.String()))
 	}
 	b := &kv.Batch{}
-	truncRequest := &roachpb.TruncateLogRequest{
-		RequestHeader: roachpb.RequestHeader{Key: r.Desc().StartKey.AsRawKey()},
+	truncRequest := &kvpb.TruncateLogRequest{
+		RequestHeader: kvpb.RequestHeader{Key: r.Desc().StartKey.AsRawKey()},
 		Index:         decision.NewFirstIndex,
 		RangeID:       r.RangeID,
 	}
@@ -729,6 +737,11 @@ func (rlq *raftLogQueue) process(
 	}
 	r.store.metrics.RaftLogTruncated.Inc(int64(decision.NumTruncatableIndexes()))
 	return true, nil
+}
+
+func (*raftLogQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 // timer returns interval between processing successive queued truncations.

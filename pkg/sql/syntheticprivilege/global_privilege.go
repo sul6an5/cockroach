@@ -11,11 +11,12 @@
 package syntheticprivilege
 
 import (
-	"context"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/errors"
 )
 
 // GlobalPrivilege represents privileges granted via
@@ -28,6 +29,8 @@ type GlobalPrivilege struct{}
 // GlobalPrivilege.
 const GlobalPrivilegeObjectType = "Global"
 
+var _ Object = &GlobalPrivilege{}
+
 // GetPath implements the Object interface.
 func (p *GlobalPrivilege) GetPath() string {
 	return "/global/"
@@ -37,21 +40,36 @@ func (p *GlobalPrivilege) GetPath() string {
 // We can use a const to identify it.
 var GlobalPrivilegeObject = &GlobalPrivilege{}
 
-// GetPrivilegeDescriptor implements the PrivilegeObject interface.
-func (p *GlobalPrivilege) GetPrivilegeDescriptor(
-	ctx context.Context, planner eval.Planner,
-) (*catpb.PrivilegeDescriptor, error) {
-	return planner.SynthesizePrivilegeDescriptor(ctx, p.GetName(), p.GetPath(), p.GetObjectType())
+// GetFallbackPrivileges implements the Object interface.
+func (e *GlobalPrivilege) GetFallbackPrivileges() *catpb.PrivilegeDescriptor {
+	// We should always be retrieving global privileges from the
+	// system.privileges table.
+	panic(errors.AssertionFailedf("not implemented"))
 }
 
-// GetObjectType implements the PrivilegeObject interface.
+// GetObjectType implements the Object interface.
 func (p *GlobalPrivilege) GetObjectType() privilege.ObjectType {
 	return privilege.Global
 }
 
-// GetName implements the PrivilegeObject interface.
+// GetName implements the Object interface.
 func (p *GlobalPrivilege) GetName() string {
 	// TODO(richardjcai): Turn this into a const map somewhere.
 	// GetName can return none since SystemCluster is not named and is 1 of 1.
 	return ""
+}
+
+// ID implements the cat.Object interface.
+func (p *GlobalPrivilege) ID() cat.StableID {
+	return cat.StableID(descpb.InvalidID)
+}
+
+// PostgresDescriptorID implements the cat.Object interface.
+func (p *GlobalPrivilege) PostgresDescriptorID() catid.DescID {
+	return descpb.InvalidID
+}
+
+// Equals implements the cat.Object interface.
+func (p *GlobalPrivilege) Equals(otherObject cat.Object) bool {
+	return p.ID() == otherObject.ID()
 }

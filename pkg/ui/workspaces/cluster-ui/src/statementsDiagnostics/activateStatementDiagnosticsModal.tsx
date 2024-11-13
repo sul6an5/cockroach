@@ -8,38 +8,28 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { Radio, Button, Input, Checkbox, Divider, Select, Alert } from "antd";
+import { Button, Checkbox, Divider, Input, Radio, Select } from "antd";
 import "antd/lib/radio/style";
 import "antd/lib/button/style";
 import "antd/lib/input/style";
 import "antd/lib/checkbox/style";
 import "antd/lib/divider/style";
 import "antd/lib/select/style";
-import "antd/lib/alert/style";
-import React, { useState, useCallback, useImperativeHandle } from "react";
+import React, { useCallback, useImperativeHandle, useState } from "react";
 import { Modal } from "src/modal";
 import { Anchor } from "src/anchor";
 import { Text } from "src/text";
-import {
-  NumberToDuration,
-  statementDiagnostics,
-  statementsSql,
-} from "src/util";
+import { statementDiagnostics, statementsSql } from "src/util";
 import classNames from "classnames/bind";
 import styles from "./activateStatementDiagnosticsModal.scss";
-import { google } from "@cockroachlabs/crdb-protobuf-client";
-import { InfoCircleFilled } from "@cockroachlabs/icons";
-type IDuration = google.protobuf.IDuration;
+import { InsertStmtDiagnosticRequest } from "../api";
+import { InlineAlert } from "@cockroachlabs/ui-components";
 
 const cx = classNames.bind(styles);
 const { Option } = Select;
 
 export interface ActivateDiagnosticsModalProps {
-  activate: (
-    statement: string,
-    minExecLatency: IDuration,
-    expiresAfter: IDuration,
-  ) => void;
+  activate: (insertStmtDiagnosticsRequest: InsertStmtDiagnosticRequest) => void;
   refreshDiagnosticsReports: () => void;
   onOpenModal?: (statement: string) => void;
 }
@@ -55,12 +45,13 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
   ) => {
     const [visible, setVisible] = useState(false);
     const [statement, setStatement] = useState<string>();
-    const [conditional, setConditional] = useState(false);
+    const [conditional, setConditional] = useState(true);
     const [expires, setExpires] = useState(true);
     const [minExecLatency, setMinExecLatency] = useState(100);
     const [minExecLatencyUnit, setMinExecLatencyUnit] =
       useState("milliseconds");
     const [expiresAfter, setExpiresAfter] = useState(15);
+    const [traceSampleRate, setTraceSampleRate] = useState(0.01);
 
     const handleSelectChange = (value: string) => {
       setMinExecLatencyUnit(value);
@@ -72,21 +63,35 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
       unit: string,
     ) => {
       const multiplier = unit == "milliseconds" ? 0.001 : 1;
-      const numSeconds = conditional ? value * multiplier : 0;
-      return NumberToDuration(numSeconds);
+      return conditional ? value * multiplier : 0; // num seconds
     };
 
     const getExpiresAfter = (expires: boolean, expiresAfter: number) => {
-      const numSeconds = expires ? expiresAfter : 0;
-      return NumberToDuration(numSeconds * 60);
+      const numMinutes = expires ? expiresAfter : 0;
+      return numMinutes * 60; // num seconds
+    };
+
+    const getTraceSampleRate = (
+      conditional: boolean,
+      traceSampleRate: number,
+    ) => {
+      if (conditional) {
+        return traceSampleRate;
+      }
+      return 0;
     };
 
     const onOkHandler = useCallback(() => {
-      activate(
-        statement,
-        getMinExecLatency(conditional, minExecLatency, minExecLatencyUnit),
-        getExpiresAfter(expires, expiresAfter),
-      );
+      activate({
+        stmtFingerprint: statement,
+        minExecutionLatencySeconds: getMinExecLatency(
+          conditional,
+          minExecLatency,
+          minExecLatencyUnit,
+        ),
+        expiresAfterSeconds: getExpiresAfter(expires, expiresAfter),
+        samplingProbability: getTraceSampleRate(conditional, traceSampleRate),
+      });
       setVisible(false);
     }, [
       activate,
@@ -96,6 +101,7 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
       minExecLatencyUnit,
       expires,
       expiresAfter,
+      traceSampleRate,
     ]);
 
     const onCancelHandler = useCallback(() => setVisible(false), []);
@@ -122,29 +128,60 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
       >
         <Text>
           Diagnostics will be collected for the next execution that matches this{" "}
-          <Anchor href={statementsSql}>statement fingerprint</Anchor>, or when
-          the execution of the statement fingerprint exceeds a specified
-          latency. The request is cancelled when a single bundle is captured.{" "}
+          <Anchor href={statementsSql}>statement fingerprint</Anchor>, or
+          according to the trace and latency thresholds set below. The request
+          is cancelled when a single diagnostics bundle is captured.{" "}
           <Anchor href={statementDiagnostics}>Learn more</Anchor>
         </Text>
         <div className={cx("diagnostic__options-container")}>
-          <Text className={cx("diagnostic__heading")}>Collect diagnostics</Text>
+          <Text className={cx("diagnostic__heading")}>
+            Collect diagnostics:
+          </Text>
           <Radio.Group value={conditional}>
             <Button.Group className={cx("diagnostic__btn-group")}>
-              <Radio
-                value={false}
-                className={cx("diagnostic__radio-btn")}
-                onChange={() => setConditional(false)}
-              >
-                On the next execution
-              </Radio>
               <Radio
                 value={true}
                 className={cx("diagnostic__radio-btn")}
                 onChange={() => setConditional(true)}
               >
-                On the next execution where the latency exceeds
+                Trace and collect diagnostics
                 <div className={cx("diagnostic__conditional-container")}>
+                  <div className={cx("diagnostic__select-text")}>
+                    At a sampled rate of:
+                  </div>
+                  <div className={cx("diagnostic__trace-container")}>
+                    <Select
+                      disabled={!conditional}
+                      defaultValue={0.01}
+                      onChange={setTraceSampleRate}
+                      className={cx("diagnostic__select__trace")}
+                      size="large"
+                    >
+                      <Option value={0.01}>1% (recommended)</Option>
+                      <Option value={0.02}>2%</Option>
+                      <Option value={0.03}>3%</Option>
+                      <Option value={0.04}>4%</Option>
+                      <Option value={0.05}>5%</Option>
+                      <Option value={1}>100% (not recommended)</Option>
+                    </Select>
+                    <span className={cx("diagnostic__trace-warning")}>
+                      We recommend starting at 1% to minimize the impact on
+                      performance.
+                    </span>
+                  </div>
+                  {getTraceSampleRate(conditional, traceSampleRate) == 1 && (
+                    <div className={cx("diagnostic__warning")}>
+                      <InlineAlert
+                        intent="warning"
+                        title="Tracing will be turned on at a 100% sampled rate until
+                      diagnostics are collected based on the specified latency threshold
+                      setting. This may have a significant impact on performance."
+                      />
+                    </div>
+                  )}
+                  <div className={cx("diagnostic__select-text")}>
+                    When the statement execution latency exceeds:
+                  </div>
                   <div className={cx("diagnostic__min-latency-container")}>
                     <Input
                       type="number"
@@ -169,11 +206,18 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
                       <Option value="milliseconds">milliseconds</Option>
                     </Select>
                   </div>
-                  <Divider type="horizontal" style={{ marginBottom: 0 }} />
                 </div>
+              </Radio>
+              <Radio
+                value={false}
+                className={cx("diagnostic__radio-btn")}
+                onChange={() => setConditional(false)}
+              >
+                Trace and collect diagnostics on the next statement execution
               </Radio>
             </Button.Group>
           </Radio.Group>
+          <Divider type="horizontal" />
           <Checkbox checked={expires} onChange={() => setExpires(!expires)}>
             <div className={cx("diagnostic__checkbox-text")}>
               Diagnostics request expires after:
@@ -195,22 +239,12 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
             </div>
             {conditional && !expires && (
               <div className={cx("diagnostic__alert")}>
-                <Alert
-                  icon={
-                    <div className={cx("diagnostic__alert-icon")}>
-                      <InfoCircleFilled fill="#0055FF" height={20} width={20} />
-                    </div>
-                  }
-                  message={
-                    <div className={cx("diagnostic__alert-message")}>
-                      Executions of the same statement fingerprint will run
+                <InlineAlert
+                  intent="info"
+                  title="Executions of the same statement fingerprint will run
                       slower while diagnostics are activated, so it is
                       recommended to set an expiration time if collecting
-                      according to a latency threshold.
-                    </div>
-                  }
-                  type="info"
-                  showIcon
+                      according to a latency threshold."
                 />
               </div>
             )}

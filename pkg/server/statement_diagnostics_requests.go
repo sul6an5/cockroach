@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -72,7 +71,7 @@ func (diagnostics *stmtDiagnostics) toProto() serverpb.StatementDiagnostics {
 func (s *statusServer) CreateStatementDiagnosticsReport(
 	ctx context.Context, req *serverpb.CreateStatementDiagnosticsReportRequest,
 ) (*serverpb.CreateStatementDiagnosticsReportResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if err := s.privilegeChecker.requireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
@@ -104,7 +103,7 @@ func (s *statusServer) CreateStatementDiagnosticsReport(
 func (s *statusServer) CancelStatementDiagnosticsReport(
 	ctx context.Context, req *serverpb.CancelStatementDiagnosticsReportRequest,
 ) (*serverpb.CancelStatementDiagnosticsReportResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if err := s.privilegeChecker.requireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
@@ -124,11 +123,11 @@ func (s *statusServer) CancelStatementDiagnosticsReport(
 
 // StatementDiagnosticsRequests retrieves all statement diagnostics
 // requests in the `system.statement_diagnostics_requests` table that
-// have not yet expired.
+// have either completed or have not yet expired.
 func (s *statusServer) StatementDiagnosticsRequests(
 	ctx context.Context, _ *serverpb.StatementDiagnosticsReportsRequest,
 ) (*serverpb.StatementDiagnosticsReportsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if err := s.privilegeChecker.requireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
@@ -139,15 +138,13 @@ func (s *statusServer) StatementDiagnosticsRequests(
 
 	// TODO(irfansharif): Remove this version gating in 23.1.
 	var extraColumns string
-	if s.admin.server.st.Version.IsActive(ctx, clusterversion.SampledStmtDiagReqs) {
+	if s.st.Version.IsActive(ctx, clusterversion.TODODelete_V22_2SampledStmtDiagReqs) {
 		extraColumns = `,
 			sampling_probability`
 	}
 	// TODO(davidh): Add pagination to this request.
 	it, err := s.internalExecutor.QueryIteratorEx(ctx, "stmt-diag-get-all", nil, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.RootUserName(),
-		},
+		sessiondata.RootUserSessionDataOverride,
 		fmt.Sprintf(`SELECT
 			id,
 			statement_fingerprint,
@@ -193,7 +190,7 @@ func (s *statusServer) StatementDiagnosticsRequests(
 		if expiresAt, ok := row[6].(*tree.DTimestampTZ); ok {
 			req.ExpiresAt = expiresAt.Time
 			// Don't return already expired requests.
-			if req.ExpiresAt.Before(timeutil.Now()) {
+			if !completed && req.ExpiresAt.Before(timeutil.Now()) {
 				continue
 			}
 		}
@@ -224,7 +221,7 @@ func (s *statusServer) StatementDiagnosticsRequests(
 func (s *statusServer) StatementDiagnostics(
 	ctx context.Context, req *serverpb.StatementDiagnosticsRequest,
 ) (*serverpb.StatementDiagnosticsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if err := s.privilegeChecker.requireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
@@ -233,9 +230,7 @@ func (s *statusServer) StatementDiagnostics(
 
 	var err error
 	row, err := s.internalExecutor.QueryRowEx(ctx, "stmt-diag-get-one", nil, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.RootUserName(),
-		},
+		sessiondata.RootUserSessionDataOverride,
 		`SELECT
 			id,
 			statement_fingerprint,

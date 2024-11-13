@@ -15,6 +15,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -38,7 +39,7 @@ import (
 // LockTableLivenessPushDelay sets the delay before pushing in order to detect
 // coordinator failures of conflicting transactions.
 var LockTableLivenessPushDelay = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.lock_table.coordinator_liveness_push_delay",
 	"the delay before pushing in order to detect coordinator failures of conflicting transactions",
 	// This is set to a short duration to ensure that we quickly detect failed
@@ -70,7 +71,7 @@ var LockTableLivenessPushDelay = settings.RegisterDurationSetting(
 // LockTableDeadlockDetectionPushDelay sets the delay before pushing in order to
 // detect dependency cycles between transactions.
 var LockTableDeadlockDetectionPushDelay = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.lock_table.deadlock_detection_push_delay",
 	"the delay before pushing in order to detect dependency cycles between transactions",
 	// This is set to a medium duration to ensure that deadlock caused by
@@ -121,7 +122,7 @@ type IntentResolver interface {
 	// block until the pushee transaction is finalized or eventually can be
 	// pushed successfully.
 	PushTransaction(
-		context.Context, *enginepb.TxnMeta, roachpb.Header, roachpb.PushTxnType,
+		context.Context, *enginepb.TxnMeta, kvpb.Header, kvpb.PushTxnType,
 	) (*roachpb.Transaction, *Error)
 
 	// ResolveIntent synchronously resolves the provided intent.
@@ -433,10 +434,10 @@ func (w *lockTableWaiterImpl) WaitOn(
 			}
 
 		case <-ctxDoneC:
-			return roachpb.NewError(ctx.Err())
+			return kvpb.NewError(ctx.Err())
 
 		case <-shouldQuiesceC:
-			return roachpb.NewError(&roachpb.NodeUnavailableError{})
+			return kvpb.NewError(&kvpb.NodeUnavailableError{})
 		}
 	}
 }
@@ -465,7 +466,7 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 
 	// Construct the request header and determine which form of push to use.
 	h := w.pushHeader(req)
-	var pushType roachpb.PushTxnType
+	var pushType kvpb.PushTxnType
 	var beforePushObs roachpb.ObservedTimestamp
 	switch req.WaitPolicy {
 	case lock.WaitPolicy_Block:
@@ -477,7 +478,7 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 		// with its own lock.
 		switch ws.guardAccess {
 		case spanset.SpanReadOnly:
-			pushType = roachpb.PUSH_TIMESTAMP
+			pushType = kvpb.PUSH_TIMESTAMP
 			beforePushObs = roachpb.ObservedTimestamp{
 				NodeID:    w.nodeDesc.NodeID,
 				Timestamp: w.clock.NowAsClockTimestamp(),
@@ -499,7 +500,7 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 			log.VEventf(ctx, 2, "pushing timestamp of txn %s above %s", ws.txn.ID.Short(), h.Timestamp)
 
 		case spanset.SpanReadWrite:
-			pushType = roachpb.PUSH_ABORT
+			pushType = kvpb.PUSH_ABORT
 			log.VEventf(ctx, 2, "pushing txn %s to abort", ws.txn.ID.Short())
 		}
 
@@ -509,7 +510,7 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 		// holder to ensure that it is active and that this isn't an abandoned
 		// lock, but we push using a PUSH_TOUCH to immediately return an error
 		// if the lock hold is still active.
-		pushType = roachpb.PUSH_TOUCH
+		pushType = kvpb.PUSH_TOUCH
 		log.VEventf(ctx, 2, "pushing txn %s to check if abandoned", ws.txn.ID.Short())
 
 	default:
@@ -520,7 +521,7 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 	if err != nil {
 		// If pushing with an Error WaitPolicy and the push fails, then the lock
 		// holder is still active. Transform the error into a WriteIntentError.
-		if _, ok := err.GetDetail().(*roachpb.TransactionPushError); ok && req.WaitPolicy == lock.WaitPolicy_Error {
+		if _, ok := err.GetDetail().(*kvpb.TransactionPushError); ok && req.WaitPolicy == lock.WaitPolicy_Error {
 			err = newWriteIntentErr(req, ws, reasonWaitPolicy)
 		}
 		return err
@@ -665,7 +666,7 @@ func (w *lockTableWaiterImpl) pushLockTxnAfterTimeout(
 ) *Error {
 	req.WaitPolicy = lock.WaitPolicy_Error
 	err := w.pushLockTxn(ctx, req, ws)
-	if _, ok := err.GetDetail().(*roachpb.WriteIntentError); ok {
+	if _, ok := err.GetDetail().(*kvpb.WriteIntentError); ok {
 		err = newWriteIntentErr(req, ws, reasonLockTimeout)
 	}
 	return err
@@ -696,7 +697,7 @@ func (w *lockTableWaiterImpl) pushRequestTxn(
 	// aborted due to a deadlock or b) the request exits the lock wait-queue and
 	// the caller of this function cancels the push.
 	h := w.pushHeader(req)
-	pushType := roachpb.PUSH_ABORT
+	pushType := kvpb.PUSH_ABORT
 	log.VEventf(ctx, 3, "pushing txn %s to detect request deadlock", ws.txn.ID.Short())
 
 	_, err := w.ir.PushTransaction(ctx, ws.txn, h, pushType)
@@ -758,8 +759,8 @@ func (w *lockTableWaiterImpl) pushRequestTxn(
 
 // pushHeader returns a BatchRequest header to be used for pushing other
 // transactions on behalf of the provided request.
-func (w *lockTableWaiterImpl) pushHeader(req Request) roachpb.Header {
-	h := roachpb.Header{
+func (w *lockTableWaiterImpl) pushHeader(req Request) kvpb.Header {
+	h := kvpb.Header{
 		Timestamp:    req.Timestamp,
 		UserPriority: req.NonTxnPriority,
 	}
@@ -961,7 +962,7 @@ const tagContentionTracer = "locks"
 const tagWaitKey = "wait_key"
 
 // tagWaitStart is the tracing span tag indicating when the request started
-// waiting on the lock it's currently waiting on.
+// waiting on the lock (a unique key,txn pair) it's currently waiting on.
 const tagWaitStart = "wait_start"
 
 // tagLockHolderTxn is the tracing span tag indicating the ID of the txn holding
@@ -984,7 +985,7 @@ const tagWaited = "wait"
 // tracing span.
 type contentionEventTracer struct {
 	sp      *tracing.Span
-	onEvent func(event *roachpb.ContentionEvent) // may be nil
+	onEvent func(event *kvpb.ContentionEvent) // may be nil
 	tag     contentionTag
 }
 
@@ -1009,15 +1010,18 @@ type contentionTag struct {
 		waiting bool
 
 		// waitStart represents the timestamp when the request started waiting on
-		// locks in the current iteration of the contentionEventTracer. The wait
-		// time in previous iterations is accumulated in lockWait. When not waiting
-		// any more, timeutil.Since(waitStart) is added to lockWait.
+		// a lock, as defined by a unique (key,txn) pair, in the current iteration
+		// of the contentionEventTracer. The wait time in previous iterations is
+		// accumulated in lockWait. When not waiting anymore or when waiting on a
+		// new (key,txn), timeutil.Since(waitStart) is added to lockWait.
 		waitStart time.Time
 
-		// curState is the current wait state, if any. It is overwritten every time
-		// the lock table notify()s the contentionEventTracer of a new state. It is
-		// not set if waiting is false.
-		curState waitingState
+		// curStateKey and curStateTxn are the current waitingState's key and txn,
+		// if any. They are overwritten every time the lock table notify()s the
+		// contentionEventTracer of a new state. They are not set if waiting is
+		// false.
+		curStateKey roachpb.Key
+		curStateTxn *enginepb.TxnMeta
 
 		// numLocks counts the number of locks this contentionEventTracer has seen so
 		// far, including the one we're currently waiting on (if any).
@@ -1065,7 +1069,7 @@ func newContentionEventTracer(sp *tracing.Span, clock *hlc.Clock) *contentionEve
 
 // SetOnContentionEvent registers a callback to be called before each event is
 // emitted. The callback may modify the event.
-func (h *contentionEventTracer) SetOnContentionEvent(f func(ev *roachpb.ContentionEvent)) {
+func (h *contentionEventTracer) SetOnContentionEvent(f func(ev *kvpb.ContentionEvent)) {
 	h.onEvent = f
 }
 
@@ -1090,7 +1094,7 @@ func (h *contentionEventTracer) notify(ctx context.Context, s waitingState) {
 
 // emit records a ContentionEvent to the tracing span corresponding to the
 // current wait state (if any).
-func (h *contentionEventTracer) emit(event *roachpb.ContentionEvent) {
+func (h *contentionEventTracer) emit(event *kvpb.ContentionEvent) {
 	if event == nil {
 		return
 	}
@@ -1102,20 +1106,20 @@ func (h *contentionEventTracer) emit(event *roachpb.ContentionEvent) {
 	h.sp.RecordStructured(event)
 }
 
-func (tag *contentionTag) generateEventLocked() *roachpb.ContentionEvent {
+func (tag *contentionTag) generateEventLocked() *kvpb.ContentionEvent {
 	if !tag.mu.waiting {
 		return nil
 	}
 
-	return &roachpb.ContentionEvent{
-		Key:      tag.mu.curState.key,
-		TxnMeta:  *tag.mu.curState.txn,
-		Duration: tag.clock.PhysicalTime().Sub(tag.mu.curState.lockWaitStart),
+	return &kvpb.ContentionEvent{
+		Key:      tag.mu.curStateKey,
+		TxnMeta:  *tag.mu.curStateTxn,
+		Duration: tag.clock.PhysicalTime().Sub(tag.mu.waitStart),
 	}
 }
 
 // See contentionEventTracer.notify.
-func (tag *contentionTag) notify(ctx context.Context, s waitingState) *roachpb.ContentionEvent {
+func (tag *contentionTag) notify(ctx context.Context, s waitingState) *kvpb.ContentionEvent {
 	tag.mu.Lock()
 	defer tag.mu.Unlock()
 
@@ -1127,33 +1131,35 @@ func (tag *contentionTag) notify(ctx context.Context, s waitingState) *roachpb.C
 		// If we're tracking an event and see a different txn/key, the event is
 		// done and we initialize the new event tracking the new txn/key.
 		//
-		// NB: we're guaranteed to have `s.{txn,key}` populated here.
-		var differentLock bool
-		if !tag.mu.waiting {
-			differentLock = true
-		} else {
-			curLockHolder, curKey := tag.mu.curState.txn.ID, tag.mu.curState.key
-			differentLock = !curLockHolder.Equal(s.txn.ID) || !curKey.Equal(s.key)
+		// NB: we're guaranteed to have `curState{Txn,Key}` populated here.
+		if tag.mu.waiting {
+			curLockTxn, curLockKey := tag.mu.curStateTxn.ID, tag.mu.curStateKey
+			differentLock := !curLockTxn.Equal(s.txn.ID) || !curLockKey.Equal(s.key)
+			if !differentLock {
+				return nil
+			}
 		}
-		var res *roachpb.ContentionEvent
-		if differentLock {
-			res = tag.generateEventLocked()
-		}
-		tag.mu.curState = s
+		res := tag.generateEventLocked()
 		tag.mu.waiting = true
-		if differentLock {
-			tag.mu.waitStart = tag.clock.PhysicalTime()
-			tag.mu.numLocks++
-			return res
+		tag.mu.curStateKey = s.key
+		tag.mu.curStateTxn = s.txn
+		// Accumulate the wait time.
+		now := tag.clock.PhysicalTime()
+		if !tag.mu.waitStart.IsZero() {
+			tag.mu.lockWait += now.Sub(tag.mu.waitStart)
 		}
-		return nil
+		tag.mu.waitStart = now
+		tag.mu.numLocks++
+		return res
 	case doneWaiting, waitQueueMaxLengthExceeded:
 		// There will be no more state updates; we're done waiting.
 		res := tag.generateEventLocked()
 		tag.mu.waiting = false
-		tag.mu.curState = waitingState{}
-		tag.mu.lockWait += tag.clock.PhysicalTime().Sub(tag.mu.waitStart)
+		tag.mu.curStateKey = nil
+		tag.mu.curStateTxn = nil
 		// Accumulate the wait time.
+		now := tag.clock.PhysicalTime()
+		tag.mu.lockWait += now.Sub(tag.mu.waitStart)
 		tag.mu.waitStart = time.Time{}
 		return res
 	default:
@@ -1190,30 +1196,28 @@ func (tag *contentionTag) Render() []attribute.KeyValue {
 	if tag.mu.waiting {
 		tags = append(tags, attribute.KeyValue{
 			Key:   tagWaitKey,
-			Value: attribute.StringValue(tag.mu.curState.key.String()),
+			Value: attribute.StringValue(tag.mu.curStateKey.String()),
 		})
 		tags = append(tags, attribute.KeyValue{
 			Key:   tagLockHolderTxn,
-			Value: attribute.StringValue(tag.mu.curState.txn.ID.String()),
+			Value: attribute.StringValue(tag.mu.curStateTxn.ID.String()),
 		})
 		tags = append(tags, attribute.KeyValue{
 			Key:   tagWaitStart,
-			Value: attribute.StringValue(tag.mu.curState.lockWaitStart.Format("15:04:05.123")),
+			Value: attribute.StringValue(tag.mu.waitStart.Format("15:04:05.123")),
 		})
 	}
 	return tags
 }
 
 const (
-	reasonWaitPolicy                 = roachpb.WriteIntentError_REASON_WAIT_POLICY
-	reasonLockTimeout                = roachpb.WriteIntentError_REASON_LOCK_TIMEOUT
-	reasonWaitQueueMaxLengthExceeded = roachpb.WriteIntentError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED
+	reasonWaitPolicy                 = kvpb.WriteIntentError_REASON_WAIT_POLICY
+	reasonLockTimeout                = kvpb.WriteIntentError_REASON_LOCK_TIMEOUT
+	reasonWaitQueueMaxLengthExceeded = kvpb.WriteIntentError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED
 )
 
-func newWriteIntentErr(
-	req Request, ws waitingState, reason roachpb.WriteIntentError_Reason,
-) *Error {
-	err := roachpb.NewError(&roachpb.WriteIntentError{
+func newWriteIntentErr(req Request, ws waitingState, reason kvpb.WriteIntentError_Reason) *Error {
+	err := kvpb.NewError(&kvpb.WriteIntentError{
 		Intents: []roachpb.Intent{roachpb.MakeIntent(ws.txn, ws.key)},
 		Reason:  reason,
 	})

@@ -37,7 +37,7 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `-e`, `begin`, `-e`, `select 3 as "3"`, `-e`, `commit`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select * from t.f`})
 	c.RunWithArgs([]string{`sql`, `--execute=SELECT database_name, owner FROM [show databases]`})
-	c.RunWithArgs([]string{`sql`, `-e`, `\l`, `-e`, `\echo hello`})
+	c.RunWithArgs([]string{`sql`, `-e`, `\echo hello`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "2"`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "@" where false`})
 	// CREATE TABLE AS returns a SELECT tag with a row count, check this.
@@ -57,10 +57,8 @@ func Example_sql() {
 	// growing capacity starting at 1 (the batch sizes will be 1, 2, 4, ...),
 	// and with the query below the division by zero error will occur after the
 	// first batch consisting of 1 row has been returned to the client.
-	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-2) from generate_series(1,3)`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(i-2) from generate_series(1,3) g(i)`})
 	c.RunWithArgs([]string{`sql`, `-e`, `SELECT '20:01:02+03:04:05'::timetz AS regression_65066`})
-	c.RunWithArgs([]string{`sql`, `-e`, `CREATE USER my_user WITH CREATEDB; GRANT admin TO my_user;`})
-	c.RunWithArgs([]string{`sql`, `-e`, `\du my_user`})
 
 	// Output:
 	// sql -e show application_name
@@ -89,12 +87,7 @@ func Example_sql() {
 	// postgres	root
 	// system	node
 	// t	root
-	// sql -e \l -e \echo hello
-	// database_name	owner	primary_region	secondary_region	regions	survival_goal
-	// defaultdb	root	NULL	NULL	{}	NULL
-	// postgres	root	NULL	NULL	{}	NULL
-	// system	node	NULL	NULL	{}	NULL
-	// t	root	NULL	NULL	{}	NULL
+	// sql -e \echo hello
 	// hello
 	// sql -e select 1 as "1"; select 2 as "2"
 	// 1
@@ -116,7 +109,7 @@ func Example_sql() {
 	// CREATE TABLE
 	// x
 	// sql -e copy t.f from stdin
-	// sql -e select 1/(@1-2) from generate_series(1,3)
+	// sql -e select 1/(i-2) from generate_series(1,3) g(i)
 	// ?column?
 	// -1.0000000000000000000
 	// (error encountered after some results were delivered)
@@ -125,12 +118,6 @@ func Example_sql() {
 	// sql -e SELECT '20:01:02+03:04:05'::timetz AS regression_65066
 	// regression_65066
 	// 20:01:02+03:04:05
-	// sql -e CREATE USER my_user WITH CREATEDB; GRANT admin TO my_user;
-	// CREATE ROLE
-	// GRANT
-	// sql -e \du my_user
-	// username	options	member_of
-	// my_user	CREATEDB	{admin}
 }
 
 func Example_sql_config() {
@@ -175,10 +162,10 @@ func Example_sql_config() {
 	// invalid syntax: \set unknownoption. Try \? for help.
 	// ERROR: -e: invalid syntax
 	// sql --set display_format=invalidvalue -e select 123 as "123"
-	// \set display_format invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
+	// \set display_format=invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
 	// ERROR: -e: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
 	// sql -e \set display_format=invalidvalue -e select 123 as "123"
-	// \set display_format invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
+	// \set display_format=invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
 	// ERROR: -e: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
 }
 

@@ -103,19 +103,18 @@ func generateOperators() []byte {
 	ops := make(map[string]operations)
 	for optyp, overloads := range tree.UnaryOps {
 		op := optyp.String()
-		for _, untyped := range overloads {
-			v := untyped.(*tree.UnaryOp)
+		_ = overloads.ForEachUnaryOp(func(v *tree.UnaryOp) error {
 			ops[op] = append(ops[op], operation{
 				left: v.Typ.String(),
 				ret:  v.ReturnType.String(),
 				op:   op,
 			})
-		}
+			return nil
+		})
 	}
 	for optyp, overloads := range tree.BinOps {
 		op := optyp.String()
-		for _, untyped := range overloads {
-			v := untyped.(*tree.BinOp)
+		_ = overloads.ForEachBinOp(func(v *tree.BinOp) error {
 			left := v.LeftType.String()
 			right := v.RightType.String()
 			ops[op] = append(ops[op], operation{
@@ -124,12 +123,12 @@ func generateOperators() []byte {
 				ret:   v.ReturnType.String(),
 				op:    op,
 			})
-		}
+			return nil
+		})
 	}
 	for optyp, overloads := range tree.CmpOps {
 		op := optyp.String()
-		for _, untyped := range overloads {
-			v := untyped.(*tree.CmpOp)
+		_ = overloads.ForEachCmpOp(func(v *tree.CmpOp) error {
 			left := v.LeftType.String()
 			right := v.RightType.String()
 			ops[op] = append(ops[op], operation{
@@ -138,7 +137,8 @@ func generateOperators() []byte {
 				ret:   "bool",
 				op:    op,
 			})
-		}
+			return nil
+		})
 	}
 	var opstrs []string
 	for k, v := range ops {
@@ -191,7 +191,7 @@ func generateFunctions(from []string, categorize bool) []byte {
 			}
 			// We generate docs for both aggregates and window functions in separate
 			// files, so we want to omit them when processing all builtins.
-			if categorize && (props.Class == tree.AggregateClass || props.Class == tree.WindowClass) {
+			if categorize && (fn.Class == tree.AggregateClass || fn.Class == tree.WindowClass) {
 				continue
 			}
 			args := fn.Types.String()

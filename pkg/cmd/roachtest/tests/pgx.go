@@ -19,12 +19,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/errors"
 )
 
 var pgxReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedPGXTag = "v4.15.0"
+var supportedPGXTag = "v5.3.1"
 
 // This test runs pgx's full test suite against a single cockroach node.
 
@@ -81,17 +82,9 @@ func registerPgx(r registry.Registry) {
 			t.Fatal(err)
 		}
 
-		t.Status("checking blocklist")
-		blocklistName, expectedFailures, ignorelistName, ignorelist := pgxBlocklists.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No pgx blocklist defined for cockroach version %s", version)
-		}
-		status := fmt.Sprintf("Running cockroach version %s, using blocklist %s", version, blocklistName)
-		if ignorelist != nil {
-			status = fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
-				version, blocklistName, ignorelistName)
-		}
-		t.L().Printf("%s", status)
+		RunningStatus := fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
+			version, "pgxBlocklist", "pgxIgnorelist")
+		t.L().Printf("%s", RunningStatus)
 
 		t.Status("setting up test db")
 		db, err := c.ConnE(ctx, t.L(), node[0])
@@ -121,31 +114,25 @@ func registerPgx(r registry.Registry) {
 				"`go env GOPATH`/bin/go-junit-report",
 		)
 
-		// Expected to fail but we should still scan the error to check if
-		// there's an SSH/roachprod error.
-		if err != nil {
-			// install.NonZeroExitCode includes unrelated to SSH errors ("255")
-			// or roachprod errors, so we call t.Fatal if the error is not an
-			// install.NonZeroExitCode error
-			commandError := (*install.NonZeroExitCode)(nil)
-			if !errors.As(err, &commandError) {
-				t.Fatal(err)
-			}
+		// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+		// Proceed for any other (command) errors
+		if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+			t.Fatal(err)
 		}
 
 		// Result error contains stdout, stderr, and any error content returned by exec package.
 		xmlResults := []byte(result.Stdout + result.Stderr)
 
 		results := newORMTestsResults()
-		results.parseJUnitXML(t, expectedFailures, ignorelist, xmlResults)
+		results.parseJUnitXML(t, pgxBlocklist, pgxIgnorelist, xmlResults)
 		results.summarizeAll(
-			t, "pgx", blocklistName, expectedFailures, version, supportedPGXTag,
+			t, "pgx", "pgxBlocklist", pgxBlocklist, version, supportedPGXTag,
 		)
 	}
 
 	r.Add(registry.TestSpec{
 		Name:    "pgx",
-		Owner:   registry.OwnerSQLExperience,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
 		Tags:    []string{`default`, `driver`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {

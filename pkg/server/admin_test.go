@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -48,6 +47,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -59,6 +60,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randident"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -263,7 +266,7 @@ func TestAdminDebugAuth(t *testing.T) {
 	}
 
 	// Authenticated as non-admin.
-	client, err = ts.GetAuthenticatedHTTPClient(false)
+	client, err = ts.GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +280,7 @@ func TestAdminDebugAuth(t *testing.T) {
 	}
 
 	// Authenticated as admin.
-	client, err = ts.GetAuthenticatedHTTPClient(true)
+	client, err = ts.GetAuthenticatedHTTPClient(true, serverutils.SingleTenantSession)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,6 +343,59 @@ func TestAdminDebugRedirect(t *testing.T) {
 	}
 }
 
+func generateRandomName() string {
+	rand, _ := randutil.NewTestRand()
+	cfg := randident.DefaultNameGeneratorConfig()
+	// REST api can not handle `/`. This is fixed in
+	// the UI by using sql-over-http endpoint instead.
+	cfg.Punctuate = -1
+	cfg.Finalize()
+
+	ng := randident.NewNameGenerator(
+		&cfg,
+		rand,
+		"a b%s-c.d",
+	)
+	return ng.GenerateOne(42)
+}
+
+func TestAdminAPIStatementDiagnosticsBundle(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+	ts := s.(*TestServer)
+
+	query := "EXPLAIN ANALYZE (DEBUG) SELECT 'secret'"
+	_, err := db.Exec(query)
+	require.NoError(t, err)
+
+	query = "SELECT id FROM system.statement_diagnostics LIMIT 1"
+	idRow, err := db.Query(query)
+	require.NoError(t, err)
+	var diagnosticRow string
+	if idRow.Next() {
+		err = idRow.Scan(&diagnosticRow)
+		require.NoError(t, err)
+	} else {
+		t.Fatal("no results")
+	}
+
+	client, err := ts.GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
+	require.NoError(t, err)
+	resp, err := client.Get(ts.AdminURL() + "/_admin/v1/stmtbundle/" + diagnosticRow)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, 500, resp.StatusCode)
+
+	adminClient, err := ts.GetAuthenticatedHTTPClient(true, serverutils.SingleTenantSession)
+	require.NoError(t, err)
+	adminResp, err := adminClient.Get(ts.AdminURL() + "/_admin/v1/stmtbundle/" + diagnosticRow)
+	require.NoError(t, err)
+	defer adminResp.Body.Close()
+	require.Equal(t, 200, adminResp.StatusCode)
+}
+
 func TestAdminAPIDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -355,14 +411,15 @@ func TestAdminAPIDatabases(t *testing.T) {
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
 
-	const testdb = "test"
-	query := "CREATE DATABASE " + testdb
+	testDbName := generateRandomName()
+	testDbEscaped := tree.NameString(testDbName)
+	query := "CREATE DATABASE " + testDbEscaped
 	if _, err := db.Exec(query); err != nil {
 		t.Fatal(err)
 	}
 	// Test needs to revoke CONNECT on the public database to properly exercise
 	// fine-grained permissions logic.
-	if _, err := db.Exec(fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM public", testdb)); err != nil {
+	if _, err := db.Exec(fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM public", testDbEscaped)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec("REVOKE CONNECT ON DATABASE defaultdb FROM public"); err != nil {
@@ -372,7 +429,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 	// We have to create the non-admin user before calling
 	// "GRANT ... TO authenticatedUserNameNoAdmin".
 	// This is done in "GetAuthenticatedHTTPClient".
-	if _, err := ts.GetAuthenticatedHTTPClient(false); err != nil {
+	if _, err := ts.GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession); err != nil {
 		t.Fatal(err)
 	}
 
@@ -381,7 +438,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 	query = fmt.Sprintf(
 		"GRANT %s ON DATABASE %s TO %s",
 		strings.Join(privileges, ", "),
-		testdb,
+		testDbEscaped,
 		authenticatedUserNameNoAdmin().SQLIdentifier(),
 	)
 	if _, err := db.Exec(query); err != nil {
@@ -401,8 +458,8 @@ func TestAdminAPIDatabases(t *testing.T) {
 		expectedDBs []string
 		isAdmin     bool
 	}{
-		{[]string{"defaultdb", "postgres", "system", testdb}, true},
-		{[]string{"postgres", testdb}, false},
+		{[]string{"defaultdb", "postgres", "system", testDbName}, true},
+		{[]string{"postgres", testDbName}, false},
 	} {
 		t.Run(fmt.Sprintf("isAdmin:%t", tc.isAdmin), func(t *testing.T) {
 			// Test databases endpoint.
@@ -420,6 +477,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 				t.Fatalf("length of result %d != expected %d", a, e)
 			}
 
+			sort.Strings(tc.expectedDBs)
 			sort.Strings(resp.Databases)
 			for i, e := range tc.expectedDBs {
 				if a := resp.Databases[i]; a != e {
@@ -429,9 +487,11 @@ func TestAdminAPIDatabases(t *testing.T) {
 
 			// Test database details endpoint.
 			var details serverpb.DatabaseDetailsResponse
+			urlEscapeDbName := url.PathEscape(testDbName)
+
 			if err := getAdminJSONProtoWithAdminOption(
 				s,
-				"databases/"+testdb,
+				"databases/"+urlEscapeDbName,
 				&details,
 				tc.isAdmin,
 			); err != nil {
@@ -472,7 +532,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 			}
 
 			// Verify Descriptor ID.
-			databaseID, err := ts.admin.queryDatabaseID(ctx, username.RootUserName(), testdb)
+			databaseID, err := ts.admin.queryDatabaseID(ctx, username.RootUserName(), testDbName)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -592,11 +652,13 @@ func TestRangeCount(t *testing.T) {
 			}
 			m[tableName] = tblResp.RangeCount
 		}
-		// Hardcode the single range used by the role_id_seq, the above
+		// Hardcode the single range used by each system sequence, the above
 		// request does not return sequences.
 		// TODO(richardjcai): Maybe update the request to return
 		// sequences as well?
+		m[fmt.Sprintf("public.%s", catconstants.DescIDSequenceTableName)] = 1
 		m[fmt.Sprintf("public.%s", catconstants.RoleIDSequenceName)] = 1
+		m[fmt.Sprintf("public.%s", catconstants.TenantIDSequenceTableName)] = 1
 		return m
 	}
 
@@ -637,9 +699,7 @@ func TestRangeCount(t *testing.T) {
 		defer db.Close()
 
 		runner := sqlutils.MakeSQLRunner(db)
-		s := sqlutils.MatrixToStr(runner.QueryStr(t, `
-select range_id, database_name, table_name, start_pretty, end_pretty from crdb_internal.ranges order by range_id asc`,
-		))
+		s := sqlutils.MatrixToStr(runner.QueryStr(t, `SHOW CLUSTER RANGES`))
 		t.Logf("actual ranges:\n%s", s)
 	}
 }
@@ -694,7 +754,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 		name, dbName, tblName, pkName string
 	}{
 		{name: "lower", dbName: "test", tblName: "tbl", pkName: "tbl_pkey"},
-		{name: "lower", dbName: "test", tblName: `testschema.tbl`, pkName: "tbl_pkey"},
+		{name: "lower other schema", dbName: "test", tblName: `testschema.tbl`, pkName: "tbl_pkey"},
 		{name: "lower with space", dbName: "test test", tblName: `"tbl tbl"`, pkName: "tbl tbl_pkey"},
 		{name: "upper", dbName: "TEST", tblName: `"TBL"`, pkName: "TBL_pkey"}, // Regression test for issue #14056
 	} {
@@ -756,9 +816,9 @@ func TestAdminAPITableDetails(t *testing.T) {
 			// Verify columns.
 			expColumns := []serverpb.TableDetailsResponse_Column{
 				{Name: "nulls_allowed", Type: "INT8", Nullable: true, DefaultValue: ""},
-				{Name: "nulls_not_allowed", Type: "INT8", Nullable: false, DefaultValue: "1000:::INT8"},
-				{Name: "default2", Type: "INT8", Nullable: true, DefaultValue: "2:::INT8"},
-				{Name: "string_default", Type: "STRING", Nullable: true, DefaultValue: "'default_string':::STRING"},
+				{Name: "nulls_not_allowed", Type: "INT8", Nullable: false, DefaultValue: "1000"},
+				{Name: "default2", Type: "INT8", Nullable: true, DefaultValue: "2"},
+				{Name: "string_default", Type: "STRING", Nullable: true, DefaultValue: "'default_string'"},
 				{Name: "rowid", Type: "INT8", Nullable: false, DefaultValue: "unique_rowid()", Hidden: true},
 			}
 			testutils.SortStructs(expColumns, "Name")
@@ -1054,10 +1114,10 @@ func TestAdminAPIEvents(t *testing.T) {
 		{"create_database", false, 0, false, 3},
 		{"drop_table", false, 0, false, 2},
 		{"create_table", false, 0, false, 3},
-		{"set_cluster_setting", false, 0, false, 4},
+		{"set_cluster_setting", false, 0, false, 2},
 		// We use limit=true with no limit here because otherwise the
 		// expCount will mess up the expected total count below.
-		{"set_cluster_setting", true, 0, true, 4},
+		{"set_cluster_setting", true, 0, true, 2},
 		{"create_table", true, 0, false, 3},
 		{"create_table", true, -1, false, 3},
 		{"create_table", true, 2, false, 2},
@@ -1160,7 +1220,7 @@ func TestAdminAPISettings(t *testing.T) {
 	allKeys := settings.Keys(settings.ForSystemTenant)
 
 	checkSetting := func(t *testing.T, k string, v serverpb.SettingsResponse_Value) {
-		ref, ok := settings.Lookup(k, settings.LookupForReporting, settings.ForSystemTenant)
+		ref, ok := settings.LookupForReporting(k, settings.ForSystemTenant)
 		if !ok {
 			t.Fatalf("%s: not found after initial lookup", k)
 		}
@@ -1434,7 +1494,7 @@ func TestClusterAPI(t *testing.T) {
 			// Override server license check.
 			if enterpriseOn {
 				old := base.CheckEnterpriseEnabled
-				base.CheckEnterpriseEnabled = func(_ *cluster.Settings, _ uuid.UUID, _, _ string) error {
+				base.CheckEnterpriseEnabled = func(_ *cluster.Settings, _ uuid.UUID, _ string) error {
 					return nil
 				}
 				defer func() { base.CheckEnterpriseEnabled = old }()
@@ -1593,7 +1653,7 @@ func TestAdminAPIJobs(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "isAdmin", func(t *testing.T, isAdmin bool) {
 		// Creating this client causes a user to be created, which causes jobs
 		// to be created, so we do it up-front rather than inside the test.
-		_, err := s.GetAuthenticatedHTTPClient(isAdmin)
+		_, err := s.GetAuthenticatedHTTPClient(isAdmin, serverutils.SingleTenantSession)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1668,8 +1728,16 @@ func TestAdminAPIJobs(t *testing.T) {
 			t.Fatal(err)
 		}
 		sqlDB.Exec(t,
-			`INSERT INTO system.jobs (id, status, payload, progress, num_runs, last_run) VALUES ($1, $2, $3, $4, $5, $6)`,
-			job.id, job.status, payloadBytes, progressBytes, job.numRuns, job.lastRun,
+			`INSERT INTO system.jobs (id, status, num_runs, last_run, job_type) VALUES ($1, $2, $3, $4, $5)`,
+			job.id, job.status, job.numRuns, job.lastRun, payload.Type().String(),
+		)
+		sqlDB.Exec(t,
+			`INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`,
+			job.id, jobs.GetLegacyPayloadKey(), payloadBytes,
+		)
+		sqlDB.Exec(t,
+			`INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`,
+			job.id, jobs.GetLegacyProgressKey(), progressBytes,
 		)
 	}
 
@@ -1703,11 +1771,6 @@ func TestAdminAPIJobs(t *testing.T) {
 		{
 			"jobs?status=reverting",
 			append(append([]int64{}, revertingOnlyIds...), retryRevertingIds...),
-			[]int64{},
-		},
-		{
-			"jobs?status=retrying",
-			append(append([]int64{}, retryRunningIds...), retryRevertingIds...),
 			[]int64{},
 		},
 		{
@@ -1787,11 +1850,6 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
-	runningOnlyIds := []int64{1, 3, 5}
-	revertingOnlyIds := []int64{2, 4, 6}
-	retryRunningIds := []int64{7}
-	retryRevertingIds := []int64{8}
-
 	now := timeutil.Now()
 
 	encodedError := func(err error) *errors.EncodedError {
@@ -1861,40 +1919,22 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 			t.Fatal(err)
 		}
 		sqlDB.Exec(t,
-			`INSERT INTO system.jobs (id, status, payload, progress, num_runs, last_run) VALUES ($1, $2, $3, $4, $5, $6)`,
-			job.id, job.status, payloadBytes, progressBytes, job.numRuns, job.lastRun,
+			`INSERT INTO system.jobs (id, status, num_runs, last_run) VALUES ($1, $2, $3, $4)`,
+			job.id, job.status, job.numRuns, job.lastRun,
+		)
+		sqlDB.Exec(t,
+			`INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`,
+			job.id, jobs.GetLegacyPayloadKey(), payloadBytes,
+		)
+		sqlDB.Exec(t,
+			`INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`,
+			job.id, jobs.GetLegacyProgressKey(), progressBytes,
 		)
 	}
 
 	var res serverpb.JobsResponse
 	if err := getAdminJSONProto(s, "jobs", &res); err != nil {
 		t.Fatal(err)
-	}
-
-	// test that the select statement correctly converts expected jobs to retry-____ statuses
-	expectedStatuses := []struct {
-		status string
-		ids    []int64
-	}{
-		{"running", runningOnlyIds},
-		{"reverting", revertingOnlyIds},
-		{"retry-running", retryRunningIds},
-		{"retry-reverting", retryRevertingIds},
-	}
-	for _, expected := range expectedStatuses {
-		var jobsWithStatus []serverpb.JobResponse
-		for _, job := range res.Jobs {
-			for _, expectedID := range expected.ids {
-				if job.ID == expectedID {
-					jobsWithStatus = append(jobsWithStatus, job)
-				}
-			}
-		}
-
-		require.Len(t, jobsWithStatus, len(expected.ids))
-		for _, job := range jobsWithStatus {
-			assert.Equal(t, expected.status, job.Status)
-		}
 	}
 
 	// Trim down our result set to the jobs we injected.
@@ -2181,6 +2221,9 @@ func TestAdminAPIDataDistribution(t *testing.T) {
 	sqlDB.Exec(t, `CREATE DATABASE "sp'ec\ch""ars"`)
 	sqlDB.Exec(t, `CREATE TABLE "sp'ec\ch""ars"."more\spec'chars" (id INT PRIMARY KEY)`)
 
+	// Make sure secondary tenants don't cause the endpoint to error.
+	sqlDB.Exec(t, "CREATE TENANT 'app'")
+
 	// Verify that we see their replicas in the DataDistribution response, evenly spread
 	// across the test cluster's three nodes.
 
@@ -2415,6 +2458,7 @@ func TestStatsforSpanOnLocalMax(t *testing.T) {
 // `Status` requests.
 func TestEndpointTelemetryBasic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
@@ -2439,6 +2483,383 @@ func TestEndpointTelemetryBasic(t *testing.T) {
 	require.Equal(t, int32(1), telemetry.Read(getServerEndpointCounter(
 		"/cockroach.server.serverpb.Status/Statements",
 	)))
+}
+
+// checkNodeCheckResultReady is a helper function for validating that the
+// results of a decommission pre-check on a single node show it is ready.
+func checkNodeCheckResultReady(
+	t *testing.T,
+	nID roachpb.NodeID,
+	replicaCount int64,
+	checkResult serverpb.DecommissionPreCheckResponse_NodeCheckResult,
+) {
+	require.Equal(t, serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+		NodeID:                nID,
+		DecommissionReadiness: serverpb.DecommissionPreCheckResponse_READY,
+		LivenessStatus:        livenesspb.NodeLivenessStatus_LIVE,
+		ReplicaCount:          replicaCount,
+		CheckedRanges:         nil,
+	}, checkResult)
+}
+
+// checkRangeCheckResult is a helper function for validating a range error
+// returned as part of a decommission pre-check.
+func checkRangeCheckResult(
+	t *testing.T,
+	desc roachpb.RangeDescriptor,
+	checkResult serverpb.DecommissionPreCheckResponse_RangeCheckResult,
+	expectedAction string,
+	expectedErrSubstr string,
+	expectTraces bool,
+) {
+	passed := false
+	defer func() {
+		if !passed {
+			t.Logf("failed checking %s", desc)
+			if expectTraces {
+				var traceBuilder strings.Builder
+				for _, event := range checkResult.Events {
+					fmt.Fprintf(&traceBuilder, "\n(%s) %s", event.Time, event.Message)
+				}
+				t.Logf("trace events: %s", traceBuilder.String())
+			}
+		}
+	}()
+	require.Equalf(t, desc.RangeID, checkResult.RangeID, "expected r%d, got r%d with error: \"%s\"",
+		desc.RangeID, checkResult.RangeID, checkResult.Error)
+	require.Equalf(t, expectedAction, checkResult.Action, "r%d expected action %s, got action %s with error: \"%s\"",
+		desc.RangeID, expectedAction, checkResult.Action, checkResult.Error)
+	require.NotEmptyf(t, checkResult.Error, "r%d expected non-empty error", checkResult.RangeID)
+	if len(expectedErrSubstr) > 0 {
+		require.Containsf(t, checkResult.Error, expectedErrSubstr, "r%d expected error with \"%s\", got error: \"%s\"",
+			desc.RangeID, expectedErrSubstr, checkResult.Error)
+	}
+	if expectTraces {
+		require.NotEmptyf(t, checkResult.Events, "r%d expected traces, got none with error: \"%s\"",
+			checkResult.RangeID, checkResult.Error)
+	} else {
+		require.Emptyf(t, checkResult.Events, "r%d expected no traces with error: \"%s\"",
+			checkResult.RangeID, checkResult.Error)
+	}
+	passed = true
+}
+
+// TestDecommissionPreCheckBasicReadiness tests the basic functionality of the
+// DecommissionPreCheck endpoint.
+func TestDecommissionPreCheckBasicReadiness(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderRace(t) // can't handle 7-node clusters
+
+	ctx := context.Background()
+	tc := serverutils.StartNewTestCluster(t, 7, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual, // saves time
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	adminSrv := tc.Server(4)
+	conn, err := adminSrv.RPCContext().GRPCDialNode(
+		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
+	require.NoError(t, err)
+	adminClient := serverpb.NewAdminClient(conn)
+
+	resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
+		NodeIDs: []roachpb.NodeID{tc.Server(5).NodeID()},
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.CheckedNodes, 1)
+	checkNodeCheckResultReady(t, tc.Server(5).NodeID(), 0, resp.CheckedNodes[0])
+}
+
+// TestDecommissionPreCheckUnready tests the functionality of the
+// DecommissionPreCheck endpoint with some nodes not ready.
+func TestDecommissionPreCheckUnready(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderRace(t) // can't handle 7-node clusters
+
+	ctx := context.Background()
+	tc := serverutils.StartNewTestCluster(t, 7, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual, // saves time
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	// Add replicas to a node we will check.
+	// Scratch range should have RF=3, liveness range should have RF=5.
+	adminSrvIdx := 3
+	decommissioningSrvIdx := 5
+	scratchKey := tc.ScratchRange(t)
+	scratchDesc := tc.AddVotersOrFatal(t, scratchKey, tc.Target(decommissioningSrvIdx))
+	livenessDesc := tc.LookupRangeOrFatal(t, keys.NodeLivenessPrefix)
+	livenessDesc = tc.AddVotersOrFatal(t, livenessDesc.StartKey.AsRawKey(), tc.Target(decommissioningSrvIdx))
+
+	adminSrv := tc.Server(adminSrvIdx)
+	decommissioningSrv := tc.Server(decommissioningSrvIdx)
+	conn, err := adminSrv.RPCContext().GRPCDialNode(
+		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
+	require.NoError(t, err)
+	adminClient := serverpb.NewAdminClient(conn)
+
+	checkNodeReady := func(nID roachpb.NodeID, replicaCount int64, strict bool) {
+		resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
+			NodeIDs:         []roachpb.NodeID{nID},
+			StrictReadiness: strict,
+		})
+		require.NoError(t, err)
+		require.Len(t, resp.CheckedNodes, 1)
+		checkNodeCheckResultReady(t, nID, replicaCount, resp.CheckedNodes[0])
+	}
+
+	awaitDecommissioned := func(nID roachpb.NodeID) {
+		testutils.SucceedsSoon(t, func() error {
+			livenesses, err := adminSrv.NodeLiveness().(*liveness.NodeLiveness).GetLivenessesFromKV(ctx)
+			if err != nil {
+				return err
+			}
+			for _, nodeLiveness := range livenesses {
+				if nodeLiveness.NodeID == nID {
+					if nodeLiveness.Membership == livenesspb.MembershipStatus_DECOMMISSIONED {
+						return nil
+					} else {
+						return errors.Errorf("n%d has membership: %s", nID, nodeLiveness.Membership)
+					}
+				}
+			}
+			return errors.Errorf("n%d liveness not found", nID)
+		})
+	}
+
+	checkAndDecommission := func(srvIdx int, replicaCount int64, strict bool) {
+		nID := tc.Server(srvIdx).NodeID()
+		checkNodeReady(nID, replicaCount, strict)
+		require.NoError(t, adminSrv.Decommission(
+			ctx, livenesspb.MembershipStatus_DECOMMISSIONING, []roachpb.NodeID{nID}))
+		require.NoError(t, adminSrv.Decommission(
+			ctx, livenesspb.MembershipStatus_DECOMMISSIONED, []roachpb.NodeID{nID}))
+		awaitDecommissioned(nID)
+	}
+
+	// In non-strict mode, this decommission appears "ready". This is because the
+	// ranges with replicas on decommissioningSrv have priority action "AddVoter",
+	// and they have valid targets.
+	checkNodeReady(decommissioningSrv.NodeID(), 2, false)
+
+	// In strict mode, we would expect the readiness check to fail.
+	resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
+		NodeIDs:          []roachpb.NodeID{decommissioningSrv.NodeID()},
+		NumReplicaReport: 50,
+		StrictReadiness:  true,
+		CollectTraces:    true,
+	})
+	require.NoError(t, err)
+	nodeCheckResult := resp.CheckedNodes[0]
+	require.Equalf(t, serverpb.DecommissionPreCheckResponse_ALLOCATION_ERRORS, nodeCheckResult.DecommissionReadiness,
+		"expected n%d to have allocation errors, got %s", nodeCheckResult.NodeID, nodeCheckResult.DecommissionReadiness)
+	require.Len(t, nodeCheckResult.CheckedRanges, 2)
+	checkRangeCheckResult(t, livenessDesc, nodeCheckResult.CheckedRanges[0],
+		"add voter", "needs repair beyond replacing/removing", true,
+	)
+	checkRangeCheckResult(t, scratchDesc, nodeCheckResult.CheckedRanges[1],
+		"add voter", "needs repair beyond replacing/removing", true,
+	)
+
+	// Add replicas to ensure we have the correct number of replicas for each range.
+	scratchDesc = tc.AddVotersOrFatal(t, scratchKey, tc.Target(adminSrvIdx))
+	livenessDesc = tc.AddVotersOrFatal(t, livenessDesc.StartKey.AsRawKey(),
+		tc.Target(adminSrvIdx), tc.Target(4), tc.Target(6),
+	)
+	require.True(t, hasReplicaOnServers(tc, &scratchDesc, 0, adminSrvIdx, decommissioningSrvIdx))
+	require.True(t, hasReplicaOnServers(tc, &livenessDesc, 0, adminSrvIdx, decommissioningSrvIdx, 4, 6))
+	require.Len(t, scratchDesc.InternalReplicas, 3)
+	require.Len(t, livenessDesc.InternalReplicas, 5)
+
+	// Decommissioning pre-check should pass on decommissioningSrv in both strict
+	// and non-strict modes, as each range can find valid upreplication targets.
+	checkNodeReady(decommissioningSrv.NodeID(), 2, true)
+
+	// Check and decommission empty nodes, decreasing to a 5-node cluster.
+	checkAndDecommission(1, 0, true)
+	checkAndDecommission(2, 0, true)
+
+	// Check that we can still decommission.
+	// Below 5 nodes, system ranges will have an effective RF=3.
+	checkNodeReady(decommissioningSrv.NodeID(), 2, true)
+
+	// Check that we can decommission the nodes with liveness replicas only.
+	checkAndDecommission(4, 1, true)
+	checkAndDecommission(6, 1, true)
+
+	// Check range descriptors are as expected.
+	scratchDesc = tc.LookupRangeOrFatal(t, scratchDesc.StartKey.AsRawKey())
+	livenessDesc = tc.LookupRangeOrFatal(t, livenessDesc.StartKey.AsRawKey())
+	require.True(t, hasReplicaOnServers(tc, &scratchDesc, 0, adminSrvIdx, decommissioningSrvIdx))
+	require.True(t, hasReplicaOnServers(tc, &livenessDesc, 0, adminSrvIdx, decommissioningSrvIdx, 4, 6))
+	require.Len(t, scratchDesc.InternalReplicas, 3)
+	require.Len(t, livenessDesc.InternalReplicas, 5)
+
+	// Cleanup orphaned liveness replicas and check.
+	livenessDesc = tc.RemoveVotersOrFatal(t, livenessDesc.StartKey.AsRawKey(), tc.Target(4), tc.Target(6))
+	require.True(t, hasReplicaOnServers(tc, &livenessDesc, 0, adminSrvIdx, decommissioningSrvIdx))
+	require.Len(t, livenessDesc.InternalReplicas, 3)
+
+	// Validate that the node is not ready to decommission.
+	resp, err = adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
+		NodeIDs:          []roachpb.NodeID{decommissioningSrv.NodeID()},
+		NumReplicaReport: 1, // Test that we limit errors.
+		StrictReadiness:  true,
+	})
+	require.NoError(t, err)
+	nodeCheckResult = resp.CheckedNodes[0]
+	require.Equalf(t, serverpb.DecommissionPreCheckResponse_ALLOCATION_ERRORS, nodeCheckResult.DecommissionReadiness,
+		"expected n%d to have allocation errors, got %s", nodeCheckResult.NodeID, nodeCheckResult.DecommissionReadiness)
+	require.Equal(t, int64(2), nodeCheckResult.ReplicaCount)
+	require.Len(t, nodeCheckResult.CheckedRanges, 1)
+	checkRangeCheckResult(t, livenessDesc, nodeCheckResult.CheckedRanges[0],
+		"replace decommissioning voter",
+		"0 of 2 live stores are able to take a new replica for the range "+
+			"(2 already have a voter, 0 already have a non-voter); "+
+			"likely not enough nodes in cluster",
+		false,
+	)
+}
+
+// TestDecommissionPreCheckMultiple tests the functionality of the
+// DecommissionPreCheck endpoint with multiple nodes.
+func TestDecommissionPreCheckMultiple(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := serverutils.StartNewTestCluster(t, 5, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual, // saves time
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	// TODO(sarkesian): Once #95909 is merged, test checks on a 3-node decommission.
+	// e.g. Test both server idxs 3,4 and 2,3,4 (which should not pass checks).
+	adminSrvIdx := 1
+	decommissioningSrvIdxs := []int{3, 4}
+	decommissioningSrvNodeIDs := make([]roachpb.NodeID, len(decommissioningSrvIdxs))
+	for i, srvIdx := range decommissioningSrvIdxs {
+		decommissioningSrvNodeIDs[i] = tc.Server(srvIdx).NodeID()
+	}
+
+	// Add replicas to nodes we will check.
+	// Scratch range should have RF=3, liveness range should have RF=5.
+	rangeDescs := []roachpb.RangeDescriptor{
+		tc.LookupRangeOrFatal(t, keys.NodeLivenessPrefix),
+		tc.LookupRangeOrFatal(t, tc.ScratchRange(t)),
+	}
+	rangeDescSrvIdxs := [][]int{
+		{0, 1, 2, 3, 4},
+		{0, 3, 4},
+	}
+	rangeDescSrvTargets := make([][]roachpb.ReplicationTarget, len(rangeDescs))
+	for i, srvIdxs := range rangeDescSrvIdxs {
+		for _, srvIdx := range srvIdxs {
+			if srvIdx != 0 {
+				rangeDescSrvTargets[i] = append(rangeDescSrvTargets[i], tc.Target(srvIdx))
+			}
+		}
+	}
+
+	for i, rangeDesc := range rangeDescs {
+		rangeDescs[i] = tc.AddVotersOrFatal(t, rangeDesc.StartKey.AsRawKey(), rangeDescSrvTargets[i]...)
+	}
+
+	for i, rangeDesc := range rangeDescs {
+		require.True(t, hasReplicaOnServers(tc, &rangeDesc, rangeDescSrvIdxs[i]...))
+		require.Len(t, rangeDesc.InternalReplicas, len(rangeDescSrvIdxs[i]))
+	}
+
+	adminSrv := tc.Server(adminSrvIdx)
+	conn, err := adminSrv.RPCContext().GRPCDialNode(
+		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
+	require.NoError(t, err)
+	adminClient := serverpb.NewAdminClient(conn)
+
+	// We expect to be able to decommission the targeted nodes simultaneously.
+	resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
+		NodeIDs:          decommissioningSrvNodeIDs,
+		NumReplicaReport: 50,
+		StrictReadiness:  true,
+		CollectTraces:    true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.CheckedNodes, len(decommissioningSrvIdxs))
+	for i, nID := range decommissioningSrvNodeIDs {
+		checkNodeCheckResultReady(t, nID, int64(len(rangeDescs)), resp.CheckedNodes[i])
+	}
+}
+
+// TestDecommissionPreCheckInvalidNode tests the functionality of the
+// DecommissionPreCheck endpoint where some nodes are invalid.
+func TestDecommissionPreCheckInvalidNode(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := serverutils.StartNewTestCluster(t, 5, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual, // saves time
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	adminSrvIdx := 1
+	validDecommissioningNodeID := roachpb.NodeID(5)
+	invalidDecommissioningNodeID := roachpb.NodeID(34)
+	decommissioningNodeIDs := []roachpb.NodeID{validDecommissioningNodeID, invalidDecommissioningNodeID}
+
+	// Add replicas to nodes we will check.
+	// Scratch range should have RF=3, liveness range should have RF=5.
+	rangeDescs := []roachpb.RangeDescriptor{
+		tc.LookupRangeOrFatal(t, keys.NodeLivenessPrefix),
+		tc.LookupRangeOrFatal(t, tc.ScratchRange(t)),
+	}
+	rangeDescSrvIdxs := [][]int{
+		{0, 1, 2, 3, 4},
+		{0, 3, 4},
+	}
+	rangeDescSrvTargets := make([][]roachpb.ReplicationTarget, len(rangeDescs))
+	for i, srvIdxs := range rangeDescSrvIdxs {
+		for _, srvIdx := range srvIdxs {
+			if srvIdx != 0 {
+				rangeDescSrvTargets[i] = append(rangeDescSrvTargets[i], tc.Target(srvIdx))
+			}
+		}
+	}
+
+	for i, rangeDesc := range rangeDescs {
+		rangeDescs[i] = tc.AddVotersOrFatal(t, rangeDesc.StartKey.AsRawKey(), rangeDescSrvTargets[i]...)
+	}
+
+	for i, rangeDesc := range rangeDescs {
+		require.True(t, hasReplicaOnServers(tc, &rangeDesc, rangeDescSrvIdxs[i]...))
+		require.Len(t, rangeDesc.InternalReplicas, len(rangeDescSrvIdxs[i]))
+	}
+
+	adminSrv := tc.Server(adminSrvIdx)
+	conn, err := adminSrv.RPCContext().GRPCDialNode(
+		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
+	require.NoError(t, err)
+	adminClient := serverpb.NewAdminClient(conn)
+
+	// We expect the pre-check to fail as some node IDs are invalid.
+	resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
+		NodeIDs:          decommissioningNodeIDs,
+		NumReplicaReport: 50,
+		StrictReadiness:  true,
+		CollectTraces:    true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.CheckedNodes, len(decommissioningNodeIDs))
+	checkNodeCheckResultReady(t, validDecommissioningNodeID, int64(len(rangeDescs)), resp.CheckedNodes[0])
+	require.Equal(t, serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+		NodeID:                invalidDecommissioningNodeID,
+		DecommissionReadiness: serverpb.DecommissionPreCheckResponse_UNKNOWN,
+		LivenessStatus:        livenesspb.NodeLivenessStatus_UNKNOWN,
+		ReplicaCount:          0,
+		CheckedRanges:         nil,
+	}, resp.CheckedNodes[1])
 }
 
 func TestDecommissionSelf(t *testing.T) {
@@ -2588,6 +3009,8 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderRace(t, "test uses timeouts, and race builds cause the timeouts to be exceeded")
+
 	ctx := context.Background()
 	tc := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
@@ -2614,11 +3037,19 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 		require.NoError(t, srv.Decommission(ctx, status, []roachpb.NodeID{decomSrv.NodeID()}))
 	}
 
-	require.Eventually(t, func() bool {
-		_, err := decomSrv.DB().Scan(ctx, keys.MinKey, keys.MaxKey, 0)
+	testutils.SucceedsWithin(t, func() error {
+		timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		_, err := decomSrv.DB().Scan(timeoutCtx, keys.MinKey, keys.MaxKey, 0)
+		if err == nil {
+			return errors.New("expected error")
+		}
 		s, ok := status.FromError(errors.UnwrapAll(err))
-		return ok && s.Code() == codes.PermissionDenied
-	}, 10*time.Second, 100*time.Millisecond, "timed out waiting for server to lose cluster access")
+		if ok && s.Code() == codes.PermissionDenied {
+			return nil
+		}
+		return err
+	}, 10*time.Second)
 
 	// Set up an admin client.
 	//lint:ignore SA1019 grpc.WithInsecure is deprecated
@@ -2636,94 +3067,94 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 	testcases := []struct {
 		name       string
 		expectCode codes.Code
-		op         func(serverpb.AdminClient) error
+		op         func(context.Context, serverpb.AdminClient) error
 	}{
-		{"Cluster", codes.OK, func(c serverpb.AdminClient) error {
+		{"Cluster", codes.OK, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Cluster(ctx, &serverpb.ClusterRequest{})
 			return err
 		}},
-		{"Databases", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Databases", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Databases(ctx, &serverpb.DatabasesRequest{})
 			return err
 		}},
-		{"DatabaseDetails", codes.Internal, func(c serverpb.AdminClient) error {
+		{"DatabaseDetails", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.DatabaseDetails(ctx, &serverpb.DatabaseDetailsRequest{Database: "foo"})
 			return err
 		}},
-		{"DataDistribution", codes.Internal, func(c serverpb.AdminClient) error {
+		{"DataDistribution", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.DataDistribution(ctx, &serverpb.DataDistributionRequest{})
 			return err
 		}},
-		{"Decommission", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Decommission", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Decommission(ctx, &serverpb.DecommissionRequest{
 				NodeIDs:          []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 				TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONED,
 			})
 			return err
 		}},
-		{"DecommissionStatus", codes.Internal, func(c serverpb.AdminClient) error {
+		{"DecommissionStatus", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.DecommissionStatus(ctx, &serverpb.DecommissionStatusRequest{
 				NodeIDs: []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 			})
 			return err
 		}},
-		{"EnqueueRange", codes.Internal, func(c serverpb.AdminClient) error {
+		{"EnqueueRange", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.EnqueueRange(ctx, &serverpb.EnqueueRangeRequest{
 				RangeID: scratchRange.RangeID,
 				Queue:   "replicaGC",
 			})
 			return err
 		}},
-		{"Events", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Events", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Events(ctx, &serverpb.EventsRequest{})
 			return err
 		}},
-		{"Health", codes.OK, func(c serverpb.AdminClient) error {
+		{"Health", codes.OK, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Health(ctx, &serverpb.HealthRequest{})
 			return err
 		}},
-		{"Jobs", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Jobs", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Jobs(ctx, &serverpb.JobsRequest{})
 			return err
 		}},
-		{"Liveness", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Liveness", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Liveness(ctx, &serverpb.LivenessRequest{})
 			return err
 		}},
-		{"Locations", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Locations", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Locations(ctx, &serverpb.LocationsRequest{})
 			return err
 		}},
-		{"NonTableStats", codes.Internal, func(c serverpb.AdminClient) error {
+		{"NonTableStats", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.NonTableStats(ctx, &serverpb.NonTableStatsRequest{})
 			return err
 		}},
-		{"QueryPlan", codes.OK, func(c serverpb.AdminClient) error {
+		{"QueryPlan", codes.OK, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.QueryPlan(ctx, &serverpb.QueryPlanRequest{Query: "SELECT 1"})
 			return err
 		}},
-		{"RangeLog", codes.Internal, func(c serverpb.AdminClient) error {
+		{"RangeLog", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.RangeLog(ctx, &serverpb.RangeLogRequest{})
 			return err
 		}},
-		{"Settings", codes.OK, func(c serverpb.AdminClient) error {
+		{"Settings", codes.OK, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Settings(ctx, &serverpb.SettingsRequest{})
 			return err
 		}},
-		{"TableStats", codes.Internal, func(c serverpb.AdminClient) error {
+		{"TableStats", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.TableStats(ctx, &serverpb.TableStatsRequest{Database: "foo", Table: "bar"})
 			return err
 		}},
-		{"TableDetails", codes.Internal, func(c serverpb.AdminClient) error {
+		{"TableDetails", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.TableDetails(ctx, &serverpb.TableDetailsRequest{Database: "foo", Table: "bar"})
 			return err
 		}},
-		{"Users", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Users", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Users(ctx, &serverpb.UsersRequest{})
 			return err
 		}},
 		// We drain at the end, since it may evict us.
-		{"Drain", codes.Unknown, func(c serverpb.AdminClient) error {
+		{"Drain", codes.Unknown, func(ctx context.Context, c serverpb.AdminClient) error {
 			stream, err := c.Drain(ctx, &serverpb.DrainRequest{DoDrain: true})
 			if err != nil {
 				return err
@@ -2736,20 +3167,27 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 	for _, tc := range testcases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			var err error
-			require.Eventually(t, func() bool {
-				err = tc.op(adminClient)
+			testutils.SucceedsWithin(t, func() error {
+				timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				err := tc.op(timeoutCtx, adminClient)
 				if tc.expectCode == codes.OK {
 					require.NoError(t, err)
-					return true
+					return nil
+				}
+				if err == nil {
+					// This will cause SuccessWithin to retry.
+					return errors.New("expected error, got no error")
 				}
 				s, ok := status.FromError(errors.UnwrapAll(err))
-				if s == nil || !ok {
-					return false
+				if !ok {
+					// Not a gRPC error.
+					// This will cause SuccessWithin to retry.
+					return err
 				}
 				require.Equal(t, tc.expectCode, s.Code())
-				return true
-			}, 10*time.Second, 100*time.Millisecond, "timed out waiting for gRPC error, got %s", err)
+				return nil
+			}, 10*time.Second)
 		})
 	}
 }
@@ -2777,6 +3215,17 @@ func TestAdminPrivilegeChecker(t *testing.T) {
 	sqlDB.Exec(t, "ALTER ROLE withvaandredacted WITH VIEWACTIVITY")
 	sqlDB.Exec(t, "ALTER ROLE withvaandredacted WITH VIEWACTIVITYREDACTED")
 	sqlDB.Exec(t, "CREATE USER withoutprivs")
+	sqlDB.Exec(t, "CREATE USER withvaglobalprivilege")
+	sqlDB.Exec(t, "GRANT SYSTEM VIEWACTIVITY TO withvaglobalprivilege")
+	sqlDB.Exec(t, "CREATE USER withvaredactedglobalprivilege")
+	sqlDB.Exec(t, "GRANT SYSTEM VIEWACTIVITYREDACTED TO withvaredactedglobalprivilege")
+	sqlDB.Exec(t, "CREATE USER withvaandredactedglobalprivilege")
+	sqlDB.Exec(t, "GRANT SYSTEM VIEWACTIVITY TO withvaandredactedglobalprivilege")
+	sqlDB.Exec(t, "GRANT SYSTEM VIEWACTIVITYREDACTED TO withvaandredactedglobalprivilege")
+	sqlDB.Exec(t, "CREATE USER withviewclustermetadata")
+	sqlDB.Exec(t, "GRANT SYSTEM VIEWCLUSTERMETADATA TO withviewclustermetadata")
+	sqlDB.Exec(t, "CREATE USER withviewdebug")
+	sqlDB.Exec(t, "GRANT SYSTEM VIEWDEBUG TO withviewdebug")
 
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 
@@ -2810,6 +3259,11 @@ func TestAdminPrivilegeChecker(t *testing.T) {
 	require.NoError(t, err)
 	withoutPrivs, err := username.MakeSQLUsernameFromPreNormalizedStringChecked("withoutprivs")
 	require.NoError(t, err)
+	withVaGlobalPrivilege := username.MakeSQLUsernameFromPreNormalizedString("withvaglobalprivilege")
+	withVaRedactedGlobalPrivilege := username.MakeSQLUsernameFromPreNormalizedString("withvaredactedglobalprivilege")
+	withVaAndRedactedGlobalPrivilege := username.MakeSQLUsernameFromPreNormalizedString("withvaandredactedglobalprivilege")
+	withviewclustermetadata := username.MakeSQLUsernameFromPreNormalizedString("withviewclustermetadata")
+	withViewDebug := username.MakeSQLUsernameFromPreNormalizedString("withviewdebug")
 
 	tests := []struct {
 		name            string
@@ -2821,6 +3275,7 @@ func TestAdminPrivilegeChecker(t *testing.T) {
 			underTest.requireViewActivityPermission,
 			map[username.SQLUsername]bool{
 				withAdmin: false, withVa: false, withVaRedacted: true, withVaAndRedacted: false, withoutPrivs: true,
+				withVaGlobalPrivilege: false, withVaRedactedGlobalPrivilege: true, withVaAndRedactedGlobalPrivilege: false,
 			},
 		},
 		{
@@ -2828,6 +3283,7 @@ func TestAdminPrivilegeChecker(t *testing.T) {
 			underTest.requireViewActivityOrViewActivityRedactedPermission,
 			map[username.SQLUsername]bool{
 				withAdmin: false, withVa: false, withVaRedacted: false, withVaAndRedacted: false, withoutPrivs: true,
+				withVaGlobalPrivilege: false, withVaRedactedGlobalPrivilege: false, withVaAndRedactedGlobalPrivilege: false,
 			},
 		},
 		{
@@ -2835,56 +3291,25 @@ func TestAdminPrivilegeChecker(t *testing.T) {
 			underTest.requireViewActivityAndNoViewActivityRedactedPermission,
 			map[username.SQLUsername]bool{
 				withAdmin: false, withVa: false, withVaRedacted: true, withVaAndRedacted: true, withoutPrivs: true,
+				withVaGlobalPrivilege: false, withVaRedactedGlobalPrivilege: true, withVaAndRedactedGlobalPrivilege: true,
 			},
 		},
 		{
 			"requireViewClusterMetadataPermission",
 			underTest.requireViewClusterMetadataPermission,
 			map[username.SQLUsername]bool{
-				withAdmin: false, withoutPrivs: true,
+				withAdmin: false, withoutPrivs: true, withviewclustermetadata: false,
 			},
 		},
 		{
 			"requireViewDebugPermission",
 			underTest.requireViewDebugPermission,
 			map[username.SQLUsername]bool{
-				withAdmin: false, withoutPrivs: true,
+				withAdmin: false, withoutPrivs: true, withViewDebug: false,
 			},
 		},
 	}
-	// test system privileges if valid version
-	if s.ClusterSettings().Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-		sqlDB.Exec(t, "CREATE USER withvaglobalprivilege")
-		sqlDB.Exec(t, "GRANT SYSTEM VIEWACTIVITY TO withvaglobalprivilege")
-		sqlDB.Exec(t, "CREATE USER withvaredactedglobalprivilege")
-		sqlDB.Exec(t, "GRANT SYSTEM VIEWACTIVITYREDACTED TO withvaredactedglobalprivilege")
-		sqlDB.Exec(t, "CREATE USER withvaandredactedglobalprivilege")
-		sqlDB.Exec(t, "GRANT SYSTEM VIEWACTIVITY TO withvaandredactedglobalprivilege")
-		sqlDB.Exec(t, "GRANT SYSTEM VIEWACTIVITYREDACTED TO withvaandredactedglobalprivilege")
-		sqlDB.Exec(t, "CREATE USER withviewclustermetadata")
-		sqlDB.Exec(t, "GRANT SYSTEM VIEWCLUSTERMETADATA TO withviewclustermetadata")
-		sqlDB.Exec(t, "CREATE USER withviewdebug")
-		sqlDB.Exec(t, "GRANT SYSTEM VIEWDEBUG TO withviewdebug")
 
-		withVaGlobalPrivilege := username.MakeSQLUsernameFromPreNormalizedString("withvaglobalprivilege")
-		withVaRedactedGlobalPrivilege := username.MakeSQLUsernameFromPreNormalizedString("withvaredactedglobalprivilege")
-		withVaAndRedactedGlobalPrivilege := username.MakeSQLUsernameFromPreNormalizedString("withvaandredactedglobalprivilege")
-		withviewclustermetadata := username.MakeSQLUsernameFromPreNormalizedString("withviewclustermetadata")
-		withViewDebug := username.MakeSQLUsernameFromPreNormalizedString("withviewdebug")
-
-		tests[0].usernameWantErr[withVaGlobalPrivilege] = false
-		tests[1].usernameWantErr[withVaGlobalPrivilege] = false
-		tests[2].usernameWantErr[withVaGlobalPrivilege] = false
-		tests[0].usernameWantErr[withVaRedactedGlobalPrivilege] = true
-		tests[1].usernameWantErr[withVaRedactedGlobalPrivilege] = false
-		tests[2].usernameWantErr[withVaRedactedGlobalPrivilege] = true
-		tests[0].usernameWantErr[withVaAndRedactedGlobalPrivilege] = false
-		tests[1].usernameWantErr[withVaAndRedactedGlobalPrivilege] = false
-		tests[2].usernameWantErr[withVaAndRedactedGlobalPrivilege] = true
-		tests[3].usernameWantErr[withviewclustermetadata] = false
-		tests[4].usernameWantErr[withViewDebug] = false
-
-	}
 	for _, tt := range tests {
 		for userName, wantErr := range tt.usernameWantErr {
 			t.Run(fmt.Sprintf("%s-%s", tt.name, userName), func(t *testing.T) {
@@ -2898,6 +3323,22 @@ func TestAdminPrivilegeChecker(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestServerError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	pgError := pgerror.New(pgcode.OutOfMemory, "TestServerError.OutOfMemory")
+	err := serverError(ctx, pgError)
+	require.Equal(t, "rpc error: code = Internal desc = An internal server error has occurred. Please check your CockroachDB logs for more details. Error Code: 53200", err.Error())
+
+	err = serverError(ctx, err)
+	require.Equal(t, "rpc error: code = Internal desc = An internal server error has occurred. Please check your CockroachDB logs for more details. Error Code: 53200", err.Error())
+
+	err = fmt.Errorf("random error that is not pgerror or grpcstatus")
+	err = serverError(ctx, err)
+	require.Equal(t, "rpc error: code = Internal desc = An internal server error has occurred. Please check your CockroachDB logs for more details.", err.Error())
 }
 
 func TestDatabaseAndTableIndexRecommendations(t *testing.T) {

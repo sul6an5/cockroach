@@ -11,7 +11,7 @@
 syntax = "proto2";
 
 package cockroach.sql.catalog.catpb;
-option go_package = "catpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb";
 
 import "gogoproto/gogo.proto";
 
@@ -34,9 +34,10 @@ message Function {
   enum Language {
     UNKNOWN_LANGUAGE = 0;
     SQL = 1;
+    PLPGSQL = 2;
   }
 
-  message Arg {
+  message Param {
     enum Class {
       UNKNOWN_ARG_CLASS = 0;
       IN = 1;
@@ -45,4 +46,26 @@ message Function {
       VARIADIC = 4;
     }
   }
+}
+
+// These wrappers are for the convenience of referencing the enum types from a
+// proto3 definition.
+message FunctionVolatility {
+  option (gogoproto.equal) = true;
+  optional Function.Volatility volatility = 1 [(gogoproto.nullable) = false];
+}
+
+message FunctionNullInputBehavior {
+  option (gogoproto.equal) = true;
+  optional Function.NullInputBehavior nullInputBehavior = 1 [(gogoproto.nullable) = false];
+}
+
+message FunctionLanguage {
+  option (gogoproto.equal) = true;
+  optional Function.Language lang = 1 [(gogoproto.nullable) = false];
+}
+
+message FunctionParamClass {
+  option (gogoproto.equal) = true;
+  optional Function.Param.Class class = 1 [(gogoproto.nullable) = false];
 }

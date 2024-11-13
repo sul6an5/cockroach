@@ -12,6 +12,7 @@ package colexec
 
 import (
 	"context"
+	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
@@ -20,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -56,6 +58,7 @@ type Columnarizer struct {
 	colexecop.NonExplainable
 
 	mode              columnarizerMode
+	initialized       bool
 	helper            colmem.SetAccountingHelper
 	metadataAllocator *colmem.Allocator
 	input             execinfra.RowSource
@@ -78,8 +81,9 @@ type Columnarizer struct {
 	removedFromFlow bool
 }
 
-var _ colexecop.Operator = &Columnarizer{}
+var _ colexecop.DrainableClosableOperator = &Columnarizer{}
 var _ colexecop.VectorizedStatsCollector = &Columnarizer{}
+var _ execreleasable.Releasable = &Columnarizer{}
 
 // NewBufferingColumnarizer returns a new Columnarizer that will be buffering up
 // rows before emitting them as output batches.
@@ -121,6 +125,12 @@ func NewStreamingColumnarizer(
 	return newColumnarizer(batchAllocator, metadataAllocator, flowCtx, processorID, input, columnarizerStreamingMode)
 }
 
+var columnarizerPool = sync.Pool{
+	New: func() interface{} {
+		return &Columnarizer{}
+	},
+}
+
 // newColumnarizer returns a new Columnarizer.
 func newColumnarizer(
 	batchAllocator *colmem.Allocator,
@@ -135,50 +145,39 @@ func newColumnarizer(
 	default:
 		colexecerror.InternalError(errors.AssertionFailedf("unexpected columnarizerMode %d", mode))
 	}
-	c := &Columnarizer{
-		metadataAllocator: metadataAllocator,
-		input:             input,
-		mode:              mode,
+	c := columnarizerPool.Get().(*Columnarizer)
+	*c = Columnarizer{
+		ProcessorBaseNoHelper: c.ProcessorBaseNoHelper,
+		metadataAllocator:     metadataAllocator,
+		input:                 input,
+		mode:                  mode,
 	}
 	c.ProcessorBaseNoHelper.Init(
 		nil, /* self */
 		flowCtx,
-		// Similar to the materializer, the columnarizer will update the eval
-		// context when closed, so we give it a copy of the eval context to
-		// preserve the "global" eval context from being mutated. In practice,
-		// the columnarizer is closed only when DrainMeta() is called which
-		// occurs at the very end of the execution, yet we choose to be
-		// defensive here.
+		// The columnarizer will update the eval context when closed, so we give
+		// it a copy of the eval context to preserve the "global" eval context
+		// from being mutated.
 		flowCtx.NewEvalCtx(),
 		processorID,
-		nil, /* output */
 		execinfra.ProcStateOpts{
-			InputsToDrain: []execinfra.RowSource{input},
-			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
-				// Close will call InternalClose(). Note that we don't return
-				// any trailing metadata here because the columnarizers
-				// propagate it in DrainMeta.
-				if err := c.Close(c.Ctx); buildutil.CrdbTestBuild && err != nil {
-					// Close never returns an error.
-					colexecerror.InternalError(errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error from Columnarizer.Close"))
-				}
-				return nil
-			}},
+			// We append input to inputs to drain below in order to reuse the same
+			// underlying slice from the pooled columnarizer.
+			TrailingMetaCallback: c.trailingMetaCallback,
+		},
 	)
+	c.AddInputToDrain(input)
 	c.typs = c.input.OutputTypes()
-	c.helper.Init(batchAllocator, execinfra.GetWorkMemLimit(flowCtx), c.typs)
+	c.helper.Init(batchAllocator, execinfra.GetWorkMemLimit(flowCtx), c.typs, false /* alwaysReallocate */)
 	return c
 }
 
 // Init is part of the colexecop.Operator interface.
 func (c *Columnarizer) Init(ctx context.Context) {
-	if c.removedFromFlow {
+	if c.removedFromFlow || c.initialized {
 		return
 	}
-	if c.Ctx != nil {
-		// Init has already been called.
-		return
-	}
+	c.initialized = true
 	c.accumulatedMeta = make([]execinfrapb.ProducerMetadata, 0, 1)
 	ctx = c.StartInternal(ctx, "columnarizer" /* name */)
 	c.input.Start(ctx)
@@ -210,6 +209,9 @@ func (c *Columnarizer) GetStats() *execinfrapb.ComponentStats {
 		return &execinfrapb.ComponentStats{Component: componentID}
 	}
 	s := c.getWrappedExecStats()
+	if s == nil {
+		return &execinfrapb.ComponentStats{Component: componentID}
+	}
 	s.Component = componentID
 	return s
 }
@@ -256,8 +258,6 @@ func (c *Columnarizer) Next() coldata.Batch {
 	return c.batch
 }
 
-var _ colexecop.DrainableClosableOperator = &Columnarizer{}
-
 // DrainMeta is part of the colexecop.MetadataSource interface.
 func (c *Columnarizer) DrainMeta() []execinfrapb.ProducerMetadata {
 	if c.removedFromFlow {
@@ -273,7 +273,7 @@ func (c *Columnarizer) DrainMeta() []execinfrapb.ProducerMetadata {
 	// When this method returns, we no longer will have the reference to the
 	// metadata, so we can release all memory from the metadata allocator.
 	defer c.metadataAllocator.ReleaseAll()
-	if c.Ctx == nil {
+	if !c.initialized {
 		// The columnarizer wasn't initialized, so the wrapped processors might
 		// not have been started leaving them in an unsafe to drain state, so
 		// we skip the draining. Mostly likely this happened because a panic was
@@ -299,6 +299,23 @@ func (c *Columnarizer) Close(context.Context) error {
 	c.helper.Release()
 	c.InternalClose()
 	return nil
+}
+
+func (c *Columnarizer) trailingMetaCallback() []execinfrapb.ProducerMetadata {
+	// Close will call InternalClose(). Note that we don't return any trailing
+	// metadata here because the columnarizers propagate it in DrainMeta.
+	if err := c.Close(c.Ctx()); buildutil.CrdbTestBuild && err != nil {
+		// Close never returns an error.
+		colexecerror.InternalError(errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error from Columnarizer.Close"))
+	}
+	return nil
+}
+
+// Release releases this Columnarizer back to the pool.
+func (c *Columnarizer) Release() {
+	c.ProcessorBaseNoHelper.Reset()
+	*c = Columnarizer{ProcessorBaseNoHelper: c.ProcessorBaseNoHelper}
+	columnarizerPool.Put(c)
 }
 
 // ChildCount is part of the execopnode.OpNode interface.

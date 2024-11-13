@@ -10,7 +10,7 @@
 
 syntax = "proto2";
 package cockroach.sql.sqlbase;
-option go_package = "catpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb";
 
 import "gogoproto/gogo.proto";
 
@@ -20,8 +20,8 @@ message UserPrivileges {
   optional string user_proto = 1 [(gogoproto.nullable) = false,
                                   (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security/username.SQLUsernameProto"];
   // privileges is a bitfield of 1<<Privilege values.
-  optional uint32 privileges = 2 [(gogoproto.nullable) = false];
-  optional uint32 with_grant_option = 3 [(gogoproto.nullable) = false];
+  optional uint64 privileges = 2 [(gogoproto.nullable) = false];
+  optional uint64 with_grant_option = 3 [(gogoproto.nullable) = false];
 }
 
 // PrivilegeDescriptor describes a list of users and attached

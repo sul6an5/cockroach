@@ -26,6 +26,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 )
@@ -139,6 +141,20 @@ func TestInfo(t *testing.T) {
 	}
 	if !contains("test", t) {
 		t.Error("Info failed")
+	}
+}
+
+// Test that error hints are included.
+func TestUnstructuredEntryEmbedsErrorHints(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer ScopeWithoutShowLogs(t).Close(t)
+
+	defer capture()()
+	err := errors.WithHint(errors.New("hello"), "world")
+	Infof(context.Background(), "hello %v", err)
+	t.Logf("log contents:\n%s", contents())
+	if !contains("HINT: "+startRedactable+"world"+endRedactable, t) {
+		t.Error("hint failed")
 	}
 }
 
@@ -759,11 +775,11 @@ func TestLogEntryPropagation(t *testing.T) {
 func BenchmarkLogEntry_String(b *testing.B) {
 	ctxtags := logtags.AddTag(context.Background(), "foo", "bar")
 	entry := &logEntry{
-		idPayload: idPayload{
-			clusterID:     "fooo",
-			nodeID:        "10",
-			tenantID:      "12",
-			sqlInstanceID: "9",
+		IDPayload: serverident.IDPayload{
+			ClusterID:        "fooo",
+			NodeID:           "10",
+			TenantIDInternal: "12",
+			SQLInstanceID:    "9",
 		},
 		ts:         timeutil.Now().UnixNano(),
 		header:     false,

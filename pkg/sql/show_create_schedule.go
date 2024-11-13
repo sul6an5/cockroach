@@ -17,7 +17,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -38,7 +37,7 @@ const (
 )
 
 func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.ScheduledJob, error) {
-	env := JobSchedulerEnv(params.ExecCfg())
+	env := JobSchedulerEnv(params.ExecCfg().JobsKnobs())
 	var schedules []*jobs.ScheduledJob
 	var rows []tree.Datums
 	var cols colinfo.ResultColumns
@@ -49,10 +48,10 @@ func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.Sched
 			return nil, err
 		}
 
-		datums, columns, err := params.ExecCfg().InternalExecutor.QueryRowExWithCols(
+		datums, columns, err := params.p.InternalSQLTxn().QueryRowExWithCols(
 			params.ctx,
 			"load-schedules",
-			params.p.Txn(), sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			params.p.Txn(), sessiondata.RootUserSessionDataOverride,
 			fmt.Sprintf("SELECT * FROM %s WHERE schedule_id = $1", env.ScheduledJobsTableName()),
 			tree.NewDInt(tree.DInt(sjID)))
 		if err != nil {
@@ -61,10 +60,10 @@ func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.Sched
 		rows = append(rows, datums)
 		cols = columns
 	} else {
-		datums, columns, err := params.ExecCfg().InternalExecutor.QueryBufferedExWithCols(
+		datums, columns, err := params.p.InternalSQLTxn().QueryBufferedExWithCols(
 			params.ctx,
 			"load-schedules",
-			params.p.Txn(), sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			params.p.Txn(), sessiondata.RootUserSessionDataOverride,
 			fmt.Sprintf("SELECT * FROM %s", env.ScheduledJobsTableName()))
 		if err != nil {
 			return nil, err
@@ -113,14 +112,7 @@ func (p *planner) ShowCreateSchedule(
 					return nil, err
 				}
 
-				createStmtStr, err := ex.GetCreateScheduleStatement(
-					ctx,
-					scheduledjobs.ProdJobSchedulerEnv,
-					p.Txn(),
-					p.Descriptors(),
-					sj,
-					p.ExecCfg().InternalExecutor,
-				)
+				createStmtStr, err := ex.GetCreateScheduleStatement(ctx, p.InternalSQLTxn(), scheduledjobs.ProdJobSchedulerEnv, sj)
 				if err != nil {
 					return nil, err
 				}

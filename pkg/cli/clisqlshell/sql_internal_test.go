@@ -11,6 +11,8 @@
 package clisqlshell
 
 import (
+	"bufio"
+	"os"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clicfg"
@@ -89,40 +91,11 @@ func TestIsEndOfStatement(t *testing.T) {
 	}
 }
 
-// Test handleCliCmd cases for client-side commands that are aliases for sql
-// statements.
-func TestHandleCliCmdSqlAlias(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	clientSideCommandTestsTable := []struct {
-		commandString string
-		wantSQLStmt   string
-	}{
-		{`\l`, `SHOW DATABASES`},
-		{`\dt`, `SHOW TABLES`},
-		{`\dT`, `SHOW TYPES`},
-		{`\du`, `SHOW USERS`},
-		{`\du myuser`, `SELECT * FROM [SHOW USERS] WHERE username = 'myuser'`},
-		{`\d mytable`, `SHOW COLUMNS FROM mytable`},
-		{`\d`, `SHOW TABLES`},
-	}
-
-	for _, tt := range clientSideCommandTestsTable {
-		c := setupTestCliState()
-		c.lastInputLine = tt.commandString
-		gotState := c.doHandleCliCmd(cliStateEnum(0), cliStateEnum(1))
-
-		assert.Equal(t, cliRunStatement, gotState)
-		assert.Equal(t, tt.wantSQLStmt, c.concatLines)
-	}
-}
-
 func TestHandleCliCmdSlashDInvalidSyntax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	clientSideCommandTests := []string{`\d goodarg badarg`, `\dz`}
+	clientSideCommandTests := []string{`\d goodarg badarg`}
 
 	for _, tt := range clientSideCommandTests {
 		c := setupTestCliState()
@@ -130,7 +103,6 @@ func TestHandleCliCmdSlashDInvalidSyntax(t *testing.T) {
 		gotState := c.doHandleCliCmd(cliStateEnum(0), cliStateEnum(1))
 
 		assert.Equal(t, cliStateEnum(0), gotState)
-		assert.Equal(t, errInvalidSyntax, c.exitErr)
 	}
 }
 
@@ -154,6 +126,67 @@ func setupTestCliState() *cliState {
 	}
 	sqlCtx := &Context{}
 	c := NewShell(cliCtx, sqlConnCtx, sqlExecCtx, sqlCtx, nil).(*cliState)
-	c.ins = noLineEditor
+	c.ins = &bufioReader{wout: os.Stdout, buf: bufio.NewReader(os.Stdin)}
 	return c
+}
+
+func TestGetSetArgs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	td := []struct {
+		input    string
+		ok       bool
+		option   string
+		hasValue bool
+		value    string
+	}{
+		// Missing option.
+		{``, false, ``, false, ``},
+		// Invalid syntax in value.
+		{`a  a"b`, false, ``, false, ``},
+		// Missing option.
+		{`    `, false, ``, false, ``},
+		// Standalone option, also supporting various characters in the option.
+		{`a`, true, `a`, false, ``},
+		{`a.b`, true, `a.b`, false, ``},
+		{`a_b`, true, `a_b`, false, ``},
+		{`a-b`, true, `a-b`, false, ``},
+		{`a123`, true, `a123`, false, ``},
+		// Invalid character in option.
+		{`a/b`, false, ``, false, ``},
+		// Optional spaces.
+		{`a   `, true, `a`, false, ``},
+		{`  a   `, true, `a`, false, ``},
+		// Simple values surrounded by spaces.
+		{`a b`, true, `a`, true, `b`},
+		{`a b    `, true, `a`, true, `b`},
+		{`   a b    `, true, `a`, true, `b`},
+		{`a    b`, true, `a`, true, `b`},
+		{`a    b     `, true, `a`, true, `b`},
+		// Quoted value.
+		{`a "b c"`, true, `a`, true, `"b c"`},
+		{`a   "b c"  `, true, `a`, true, `"b c"`},
+		{`a   "b\"c"  `, true, `a`, true, `"b\"c"`},
+		{`a "" `, true, `a`, true, `""`},
+		// Non-quoted value.
+		{`a   b.c  `, true, `a`, true, `b.c`},
+		// Equal sign with optional spaces.
+		{` a=    b`, true, `a`, true, `b`},
+		{` a=    b`, true, `a`, true, `b`},
+		{` a    =    b`, true, `a`, true, `b`},
+		{` a    =    b   `, true, `a`, true, `b`},
+		{` a     =b`, true, `a`, true, `b`},
+		{` a     =b  `, true, `a`, true, `b`},
+		{` a     ="b c"  `, true, `a`, true, `"b c"`},
+		{` a "=b"`, true, `a`, true, `"=b"`},
+	}
+
+	for _, tc := range td {
+		ok, option, hasValue, value := getSetArgs(tc.input)
+		if ok != tc.ok || option != tc.option || hasValue != tc.hasValue || value != tc.value {
+			t.Errorf("%s: expected (%v,%v,%v,%v), got (%v,%v,%v,%v)", tc.input,
+				tc.ok, tc.option, tc.hasValue, tc.value,
+				ok, option, hasValue, value)
+		}
+	}
 }

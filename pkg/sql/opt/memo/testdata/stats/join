@@ -1371,14 +1371,14 @@ inner-join (lookup t.public.def)
  ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int) t.public.def.d:6(int!null) t.public.def.e:7(int!null) t.public.def.f:8(int)
  ├── key columns: [1 2] = [6 7]
  ├── stats: [rows=0.01, distinct(1)=0.01, null(1)=0, distinct(2)=0.01, null(2)=0, distinct(3)=0.009995, null(3)=0.0001, distinct(6)=0.01, null(6)=0, distinct(7)=0.01, null(7)=0, distinct(8)=0.00999995, null(8)=0.0001, distinct(7,8)=0.01, null(7,8)=0, distinct(1-3)=0.0099995, null(1-3)=0]
- ├── cost: 2127.9107
+ ├── cost: 2135.9107
  ├── key: (6,7)
  ├── fd: (1,2)-->(3), (6,7)-->(8), (1)==(6), (6)==(1), (2)==(7), (7)==(2)
  ├── interesting orderings: (+(1|6),+(2|7))
  ├── scan t.public.abc
  │    ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=1, distinct(1-3)=100, null(1-3)=0]
- │    ├── cost: 127.87
+ │    ├── cost: 131.87
  │    ├── key: (1,2)
  │    ├── fd: (1,2)-->(3)
  │    ├── prune: (1-3)
@@ -1399,14 +1399,14 @@ semi-join (lookup t.public.def)
  ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  ├── key columns: [1 2] = [6 7]
  ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=1, distinct(7)=1, null(7)=0, distinct(8)=1, null(8)=0, distinct(7,8)=1, null(7,8)=0, distinct(1-3)=100, null(1-3)=0]
- ├── cost: 2127.9106
+ ├── cost: 2135.9106
  ├── key: (1,2)
  ├── fd: (1,2)-->(3)
  ├── interesting orderings: (+1,+2)
  ├── scan t.public.abc
  │    ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=1, distinct(1-3)=100, null(1-3)=0]
- │    ├── cost: 127.87
+ │    ├── cost: 131.87
  │    ├── key: (1,2)
  │    ├── fd: (1,2)-->(3)
  │    ├── prune: (1-3)
@@ -1424,14 +1424,14 @@ anti-join (lookup t.public.def)
  ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  ├── key columns: [1 2] = [6 7]
  ├── stats: [rows=1e-10, distinct(1)=1e-10, null(1)=0, distinct(2)=1e-10, null(2)=0, distinct(3)=1e-10, null(3)=1e-10, distinct(7)=1e-10, null(7)=0, distinct(8)=1e-10, null(8)=0, distinct(7,8)=1e-10, null(7,8)=0, distinct(1-3)=1e-10, null(1-3)=0]
- ├── cost: 2127.9106
+ ├── cost: 2135.9106
  ├── key: (1,2)
  ├── fd: (1,2)-->(3)
  ├── interesting orderings: (+1,+2)
  ├── scan t.public.abc
  │    ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=1, distinct(1-3)=100, null(1-3)=0]
- │    ├── cost: 127.87
+ │    ├── cost: 131.87
  │    ├── key: (1,2)
  │    ├── fd: (1,2)-->(3)
  │    ├── prune: (1-3)
@@ -1449,14 +1449,14 @@ semi-join (lookup t.public.def)
  ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  ├── key columns: [1 2] = [6 7]
  ├── stats: [rows=0, distinct(1)=0, null(1)=0, distinct(2)=0, null(2)=0, distinct(3)=0, null(3)=0, distinct(7)=0, null(7)=0, distinct(8)=0, null(8)=0, distinct(7,8)=0, null(7,8)=0, distinct(1-3)=0, null(1-3)=0]
- ├── cost: 2127.9206
+ ├── cost: 2135.9206
  ├── key: (1,2)
  ├── fd: (1,2)-->(3)
  ├── interesting orderings: (+1,+2)
  ├── scan t.public.abc
  │    ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=1, distinct(1-3)=100, null(1-3)=0]
- │    ├── cost: 127.87
+ │    ├── cost: 131.87
  │    ├── key: (1,2)
  │    ├── fd: (1,2)-->(3)
  │    ├── prune: (1-3)
@@ -1475,14 +1475,14 @@ anti-join (lookup t.public.def)
  ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  ├── key columns: [1 2] = [6 7]
  ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=1, distinct(7)=1, null(7)=0, distinct(8)=1, null(8)=0, distinct(7,8)=1, null(7,8)=0, distinct(1-3)=100, null(1-3)=0]
- ├── cost: 2127.9206
+ ├── cost: 2135.9206
  ├── key: (1,2)
  ├── fd: (1,2)-->(3)
  ├── interesting orderings: (+1,+2)
  ├── scan t.public.abc
  │    ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int!null) t.public.abc.c:3(int)
  │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=1, distinct(1-3)=100, null(1-3)=0]
- │    ├── cost: 127.87
+ │    ├── cost: 131.87
  │    ├── key: (1,2)
  │    ├── fd: (1,2)-->(3)
  │    ├── prune: (1-3)
@@ -1648,20 +1648,92 @@ ALTER TABLE uv INJECT STATISTICS '[
 opt
 SELECT * FROM xysd, uv WHERE (s = 'foo' AND u = 3 AND v = 4) OR (s = 'bar' AND u = 5 AND v = 6)
 ----
-inner-join (cross)
+project
  ├── columns: x:1(int!null) y:2(int) s:3(string!null) d:4(decimal!null) u:7(int!null) v:8(int!null)
  ├── stats: [rows=59573.61, distinct(3)=2, null(3)=0, distinct(7)=2, null(7)=0, distinct(8)=2, null(8)=0, distinct(7,8)=2.18365, null(7,8)=0]
  ├── fd: (1)-->(2-4), (3,4)-->(1,2)
- ├── scan uv
- │    ├── columns: u:7(int) v:8(int!null)
- │    └── stats: [rows=10000, distinct(7)=500, null(7)=0, distinct(8)=100, null(8)=0, distinct(7,8)=550, null(7,8)=0]
- ├── scan xysd
- │    ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
- │    ├── stats: [rows=5000, distinct(1)=5000, null(1)=0, distinct(3)=10, null(3)=0, distinct(4)=500, null(4)=0]
- │    ├── key: (1)
- │    └── fd: (1)-->(2-4), (3,4)~~>(1,2)
- └── filters
-      └── (((s:3 = 'foo') AND (u:7 = 3)) AND (v:8 = 4)) OR (((s:3 = 'bar') AND (u:7 = 5)) AND (v:8 = 6)) [type=bool, outer=(3,7,8), constraints=(/3: [/'bar' - /'bar'] [/'foo' - /'foo']; /7: [/3 - /3] [/5 - /5]; /8: [/4 - /4] [/6 - /6])]
+ └── distinct-on
+      ├── columns: x:1(int!null) y:2(int) s:3(string!null) d:4(decimal!null) u:7(int!null) v:8(int!null) rowid:9(int!null)
+      ├── grouping columns: x:1(int!null) rowid:9(int!null)
+      ├── stats: [rows=16383.64, distinct(1,9)=16383.6, null(1,9)=0]
+      ├── key: (1,9)
+      ├── fd: (1,9)-->(2-4,7,8)
+      ├── union-all
+      │    ├── columns: x:1(int!null) y:2(int) s:3(string!null) d:4(decimal!null) u:7(int!null) v:8(int!null) rowid:9(int!null)
+      │    ├── left columns: x:12(int) y:13(int) s:14(string) d:15(decimal) u:18(int) v:19(int) rowid:20(int)
+      │    ├── right columns: x:23(int) y:24(int) s:25(string) d:26(decimal) u:29(int) v:30(int) rowid:31(int)
+      │    ├── stats: [rows=16383.64, distinct(1,9)=16383.6, null(1,9)=0]
+      │    ├── inner-join (cross)
+      │    │    ├── columns: x:12(int!null) y:13(int) s:14(string!null) d:15(decimal!null) u:18(int!null) v:19(int!null) rowid:20(int!null)
+      │    │    ├── stats: [rows=8191.818, distinct(12,20)=8191.82, null(12,20)=0]
+      │    │    ├── key: (12,20)
+      │    │    ├── fd: ()-->(14,18,19), (12)-->(13,15), (15)-->(12,13)
+      │    │    ├── index-join xysd
+      │    │    │    ├── columns: x:12(int!null) y:13(int) s:14(string!null) d:15(decimal!null)
+      │    │    │    ├── stats: [rows=500, distinct(12)=500, null(12)=0, distinct(14)=1, null(14)=0]
+      │    │    │    ├── key: (12)
+      │    │    │    ├── fd: ()-->(14), (12)-->(13,15), (15)-->(12,13)
+      │    │    │    └── scan xysd@xysd_s_d_key
+      │    │    │         ├── columns: x:12(int!null) s:14(string!null) d:15(decimal!null)
+      │    │    │         ├── constraint: /-14/15: [/'foo' - /'foo']
+      │    │    │         ├── stats: [rows=500, distinct(14)=1, null(14)=0]
+      │    │    │         ├── key: (12)
+      │    │    │         └── fd: ()-->(14), (12)-->(15), (15)-->(12)
+      │    │    ├── select
+      │    │    │    ├── columns: u:18(int!null) v:19(int!null) rowid:20(int!null)
+      │    │    │    ├── stats: [rows=16.38364, distinct(18)=1, null(18)=0, distinct(19)=1, null(19)=0, distinct(20)=16.3836, null(20)=0, distinct(18,19)=1, null(18,19)=0]
+      │    │    │    ├── key: (20)
+      │    │    │    ├── fd: ()-->(18,19)
+      │    │    │    ├── scan uv
+      │    │    │    │    ├── columns: u:18(int) v:19(int!null) rowid:20(int!null)
+      │    │    │    │    ├── stats: [rows=10000, distinct(18)=500, null(18)=0, distinct(19)=100, null(19)=0, distinct(20)=10000, null(20)=0, distinct(18,19)=550, null(18,19)=0]
+      │    │    │    │    ├── key: (20)
+      │    │    │    │    └── fd: (20)-->(18,19)
+      │    │    │    └── filters
+      │    │    │         ├── u:18 = 3 [type=bool, outer=(18), constraints=(/18: [/3 - /3]; tight), fd=()-->(18)]
+      │    │    │         └── v:19 = 4 [type=bool, outer=(19), constraints=(/19: [/4 - /4]; tight), fd=()-->(19)]
+      │    │    └── filters (true)
+      │    └── inner-join (cross)
+      │         ├── columns: x:23(int!null) y:24(int) s:25(string!null) d:26(decimal!null) u:29(int!null) v:30(int!null) rowid:31(int!null)
+      │         ├── stats: [rows=8191.818, distinct(23,31)=8191.82, null(23,31)=0]
+      │         ├── key: (23,31)
+      │         ├── fd: ()-->(25,29,30), (23)-->(24,26), (26)-->(23,24)
+      │         ├── index-join xysd
+      │         │    ├── columns: x:23(int!null) y:24(int) s:25(string!null) d:26(decimal!null)
+      │         │    ├── stats: [rows=500, distinct(23)=500, null(23)=0, distinct(25)=1, null(25)=0]
+      │         │    ├── key: (23)
+      │         │    ├── fd: ()-->(25), (23)-->(24,26), (26)-->(23,24)
+      │         │    └── scan xysd@xysd_s_d_key
+      │         │         ├── columns: x:23(int!null) s:25(string!null) d:26(decimal!null)
+      │         │         ├── constraint: /-25/26: [/'bar' - /'bar']
+      │         │         ├── stats: [rows=500, distinct(25)=1, null(25)=0]
+      │         │         ├── key: (23)
+      │         │         └── fd: ()-->(25), (23)-->(26), (26)-->(23)
+      │         ├── select
+      │         │    ├── columns: u:29(int!null) v:30(int!null) rowid:31(int!null)
+      │         │    ├── stats: [rows=16.38364, distinct(29)=1, null(29)=0, distinct(30)=1, null(30)=0, distinct(31)=16.3836, null(31)=0, distinct(29,30)=1, null(29,30)=0]
+      │         │    ├── key: (31)
+      │         │    ├── fd: ()-->(29,30)
+      │         │    ├── scan uv
+      │         │    │    ├── columns: u:29(int) v:30(int!null) rowid:31(int!null)
+      │         │    │    ├── stats: [rows=10000, distinct(29)=500, null(29)=0, distinct(30)=100, null(30)=0, distinct(31)=10000, null(31)=0, distinct(29,30)=550, null(29,30)=0]
+      │         │    │    ├── key: (31)
+      │         │    │    └── fd: (31)-->(29,30)
+      │         │    └── filters
+      │         │         ├── u:29 = 5 [type=bool, outer=(29), constraints=(/29: [/5 - /5]; tight), fd=()-->(29)]
+      │         │         └── v:30 = 6 [type=bool, outer=(30), constraints=(/30: [/6 - /6]; tight), fd=()-->(30)]
+      │         └── filters (true)
+      └── aggregations
+           ├── const-agg [as=y:2, type=int, outer=(2)]
+           │    └── y:2 [type=int]
+           ├── const-agg [as=s:3, type=string, outer=(3)]
+           │    └── s:3 [type=string]
+           ├── const-agg [as=d:4, type=decimal, outer=(4)]
+           │    └── d:4 [type=decimal]
+           ├── const-agg [as=u:7, type=int, outer=(7)]
+           │    └── u:7 [type=int]
+           └── const-agg [as=v:8, type=int, outer=(8)]
+                └── v:8 [type=int]
 
 # Test selectivity of ORed join predicates
 # Estimate of # rows should be low, and nowhere near the no-stats
@@ -1750,7 +1822,7 @@ left-join (cross)
  │    └── stats: [rows=1000]
  ├── scan classrequest
  │    ├── columns: studentid:6(int!null) firstchoiceclassid:7(int) secondchoiceclassid:8(int) thirdchoiceclassid:9(int)
- │    ├── stats: [rows=1000]
+ │    ├── stats: [rows=1000, distinct(8)=100, null(8)=10]
  │    ├── key: (6)
  │    └── fd: (6)-->(7-9)
  └── filters
@@ -1823,7 +1895,7 @@ semi-join (cross)
  │    └── stats: [rows=1000]
  ├── scan classrequest
  │    ├── columns: firstchoiceclassid:7(int) secondchoiceclassid:8(int)
- │    └── stats: [rows=1000]
+ │    └── stats: [rows=1000, distinct(8)=100, null(8)=10]
  └── filters
       └── (firstchoiceclassid:7 = classid:1) OR (secondchoiceclassid:8 = 5) [type=bool, outer=(1,7,8)]
 
@@ -2040,3 +2112,58 @@ project
  │    └── 82 [type=int]
  └── projections
       └── '1971-10-24' [as=date:19, type=date]
+
+# Regression test for #88455 - don't double-count selectivity for OR expressions
+# with tight constraints in join ON conditions.
+exec-ddl
+CREATE TABLE t0_88455 (c0 INT);
+----
+
+exec-ddl
+CREATE TABLE t1_88455 (c0 INT);
+----
+
+exec-ddl
+ALTER TABLE t0_88455 INJECT STATISTICS '[
+  {
+    "columns": [
+    "c0"
+    ],
+    "created_at": "2022-08-09 09:00:00.00000",
+    "distinct_count": 13,
+    "name": "__auto__",
+    "null_count": 0,
+    "row_count": 13
+  }
+]'
+----
+
+exec-ddl
+ALTER TABLE t1_88455 INJECT STATISTICS '[
+  {
+    "columns": [
+    "c0"
+    ],
+    "created_at": "2022-08-09 09:00:00.00000",
+    "distinct_count": 5,
+    "name": "__auto__",
+    "null_count": 0,
+    "row_count": 5
+  }
+]'
+----
+
+opt format=show-stats
+SELECT * FROM t0_88455 LEFT OUTER JOIN t1_88455 ON t0_88455.c0<1 OR t0_88455.c0>1;
+----
+left-join (cross)
+ ├── columns: c0:1(int) c0:5(int)
+ ├── stats: [rows=21.66667]
+ ├── scan t0_88455
+ │    ├── columns: t0_88455.c0:1(int)
+ │    └── stats: [rows=13, distinct(1)=13, null(1)=0]
+ ├── scan t1_88455
+ │    ├── columns: t1_88455.c0:5(int)
+ │    └── stats: [rows=5]
+ └── filters
+      └── (t0_88455.c0:1 < 1) OR (t0_88455.c0:1 > 1) [type=bool, outer=(1), constraints=(/1: (/NULL - /0] [/2 - ]; tight)]

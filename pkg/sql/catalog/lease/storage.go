@@ -12,13 +12,14 @@ package lease
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -26,10 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -46,12 +48,13 @@ import (
 // the manager. Some of these fields belong on the manager, in any case, since
 // they're only used by the manager and not by the store itself.
 type storage struct {
-	nodeIDContainer  *base.SQLIDContainer
-	db               *kv.DB
-	clock            *hlc.Clock
-	internalExecutor sqlutil.InternalExecutor
-	settings         *cluster.Settings
-	codec            keys.SQLCodec
+	nodeIDContainer *base.SQLIDContainer
+	db              isql.DB
+	clock           *hlc.Clock
+	settings        *cluster.Settings
+	codec           keys.SQLCodec
+	regionPrefix    *atomic.Value
+	sysDBCache      *catkv.SystemDatabaseCache
 
 	// group is used for all calls made to acquireNodeLease to prevent
 	// concurrent lease acquisitions from the store.
@@ -59,6 +62,20 @@ type storage struct {
 
 	outstandingLeases *metric.Gauge
 	testingKnobs      StorageTestingKnobs
+	writer            writer
+}
+
+type leaseFields struct {
+	regionPrefix []byte
+	descID       descpb.ID
+	version      descpb.DescriptorVersion
+	instanceID   base.SQLInstanceID
+	expiration   tree.DTimestamp
+}
+
+type writer interface {
+	deleteLease(context.Context, *kv.Txn, leaseFields) error
+	insertLease(context.Context, *kv.Txn, leaseFields) error
 }
 
 // LeaseRenewalDuration controls the default time before a lease expires when
@@ -68,6 +85,14 @@ var LeaseRenewalDuration = settings.RegisterDurationSetting(
 	"sql.catalog.descriptor_lease_renewal_fraction",
 	"controls the default time before a lease expires when acquisition to renew the lease begins",
 	base.DefaultDescriptorLeaseRenewalTimeout)
+
+// LeaseRenewalCrossValidate controls if cross validation should be done during
+// lease renewal.
+var LeaseRenewalCrossValidate = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.catalog.descriptor_lease_renewal_cross_validation.enabled",
+	"controls if cross validation should be done during lease renewal",
+	base.DefaultLeaseRenewalCrossValidate)
 
 func (s storage) leaseRenewalTimeout() time.Duration {
 	return LeaseRenewalDuration.Get(&s.settings.SV)
@@ -82,14 +107,19 @@ func (s storage) jitteredLeaseDuration() time.Duration {
 		2*jitterFraction*rand.Float64()))
 }
 
+func (s storage) crossValidateDuringRenewal() bool {
+	return LeaseRenewalCrossValidate.Get(&s.settings.SV)
+}
+
 // acquire a lease on the most recent version of a descriptor. If the lease
 // cannot be obtained because the descriptor is in the process of being dropped
 // or offline (currently only applicable to tables), the error will be of type
 // inactiveTableError. The expiration time set for the lease > minExpiration.
 func (s storage) acquire(
 	ctx context.Context, minExpiration hlc.Timestamp, id descpb.ID,
-) (desc catalog.Descriptor, expiration hlc.Timestamp, _ error) {
+) (desc catalog.Descriptor, expiration hlc.Timestamp, prefix []byte, _ error) {
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
+	prefix = s.getRegionPrefix()
 	acquireInTxn := func(ctx context.Context, txn *kv.Txn) (err error) {
 
 		// Run the descriptor read as high-priority, thereby pushing any intents out
@@ -112,13 +142,13 @@ func (s storage) acquire(
 		// would not overwrite the old entry if we just were to do another insert.
 		if !expiration.IsEmpty() && desc != nil {
 			prevExpirationTS := storedLeaseExpiration(expiration)
-			deleteLease := fmt.Sprintf(
-				`DELETE FROM system.public.lease WHERE "descID" = %d AND version = %d AND "nodeID" = %d AND expiration = %s`,
-				desc.GetID(), desc.GetVersion(), instanceID, &prevExpirationTS,
-			)
-			if _, err := s.internalExecutor.Exec(
-				ctx, "lease-delete-after-ambiguous", txn, deleteLease,
-			); err != nil {
+			if err := s.writer.deleteLease(ctx, txn, leaseFields{
+				regionPrefix: prefix,
+				descID:       desc.GetID(),
+				version:      desc.GetVersion(),
+				instanceID:   instanceID,
+				expiration:   prevExpirationTS,
+			}); err != nil {
 				return errors.Wrap(err, "deleting ambiguously created lease")
 			}
 		}
@@ -130,46 +160,34 @@ func (s storage) acquire(
 			// a monotonically increasing expiration.
 			expiration = minExpiration.Add(int64(time.Millisecond), 0)
 		}
-
-		version := s.settings.Version.ActiveVersion(ctx)
-		direct := catkv.MakeDirect(s.codec, version)
-		desc, err = direct.MustGetDescriptorByID(ctx, txn, id, catalog.Any)
+		desc, err = s.mustGetDescriptorByID(ctx, txn, id)
 		if err != nil {
 			return err
 		}
-		if err := catalog.FilterDescriptorState(
-			desc, tree.CommonLookupFlags{IncludeOffline: true}, // filter dropped only
-		); err != nil {
+		if err := catalog.FilterAddingDescriptor(desc); err != nil {
+			return err
+		}
+		if err := catalog.FilterDroppedDescriptor(desc); err != nil {
 			return err
 		}
 		log.VEventf(ctx, 2, "storage attempting to acquire lease %v@%v", desc, expiration)
 
-		// We use string interpolation here, instead of passing the arguments to
-		// InternalExecutor.Exec() because we don't want to pay for preparing the
-		// statement (which would happen if we'd pass arguments). Besides the
-		// general cost of preparing, preparing this statement always requires a
-		// read from the database for the special descriptor of a system table
-		// (#23937).
 		ts := storedLeaseExpiration(expiration)
-		insertLease := fmt.Sprintf(
-			`INSERT INTO system.public.lease ("descID", version, "nodeID", expiration) VALUES (%d, %d, %d, %s)`,
-			desc.GetID(), desc.GetVersion(), instanceID, &ts,
-		)
-		count, err := s.internalExecutor.Exec(ctx, "lease-insert", txn, insertLease)
-		if err != nil {
-			return err
+		lf := leaseFields{
+			regionPrefix: prefix,
+			descID:       desc.GetID(),
+			version:      desc.GetVersion(),
+			instanceID:   s.nodeIDContainer.SQLInstanceID(),
+			expiration:   ts,
 		}
-		if count != 1 {
-			return errors.Errorf("%s: expected 1 result, found %d", insertLease, count)
-		}
-		return nil
+		return s.writer.insertLease(ctx, txn, lf)
 	}
 
 	// Run a retry loop to deal with AmbiguousResultErrors. All other error types
 	// are propagated up to the caller.
 	for r := retry.StartWithCtx(ctx, retry.Options{}); r.Next(); {
-		err := s.db.Txn(ctx, acquireInTxn)
-		var pErr *roachpb.AmbiguousResultError
+		err := s.db.KV().Txn(ctx, acquireInTxn)
+		var pErr *kvpb.AmbiguousResultError
 		switch {
 		case errors.As(err, &pErr):
 			log.Infof(ctx, "ambiguous error occurred during lease acquisition for %v, retrying: %v", id, err)
@@ -179,16 +197,16 @@ func (s storage) acquire(
 				" removal for %v, retrying: %v", id, err)
 			continue
 		case err != nil:
-			return nil, hlc.Timestamp{}, err
+			return nil, hlc.Timestamp{}, nil, err
 		}
 		log.VEventf(ctx, 2, "storage acquired lease %v@%v", desc, expiration)
 		if s.testingKnobs.LeaseAcquiredEvent != nil {
 			s.testingKnobs.LeaseAcquiredEvent(desc, err)
 		}
 		s.outstandingLeases.Inc(1)
-		return desc, expiration, nil
+		return desc, expiration, prefix, nil
 	}
-	return nil, hlc.Timestamp{}, ctx.Err()
+	return nil, hlc.Timestamp{}, nil, ctx.Err()
 }
 
 // Release a previously acquired descriptor. Never let this method
@@ -199,7 +217,7 @@ func (s storage) release(ctx context.Context, stopper *stop.Stopper, lease *stor
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	retryOptions := base.DefaultRetryOptions()
 	retryOptions.Closer = stopper.ShouldQuiesce()
-	firstAttempt := true
+
 	// This transaction is idempotent; the retry was put in place because of
 	// NodeUnavailableErrors.
 	for r := retry.StartWithCtx(ctx, retryOptions); r.Next(); {
@@ -208,29 +226,21 @@ func (s storage) release(ctx context.Context, stopper *stop.Stopper, lease *stor
 		if instanceID == 0 {
 			panic("SQL instance ID not set")
 		}
-		const deleteLease = `DELETE FROM system.public.lease ` +
-			`WHERE ("descID", version, "nodeID", expiration) = ($1, $2, $3, $4)`
-		count, err := s.internalExecutor.Exec(
-			ctx,
-			"lease-release",
-			nil, /* txn */
-			deleteLease,
-			lease.id, lease.version, instanceID, &lease.expiration,
-		)
+		lf := leaseFields{
+			regionPrefix: lease.prefix,
+			descID:       lease.id,
+			version:      descpb.DescriptorVersion(lease.version),
+			instanceID:   instanceID,
+			expiration:   lease.expiration,
+		}
+		err := s.writer.deleteLease(ctx, nil /* txn */, lf)
 		if err != nil {
 			log.Warningf(ctx, "error releasing lease %q: %s", lease, err)
 			if grpcutil.IsConnectionRejected(err) {
 				return
 			}
-			firstAttempt = false
 			continue
 		}
-		// We allow count == 0 after the first attempt.
-		if count > 1 || (count == 0 && firstAttempt) {
-			log.Warningf(ctx, "unexpected results while deleting lease %+v: "+
-				"expected 1 result, found %d", lease, count)
-		}
-
 		s.outstandingLeases.Dec(1)
 		if s.testingKnobs.LeaseReleasedEvent != nil {
 			s.testingKnobs.LeaseReleasedEvent(
@@ -252,15 +262,13 @@ func (s storage) getForExpiration(
 	ctx context.Context, expiration hlc.Timestamp, id descpb.ID,
 ) (catalog.Descriptor, error) {
 	var desc catalog.Descriptor
-	err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	err := s.db.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		prevTimestamp := expiration.Prev()
 		err := txn.SetFixedTimestamp(ctx, prevTimestamp)
 		if err != nil {
 			return err
 		}
-		version := s.settings.Version.ActiveVersion(ctx)
-		direct := catkv.MakeDirect(s.codec, version)
-		desc, err = direct.MustGetDescriptorByID(ctx, txn, id, catalog.Any)
+		desc, err = s.mustGetDescriptorByID(ctx, txn, id)
 		if err != nil {
 			return err
 		}
@@ -273,4 +281,46 @@ func (s storage) getForExpiration(
 		return nil
 	})
 	return desc, err
+}
+
+func (s storage) newCatalogReader(ctx context.Context) catkv.CatalogReader {
+	return catkv.NewCatalogReader(
+		s.codec,
+		s.settings.Version.ActiveVersion(ctx),
+		s.sysDBCache,
+		nil, /* maybeMonitor */
+	)
+}
+
+func (s storage) mustGetDescriptorByID(
+	ctx context.Context, txn *kv.Txn, id descpb.ID,
+) (catalog.Descriptor, error) {
+	cr := s.newCatalogReader(ctx)
+	const isDescriptorRequired = true
+	c, err := cr.GetByIDs(ctx, txn, []descpb.ID{id}, isDescriptorRequired, catalog.Any)
+	if err != nil {
+		return nil, err
+	}
+	desc := c.LookupDescriptor(id)
+	validationLevel := catalog.ValidationLevelSelfOnly
+	if s.crossValidateDuringRenewal() {
+		validationLevel = validate.ImmutableRead
+	}
+	vd := catkv.NewCatalogReaderBackedValidationDereferencer(cr, txn, nil /* dvmpMaybe */)
+	ve := validate.Validate(
+		ctx,
+		s.settings.Version.ActiveVersion(ctx),
+		vd,
+		catalog.ValidationReadTelemetry,
+		validationLevel,
+		desc,
+	)
+	if err := ve.CombinedError(); err != nil {
+		return nil, err
+	}
+	return desc, nil
+}
+
+func (s storage) getRegionPrefix() []byte {
+	return s.regionPrefix.Load().([]byte)
 }

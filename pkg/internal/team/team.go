@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/internal/reporoot"
 	"github.com/cockroachdb/errors"
 	"gopkg.in/yaml.v2"
@@ -32,10 +33,12 @@ type Team struct {
 	// Aliases is a map from additional team name to purpose for which to use
 	// them. The purpose "other" indicates a team that exists but which has no
 	// particular purpose as far as `teams` is concerned (for example, teams like
-	// the @cockroachdb/bulk-prs team which exists primarily to route, via
-	// CODEOWNERS, code reviews for the @cockroachdb/bulk-io team). This map
+	// the @cockroachdb/kv-prs team which exists primarily to route, via
+	// CODEOWNERS, code reviews for the @cockroachdb/kv team). This map
 	// does not contain TeamName.
 	Aliases map[Alias]Purpose `yaml:"aliases"`
+	// GitHub label will be added to issues posted for this team.
+	Label string `yaml:"label"`
 	// TriageColumnID is the GitHub Column ID to assign issues to.
 	TriageColumnID int `yaml:"triage_column_id"`
 	// Email is the email address for this team.
@@ -82,11 +85,20 @@ func (m Map) GetAliasesForPurpose(alias Alias, purpose Purpose) ([]Alias, bool) 
 
 // DefaultLoadTeams loads teams from the repo root's TEAMS.yaml.
 func DefaultLoadTeams() (Map, error) {
-	path := reporoot.GetFor(".", "TEAMS.yaml")
-	if path == "" {
-		return nil, errors.New("TEAMS.yaml not found")
+	var path string
+	if os.Getenv("BAZEL_TEST") != "" {
+		runfiles, err := bazel.RunfilesPath()
+		if err != nil {
+			return nil, err
+		}
+		path = filepath.Join(runfiles, "TEAMS.yaml")
+	} else {
+		root := reporoot.GetFor(".", "TEAMS.yaml")
+		if root == "" {
+			return nil, errors.New("TEAMS.yaml not found")
+		}
+		path = filepath.Join(root, "TEAMS.yaml")
 	}
-	path = filepath.Join(path, "TEAMS.yaml")
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err

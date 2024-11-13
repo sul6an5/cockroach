@@ -14,6 +14,7 @@ import (
 	"context"
 	"strconv"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -112,6 +113,10 @@ type Builder struct {
 	// are referenced multiple times in the same query.
 	views map[cat.View]*tree.Select
 
+	// sourceViews contains a map with all the views in the current data source
+	// chain. It is used to detect circular dependencies.
+	sourceViews map[string]struct{}
+
 	// subquery contains a pointer to the subquery which is currently being built
 	// (if any).
 	subquery *subquery
@@ -123,6 +128,17 @@ type Builder struct {
 	// If set, we are processing a function definition; in this case catalog caches
 	// are disabled and only statements whitelisted are allowed.
 	insideFuncDef bool
+
+	// insideUDF is true when the current expressions are being built within a
+	// UDF.
+	// TODO(mgartner): Once other UDFs can be referenced from within a UDF, a
+	// boolean will not be sufficient to track whether or not we are in a UDF.
+	// We'll need to track the depth of the UDFs we are building expressions
+	// within.
+	insideUDF bool
+
+	// insideDataSource is true when we are processing a data source.
+	insideDataSource bool
 
 	// If set, we are collecting view dependencies in schemaDeps. This can only
 	// happen inside view/function definitions.
@@ -152,6 +168,10 @@ type Builder struct {
 	// (without ON CONFLICT) or false otherwise. All mutated tables will have an
 	// entry in the map.
 	areAllTableMutationsSimpleInserts map[cat.StableID]bool
+
+	// subqueryNameIdx helps generate unique subquery names during star
+	// expansion.
+	subqueryNameIdx int
 }
 
 // New creates a new Builder structure initialized with the given
@@ -217,7 +237,7 @@ func (b *Builder) Build() (err error) {
 	// Special case for CannedOptPlan.
 	if canned, ok := b.stmt.(*tree.CannedOptPlan); ok {
 		b.factory.DisableOptimizations()
-		_, err := exprgen.Build(b.catalog, b.factory, canned.Plan)
+		_, err := exprgen.Build(b.ctx, b.catalog, b.factory, canned.Plan)
 		return err
 	}
 
@@ -295,6 +315,13 @@ func (b *Builder) buildStmt(
 	if b.insideFuncDef {
 		switch stmt := stmt.(type) {
 		case *tree.Select:
+		case tree.SelectStatement:
+		case *tree.Delete:
+			panic(unimplemented.NewWithIssuef(87289, "%s usage inside a function definition", stmt.StatementTag()))
+		case *tree.Insert:
+			panic(unimplemented.NewWithIssuef(87289, "%s usage inside a function definition", stmt.StatementTag()))
+		case *tree.Update:
+			panic(unimplemented.NewWithIssuef(87289, "%s usage inside a function definition", stmt.StatementTag()))
 		default:
 			panic(unimplemented.Newf("user-defined functions", "%s usage inside a function definition", stmt.StatementTag()))
 		}
@@ -358,6 +385,9 @@ func (b *Builder) buildStmt(
 
 	case *tree.ControlSchedules:
 		return b.buildControlSchedules(stmt, inScope)
+
+	case *tree.ShowCompletions:
+		return b.buildShowCompletions(stmt, inScope)
 
 	case *tree.CancelQueries:
 		return b.buildCancelQueries(stmt, inScope)
@@ -445,7 +475,7 @@ func (b *Builder) maybeTrackRegclassDependenciesForViews(texpr tree.TypedExpr) {
 			// we cannot resolve the variables in this context. This matches Postgres
 			// behavior.
 			if !tree.ContainsVars(texpr) {
-				regclass, err := eval.Expr(b.evalCtx, texpr)
+				regclass, err := eval.Expr(b.ctx, b.evalCtx, texpr)
 				if err != nil {
 					panic(err)
 				}
@@ -475,13 +505,9 @@ func (b *Builder) maybeTrackRegclassDependenciesForViews(texpr tree.TypedExpr) {
 func (b *Builder) maybeTrackUserDefinedTypeDepsForViews(texpr tree.TypedExpr) {
 	if b.trackSchemaDeps {
 		if texpr.ResolvedType().UserDefined() {
-			children, err := typedesc.GetTypeDescriptorClosure(texpr.ResolvedType())
-			if err != nil {
-				panic(err)
-			}
-			for id := range children {
+			typedesc.GetTypeDescriptorClosure(texpr.ResolvedType()).ForEach(func(id descpb.ID) {
 				b.schemaTypeDeps.Add(int(id))
-			}
+			})
 		}
 	}
 }
@@ -501,7 +527,7 @@ func (o *optTrackingTypeResolver) ResolveType(
 	if err != nil {
 		return nil, err
 	}
-	o.metadata.AddUserDefinedType(typ)
+	o.metadata.AddUserDefinedType(typ, name)
 	return typ, nil
 }
 
@@ -513,6 +539,6 @@ func (o *optTrackingTypeResolver) ResolveTypeByOID(
 	if err != nil {
 		return nil, err
 	}
-	o.metadata.AddUserDefinedType(typ)
+	o.metadata.AddUserDefinedType(typ, nil /* name */)
 	return typ, nil
 }

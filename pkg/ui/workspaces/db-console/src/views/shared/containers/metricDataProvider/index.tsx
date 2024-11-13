@@ -10,7 +10,7 @@
 
 import _ from "lodash";
 import Long from "long";
-import moment from "moment";
+import moment from "moment-timezone";
 import React from "react";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
@@ -20,7 +20,7 @@ import {
   requestMetrics as requestMetricsAction,
 } from "src/redux/metrics";
 import { AdminUIState } from "src/redux/state";
-import { toDateRange, util } from "@cockroachlabs/cluster-ui";
+import { util } from "@cockroachlabs/cluster-ui";
 import { findChildrenOfType } from "src/util/find";
 import {
   Metric,
@@ -37,7 +37,11 @@ import {
 } from "@cockroachlabs/cluster-ui";
 import { History } from "history";
 import { refreshSettings } from "src/redux/apiReducers";
-import { selectTimeScale } from "src/redux/timeScale";
+import { adjustTimeScale, selectMetricsTime } from "src/redux/timeScale";
+import {
+  selectResolution10sStorageTTL,
+  selectResolution30mStorageTTL,
+} from "src/redux/clusterSettings";
 
 /**
  * queryFromProps is a helper method which generates a TimeSeries Query data
@@ -49,7 +53,7 @@ function queryFromProps(
 ): protos.cockroach.ts.tspb.IQuery {
   let derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NONE;
   let sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.SUM;
-  let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;
+  let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
 
   // Compute derivative function.
   if (!_.isNil(metricProps.derivative)) {
@@ -248,26 +252,40 @@ class MetricsDataProvider extends React.Component<
 
 // timeInfoSelector converts the current global time window into a set of Long
 // timestamps, which can be sent with requests to the server.
-const timeInfoSelector = createSelector(selectTimeScale, scale => {
-  if (!_.isObject(scale)) {
-    return null;
-  }
-  const [startMoment, endMoment] = toDateRange(scale);
-  const start = startMoment.valueOf();
-  const end = endMoment.valueOf();
-  const syncedScale = findClosestTimeScale(
-    defaultTimeScaleOptions,
-    util.MilliToSeconds(end - start),
-  );
+const timeInfoSelector = createSelector(
+  selectResolution10sStorageTTL,
+  selectResolution30mStorageTTL,
+  selectMetricsTime,
+  (sTTL, mTTL, metricsTime) => {
+    if (!_.isObject(metricsTime.currentWindow)) {
+      return null;
+    }
+    const { start: startMoment, end: endMoment } = metricsTime.currentWindow;
+    const start = startMoment.valueOf();
+    const end = endMoment.valueOf();
+    const syncedScale = findClosestTimeScale(
+      defaultTimeScaleOptions,
+      util.MilliToSeconds(end - start),
+    );
+    // Call adjustTimeScale to handle the case where the sample size
+    // (also known as resolution) is too small for a start and end time
+    // that is before the data's ttl.
+    const adjusted = adjustTimeScale(
+      { ...syncedScale, fixedWindowEnd: false },
+      { start: startMoment, end: endMoment },
+      sTTL,
+      mTTL,
+    );
 
-  return {
-    start: Long.fromNumber(util.MilliToNano(start)),
-    end: Long.fromNumber(util.MilliToNano(end)),
-    sampleDuration: Long.fromNumber(
-      util.MilliToNano(syncedScale.sampleSize.asMilliseconds()),
-    ),
-  };
-});
+    return {
+      start: Long.fromNumber(util.MilliToNano(start)),
+      end: Long.fromNumber(util.MilliToNano(end)),
+      sampleDuration: Long.fromNumber(
+        util.MilliToNano(adjusted.timeScale.sampleSize.asMilliseconds()),
+      ),
+    };
+  },
+);
 
 const current = () => {
   let now = moment();

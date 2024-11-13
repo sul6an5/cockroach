@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 type shouldOmitFKClausesFromCreate int
@@ -54,6 +55,9 @@ type ShowCreateDisplayOptions struct {
 	// to read any table data from the backup (nor is there a guarantee that the
 	// system.comments table is included in the backup at all).
 	IgnoreComments bool
+	// RedactableValues causes all constants, literals, and other user-provided
+	// values to be surrounded with redaction markers.
+	RedactableValues bool
 }
 
 // ShowCreateTable returns a valid SQL representation of the CREATE
@@ -72,9 +76,16 @@ func ShowCreateTable(
 	lCtx simpleSchemaResolver,
 	displayOptions ShowCreateDisplayOptions,
 ) (string, error) {
+	ctx, sp := tracing.ChildSpan(ctx, "sql.ShowCreateTable")
+	defer sp.Finish()
+
 	a := &tree.DatumAlloc{}
 
-	f := p.ExtendedEvalContext().FmtCtx(tree.FmtSimple)
+	fmtFlags := tree.FmtSimple
+	if displayOptions.RedactableValues {
+		fmtFlags |= tree.FmtMarkRedactionNode | tree.FmtOmitNameRedaction
+	}
+	f := p.ExtendedEvalContext().FmtCtx(fmtFlags)
 	f.WriteString("CREATE ")
 	if desc.IsTemporary() {
 		f.WriteString("TEMP ")
@@ -90,6 +101,7 @@ func ShowCreateTable(
 		f.WriteString("\n\t")
 		colstr, err := schemaexpr.FormatColumnForDisplay(
 			ctx, desc, col, &p.RunParams(ctx).p.semaCtx, p.RunParams(ctx).p.SessionData(),
+			displayOptions.RedactableValues,
 		)
 		if err != nil {
 			return "", err
@@ -107,10 +119,10 @@ func ShowCreateTable(
 	// TODO (lucy): Possibly include FKs in the mutations list here, or else
 	// exclude check mutations below, for consistency.
 	if displayOptions.FKDisplayMode != OmitFKClausesFromCreate {
-		if err := desc.ForeachOutboundFK(func(fk *descpb.ForeignKeyConstraint) error {
+		for _, fk := range desc.OutboundForeignKeys() {
 			fkCtx := tree.NewFmtCtx(tree.FmtSimple)
 			fkCtx.WriteString(",\n\tCONSTRAINT ")
-			fkCtx.FormatNameP(&fk.Name)
+			fkCtx.FormatName(fk.GetName())
 			fkCtx.WriteString(" ")
 			// Passing in EmptySearchPath causes the schema name to show up in the
 			// constraint definition, which we need for `cockroach dump` output to be
@@ -119,20 +131,17 @@ func ShowCreateTable(
 				&fkCtx.Buffer,
 				dbPrefix,
 				desc,
-				fk,
+				fk.ForeignKeyDesc(),
 				lCtx,
 				sessiondata.EmptySearchPath,
 			); err != nil {
 				if displayOptions.FKDisplayMode == OmitMissingFKClausesFromCreate {
-					return nil
+					continue
 				}
 				// When FKDisplayMode == IncludeFkClausesInCreate.
-				return err
+				return "", err
 			}
 			f.WriteString(fkCtx.String())
-			return nil
-		}); err != nil {
-			return "", err
 		}
 	}
 	for _, idx := range desc.PublicNonPrimaryIndexes() {
@@ -141,7 +150,8 @@ func ShowCreateTable(
 		// Build the PARTITION BY clause.
 		var partitionBuf bytes.Buffer
 		if err := ShowCreatePartitioning(
-			a, p.ExecCfg().Codec, desc, idx, idx.GetPartitioning(), &partitionBuf, 1 /* indent */, 0, /* colOffset */
+			a, p.ExecCfg().Codec, desc, idx, idx.GetPartitioning(), &partitionBuf, 1, /* indent */
+			0 /* colOffset */, displayOptions.RedactableValues,
 		); err != nil {
 			return "", err
 		}
@@ -153,7 +163,7 @@ func ShowCreateTable(
 			&descpb.AnonymousTable,
 			idx,
 			partitionBuf.String(),
-			tree.FmtSimple,
+			fmtFlags,
 			p.RunParams(ctx).p.SemaCtx(),
 			p.RunParams(ctx).p.SessionData(),
 			catformat.IndexDisplayDefOnly,
@@ -171,7 +181,8 @@ func ShowCreateTable(
 	}
 
 	if err := ShowCreatePartitioning(
-		a, p.ExecCfg().Codec, desc, desc.GetPrimaryIndex(), desc.GetPrimaryIndex().GetPartitioning(), &f.Buffer, 0 /* indent */, 0, /* colOffset */
+		a, p.ExecCfg().Codec, desc, desc.GetPrimaryIndex(), desc.GetPrimaryIndex().GetPartitioning(),
+		&f.Buffer, 0 /* indent */, 0 /* colOffset */, displayOptions.RedactableValues,
 	); err != nil {
 		return "", err
 	}
@@ -217,31 +228,29 @@ func formatQuoteNames(buf *bytes.Buffer, names ...string) {
 func (p *planner) ShowCreate(
 	ctx context.Context,
 	dbPrefix string,
-	allDescs []descpb.Descriptor,
+	allHydratedDescs []catalog.Descriptor,
 	desc catalog.TableDescriptor,
 	displayOptions ShowCreateDisplayOptions,
 ) (string, error) {
-	var stmt string
-	var err error
+	ctx, sp := tracing.ChildSpan(ctx, "sql.ShowCreate")
+	defer sp.Finish()
+
 	tn := tree.MakeUnqualifiedTableName(tree.Name(desc.GetName()))
 	if desc.IsView() {
-		stmt, err = ShowCreateView(ctx, &p.RunParams(ctx).p.semaCtx, p.RunParams(ctx).p.SessionData(), &tn, desc)
-	} else if desc.IsSequence() {
-		stmt, err = ShowCreateSequence(ctx, &tn, desc)
-	} else {
-		lCtx, lErr := newInternalLookupCtxFromDescriptorProtos(
-			ctx, allDescs, nil, /* want all tables */
+		return ShowCreateView(
+			ctx, &p.RunParams(ctx).p.semaCtx, p.RunParams(ctx).p.SessionData(), &tn, desc,
+			displayOptions.RedactableValues,
 		)
-		if lErr != nil {
-			return "", lErr
-		}
-		// Overwrite desc with hydrated descriptor.
-		desc, err = lCtx.getTableByID(desc.GetID())
-		if err != nil {
-			return "", err
-		}
-		stmt, err = ShowCreateTable(ctx, p, &tn, dbPrefix, desc, lCtx, displayOptions)
 	}
-
-	return stmt, err
+	if desc.IsSequence() {
+		return ShowCreateSequence(ctx, &tn, desc)
+	}
+	lCtx := newInternalLookupCtx(allHydratedDescs, nil /* prefix */)
+	// Overwrite desc with hydrated descriptor.
+	var err error
+	desc, err = lCtx.getTableByID(desc.GetID())
+	if err != nil {
+		return "", err
+	}
+	return ShowCreateTable(ctx, p, &tn, dbPrefix, desc, lCtx, displayOptions)
 }

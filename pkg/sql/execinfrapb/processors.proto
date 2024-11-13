@@ -17,7 +17,7 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
 import "sql/execinfrapb/data.proto";
 import "sql/execinfrapb/processors_base.proto";
@@ -122,8 +122,14 @@ message ProcessorCoreUnion {
   optional ExportSpec exporter = 37;
   optional IndexBackfillMergerSpec indexBackfillMerger = 38;
   optional TTLSpec ttl = 39;
+  optional HashGroupJoinerSpec hashGroupJoiner = 40;
+  optional GenerativeSplitAndScatterSpec generativeSplitAndScatter = 41;
+  optional CloudStorageTestSpec cloudStorageTest = 42;
+  optional InsertSpec insert = 43;
+  optional IngestStoppedSpec ingestStopped = 44;
 
   reserved 6, 12, 14, 17, 18, 19, 20;
+  // NEXT ID: 45.
 }
 
 // NoopCoreSpec indicates a "no-op" processor core. This is used when we just

@@ -76,7 +76,7 @@ func NewChunkProgressLogger(
 			completed: startFraction,
 			reported:  startFraction,
 			Report: func(ctx context.Context, pct float32) error {
-				return j.FractionProgressed(ctx, nil /* txn */, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
+				return j.NoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
 					if progressedFn != nil {
 						progressedFn(ctx, details)
 					}
@@ -143,7 +143,7 @@ func (p *ProgressUpdateBatcher) Add(ctx context.Context, delta float32) error {
 	p.completed += delta
 	completed := p.completed
 	shouldReport := p.completed-p.reported > progressFractionThreshold
-	shouldReport = shouldReport && p.lastReported.Add(progressTimeThreshold).Before(timeutil.Now())
+	shouldReport = shouldReport || (p.completed > p.reported && p.lastReported.Add(progressTimeThreshold).Before(timeutil.Now()))
 
 	if shouldReport {
 		p.reported = p.completed

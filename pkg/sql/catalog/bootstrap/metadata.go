@@ -13,17 +13,23 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"sort"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -121,6 +127,17 @@ func (ms MetadataSchema) ForEachCatalogDescriptor(fn func(desc catalog.Descripto
 	return nil
 }
 
+// FindDescriptorByName retrieves the descriptor with the specified
+// name. It returns nil if no descriptor with this name was found.
+func (ms MetadataSchema) FindDescriptorByName(name string) catalog.Descriptor {
+	for _, desc := range ms.descs {
+		if desc.GetName() == name {
+			return desc
+		}
+	}
+	return nil
+}
+
 // AddSplitIDs adds some "table ids" to the MetadataSchema such that
 // corresponding keys are returned as split points by GetInitialValues().
 // AddDescriptor() has the same effect for the table descriptors that are passed
@@ -152,7 +169,22 @@ func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey)
 	{
 		value := roachpb.Value{}
 		value.SetInt(int64(ms.FirstNonSystemDescriptorID()))
-		add(ms.codec.DescIDSequenceKey(), value)
+		add(ms.codec.SequenceKey(keys.DescIDSequenceID), value)
+		if ms.codec.ForSystemTenant() {
+			// We need to also set the value of the legacy descriptor ID generator
+			// until clusterversion.V23_1DescIDSequenceForSystemTenant is removed.
+			legacyValue := roachpb.Value{}
+			legacyValue.SetInt(int64(ms.FirstNonSystemDescriptorID()))
+			add(keys.LegacyDescIDGenerator, legacyValue)
+		}
+	}
+	// Generate initial values for the system database's public schema, which
+	// doesn't have a descriptor.
+	{
+		publicSchemaValue := roachpb.Value{}
+		publicSchemaValue.SetInt(int64(keys.SystemPublicSchemaID))
+		nameInfo := descpb.NameInfo{ParentID: keys.SystemDatabaseID, Name: tree.PublicSchema}
+		add(catalogkeys.EncodeNameKey(ms.codec, &nameInfo), publicSchemaValue)
 	}
 
 	// Generate initial values for system databases and tables, which have
@@ -161,16 +193,7 @@ func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey)
 		// Create name metadata key.
 		nameValue := roachpb.Value{}
 		nameValue.SetInt(int64(desc.GetID()))
-		if desc.GetParentID() != keys.RootNamespaceID {
-			add(catalogkeys.MakePublicObjectNameKey(ms.codec, desc.GetParentID(), desc.GetName()), nameValue)
-		} else {
-			// Initializing a database. Databases must be initialized with
-			// the public schema, as all tables are scoped under the public schema.
-			add(catalogkeys.MakeDatabaseNameKey(ms.codec, desc.GetName()), nameValue)
-			publicSchemaValue := roachpb.Value{}
-			publicSchemaValue.SetInt(int64(keys.SystemPublicSchemaID))
-			add(catalogkeys.MakeSchemaNameKey(ms.codec, desc.GetID(), tree.PublicSchema), publicSchemaValue)
-		}
+		add(catalogkeys.EncodeNameKey(ms.codec, desc), nameValue)
 
 		// Set initial sequence values.
 		if tbl, ok := desc.(catalog.TableDescriptor); ok && tbl.IsSequence() && tbl.GetID() != keys.DescIDSequenceID {
@@ -209,14 +232,16 @@ func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey)
 	// boundaries. In fact, if we tried to split at table boundaries, those
 	// splits would quickly be merged away. The only enforced split points are
 	// between secondary tenants (e.g. between /tenant/<id> and /tenant/<id+1>).
-	// So we drop all descriptor split points and replace it with a single split
-	// point at the beginning of this tenant's keyspace.
+	// So we drop all descriptor split points and replace them with split points
+	// at the beginning and end of this tenant's keyspace.
 	if ms.codec.ForSystemTenant() {
 		for _, id := range ms.otherSplitIDs {
 			splits = append(splits, roachpb.RKey(ms.codec.TablePrefix(id)))
 		}
 	} else {
-		splits = []roachpb.RKey{roachpb.RKey(ms.codec.TenantPrefix())}
+		tenantStartKey := roachpb.RKey(ms.codec.TenantPrefix())
+		tenantEndKey := tenantStartKey.PrefixEnd()
+		splits = []roachpb.RKey{tenantStartKey, tenantEndKey}
 	}
 
 	// Other key/value generation that doesn't fit into databases and
@@ -231,6 +256,102 @@ func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey)
 	})
 
 	return ret, splits
+}
+
+type initialValueStrings struct {
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
+}
+
+// InitialValuesToString returns a string representation of the return values
+// of MetadataSchema.GetInitialValues. The tenant prefix is stripped.
+func InitialValuesToString(ms MetadataSchema) string {
+	kvs, splits := ms.GetInitialValues()
+	// Collect the records.
+	type record struct {
+		k, v []byte
+	}
+	records := make([]record, 0, len(kvs)+len(splits))
+	for _, kv := range kvs {
+		records = append(records, record{k: kv.Key, v: kv.Value.TagAndDataBytes()})
+	}
+	p := ms.codec.TenantPrefix()
+	pNext := p.PrefixEnd()
+	for _, s := range splits {
+		// Filter out the tenant end key because it does not have the same prefix.
+		if bytes.HasPrefix(s, pNext) {
+			continue
+		}
+		records = append(records, record{k: s})
+	}
+	// Strip the tenant prefix if there is one.
+	for i, r := range records {
+		if !bytes.Equal(p, r.k[:len(p)]) {
+			panic("unexpected prefix")
+		}
+		records[i].k = r.k[len(p):]
+	}
+	// Build the string representation.
+	s := make([]initialValueStrings, len(records))
+	for i, r := range records {
+		s[i].Key = hex.EncodeToString(r.k)
+		s[i].Value = hex.EncodeToString(r.v)
+	}
+	// Sort the records by key.
+	sort.Slice(s, func(i, j int) bool {
+		return s[i].Key < s[j].Key
+	})
+	// Build the string representation.
+	var sb strings.Builder
+	sb.WriteRune('[')
+	for i, r := range s {
+		if i > 0 {
+			sb.WriteRune(',')
+		}
+		b, err := json.Marshal(r)
+		if err != nil {
+			panic(err)
+		}
+		sb.Write(b)
+		sb.WriteRune('\n')
+	}
+	sb.WriteRune(']')
+	return sb.String()
+}
+
+// InitialValuesFromString is the reciprocal to InitialValuesToString and
+// appends the tenant prefix from the given codec.
+func InitialValuesFromString(
+	codec keys.SQLCodec, str string,
+) (kvs []roachpb.KeyValue, splits []roachpb.RKey, _ error) {
+	p := codec.TenantPrefix()
+	var s []initialValueStrings
+	if err := json.Unmarshal([]byte(str), &s); err != nil {
+		return nil, nil, err
+	}
+	for i, r := range s {
+		k, err := hex.DecodeString(r.Key)
+		if err != nil {
+			return nil, nil, errors.Errorf("failed to decode hex key %s for record #%d", r.Key, i+1)
+		}
+		v, err := hex.DecodeString(r.Value)
+		if err != nil {
+			return nil, nil, errors.Errorf("failed to decode hex value %s fo record #%d", r.Value, i+1)
+		}
+		k = append(p[:len(p):len(p)], k...)
+		if len(v) == 0 {
+			splits = append(splits, k)
+		} else {
+			kv := roachpb.KeyValue{Key: k}
+			kv.Value.SetTagAndData(v)
+			kvs = append(kvs, kv)
+		}
+	}
+	// Add back the filtered out tenant end key.
+	if !codec.ForSystemTenant() {
+		splits = append(splits, roachpb.RKey(p.PrefixEnd()))
+	}
+	return kvs, splits, nil
 }
 
 // DescriptorIDs returns the descriptor IDs present in the metadata schema in
@@ -277,13 +398,11 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	target.AddDescriptor(systemschema.UsersTable)
 	target.AddDescriptor(systemschema.ZonesTable)
 	target.AddDescriptor(systemschema.SettingsTable)
-	// Only add the descriptor ID sequence if this is a non-system tenant.
-	// System tenants use the global descIDGenerator key. See #48513.
-	target.AddDescriptorForNonSystemTenant(systemschema.DescIDSequence)
+	target.AddDescriptor(systemschema.DescIDSequence)
 	target.AddDescriptorForSystemTenant(systemschema.TenantsTable)
 
 	// Add all the other system tables.
-	target.AddDescriptor(systemschema.LeaseTable)
+	target.AddDescriptor(systemschema.LeaseTable())
 	target.AddDescriptor(systemschema.EventLogTable)
 	target.AddDescriptor(systemschema.RangeEventTable)
 	target.AddDescriptor(systemschema.UITable)
@@ -315,7 +434,7 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	// Tables introduced in 20.2.
 
 	target.AddDescriptor(systemschema.ScheduledJobsTable)
-	target.AddDescriptor(systemschema.SqllivenessTable)
+	target.AddDescriptor(systemschema.SqllivenessTable())
 	target.AddDescriptor(systemschema.MigrationsTable)
 
 	// Tables introduced in 21.1.
@@ -328,7 +447,7 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	target.AddDescriptor(systemschema.TransactionStatisticsTable)
 	target.AddDescriptor(systemschema.DatabaseRoleSettingsTable)
 	target.AddDescriptorForSystemTenant(systemschema.TenantUsageTable)
-	target.AddDescriptor(systemschema.SQLInstancesTable)
+	target.AddDescriptor(systemschema.SQLInstancesTable())
 	target.AddDescriptorForSystemTenant(systemschema.SpanConfigurationsTable)
 
 	// Tables introduced in 22.1.
@@ -341,29 +460,34 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	target.AddDescriptor(systemschema.SystemExternalConnectionsTable)
 	target.AddDescriptor(systemschema.RoleIDSequence)
 
+	// Tables introduced in 23.1.
+	target.AddDescriptor(systemschema.SystemJobInfoTable)
+	target.AddDescriptor(systemschema.SpanStatsUniqueKeysTable)
+	target.AddDescriptor(systemschema.SpanStatsBucketsTable)
+	target.AddDescriptor(systemschema.SpanStatsSamplesTable)
+	target.AddDescriptor(systemschema.SpanStatsTenantBoundariesTable)
+	target.AddDescriptorForSystemTenant(systemschema.SystemTaskPayloadsTable)
+	target.AddDescriptorForSystemTenant(systemschema.SystemTenantTasksTable)
+	target.AddDescriptor(systemschema.StatementActivityTable)
+	target.AddDescriptor(systemschema.TransactionActivityTable)
+	target.AddDescriptorForSystemTenant(systemschema.TenantIDSequence)
+
 	// Adding a new system table? It should be added here to the metadata schema,
 	// and also created as a migration for older clusters.
+	// If adding a call to AddDescriptor or AddDescriptorForSystemTenant, please
+	// bump the value of NumSystemTablesForSystemTenant below. This constant is
+	// just used for testing purposes.
 }
+
+// NumSystemTablesForSystemTenant is the number of system tables defined on
+// the system tenant. This constant is only defined to avoid having to manually
+// update auto stats tests every time a new system table is added.
+const NumSystemTablesForSystemTenant = 51
 
 // addSplitIDs adds a split point for each of the PseudoTableIDs to the supplied
 // MetadataSchema.
 func addSplitIDs(target *MetadataSchema) {
 	target.AddSplitIDs(keys.PseudoTableIDs...)
-}
-
-// createZoneConfigKV creates a kv pair for the zone config for the given key
-// and config value.
-func createZoneConfigKV(
-	keyID int, codec keys.SQLCodec, zoneConfig *zonepb.ZoneConfig,
-) roachpb.KeyValue {
-	value := roachpb.Value{}
-	if err := value.SetProto(zoneConfig); err != nil {
-		panic(errors.NewAssertionErrorWithWrappedErrf(err, "could not marshal ZoneConfig for ID: %d", keyID))
-	}
-	return roachpb.KeyValue{
-		Key:   codec.ZoneKey(uint32(keyID)),
-		Value: value,
-	}
 }
 
 // InitialZoneConfigKVs returns a list of KV pairs to seed `system.zones`. The
@@ -373,10 +497,23 @@ func InitialZoneConfigKVs(
 	defaultZoneConfig *zonepb.ZoneConfig,
 	defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) (ret []roachpb.KeyValue) {
+	const skippedColumnFamilyID = 0
+	w := MakeKVWriter(codec, systemschema.ZonesTable, skippedColumnFamilyID)
+	add := func(id uint32, zc *zonepb.ZoneConfig) {
+		bytes, err := protoutil.Marshal(zc)
+		if err != nil {
+			panic(errors.NewAssertionErrorWithWrappedErrf(err, "could not marshal ZoneConfig for ID: %d", id))
+		}
+		kvs, err := w.RecordToKeyValues(tree.NewDInt(tree.DInt(id)), tree.NewDBytes(tree.DBytes(bytes)))
+		if err != nil {
+			panic(err)
+		}
+		ret = append(ret, kvs...)
+	}
+
 	// Both the system tenant and secondary tenants get their own RANGE DEFAULT
 	// zone configuration.
-	ret = append(ret,
-		createZoneConfigKV(keys.RootNamespaceID, codec, defaultZoneConfig))
+	add(keys.RootNamespaceID, defaultZoneConfig)
 
 	if !codec.ForSystemTenant() {
 		return ret
@@ -391,8 +528,6 @@ func InitialZoneConfigKVs(
 
 	// .meta zone config entry with a shorter GC time.
 	metaRangeZoneConf.GC.TTLSeconds = 60 * 60 // 1h
-	ret = append(ret,
-		createZoneConfigKV(keys.MetaRangesID, codec, metaRangeZoneConf))
 
 	// Some reporting tables have shorter GC times.
 	replicationConstraintStatsZoneConf := &zonepb.ZoneConfig{
@@ -407,18 +542,14 @@ func InitialZoneConfigKVs(
 
 	// Liveness zone config entry with a shorter GC time.
 	livenessZoneConf.GC.TTLSeconds = 10 * 60 // 10m
-	ret = append(ret,
-		createZoneConfigKV(keys.LivenessRangesID, codec, livenessZoneConf))
-	ret = append(ret,
-		createZoneConfigKV(keys.SystemRangesID, codec, systemZoneConf))
-	ret = append(ret,
-		createZoneConfigKV(keys.SystemDatabaseID, codec, systemZoneConf))
-	ret = append(ret,
-		createZoneConfigKV(keys.ReplicationConstraintStatsTableID, codec, replicationConstraintStatsZoneConf))
-	ret = append(ret,
-		createZoneConfigKV(keys.ReplicationStatsTableID, codec, replicationStatsZoneConf))
-	ret = append(ret,
-		createZoneConfigKV(keys.TenantUsageTableID, codec, tenantUsageZoneConf))
+
+	add(keys.MetaRangesID, metaRangeZoneConf)
+	add(keys.LivenessRangesID, livenessZoneConf)
+	add(keys.SystemRangesID, systemZoneConf)
+	add(keys.SystemDatabaseID, systemZoneConf)
+	add(keys.ReplicationConstraintStatsTableID, replicationConstraintStatsZoneConf)
+	add(keys.ReplicationStatsTableID, replicationStatsZoneConf)
+	add(keys.TenantUsageTableID, tenantUsageZoneConf)
 
 	return ret
 }
@@ -444,6 +575,47 @@ func addSystemDatabaseToSchema(
 	addSystemDescriptorsToSchema(target)
 	addSplitIDs(target)
 	addZoneConfigKVsToSchema(target, defaultZoneConfig, defaultSystemZoneConfig)
+	addSystemTenantEntry(target)
+}
+
+// addSystemTenantEntry adds a kv pair to system.tenants to define the initial
+// system tenant entry.
+func addSystemTenantEntry(target *MetadataSchema) {
+	info := mtinfopb.ProtoInfo{
+		DeprecatedID:        roachpb.SystemTenantID.ToUint64(),
+		DeprecatedDataState: mtinfopb.ProtoInfo_READY,
+	}
+	infoBytes, err := protoutil.Marshal(&info)
+	if err != nil {
+		panic(err)
+	}
+
+	// Find the system.tenant descriptor in the newly created catalog.
+	desc := target.FindDescriptorByName(string(catconstants.TenantsTableName))
+	if desc == nil {
+		// No system.tenant table (we're likely in a secondary
+		// tenant). Nothing to do.
+		return
+	}
+	tenantsTableWriter := MakeKVWriter(target.codec, desc.(catalog.TableDescriptor))
+	kvs, err := tenantsTableWriter.RecordToKeyValues(
+		// ID
+		tree.NewDInt(tree.DInt(roachpb.SystemTenantID.ToUint64())),
+		// active -- deprecated.
+		tree.MakeDBool(true),
+		// info.
+		tree.NewDBytes(tree.DBytes(infoBytes)),
+		// name.
+		tree.NewDString(catconstants.SystemTenantName),
+		// data_state.
+		tree.NewDInt(tree.DInt(mtinfopb.DataStateReady)),
+		// service_mode.
+		tree.NewDInt(tree.DInt(mtinfopb.ServiceModeShared)),
+	)
+	if err != nil {
+		panic(err)
+	}
+	target.otherKV = append(target.otherKV, kvs...)
 }
 
 // TestingMinUserDescID returns the smallest user-created descriptor ID in a

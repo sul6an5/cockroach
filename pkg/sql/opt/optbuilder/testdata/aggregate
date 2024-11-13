@@ -3663,14 +3663,14 @@ group-by (hash)
  ├── columns: firstcol:1(int!null) secondcol:2(int) thirdcol:2(int)
  ├── grouping columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int)
  ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
- ├── cost: 1155.01625
+ ├── cost: 1159.01625
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── interesting orderings: (+1)
  └── project
       ├── columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int)
       ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
-      ├── cost: 1114.84
+      ├── cost: 1118.84
       ├── key: (1)
       ├── fd: (1)-->(2)
       ├── prune: (1,2)
@@ -3678,7 +3678,7 @@ group-by (hash)
       └── scan t.public.xyz
            ├── columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int) t.public.xyz.z:3(float) t.public.xyz.crdb_internal_mvcc_timestamp:4(decimal) t.public.xyz.tableoid:5(oid)
            ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
-           ├── cost: 1104.82
+           ├── cost: 1108.82
            ├── key: (1)
            ├── fd: (1)-->(2-5)
            ├── prune: (1-5)
@@ -4781,3 +4781,30 @@ project
                      │              └── unnest:2
                      └── projections
                           └── CASE WHEN arr:1 IS NULL THEN '[]' ELSE json_agg:3 END [as=json_agg:4]
+
+# Regression test for incorrectly ignoring NULLS LAST in aggregate functions (#91295).
+exec-ddl
+CREATE TABLE nulls_last_test (
+    id INT NULL
+)
+----
+
+build
+SELECT array_agg(id ORDER BY id NULLS LAST) FROM nulls_last_test
+----
+scalar-group-by
+ ├── columns: array_agg:6
+ ├── window partition=() ordering=+5,+1
+ │    ├── columns: id:1 rowid:2!null crdb_internal_mvcc_timestamp:3 tableoid:4 column5:5!null array_agg:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null id:1 rowid:2!null crdb_internal_mvcc_timestamp:3 tableoid:4
+ │    │    ├── scan nulls_last_test
+ │    │    │    └── columns: id:1 rowid:2!null crdb_internal_mvcc_timestamp:3 tableoid:4
+ │    │    └── projections
+ │    │         └── id:1 IS NULL [as=column5:5]
+ │    └── windows
+ │         └── array-agg [as=array_agg:6, frame="range from unbounded to unbounded"]
+ │              └── id:1
+ └── aggregations
+      └── const-agg [as=array_agg:6]
+           └── array_agg:6

@@ -21,14 +21,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl/tenantcostserver"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/metrictestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -40,10 +42,10 @@ import (
 
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
 
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		defer leaktest.AfterTest(t)()
+		defer log.Scope(t).Close(t)
 
 		var ts testState
 		ts.start(t)
@@ -83,7 +85,8 @@ func (ts *testState) start(t *testing.T) {
 	ts.tenantUsage = tenantcostserver.NewInstance(
 		ts.s.ClusterSettings(),
 		ts.kvDB,
-		ts.s.InternalExecutor().(*sql.InternalExecutor), ts.clock,
+		ts.s.InternalDB().(isql.DB),
+		ts.clock,
 	)
 	ts.metricsReg = metric.NewRegistry()
 	ts.metricsReg.AddMetricStruct(ts.tenantUsage.Metrics())
@@ -170,13 +173,13 @@ func (ts *testState) tokenBucketRequest(t *testing.T, d *datadriven.TestData) st
 	if err != nil {
 		d.Fatalf(t, "failed to parse duration: %v", args.Period)
 	}
-	req := roachpb.TokenBucketRequest{
+	req := kvpb.TokenBucketRequest{
 		TenantID:           tenantID,
 		InstanceID:         args.InstanceID,
 		InstanceLease:      []byte(args.InstanceLease),
 		NextLiveInstanceID: args.NextLiveInstanceID,
 		SeqNum:             args.SeqNum,
-		ConsumptionSinceLastRequest: roachpb.TenantConsumption{
+		ConsumptionSinceLastRequest: kvpb.TenantConsumption{
 			RU:                     args.Consumption.RU,
 			KVRU:                   args.Consumption.KVRU,
 			ReadBatches:            args.Consumption.ReadBatches,
@@ -194,7 +197,7 @@ func (ts *testState) tokenBucketRequest(t *testing.T, d *datadriven.TestData) st
 		TargetRequestPeriod: period,
 	}
 	res := ts.tenantUsage.TokenBucketRequest(
-		context.Background(), roachpb.MakeTenantID(tenantID), &req,
+		context.Background(), roachpb.MustMakeTenantID(tenantID), &req,
 	)
 	if res.Error != (errors.EncodedError{}) {
 		return fmt.Sprintf("error: %v", errors.DecodeError(context.Background(), res.Error))
@@ -241,12 +244,19 @@ func (ts *testState) configure(t *testing.T, d *datadriven.TestData) string {
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &args); err != nil {
 		d.Fatalf(t, "failed to parse request yaml: %v", err)
 	}
-	if err := ts.kvDB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+	db := ts.s.InternalDB().(isql.DB)
+	if err := db.Txn(context.Background(), func(
+		ctx context.Context, txn isql.Txn,
+	) error {
 		return ts.tenantUsage.ReconfigureTokenBucket(
-			ctx, txn,
-			roachpb.MakeTenantID(tenantID),
-			args.AvailableRU, args.RefillRate, args.MaxBurstRU,
-			time.Time{}, 0,
+			ctx,
+			txn,
+			roachpb.MustMakeTenantID(tenantID),
+			args.AvailableRU,
+			args.RefillRate,
+			args.MaxBurstRU,
+			time.Time{},
+			0,
 		)
 	}); err != nil {
 		d.Fatalf(t, "reconfigure error: %v", err)
@@ -256,16 +266,19 @@ func (ts *testState) configure(t *testing.T, d *datadriven.TestData) string {
 
 // inspect shows all the metadata for a tenant (specified in a tenant=X
 // argument), in a user-friendly format.
-func (ts *testState) inspect(t *testing.T, d *datadriven.TestData) string {
+func (ts *testState) inspect(t *testing.T, d *datadriven.TestData) (res string) {
 	tenantID := ts.tenantID(t, d)
-	res, err := tenantcostserver.InspectTenantMetadata(
-		context.Background(),
-		ts.s.InternalExecutor().(*sql.InternalExecutor),
-		nil, /* txn */
-		roachpb.MakeTenantID(tenantID),
-		timeFormat,
-	)
-	if err != nil {
+	if err := ts.s.InternalDB().(isql.DB).Txn(context.Background(), func(
+		ctx context.Context, txn isql.Txn,
+	) (err error) {
+		res, err = tenantcostserver.InspectTenantMetadata(
+			context.Background(),
+			txn,
+			roachpb.MustMakeTenantID(tenantID),
+			timeFormat,
+		)
+		return err
+	}); err != nil {
 		d.Fatalf(t, "error inspecting tenant state: %v", err)
 	}
 	return res
@@ -317,7 +330,7 @@ func TestInstanceCleanup(t *testing.T) {
 
 	// Note: this number needs to be at most maxInstancesCleanup.
 	const maxInstances = 10
-	var liveset, prev util.FastIntSet
+	var liveset, prev intsets.Fast
 
 	for steps := 0; steps < 100; steps++ {
 		// Keep the previous set for debugging.
@@ -340,7 +353,7 @@ func TestInstanceCleanup(t *testing.T) {
 		// Send one token bucket update from each instance, in random order.
 		instances := liveset.Ordered()
 		for _, i := range rand.Perm(len(instances)) {
-			req := roachpb.TokenBucketRequest{
+			req := kvpb.TokenBucketRequest{
 				TenantID:   5,
 				InstanceID: uint32(instances[i]),
 			}
@@ -350,7 +363,7 @@ func TestInstanceCleanup(t *testing.T) {
 				req.NextLiveInstanceID = uint32(instances[0])
 			}
 			res := ts.tenantUsage.TokenBucketRequest(
-				context.Background(), roachpb.MakeTenantID(5), &req,
+				context.Background(), roachpb.MustMakeTenantID(5), &req,
 			)
 			if res.Error != (errors.EncodedError{}) {
 				t.Fatal(errors.DecodeError(context.Background(), res.Error))
@@ -360,7 +373,7 @@ func TestInstanceCleanup(t *testing.T) {
 		rows := ts.r.Query(t,
 			"SELECT instance_id FROM system.tenant_usage WHERE tenant_id = 5 AND instance_id > 0",
 		)
-		var serverSet util.FastIntSet
+		var serverSet intsets.Fast
 		for rows.Next() {
 			var id int
 			if err := rows.Scan(&id); err != nil {

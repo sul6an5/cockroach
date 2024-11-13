@@ -53,7 +53,7 @@ type planVisitor struct {
 
 // makePlanVisitor creates a planVisitor instance.
 // ctx will be stored in the planVisitor and used when visiting planNode's and
-// expressions..
+// expressions.
 func makePlanVisitor(ctx context.Context, observer planObserver) planVisitor {
 	return planVisitor{observer: observer, ctx: ctx}
 }
@@ -215,7 +215,9 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			n.sourcePlan = v.visit(n.sourcePlan)
 		}
 
+	case *alterTenantCapabilityNode:
 	case *alterTenantSetClusterSettingNode:
+	case *alterTenantServiceNode:
 	case *createViewNode:
 	case *setVarNode:
 	case *setClusterSettingNode:
@@ -360,7 +362,9 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&alterTableOwnerNode{}):                     "alter table owner",
 	reflect.TypeOf(&alterTableSetLocalityNode{}):               "alter table set locality",
 	reflect.TypeOf(&alterTableSetSchemaNode{}):                 "alter table set schema",
+	reflect.TypeOf(&alterTenantCapabilityNode{}):               "alter tenant capability",
 	reflect.TypeOf(&alterTenantSetClusterSettingNode{}):        "alter tenant set cluster setting",
+	reflect.TypeOf(&alterTenantServiceNode{}):                  "alter tenant service",
 	reflect.TypeOf(&alterTypeNode{}):                           "alter type",
 	reflect.TypeOf(&alterRoleNode{}):                           "alter role",
 	reflect.TypeOf(&alterRoleSetNode{}):                        "alter role set var",
@@ -368,6 +372,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&bufferNode{}):                              "buffer",
 	reflect.TypeOf(&cancelQueriesNode{}):                       "cancel queries",
 	reflect.TypeOf(&cancelSessionsNode{}):                      "cancel sessions",
+	reflect.TypeOf(&cdcValuesNode{}):                           "wrapped streaming node",
 	reflect.TypeOf(&changeDescriptorBackedPrivilegesNode{}):    "change privileges",
 	reflect.TypeOf(&changeNonDescriptorBackedPrivilegesNode{}): "change system privileges",
 	reflect.TypeOf(&commentOnColumnNode{}):                     "comment on column",
@@ -376,6 +381,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&commentOnIndexNode{}):                      "comment on index",
 	reflect.TypeOf(&commentOnTableNode{}):                      "comment on table",
 	reflect.TypeOf(&commentOnSchemaNode{}):                     "comment on schema",
+	reflect.TypeOf(&completionsNode{}):                         "show completions",
 	reflect.TypeOf(&controlJobsNode{}):                         "control jobs",
 	reflect.TypeOf(&controlSchedulesNode{}):                    "control schedules",
 	reflect.TypeOf(&createDatabaseNode{}):                      "create database",
@@ -387,6 +393,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&createSchemaNode{}):                        "create schema",
 	reflect.TypeOf(&createStatsNode{}):                         "create statistics",
 	reflect.TypeOf(&createTableNode{}):                         "create table",
+	reflect.TypeOf(&createTenantNode{}):                        "create tenant",
 	reflect.TypeOf(&createTypeNode{}):                          "create type",
 	reflect.TypeOf(&CreateRoleNode{}):                          "create user/role",
 	reflect.TypeOf(&createViewNode{}):                          "create view",
@@ -402,6 +409,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&dropSequenceNode{}):                        "drop sequence",
 	reflect.TypeOf(&dropSchemaNode{}):                          "drop schema",
 	reflect.TypeOf(&dropTableNode{}):                           "drop table",
+	reflect.TypeOf(&dropTenantNode{}):                          "drop tenant",
 	reflect.TypeOf(&dropTypeNode{}):                            "drop type",
 	reflect.TypeOf(&DropRoleNode{}):                            "drop user/role",
 	reflect.TypeOf(&dropViewNode{}):                            "drop view",
@@ -436,7 +444,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&renameDatabaseNode{}):                      "rename database",
 	reflect.TypeOf(&renameIndexNode{}):                         "rename index",
 	reflect.TypeOf(&renameTableNode{}):                         "rename table",
-	reflect.TypeOf(&reparentDatabaseNode{}):                    "reparent database",
+	reflect.TypeOf(&renameTenantNode{}):                        "rename tenant",
 	reflect.TypeOf(&renderNode{}):                              "render",
 	reflect.TypeOf(&resetAllNode{}):                            "reset all",
 	reflect.TypeOf(&RevokeRoleNode{}):                          "revoke role",
@@ -454,6 +462,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&setVarNode{}):                              "set",
 	reflect.TypeOf(&setZoneConfigNode{}):                       "configure zone",
 	reflect.TypeOf(&showFingerprintsNode{}):                    "show fingerprints",
+	reflect.TypeOf(&showTenantNode{}):                          "show tenant",
 	reflect.TypeOf(&showTraceNode{}):                           "show trace for",
 	reflect.TypeOf(&showTraceReplicaNode{}):                    "replica trace",
 	reflect.TypeOf(&showVarNode{}):                             "show",

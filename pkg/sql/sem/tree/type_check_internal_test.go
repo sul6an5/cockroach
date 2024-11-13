@@ -37,7 +37,7 @@ func BenchmarkTypeCheck(b *testing.B) {
 		b.Fatalf("%s: %v", expr, err)
 	}
 	ctx := tree.MakeSemaContext()
-	if err := ctx.Placeholders.Init(1 /* numPlaceholders */, nil /* typeHints */, false /* fromSQL */); err != nil {
+	if err := ctx.Placeholders.Init(1 /* numPlaceholders */, nil /* typeHints */); err != nil {
 		b.Fatal(err)
 	}
 	for i := 0; i < b.N; i++ {
@@ -74,7 +74,7 @@ func TestTypeCheckNormalize(t *testing.T) {
 			}
 			evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer evalCtx.Stop(context.Background())
-			typedExpr, err := normalize.Expr(evalCtx, typeChecked)
+			typedExpr, err := normalize.Expr(ctx, evalCtx, typeChecked)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -183,7 +183,7 @@ func attemptTypeCheckSameTypedExprs(t *testing.T, idx int, test sameTypedExprsTe
 	ctx := context.Background()
 	forEachPerm(test.exprs, 0, func(exprs []copyableExpr) {
 		semaCtx := tree.MakeSemaContext()
-		if err := semaCtx.Placeholders.Init(len(test.ptypes), clonePlaceholderTypes(test.ptypes), false /* fromSQL */); err != nil {
+		if err := semaCtx.Placeholders.Init(len(test.ptypes), clonePlaceholderTypes(test.ptypes)); err != nil {
 			t.Fatal(err)
 		}
 		desired := types.Any
@@ -199,7 +199,7 @@ func attemptTypeCheckSameTypedExprs(t *testing.T, idx int, test sameTypedExprsTe
 					idx, test.expectedType, buildExprs(exprs), typ)
 			}
 			if !reflect.DeepEqual(semaCtx.Placeholders.Types, test.expectedPTypes) {
-				t.Errorf("%d: expected placeholder types %v after TypeCheckSameTypedExprs for %v, found %v", idx, test.expectedPTypes, buildExprs(exprs), semaCtx.Placeholders.Types)
+				t.Errorf("%d: expected placeholder types %v after typeCheckSameTypedExprs for %v, found %v", idx, test.expectedPTypes, buildExprs(exprs), semaCtx.Placeholders.Types)
 			}
 		}
 	})
@@ -314,6 +314,7 @@ func TestTypeCheckSameTypedExprsError(t *testing.T) {
 	tupleIntMismatchErr := `expected .* to be of type (tuple|int), found type (tuple|int)`
 	tupleLenErr := `expected tuple .* to have a length of .*`
 	placeholderErr := `could not determine data type of placeholder .*`
+	placeholderAlreadyAssignedErr := `placeholder .* already has type (decimal|int), cannot assign (decimal|int)`
 
 	testData := []struct {
 		ptypes  tree.PlaceholderTypes
@@ -325,7 +326,7 @@ func TestTypeCheckSameTypedExprsError(t *testing.T) {
 		// Single type mismatches.
 		{nil, nil, exprs(dint(1), decConst("1.1")), decimalIntMismatchErr},
 		{nil, nil, exprs(dint(1), ddecimal(1)), decimalIntMismatchErr},
-		{ptypesInt, nil, exprs(decConst("1.1"), placeholder(0)), decimalIntMismatchErr},
+		{ptypesInt, nil, exprs(decConst("1.1"), placeholder(0)), placeholderAlreadyAssignedErr},
 		// Tuple type mismatches.
 		{nil, nil, exprs(tuple(dint(1)), tuple(ddecimal(1))), tupleFloatIntMismatchErr},
 		{nil, nil, exprs(tuple(dint(1)), dint(1), dint(1)), tupleIntMismatchErr},
@@ -337,7 +338,7 @@ func TestTypeCheckSameTypedExprsError(t *testing.T) {
 	for i, d := range testData {
 		t.Run(fmt.Sprintf("test_%d", i), func(t *testing.T) {
 			semaCtx := tree.MakeSemaContext()
-			if err := semaCtx.Placeholders.Init(len(d.ptypes), d.ptypes, false /* fromSQL */); err != nil {
+			if err := semaCtx.Placeholders.Init(len(d.ptypes), d.ptypes); err != nil {
 				t.Error(err)
 			}
 			desired := types.Any
@@ -345,7 +346,9 @@ func TestTypeCheckSameTypedExprsError(t *testing.T) {
 				desired = d.desired
 			}
 			forEachPerm(d.exprs, 0, func(exprs []copyableExpr) {
-				if _, _, err := tree.TypeCheckSameTypedExprs(ctx, &semaCtx, desired, buildExprs(exprs)...); !testutils.IsError(err, d.expectedErr) {
+				if _, _, err := tree.TypeCheckSameTypedExprs(
+					ctx, &semaCtx, desired, buildExprs(exprs)...,
+				); !testutils.IsError(err, d.expectedErr) {
 					t.Errorf("%d: expected %s, but found %v", i, d.expectedErr, err)
 				}
 			})

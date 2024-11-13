@@ -70,7 +70,10 @@ func registerTPCDSVec(r registry.Registry) {
 		}
 		t.Status("restoring TPCDS dataset for Scale Factor 1")
 		if _, err := clusterConn.Exec(
-			`RESTORE DATABASE tpcds FROM 'gs://cockroach-fixtures/workload/tpcds/scalefactor=1/backup?AUTH=implicit';`,
+			`
+RESTORE DATABASE tpcds FROM 'gs://cockroach-fixtures/workload/tpcds/scalefactor=1/backup?AUTH=implicit'
+WITH unsafe_restore_incompatible_version;
+`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -91,7 +94,7 @@ func registerTPCDSVec(r registry.Registry) {
 		// We additionally open fresh connections for each query.
 		setStmtTimeout := fmt.Sprintf("SET statement_timeout='%s';", timeout)
 		firstNode := c.Node(1)
-		urls, err := c.ExternalPGUrl(ctx, t.L(), firstNode)
+		urls, err := c.ExternalPGUrl(ctx, t.L(), firstNode, "")
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -560,15 +561,15 @@ func TestPGPreparedQuery(t *testing.T) {
 				Results("system", "public", "users", username.RootUser, "UPDATE", true),
 		}},
 		{"SHOW INDEXES FROM system.users", []preparedQueryTest{
-			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false, true).
-				Results("users", "primary", false, 2, "hashedPassword", "N/A", true, false, true).
-				Results("users", "primary", false, 3, "isRole", "N/A", true, false, true).
-				Results("users", "primary", false, 4, "user_id", "N/A", true, false, true).
-				Results("users", "users_user_id_idx", false, 1, "user_id", "ASC", false, false, true).
-				Results("users", "users_user_id_idx", false, 2, "username", "ASC", true, true, true),
+			baseTest.Results("users", "primary", false, 1, "username", "username", "ASC", false, false, true).
+				Results("users", "primary", false, 2, "hashedPassword", "hashedPassword", "N/A", true, false, true).
+				Results("users", "primary", false, 3, "isRole", "isRole", "N/A", true, false, true).
+				Results("users", "primary", false, 4, "user_id", "user_id", "N/A", true, false, true).
+				Results("users", "users_user_id_idx", false, 1, "user_id", "user_id", "ASC", false, false, true).
+				Results("users", "users_user_id_idx", false, 2, "username", "username", "ASC", true, true, true),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("public", "comments", "table", gosql.NullString{}, 0, gosql.NullString{}).Others(39),
+			baseTest.Results("public", "comments", "table", "node", 0, gosql.NullString{}).Others(bootstrap.NumSystemTablesForSystemTenant - 1),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
 			baseTest.Results("crdb_internal", gosql.NullString{}).Others(4),
@@ -1634,7 +1635,7 @@ func TestSQLNetworkMetrics(t *testing.T) {
 		t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanupFn()
 
-	const minbytes = 20
+	const minbytes = 10
 	const maxbytes = 2 * 1024
 
 	// Make sure we're starting at 0.

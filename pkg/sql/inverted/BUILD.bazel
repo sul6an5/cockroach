@@ -14,6 +14,7 @@ go_library(
         "//pkg/keysbase",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -25,7 +26,7 @@ go_test(
     data = glob(["testdata/**"]),
     embed = [":inverted"],
     deps = [
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/encoding",
         "//pkg/util/leaktest",
         "//pkg/util/treeprinter",

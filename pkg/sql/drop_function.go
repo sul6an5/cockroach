@@ -14,14 +14,20 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -50,7 +56,7 @@ func (p *planner) DropFunction(
 		toDrop:       make([]*funcdesc.Mutable, 0, len(n.Functions)),
 		dropBehavior: n.DropBehavior,
 	}
-	fnResolved := util.MakeFastIntSet()
+	fnResolved := intsets.MakeFast()
 	for _, fn := range n.Functions {
 		ol, err := p.matchUDF(ctx, &fn, !n.IfExists)
 		if err != nil {
@@ -59,10 +65,7 @@ func (p *planner) DropFunction(
 		if ol == nil {
 			continue
 		}
-		fnID, err := funcdesc.UserDefinedFunctionOIDToID(ol.Oid)
-		if err != nil {
-			return nil, err
-		}
+		fnID := funcdesc.UserDefinedFunctionOIDToID(ol.Oid)
 		if fnResolved.Contains(int(fnID)) {
 			continue
 		}
@@ -70,6 +73,21 @@ func (p *planner) DropFunction(
 		mut, err := p.checkPrivilegesForDropFunction(ctx, fnID)
 		if err != nil {
 			return nil, err
+		}
+		if n.DropBehavior != tree.DropCascade && len(mut.DependedOnBy) > 0 {
+			dependedOnByIDs := make([]descpb.ID, 0, len(mut.DependedOnBy))
+			for _, ref := range mut.DependedOnBy {
+				dependedOnByIDs = append(dependedOnByIDs, ref.ID)
+			}
+			depNames, err := p.getFullyQualifiedNamesFromIDs(ctx, dependedOnByIDs)
+			if err != nil {
+				return nil, err
+			}
+			return nil, pgerror.Newf(
+				pgcode.DependentObjectsStillExist,
+				"cannot drop function %q because other objects (%v) still depend on it",
+				mut.Name, depNames,
+			)
 		}
 		dropNode.toDrop = append(dropNode.toDrop, mut)
 	}
@@ -113,21 +131,23 @@ func (p *planner) matchUDF(
 		return nil, err
 	}
 
-	argTypes, err := fn.InputArgTypes(ctx, p)
+	paramTypes, err := fn.ParamTypes(ctx, p)
 	if err != nil {
 		return nil, err
 	}
-	ol, err := fnDef.MatchOverload(argTypes, fn.FuncName.Schema(), &path)
+	ol, err := fnDef.MatchOverload(paramTypes, fn.FuncName.Schema(), &path)
 	if err != nil {
 		if !required && errors.Is(err, tree.ErrFunctionUndefined) {
 			return nil, nil
 		}
 		return nil, err
 	}
+	// Note that we don't check ol.HasSQLBody() here, because builtin functions
+	// can't be dropped even if they are defined using a SQL string.
 	if !ol.IsUDF {
 		return nil, errors.Errorf(
-			"cannot drop function %s because it is required by the database system",
-			ol.Signature(true /*Simplify*/),
+			"cannot drop function %s%s because it is required by the database system",
+			fnDef.Name, ol.Signature(true /*Simplify*/),
 		)
 	}
 	return &ol, nil
@@ -136,7 +156,7 @@ func (p *planner) matchUDF(
 func (p *planner) checkPrivilegesForDropFunction(
 	ctx context.Context, fnID descpb.ID,
 ) (*funcdesc.Mutable, error) {
-	mutable, err := p.Descriptors().GetMutableFunctionByID(ctx, p.Txn(), fnID, tree.ObjectLookupFlagsWithRequired())
+	mutable, err := p.Descriptors().MutableByID(p.Txn()).Function(ctx, fnID)
 	if err != nil {
 		return nil, err
 	}
@@ -172,18 +192,13 @@ func (p *planner) dropFunctionImpl(ctx context.Context, fnMutable *funcdesc.Muta
 	// Exit early with an error if the function is undergoing a declarative schema
 	// change, before we try to get job IDs and update job statuses later. See
 	// createOrUpdateSchemaChangeJob.
-	if fnMutable.GetDeclarativeSchemaChangerState() != nil {
+	if catalog.HasConcurrentDeclarativeSchemaChange(fnMutable) {
 		return scerrors.ConcurrentSchemaChangeError(fnMutable)
 	}
 
 	// Remove backreference from tables/views/sequences referenced by this UDF.
 	for _, id := range fnMutable.DependsOn {
-		// TODO(chengxiong): remove backreference from UDFs that this UDF has
-		// reference to. This is needed when we allow UDFs being referenced by
-		// UDFs.
-		refMutable, err := p.Descriptors().GetMutableTableByID(
-			ctx, p.txn, id, tree.ObjectLookupFlagsWithRequired(),
-		)
+		refMutable, err := p.Descriptors().MutableByID(p.txn).Table(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -213,9 +228,7 @@ func (p *planner) dropFunctionImpl(ctx context.Context, fnMutable *funcdesc.Muta
 	}
 
 	// Remove function signature from schema.
-	scDesc, err := p.Descriptors().GetMutableSchemaByID(
-		ctx, p.Txn(), fnMutable.ParentSchemaID, tree.ObjectLookupFlagsWithRequired().CommonLookupFlags,
-	)
+	scDesc, err := p.Descriptors().MutableByID(p.Txn()).Schema(ctx, fnMutable.ParentSchemaID)
 	if err != nil {
 		return err
 	}
@@ -229,7 +242,12 @@ func (p *planner) dropFunctionImpl(ctx context.Context, fnMutable *funcdesc.Muta
 
 	// Mark the UDF as dropped.
 	fnMutable.SetDropped()
-	return p.writeFuncSchemaChange(ctx, fnMutable)
+	if err := p.writeDropFuncSchemaChange(ctx, fnMutable); err != nil {
+		return err
+	}
+	fnName := tree.MakeQualifiedFunctionName(p.CurrentDatabase(), scDesc.GetName(), fnMutable.GetName())
+	event := eventpb.DropFunction{FunctionName: fnName.FQString()}
+	return p.logEvent(ctx, fnMutable.GetID(), &event)
 }
 
 func (p *planner) writeFuncDesc(ctx context.Context, funcDesc *funcdesc.Mutable) error {
@@ -243,6 +261,28 @@ func (p *planner) writeFuncDesc(ctx context.Context, funcDesc *funcdesc.Mutable)
 }
 
 func (p *planner) writeFuncSchemaChange(ctx context.Context, funcDesc *funcdesc.Mutable) error {
+	return p.writeFuncDesc(ctx, funcDesc)
+}
+
+func (p *planner) writeDropFuncSchemaChange(ctx context.Context, funcDesc *funcdesc.Mutable) error {
+	_, recordExists := p.extendedEvalCtx.jobs.uniqueToCreate[funcDesc.ID]
+	if recordExists {
+		// For now being, we create jobs for functions only when functions are
+		// dropped.
+		return nil
+	}
+	jobRecord := jobs.Record{
+		JobID:         p.extendedEvalCtx.ExecCfg.JobRegistry.MakeJobID(),
+		Description:   "Drop Function",
+		Username:      p.User(),
+		DescriptorIDs: descpb.IDs{funcDesc.ID},
+		Details: jobspb.SchemaChangeDetails{
+			DroppedFunctions: descpb.IDs{funcDesc.ID},
+		},
+		Progress: jobspb.TypeSchemaChangeProgress{},
+	}
+	p.extendedEvalCtx.jobs.uniqueToCreate[funcDesc.ID] = &jobRecord
+	log.Infof(ctx, "queued drop function job %d for function %d", jobRecord.JobID, funcDesc.ID)
 	return p.writeFuncDesc(ctx, funcDesc)
 }
 

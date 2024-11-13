@@ -76,6 +76,10 @@ type GrafanaConfig struct {
 	// NB: when using gists, https://gist.github.com/[gist_user]/[gist_id]/raw/
 	// provides a link that always references the most up to date version.
 	DashboardURLs []string
+
+	// DashboardJSON are strings containing the JSON for dashboards to
+	// provision in addition to any other sources.
+	DashboardJSON []string
 }
 
 // WithWorkload sets up a scraping config for a single `workload` running on the
@@ -130,6 +134,13 @@ func (cfg *Config) WithCluster(nodes install.Nodes) *Config {
 	return cfg
 }
 
+// WithTenantPod adds scraping for a tenant SQL pod running on the given nodes.
+// Chains for convenience.
+func (cfg *Config) WithTenantPod(node install.Node, tenantID int) *Config {
+	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, MakeInsecureTenantPodScrapeConfig(node, tenantID)...)
+	return cfg
+}
+
 // WithGrafanaDashboard adds links to dashboards to provision into Grafana. See
 // cfg.Grafana.DashboardURLs for helpful tips.
 // Enables Grafana if not already enabled.
@@ -137,6 +148,23 @@ func (cfg *Config) WithCluster(nodes install.Nodes) *Config {
 func (cfg *Config) WithGrafanaDashboard(url string) *Config {
 	cfg.Grafana.Enabled = true
 	cfg.Grafana.DashboardURLs = append(cfg.Grafana.DashboardURLs, url)
+	return cfg
+}
+
+// WithGrafanaDashboardJSON adds a string containing the JSON for a dashboard
+// to provision into Grafana.
+// Enables Grafana if not already enabled.
+// Chains for convenience.
+func (cfg *Config) WithGrafanaDashboardJSON(str string) *Config {
+	cfg.Grafana.Enabled = true
+	cfg.Grafana.DashboardJSON = append(cfg.Grafana.DashboardJSON, str)
+	return cfg
+}
+
+// WithScrapeConfigs adds scraping configs to the prometheus instance. Chains
+// for convenience.
+func (cfg *Config) WithScrapeConfigs(config ...ScrapeConfig) *Config {
+	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, config...)
 	return cfg
 }
 
@@ -170,7 +198,10 @@ func MakeInsecureCockroachScrapeConfig(nodes install.Nodes) []ScrapeConfig {
 		sl = append(sl, ScrapeConfig{
 			JobName:     "cockroach-n" + s,
 			MetricsPath: "/_status/vars",
-			Labels:      map[string]string{"node": s},
+			Labels: map[string]string{
+				"node":   s,
+				"tenant": "system", // all CRDB nodes emit SQL metrics for the system tenant since it's embedded
+			},
 			ScrapeNodes: []ScrapeNode{
 				{
 					Node: node,
@@ -179,6 +210,27 @@ func MakeInsecureCockroachScrapeConfig(nodes install.Nodes) []ScrapeConfig {
 			},
 		})
 	}
+	return sl
+}
+
+// MakeInsecureTenantPodScrapeConfig creates a scrape config for a given tenant
+// SQL pod. All nodes are assumed to be insecure and running on port 8081.
+func MakeInsecureTenantPodScrapeConfig(node install.Node, tenantID int) []ScrapeConfig {
+	var sl []ScrapeConfig
+	sl = append(sl, ScrapeConfig{
+		JobName:     fmt.Sprintf("cockroach-tenant-t%d-n%d", tenantID, int(node)),
+		MetricsPath: "/_status/vars",
+		Labels: map[string]string{
+			"node":   strconv.Itoa(int(node)),
+			"tenant": strconv.Itoa(tenantID),
+		},
+		ScrapeNodes: []ScrapeNode{
+			{
+				Node: node,
+				Port: 8081,
+			},
+		},
+	})
 	return sl
 }
 
@@ -195,7 +247,7 @@ func Init(
 		// NB: when upgrading here, make sure to target a version that picks up this PR:
 		// https://github.com/prometheus/node_exporter/pull/2311
 		// At time of writing, there hasn't been a release in over half a year.
-		if err := c.RepeatRun(ctx, l, os.Stdout, os.Stderr, cfg.NodeExporter,
+		if err := c.RepeatRun(ctx, l, l.Stdout, l.Stderr, cfg.NodeExporter,
 			"download node exporter",
 			`
 (sudo systemctl stop node_exporter || true) &&
@@ -207,7 +259,7 @@ rm -rf node_exporter && mkdir -p node_exporter && curl -fsSL \
 		}
 
 		// Start node_exporter.
-		if err := c.Run(ctx, l, os.Stdout, os.Stderr, cfg.NodeExporter, "init node exporter",
+		if err := c.Run(ctx, l, l.Stdout, l.Stderr, cfg.NodeExporter, "init node exporter",
 			`cd node_exporter &&
 sudo systemd-run --unit node_exporter --same-dir ./node_exporter`,
 		); err != nil {
@@ -219,8 +271,8 @@ sudo systemd-run --unit node_exporter --same-dir ./node_exporter`,
 	if err := c.RepeatRun(
 		ctx,
 		l,
-		os.Stdout,
-		os.Stderr,
+		l.Stdout,
+		l.Stderr,
 		cfg.PrometheusNode,
 		"reset prometheus",
 		"sudo systemctl stop prometheus || echo 'no prometheus is running'",
@@ -231,8 +283,8 @@ sudo systemd-run --unit node_exporter --same-dir ./node_exporter`,
 	if err := c.RepeatRun(
 		ctx,
 		l,
-		os.Stdout,
-		os.Stderr,
+		l.Stdout,
+		l.Stderr,
 		cfg.PrometheusNode,
 		"download prometheus",
 		`sudo rm -rf /tmp/prometheus && mkdir /tmp/prometheus && cd /tmp/prometheus &&
@@ -265,8 +317,8 @@ sudo systemd-run --unit node_exporter --same-dir ./node_exporter`,
 	if err := c.Run(
 		ctx,
 		l,
-		os.Stdout,
-		os.Stderr,
+		l.Stdout,
+		l.Stderr,
 		cfg.PrometheusNode,
 		"start-prometheus",
 		`cd /tmp/prometheus &&
@@ -279,27 +331,29 @@ sudo systemd-run --unit prometheus --same-dir \
 	if cfg.Grafana.Enabled {
 		// Install Grafana.
 		if err := c.RepeatRun(ctx, l,
-			os.Stdout,
-			os.Stderr, cfg.PrometheusNode, "install grafana",
-			`sudo apt-get install -qqy apt-transport-https &&
+			l.Stdout,
+			l.Stderr, cfg.PrometheusNode, "install grafana",
+			`
+sudo apt-get install -qqy apt-transport-https &&
 sudo apt-get install -qqy software-properties-common wget &&
-wget -q -O - https://packages.grafana.com/gpg.key | sudo apt-key add - &&
-echo "deb https://packages.grafana.com/enterprise/deb stable main" | sudo tee -a /etc/apt/sources.list.d/grafana.list &&
-sudo apt-get update -qqy && sudo apt-get install -qqy grafana-enterprise && sudo mkdir -p /var/lib/grafana/dashboards`,
+sudo apt-get install -y adduser libfontconfig1 &&
+wget https://dl.grafana.com/enterprise/release/grafana-enterprise_9.2.3_amd64.deb -O grafana-enterprise_9.2.3_amd64.deb &&
+sudo dpkg -i grafana-enterprise_9.2.3_amd64.deb &&
+sudo mkdir -p /var/lib/grafana/dashboards`,
 		); err != nil {
 			return nil, err
 		}
 
 		// Provision local prometheus instance as data source.
 		if err := c.RepeatRun(ctx, l,
-			os.Stdout,
-			os.Stderr, cfg.PrometheusNode, "permissions",
-			`sudo chmod 777 /etc/grafana/provisioning/datasources /etc/grafana/provisioning/dashboards /var/lib/grafana/dashboards`,
+			l.Stdout,
+			l.Stderr, cfg.PrometheusNode, "permissions",
+			`sudo chmod -R 777 /etc/grafana/provisioning/datasources /etc/grafana/provisioning/dashboards /var/lib/grafana/dashboards /etc/grafana/grafana.ini`,
 		); err != nil {
 			return nil, err
 		}
 
-		// Set up grafana config
+		// Set up grafana config.
 		if err := c.PutString(ctx, l, cfg.PrometheusNode, `apiVersion: 1
 
 datasources:
@@ -310,7 +364,6 @@ datasources:
 `, "/etc/grafana/provisioning/datasources/prometheus.yaml", 0777); err != nil {
 			return nil, err
 		}
-
 		if err := c.PutString(ctx, l, cfg.PrometheusNode, `apiVersion: 1
 
 providers:
@@ -319,21 +372,38 @@ providers:
    folder: ''
    folderUid: ''
    type: file
+   allowUiUpdates: true
    options:
      path: /var/lib/grafana/dashboards
 `, "/etc/grafana/provisioning/dashboards/cockroach.yaml", 0777); err != nil {
 			return nil, err
 		}
+		if err := c.PutString(ctx, l, cfg.PrometheusNode, `
+[auth.anonymous]
+enabled = true
+org_role = Admin
+`,
+			"/etc/grafana/grafana.ini", 0777); err != nil {
+			return nil, err
+		}
+
 		for idx, u := range cfg.Grafana.DashboardURLs {
 			cmd := fmt.Sprintf("curl -fsSL %s -o /var/lib/grafana/dashboards/%d.json", u, idx)
-			if err := c.Run(ctx, l, os.Stdout, os.Stderr, cfg.PrometheusNode, "download dashboard",
+			if err := c.Run(ctx, l, l.Stdout, l.Stderr, cfg.PrometheusNode, "download dashboard",
 				cmd); err != nil {
 				l.PrintfCtx(ctx, "failed to download dashboard from %s: %s", u, err)
 			}
 		}
 
+		for idx, json := range cfg.Grafana.DashboardJSON {
+			if err := c.PutString(ctx, l, cfg.PrometheusNode, json,
+				fmt.Sprintf("/var/lib/grafana/dashboards/s-%d.json", idx), 0777); err != nil {
+				return nil, err
+			}
+		}
+
 		// Start Grafana. Default port is 3000.
-		if err := c.Run(ctx, l, os.Stdout, os.Stderr, cfg.PrometheusNode, "start grafana",
+		if err := c.Run(ctx, l, l.Stdout, l.Stderr, cfg.PrometheusNode, "start grafana",
 			`sudo systemctl restart grafana-server`); err != nil {
 			return nil, err
 		}
@@ -355,11 +425,11 @@ func Snapshot(
 	if err := c.Run(
 		ctx,
 		l,
-		os.Stdout,
-		os.Stderr,
+		l.Stdout,
+		l.Stderr,
 		promNode,
 		"prometheus snapshot",
-		`curl -XPOST http://localhost:9090/api/v1/admin/tsdb/snapshot &&
+		`sudo rm -rf /tmp/prometheus/data/snapshots/* && curl -XPOST http://localhost:9090/api/v1/admin/tsdb/snapshot &&
 	cd /tmp/prometheus && tar cvf prometheus-snapshot.tar.gz data/snapshots`,
 	); err != nil {
 		return err
@@ -367,6 +437,7 @@ func Snapshot(
 	if err := os.WriteFile(filepath.Join(dir, "prometheus-docker-run.sh"), []byte(`#!/bin/sh
 set -eu
 
+rm -rf data/snapshots
 tar xf prometheus-snapshot.tar.gz
 snapdir=$(find data/snapshots -mindepth 1 -maxdepth 1 -type d)
 promyml=$(mktemp)
@@ -425,13 +496,13 @@ func Shutdown(
 			shutdownErr = errors.CombineErrors(shutdownErr, err)
 		}
 	}
-	if err := c.Run(ctx, l, os.Stdout, os.Stderr, nodes, "stop node exporter",
+	if err := c.Run(ctx, l, l.Stdout, l.Stderr, nodes, "stop node exporter",
 		`sudo systemctl stop node_exporter || echo 'Stopped node exporter'`); err != nil {
 		l.Printf("Failed to stop node exporter: %v", err)
 		shutdownErr = errors.CombineErrors(shutdownErr, err)
 	}
 
-	if err := c.Run(ctx, l, os.Stdout, os.Stderr, promNode, "stop grafana",
+	if err := c.Run(ctx, l, l.Stdout, l.Stderr, promNode, "stop grafana",
 		`sudo systemctl stop grafana-server || echo 'Stopped grafana'`); err != nil {
 		l.Printf("Failed to stop grafana server: %v", err)
 		shutdownErr = errors.CombineErrors(shutdownErr, err)
@@ -440,8 +511,8 @@ func Shutdown(
 	if err := c.RepeatRun(
 		ctx,
 		l,
-		os.Stdout,
-		os.Stderr,
+		l.Stdout,
+		l.Stderr,
 		promNode,
 		"stop prometheus",
 		"sudo systemctl stop prometheus || echo 'Stopped prometheus'",
@@ -475,6 +546,10 @@ func makeNodeIPMap(c *install.SyncedCluster) (map[install.Node]string, error) {
 
 // makeYAMLConfig creates a prometheus YAML config for the server to use.
 func makeYAMLConfig(scrapeConfigs []ScrapeConfig, nodeIPs map[install.Node]string) (string, error) {
+	type tlsConfig struct {
+		InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	}
+
 	type yamlStaticConfig struct {
 		Labels  map[string]string `yaml:",omitempty"`
 		Targets []string
@@ -484,6 +559,7 @@ func makeYAMLConfig(scrapeConfigs []ScrapeConfig, nodeIPs map[install.Node]strin
 		JobName       string             `yaml:"job_name"`
 		StaticConfigs []yamlStaticConfig `yaml:"static_configs"`
 		MetricsPath   string             `yaml:"metrics_path"`
+		TLSConfig     tlsConfig          `yaml:"tls_config"`
 	}
 
 	type yamlConfig struct {
@@ -514,6 +590,9 @@ func makeYAMLConfig(scrapeConfigs []ScrapeConfig, nodeIPs map[install.Node]strin
 						Labels:  scrapeConfig.Labels,
 						Targets: targets,
 					},
+				},
+				TLSConfig: tlsConfig{
+					InsecureSkipVerify: true,
 				},
 			},
 		)

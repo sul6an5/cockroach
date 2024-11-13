@@ -32,9 +32,10 @@ if [[ -z "$build_name" ]] ; then
 fi
 # Hard coded release number used only by the RedHat images
 rhel_release=1
-rhel_registry="scan.connect.redhat.com"
 rhel_project_id=5e61ea74fe2231a0c2860382
-rhel_repository="${rhel_registry}/p194808216984433e18e6e90dd859cb1ea7c738ec50/cockroach"
+rhel_registry="quay.io"
+rhel_registry_username="redhat-isv-containers+${rhel_project_id}-robot"
+rhel_repository="${rhel_registry}/redhat-isv-containers/$rhel_project_id"
 dockerhub_repository="cockroachdb/cockroach"
 
 if ! [[ -z "${DRY_RUN}" ]] ; then
@@ -44,7 +45,7 @@ fi
 tc_end_block "Variable Setup"
 
 tc_start_block "Configure docker"
-docker_login_with_redhat
+echo "${QUAY_REGISTRY_KEY}" | docker login --username $rhel_registry_username --password-stdin $rhel_registry
 tc_end_block "Configure docker"
 
 tc_start_block "Rebuild docker image"
@@ -56,14 +57,24 @@ sed \
 cat build/deploy-redhat/Dockerfile
 
 docker build --no-cache \
+  --pull \
   --label release=$rhel_release \
-  --tag=${rhel_repository}:${build_name} \
+  --tag="${rhel_repository}:${build_name}" \
   build/deploy-redhat
 tc_end_block "Rebuild docker image"
 
 tc_start_block "Push RedHat docker image"
 retry docker push "${rhel_repository}:${build_name}"
 tc_end_block "Push RedHat docker image"
+
+tc_start_block "Tag docker image as latest"
+if [[ -n "${PUBLISH_LATEST}" ]]; then
+  docker tag "${rhel_repository}:${build_name}" "${rhel_repository}:latest"
+  retry docker push "${rhel_repository}:latest"
+else
+  echo "Not required"
+fi
+tc_end_block "Tag docker images as latest"
 
 tc_start_block "Run preflight"
 mkdir -p artifacts
@@ -77,7 +88,7 @@ docker run \
   --env PFLT_PYXIS_API_TOKEN="$REDHAT_API_TOKEN" \
   --env PFLT_DOCKERCONFIG=/temp-authfile.json \
   --env DOCKER_CONFIG=/tmp/docker \
-  -v $PWD/artifacts:/artifacts \
+  -v "$PWD/artifacts:/artifacts" \
   -v ~/.docker/config.json:/temp-authfile.json:ro \
   -v ~/.docker/config.json:/tmp/docker/config.json:ro \
   quay.io/opdev/preflight:stable check container \

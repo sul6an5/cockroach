@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -51,7 +52,7 @@ func (s *initResolvedTSScan) Run(ctx context.Context) {
 	if err := s.iterateAndConsume(ctx); err != nil {
 		err = errors.Wrap(err, "initial resolved timestamp scan failed")
 		log.Errorf(ctx, "%v", err)
-		s.p.StopWithErr(roachpb.NewError(err))
+		s.p.StopWithErr(kvpb.NewError(err))
 	} else {
 		// Inform the processor that its resolved timestamp can be initialized.
 		s.p.setResolvedTSInitialized(ctx)
@@ -125,7 +126,11 @@ func (s *SeparatedIntentScanner) ConsumeIntents(
 			return errors.Wrapf(err, "decoding LockTable key: %s", lockedKey)
 		}
 
-		if err := protoutil.Unmarshal(s.iter.UnsafeValue(), &meta); err != nil {
+		v, err := s.iter.UnsafeValue()
+		if err != nil {
+			return err
+		}
+		if err := protoutil.Unmarshal(v, &meta); err != nil {
 			return errors.Wrapf(err, "unmarshaling mvcc meta for locked key %s", lockedKey)
 		}
 		if meta.Txn == nil {
@@ -190,7 +195,11 @@ func (l *LegacyIntentScanner) ConsumeIntents(
 		}
 
 		// Found a metadata key. Unmarshal.
-		if err := protoutil.Unmarshal(l.iter.UnsafeValue(), &meta); err != nil {
+		v, err := l.iter.UnsafeValue()
+		if err != nil {
+			return err
+		}
+		if err := protoutil.Unmarshal(v, &meta); err != nil {
 			return errors.Wrapf(err, "unmarshaling mvcc meta: %v", unsafeKey)
 		}
 

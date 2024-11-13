@@ -20,6 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -64,9 +66,11 @@ func distImport(
 	from []string,
 	format roachpb.IOFileFormat,
 	walltime int64,
-	alwaysFlushProgress bool,
+	testingKnobs importTestingKnobs,
 	procsPerNode int,
-) (roachpb.BulkOpSummary, error) {
+) (kvpb.BulkOpSummary, error) {
+	ctx, sp := tracing.ChildSpan(ctx, "importer.distImport")
+	defer sp.Finish()
 
 	dsp := execCtx.DistSQLPlanner()
 	makePlan := func(ctx context.Context, dsp *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
@@ -109,13 +113,13 @@ func distImport(
 
 		p.PlanToStreamColMap = []int{0, 1}
 
-		dsp.FinalizePlan(planCtx, p)
+		sql.FinalizePlan(ctx, planCtx, p)
 		return p, planCtx, nil
 	}
 
 	p, planCtx, err := makePlan(ctx, dsp)
 	if err != nil {
-		return roachpb.BulkOpSummary{}, err
+		return kvpb.BulkOpSummary{}, err
 	}
 	evalCtx := planCtx.ExtendedEvalCtx
 
@@ -124,7 +128,7 @@ func distImport(
 	// data written since the last time we update the job progress.
 	accumulatedBulkSummary := struct {
 		syncutil.Mutex
-		roachpb.BulkOpSummary
+		kvpb.BulkOpSummary
 	}{}
 	accumulatedBulkSummary.Lock()
 	accumulatedBulkSummary.BulkOpSummary = getLastImportSummary(job)
@@ -133,22 +137,23 @@ func distImport(
 	importDetails := job.Progress().Details.(*jobspb.Progress_Import).Import
 	if importDetails.ReadProgress == nil {
 		// Initialize the progress metrics on the first attempt.
-		if err := job.FractionProgressed(ctx, nil, /* txn */
-			func(ctx context.Context, details jobspb.ProgressDetails) float32 {
-				prog := details.(*jobspb.Progress_Import).Import
-				prog.ReadProgress = make([]float32, len(from))
-				prog.ResumePos = make([]int64, len(from))
-				if prog.SequenceDetails == nil {
-					prog.SequenceDetails = make([]*jobspb.SequenceDetails, len(from))
-					for i := range prog.SequenceDetails {
-						prog.SequenceDetails[i] = &jobspb.SequenceDetails{}
-					}
+		if err := job.NoTxn().FractionProgressed(ctx, func(
+			ctx context.Context, details jobspb.ProgressDetails,
+		) float32 {
+			prog := details.(*jobspb.Progress_Import).Import
+			prog.ReadProgress = make([]float32, len(from))
+			prog.ResumePos = make([]int64, len(from))
+			if prog.SequenceDetails == nil {
+				prog.SequenceDetails = make([]*jobspb.SequenceDetails, len(from))
+				for i := range prog.SequenceDetails {
+					prog.SequenceDetails[i] = &jobspb.SequenceDetails{}
 				}
+			}
 
-				return 0.0
-			},
+			return 0.0
+		},
 		); err != nil {
-			return roachpb.BulkOpSummary{}, err
+			return kvpb.BulkOpSummary{}, err
 		}
 	}
 
@@ -156,25 +161,26 @@ func distImport(
 	fractionProgress := make([]uint32, len(from))
 
 	updateJobProgress := func() error {
-		return job.FractionProgressed(ctx, nil, /* txn */
-			func(ctx context.Context, details jobspb.ProgressDetails) float32 {
-				var overall float32
-				prog := details.(*jobspb.Progress_Import).Import
-				for i := range rowProgress {
-					prog.ResumePos[i] = atomic.LoadInt64(&rowProgress[i])
-				}
-				for i := range fractionProgress {
-					fileProgress := math.Float32frombits(atomic.LoadUint32(&fractionProgress[i]))
-					prog.ReadProgress[i] = fileProgress
-					overall += fileProgress
-				}
+		return job.NoTxn().FractionProgressed(ctx, func(
+			ctx context.Context, details jobspb.ProgressDetails,
+		) float32 {
+			var overall float32
+			prog := details.(*jobspb.Progress_Import).Import
+			for i := range rowProgress {
+				prog.ResumePos[i] = atomic.LoadInt64(&rowProgress[i])
+			}
+			for i := range fractionProgress {
+				fileProgress := math.Float32frombits(atomic.LoadUint32(&fractionProgress[i]))
+				prog.ReadProgress[i] = fileProgress
+				overall += fileProgress
+			}
 
-				accumulatedBulkSummary.Lock()
-				prog.Summary.Add(accumulatedBulkSummary.BulkOpSummary)
-				accumulatedBulkSummary.Reset()
-				accumulatedBulkSummary.Unlock()
-				return overall / float32(len(from))
-			},
+			accumulatedBulkSummary.Lock()
+			prog.Summary.Add(accumulatedBulkSummary.BulkOpSummary)
+			accumulatedBulkSummary.Reset()
+			accumulatedBulkSummary.Unlock()
+			return overall / float32(len(from))
+		},
 		)
 	}
 
@@ -191,16 +197,16 @@ func distImport(
 			accumulatedBulkSummary.Add(meta.BulkProcessorProgress.BulkSummary)
 			accumulatedBulkSummary.Unlock()
 
-			if alwaysFlushProgress {
+			if testingKnobs.alwaysFlushJobProgress {
 				return updateJobProgress()
 			}
 		}
 		return nil
 	}
 
-	var res roachpb.BulkOpSummary
+	var res kvpb.BulkOpSummary
 	rowResultWriter := sql.NewCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
-		var counts roachpb.BulkOpSummary
+		var counts kvpb.BulkOpSummary
 		if err := protoutil.Unmarshal([]byte(*row[0].(*tree.DBytes)), &counts); err != nil {
 			return err
 		}
@@ -210,7 +216,7 @@ func distImport(
 
 	if evalCtx.Codec.ForSystemTenant() {
 		if err := presplitTableBoundaries(ctx, execCtx.ExecCfg(), tables); err != nil {
-			return roachpb.BulkOpSummary{}, err
+			return kvpb.BulkOpSummary{}, err
 		}
 	}
 
@@ -222,8 +228,6 @@ func distImport(
 		nil, /* txn - the flow does not read or write the database */
 		nil, /* clockUpdater */
 		evalCtx.Tracing,
-		evalCtx.ExecCfg.ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
@@ -259,22 +263,31 @@ func distImport(
 		defer cancelReplanner()
 		defer close(stopProgress)
 
+		if testingKnobs.beforeRunDSP != nil {
+			if err := testingKnobs.beforeRunDSP(); err != nil {
+				return err
+			}
+		}
+
+		execCfg := execCtx.ExecCfg()
+		jobsprofiler.StorePlanDiagram(ctx, execCfg.DistSQLSrv.Stopper, p, execCfg.InternalDB, job.ID())
+
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := *evalCtx
-		dsp.Run(ctx, planCtx, nil, p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
+		dsp.Run(ctx, planCtx, nil, p, recv, &evalCtxCopy, testingKnobs.onSetupFinish)
 		return rowResultWriter.Err()
 	})
 
 	g.GoCtx(replanChecker)
 
 	if err := g.Wait(); err != nil {
-		return roachpb.BulkOpSummary{}, err
+		return kvpb.BulkOpSummary{}, err
 	}
 
 	return res, nil
 }
 
-func getLastImportSummary(job *jobs.Job) roachpb.BulkOpSummary {
+func getLastImportSummary(job *jobs.Job) kvpb.BulkOpSummary {
 	progress := job.Progress()
 	importProgress := progress.GetImport()
 	return importProgress.Summary

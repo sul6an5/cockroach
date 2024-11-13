@@ -19,23 +19,46 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// GetGenerator is used to construct a ValueGenerator from a FuncExpr.
-func GetGenerator(ctx *Context, expr *tree.FuncExpr) (ValueGenerator, error) {
+// GetFuncGenerator is used to construct a ValueGenerator from a FuncExpr.
+func GetFuncGenerator(
+	ctx context.Context, evalCtx *Context, expr *tree.FuncExpr,
+) (ValueGenerator, error) {
 	if !expr.IsGeneratorClass() {
 		return nil, errors.AssertionFailedf(
-			"cannot call EvalArgsAndGetGenerator() on non-aggregate function: %q",
+			"cannot call GetFuncGenerator() on non-generator function: %q",
 			tree.ErrString(expr),
 		)
 	}
 	ol := expr.ResolvedOverload()
 	if ol.GeneratorWithExprs != nil {
-		return ol.GeneratorWithExprs.(GeneratorWithExprsOverload)(ctx, expr.Exprs)
+		return ol.GeneratorWithExprs.(GeneratorWithExprsOverload)(ctx, evalCtx, expr.Exprs)
 	}
-	nullArg, args, err := (*evaluator)(ctx).evalFuncArgs(expr)
+	nullArg, args, err := (*evaluator)(evalCtx).evalFuncArgs(ctx, expr)
 	if err != nil || nullArg {
 		return nil, err
 	}
-	return ol.Generator.(GeneratorOverload)(ctx, args)
+	return ol.Generator.(GeneratorOverload)(ctx, evalCtx, args)
+}
+
+// GetRoutineGenerator is used to construct a ValueGenerator from a FuncExpr.
+func GetRoutineGenerator(
+	ctx context.Context, evalCtx *Context, expr *tree.RoutineExpr,
+) (ValueGenerator, error) {
+	args, err := (*evaluator)(evalCtx).evalRoutineArgs(ctx, expr)
+	if err != nil {
+		return nil, err
+	}
+	if !expr.CalledOnNullInput {
+		for i := range args {
+			if args[i] == tree.DNull {
+				// Strict routines (CalledOnNullInput=false) should not be
+				// invoked if any of their arguments are NULL. Return nil so
+				// that the EmptyGenerator or NullGenerator is used.
+				return nil, nil
+			}
+		}
+	}
+	return (*evaluator)(evalCtx).Planner.RoutineExprGenerator(ctx, expr, args), nil
 }
 
 // Table generators, also called "set-generating functions", are
@@ -56,7 +79,7 @@ func GetGenerator(ctx *Context, expr *tree.FuncExpr) (ValueGenerator, error) {
 //   construct a special row source from them.
 
 // ValueGenerator is the interface provided by the value generator
-// functions for SQL SRfs. Objects that implement this interface are
+// functions for SQL SRFs. Objects that implement this interface are
 // able to produce rows of values in a streaming fashion (like Go
 // iterators or generators in Python).
 type ValueGenerator interface {

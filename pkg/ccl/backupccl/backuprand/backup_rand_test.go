@@ -16,9 +16,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuputils"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuptestutils"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -27,13 +28,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestBackupRestoreRandomDataRoundtrips conducts backup/restore roundtrips on
 // randomly generated tables and verifies their data and schema are preserved.
 // It tests that full database backup as well as all subsets of per-table backup
 // roundtrip properly. 50% of the time, the test runs the restore with the
-// schema_only parameter, which does not restore any rows from user tables.
+// schema_only parameter, which does not restore any rows from user tables. The
+// test will also run with bulkio.restore.use_simple_import_spans set to true
+// 50% of the time.
 func TestBackupRestoreRandomDataRoundtrips(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -50,7 +54,7 @@ func TestBackupRestoreRandomDataRoundtrips(t *testing.T) {
 			ExternalIODir:            dir,
 		},
 	}
-	const localFoo = "nodelocal://0/foo/"
+	const localFoo = "nodelocal://1/foo/"
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, params)
@@ -72,6 +76,10 @@ func TestBackupRestoreRandomDataRoundtrips(t *testing.T) {
 		runSchemaOnlyExtension = ", schema_only"
 	}
 
+	if rng.Intn(2) == 0 {
+		sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.use_simple_import_spans = true")
+	}
+
 	tables := sqlDB.Query(t, `SELECT name FROM crdb_internal.tables WHERE 
 database_name = 'rand' AND schema_name = 'public'`)
 	var tableNames []string
@@ -90,11 +98,13 @@ database_name = 'rand' AND schema_name = 'public'`)
 	}
 
 	expectedCreateTableStmt := make(map[string]string)
-	expectedData := make(map[string][][]string)
+	expectedData := make(map[string]int)
 	for _, tableName := range tableNames {
-		expectedCreateTableStmt[tableName] = sqlDB.QueryStr(t, fmt.Sprintf(`SELECT create_statement FROM [SHOW CREATE TABLE %s]`, tableName))[0][0]
+		expectedCreateTableStmt[tableName] = sqlDB.QueryStr(t,
+			fmt.Sprintf(`SELECT create_statement FROM [SHOW CREATE TABLE %s]`, tree.NameString(tableName)))[0][0]
 		if runSchemaOnlyExtension == "" {
-			expectedData[tableName] = sqlDB.QueryStr(t, fmt.Sprintf(`SELECT * FROM %s`, tableName))
+			tableID := sqlutils.QueryTableID(t, sqlDB.DB, "rand", "public", tableName)
+			expectedData[tableName] = sqlutils.FingerprintTable(t, sqlDB, tableID)
 		}
 	}
 
@@ -104,12 +114,12 @@ database_name = 'rand' AND schema_name = 'public'`)
 	dbBackup := localFoo + "wholedb"
 	tablesBackup := localFoo + "alltables"
 	dbBackups := []string{dbBackup, tablesBackup}
-	if err := backuputils.VerifyBackupRestoreStatementResult(
+	if err := backuptestutils.VerifyBackupRestoreStatementResult(
 		t, sqlDB, "BACKUP DATABASE rand INTO $1", dbBackup,
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := backuputils.VerifyBackupRestoreStatementResult(
+	if err := backuptestutils.VerifyBackupRestoreStatementResult(
 		t, sqlDB, "BACKUP TABLE rand.* INTO $1", tablesBackup,
 	); err != nil {
 		t.Fatal(err)
@@ -120,14 +130,15 @@ database_name = 'rand' AND schema_name = 'public'`)
 	// generated tables.
 	verifyTables := func(t *testing.T, tableNames []string) {
 		for _, tableName := range tableNames {
-			t.Logf("Verifying table %s", tableName)
-			restoreTable := "restoredb." + tableName
+			t.Logf("Verifying table %q", tableName)
+			restoreTable := "restoredb." + tree.NameString(tableName)
 			createStmt := sqlDB.QueryStr(t,
 				fmt.Sprintf(`SELECT create_statement FROM [SHOW CREATE TABLE %s]`, restoreTable))[0][0]
 			assert.Equal(t, expectedCreateTableStmt[tableName], createStmt,
 				"SHOW CREATE %s not equal after RESTORE", tableName)
 			if runSchemaOnlyExtension == "" {
-				sqlDB.CheckQueryResults(t, fmt.Sprintf(`SELECT * FROM %s`, restoreTable), expectedData[tableName])
+				tableID := sqlutils.QueryTableID(t, sqlDB.DB, "restoredb", "public", tableName)
+				require.Equal(t, expectedData[tableName], sqlutils.FingerprintTable(t, sqlDB, tableID))
 			} else {
 				sqlDB.CheckQueryResults(t, fmt.Sprintf(`SELECT count(*) FROM %s`, restoreTable),
 					[][]string{{"0"}})
@@ -142,7 +153,7 @@ database_name = 'rand' AND schema_name = 'public'`)
 		sqlDB.Exec(t, "DROP DATABASE IF EXISTS restoredb")
 		sqlDB.Exec(t, "CREATE DATABASE restoredb")
 		tableQuery := fmt.Sprintf("RESTORE rand.* FROM LATEST IN $1 WITH OPTIONS (into_db='restoredb'%s)", runSchemaOnlyExtension)
-		if err := backuputils.VerifyBackupRestoreStatementResult(
+		if err := backuptestutils.VerifyBackupRestoreStatementResult(
 			t, sqlDB, tableQuery, backup,
 		); err != nil {
 			t.Fatal(err)
@@ -151,7 +162,7 @@ database_name = 'rand' AND schema_name = 'public'`)
 		sqlDB.Exec(t, "DROP DATABASE IF EXISTS restoredb")
 
 		dbQuery := fmt.Sprintf("RESTORE DATABASE rand FROM LATEST IN $1 WITH OPTIONS (new_db_name='restoredb'%s)", runSchemaOnlyExtension)
-		if err := backuputils.VerifyBackupRestoreStatementResult(t, sqlDB, dbQuery, backup); err != nil {
+		if err := backuptestutils.VerifyBackupRestoreStatementResult(t, sqlDB, dbQuery, backup); err != nil {
 			t.Fatal(err)
 		}
 		verifyTables(t, tableNames)
@@ -166,7 +177,14 @@ database_name = 'rand' AND schema_name = 'public'`)
 		if len(combo) == 0 {
 			continue
 		}
-		tables := strings.Join(combo, ", ")
+		var buf strings.Builder
+		comma := ""
+		for _, t := range combo {
+			buf.WriteString(comma)
+			buf.WriteString(tree.NameString(t))
+			comma = ", "
+		}
+		tables := buf.String()
 		t.Logf("Testing subset backup/restore %s", tables)
 		sqlDB.Exec(t, fmt.Sprintf(`BACKUP TABLE %s INTO $1`, tables), backupTarget)
 		_, err := tc.Conns[0].Exec(

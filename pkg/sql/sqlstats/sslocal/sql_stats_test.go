@@ -12,8 +12,12 @@ package sslocal_test
 
 import (
 	"context"
+	gosql "database/sql"
+	"encoding/json"
 	"math"
 	"net/url"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
@@ -35,12 +40,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/jackc/pgx/v4"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -71,7 +80,7 @@ func TestStmtStatsBulkIngestWithRandomMetadata(t *testing.T) {
 			&sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
-				statistics *roachpb.CollectedStatementStatistics,
+				statistics *appstatspb.CollectedStatementStatistics,
 			) error {
 				var found bool
 				for i := range testData {
@@ -90,73 +99,73 @@ func TestSQLStatsStmtStatsBulkIngest(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testData := []struct {
-		id    roachpb.StmtFingerprintID
-		key   roachpb.StatementStatisticsKey
-		stats roachpb.StatementStatistics
+		id    appstatspb.StmtFingerprintID
+		key   appstatspb.StatementStatisticsKey
+		stats appstatspb.StatementStatistics
 	}{
 		{
 			id: 0,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app1",
 				Query:    "SELECT 1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 7,
 			},
 		},
 		{
 			id: 0,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app0",
 				Query:    "SELECT 1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 2,
 			},
 		},
 		{
 			id: 1,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app100",
 				Query:    "SELECT 1,1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 31,
 			},
 		},
 		{
 			id: 1,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app0",
 				Query:    "SELECT 1,1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 32,
 			},
 		},
 		{
 			id: 0,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app1",
 				Query:    "SELECT 1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 33,
 			},
 		},
 		{
 			id: 1,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app100",
 				Query:    "SELECT 1,1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 2,
 			},
 		},
@@ -190,7 +199,7 @@ func TestSQLStatsStmtStatsBulkIngest(t *testing.T) {
 			&sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
-				statistics *roachpb.CollectedStatementStatistics,
+				statistics *appstatspb.CollectedStatementStatistics,
 			) error {
 				require.Equal(t, "testdb", statistics.Key.Database)
 				foundStats[statistics.Key.App+statistics.Key.Query] = statistics.Stats.Count
@@ -205,65 +214,65 @@ func TestSQLStatsTxnStatsBulkIngest(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testData := []struct {
-		stats roachpb.CollectedTransactionStatistics
+		stats appstatspb.CollectedTransactionStatistics
 	}{
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(0),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(0),
 				App:                      "app1",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 7,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(0),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(0),
 				App:                      "app0",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 2,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(1),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(1),
 				App:                      "app100",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 31,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(1),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(1),
 				App:                      "app0",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 32,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(0),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(0),
 				App:                      "app1",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 33,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(1),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(1),
 				App:                      "app100",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 2,
 				},
 			},
 		},
 	}
 
-	expectedCount := make(map[roachpb.TransactionFingerprintID]int64)
+	expectedCount := make(map[appstatspb.TransactionFingerprintID]int64)
 	input :=
 		make([]serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics, 0, len(testData))
 
@@ -281,14 +290,14 @@ func TestSQLStatsTxnStatsBulkIngest(t *testing.T) {
 	sqlStats, err := sslocal.NewTempSQLStatsFromExistingTxnStats(input)
 	require.NoError(t, err)
 
-	foundStats := make(map[roachpb.TransactionFingerprintID]int64)
+	foundStats := make(map[appstatspb.TransactionFingerprintID]int64)
 	require.NoError(t,
 		sqlStats.IterateTransactionStats(
 			context.Background(),
 			&sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
-				statistics *roachpb.CollectedTransactionStatistics,
+				statistics *appstatspb.CollectedTransactionStatistics,
 			) error {
 				foundStats[statistics.TransactionFingerprintID] = statistics.Stats.Count
 				return nil
@@ -439,19 +448,21 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		nil /* curCount */, nil /* maxHist */, math.MaxInt64, st,
 	)
 
+	insightsProvider := insights.New(st, insights.NewMetrics())
 	sqlStats := sslocal.New(
 		st,
 		sqlstats.MaxMemSQLStatsStmtFingerprints,
 		sqlstats.MaxMemSQLStatsTxnFingerprints,
 		nil, /* curMemoryBytesCount */
 		nil, /* maxMemoryBytesHist */
-		insights.New(st, insights.NewMetrics()).Writer(),
+		insightsProvider.Writer,
 		monitor,
 		nil, /* reportingSink */
 		nil, /* knobs */
+		insightsProvider.LatencyInformation(),
 	)
 
-	appStats := sqlStats.GetApplicationStats("" /* appName */)
+	appStats := sqlStats.GetApplicationStats("" /* appName */, false /* internal */)
 	statsCollector := sslocal.NewStatsCollector(
 		st,
 		appStats,
@@ -460,36 +471,36 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 	)
 
 	recordStats := func(testCase *tc) {
-		var txnFingerprintID roachpb.TransactionFingerprintID
+		var txnFingerprintID appstatspb.TransactionFingerprintID
 		txnFingerprintIDHash := util.MakeFNV64()
 		statsCollector.StartTransaction()
 		defer func() {
 			statsCollector.EndTransaction(ctx, txnFingerprintID)
 			require.NoError(t,
 				statsCollector.
-					RecordTransaction(ctx, txnFingerprintID, sqlstats.RecordedTxnStats{}))
+					RecordTransaction(ctx, txnFingerprintID, sqlstats.RecordedTxnStats{
+						SessionData: &sessiondata.SessionData{
+							SessionData: sessiondatapb.SessionData{
+								UserProto:       username.RootUserName().EncodeProto(),
+								Database:        "defaultdb",
+								ApplicationName: "appname_findme",
+							},
+						},
+					}))
 		}()
 		for _, fingerprint := range testCase.fingerprints {
 			stmtFingerprintID, err := statsCollector.RecordStatement(
 				ctx,
-				roachpb.StatementStatisticsKey{
+				appstatspb.StatementStatisticsKey{
 					Query:       fingerprint,
 					ImplicitTxn: testCase.implicit,
 				},
-				sqlstats.RecordedStmtStats{
-					SessionData: &sessiondata.SessionData{
-						SessionData: sessiondatapb.SessionData{
-							UserProto:       username.RootUserName().EncodeProto(),
-							Database:        "defaultdb",
-							ApplicationName: "appname_findme",
-						},
-					},
-				},
+				sqlstats.RecordedStmtStats{},
 			)
 			require.NoError(t, err)
 			txnFingerprintIDHash.Add(uint64(stmtFingerprintID))
 		}
-		txnFingerprintID = roachpb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
+		txnFingerprintID = appstatspb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
 	}
 
 	for _, tc := range testCases {
@@ -557,18 +568,20 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 		require.NoError(t, err)
 
 		// Construct the SQL Stats machinery.
+		insightsProvider := insights.New(st, insights.NewMetrics())
 		sqlStats := sslocal.New(
 			st,
 			sqlstats.MaxMemSQLStatsStmtFingerprints,
 			sqlstats.MaxMemSQLStatsTxnFingerprints,
 			nil,
 			nil,
-			insights.New(st, insights.NewMetrics()).Writer(),
+			insightsProvider.Writer,
 			monitor,
 			nil,
 			nil,
+			insightsProvider.LatencyInformation(),
 		)
-		appStats := sqlStats.GetApplicationStats("" /* appName */)
+		appStats := sqlStats.GetApplicationStats("" /* appName */, false /* internal */)
 		statsCollector := sslocal.NewStatsCollector(
 			st,
 			appStats,
@@ -584,32 +597,32 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 			for _, fingerprint := range txn.stmtFingerprints {
 				stmtFingerprintID, err := statsCollector.RecordStatement(
 					ctx,
-					roachpb.StatementStatisticsKey{Query: fingerprint},
-					sqlstats.RecordedStmtStats{
-						SessionData: &sessiondata.SessionData{
-							SessionData: sessiondatapb.SessionData{
-								UserProto:       username.RootUserName().EncodeProto(),
-								Database:        "defaultdb",
-								ApplicationName: "appname_findme",
-							},
-						},
-					},
+					appstatspb.StatementStatisticsKey{Query: fingerprint},
+					sqlstats.RecordedStmtStats{},
 				)
 				require.NoError(t, err)
 				txnFingerprintIDHash.Add(uint64(stmtFingerprintID))
 			}
 
-			transactionFingerprintID := roachpb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
+			transactionFingerprintID := appstatspb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
 			statsCollector.EndTransaction(ctx, transactionFingerprintID)
-			err := statsCollector.RecordTransaction(ctx, transactionFingerprintID, sqlstats.RecordedTxnStats{})
+			err := statsCollector.RecordTransaction(ctx, transactionFingerprintID, sqlstats.RecordedTxnStats{
+				SessionData: &sessiondata.SessionData{
+					SessionData: sessiondatapb.SessionData{
+						UserProto:       username.RootUserName().EncodeProto(),
+						Database:        "defaultdb",
+						ApplicationName: "appname_findme",
+					},
+				},
+			})
 			require.NoError(t, err)
 
 			// Gather the collected stats so that we can assert on them.
-			var stats []*roachpb.CollectedStatementStatistics
+			var stats []*appstatspb.CollectedStatementStatistics
 			err = statsCollector.IterateStatementStats(
 				ctx,
 				&sqlstats.IteratorOptions{},
-				func(_ context.Context, s *roachpb.CollectedStatementStatistics) error {
+				func(_ context.Context, s *appstatspb.CollectedStatementStatistics) error {
 					stats = append(stats, s)
 					return nil
 				},
@@ -760,12 +773,12 @@ func TestFingerprintCreation(t *testing.T) {
 	}()
 
 	testConn := sqlutils.MakeSQLRunner(sqlConn)
-	testConn.Exec(t, "SET application_name = 'app1'")
 	testConn.Exec(t, "CREATE TABLE t (v INT)")
 
 	var count int64
 
 	t.Run("test hide constants", func(t *testing.T) {
+		testConn.Exec(t, "SET application_name = 'app1'")
 		testCases := []struct {
 			stmt        string
 			fingerprint string
@@ -1049,4 +1062,506 @@ func TestFingerprintCreation(t *testing.T) {
 			require.Equal(t, tc.count, count)
 		}
 	})
+
+	t.Run("test hide placeholders", func(t *testing.T) {
+		testConn.Exec(t, "SET application_name = 'app2'")
+		argsOne := []interface{}{1}
+		argsTwo := []interface{}{1, 2}
+		testCases := []struct {
+			stmt        string
+			fingerprint string
+			count       int64
+			literals    []interface{}
+		}{
+			{
+				stmt:        "SELECT * FROM t WHERE v IN ($1)",
+				fingerprint: "SELECT * FROM t WHERE v IN ($1,)",
+				count:       1,
+				literals:    argsOne,
+			},
+			{
+				stmt:        "SELECT * FROM t WHERE v IN (1)",
+				fingerprint: "SELECT * FROM t WHERE v IN (_,)",
+				count:       1,
+			},
+			{
+				stmt:        "SELECT * FROM t WHERE v IN ($1, $2)",
+				fingerprint: "SELECT * FROM t WHERE v IN ($1, $1)",
+				count:       1,
+				literals:    argsTwo,
+			},
+			{
+				stmt:        "SELECT * FROM t WHERE v IN ($2, $1)",
+				fingerprint: "SELECT * FROM t WHERE v IN ($1, $1)",
+				count:       2,
+				literals:    argsTwo,
+			},
+			{
+				stmt:        "SELECT * FROM t WHERE v IN (1,2)",
+				fingerprint: "SELECT * FROM t WHERE v IN (_, _)",
+				count:       1,
+			},
+		}
+
+		for _, tc := range testCases {
+			testConn.Exec(t, tc.stmt, tc.literals...)
+			rows := testConn.QueryRow(t, "SELECT statistics -> 'statistics' ->> 'cnt' FROM "+
+				"CRDB_INTERNAL.STATEMENT_STATISTICS WHERE app_name = 'app2' "+
+				"AND metadata ->> 'query'=$1", tc.fingerprint)
+			rows.Scan(&count)
+
+			require.Equal(t, tc.count, count)
+		}
+	})
+}
+
+func TestSQLStatsIdleLatencies(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderStress(t, "These tests make timing assertions, which may fail under stress.")
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	testCases := []struct {
+		name     string
+		stmtLats map[string]float64
+		txnLat   float64
+		ops      func(*testing.T, *gosql.DB)
+	}{
+		{
+			name:     "no latency",
+			stmtLats: map[string]float64{"SELECT _": 0},
+			txnLat:   0,
+			ops: func(t *testing.T, db *gosql.DB) {
+				tx, err := db.Begin()
+				require.NoError(t, err)
+				_, err = tx.Exec("SELECT 1")
+				require.NoError(t, err)
+				err = tx.Commit()
+				require.NoError(t, err)
+			},
+		},
+		{
+			name:     "no latency (implicit txn)",
+			stmtLats: map[string]float64{"SELECT _": 0},
+			txnLat:   0,
+			ops: func(t *testing.T, db *gosql.DB) {
+				// These 100ms don't count because we're not in an explicit transaction.
+				time.Sleep(100 * time.Millisecond)
+				_, err := db.Exec("SELECT 1")
+				require.NoError(t, err)
+			},
+		},
+		{
+			name:     "no latency - prepared statement (implicit txn)",
+			stmtLats: map[string]float64{"SELECT $1::INT8": 0},
+			txnLat:   0,
+			ops: func(t *testing.T, db *gosql.DB) {
+				stmt, err := db.Prepare("SELECT $1::INT")
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				_, err = stmt.Exec(1)
+				require.NoError(t, err)
+			},
+		},
+		{
+			name:     "simple statement",
+			stmtLats: map[string]float64{"SELECT _": 0.1},
+			txnLat:   0.2,
+			ops: func(t *testing.T, db *gosql.DB) {
+				tx, err := db.Begin()
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				_, err = tx.Exec("SELECT 1")
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				err = tx.Commit()
+				require.NoError(t, err)
+			},
+		},
+		{
+			name:     "compound statement",
+			stmtLats: map[string]float64{"SELECT _": 0.1, "SELECT count(*) FROM crdb_internal.statement_statistics": 0},
+			txnLat:   0.2,
+			ops: func(t *testing.T, db *gosql.DB) {
+				tx, err := db.Begin()
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				_, err = tx.Exec("SELECT 1; SELECT count(*) FROM crdb_internal.statement_statistics")
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				err = tx.Commit()
+				require.NoError(t, err)
+			},
+		},
+		{
+			name:     "multiple statements - slow generation",
+			stmtLats: map[string]float64{"SELECT pg_sleep(_)": 0, "SELECT _": 0},
+			txnLat:   0,
+			ops: func(t *testing.T, db *gosql.DB) {
+				tx, err := db.Begin()
+				require.NoError(t, err)
+				_, err = tx.Exec("SELECT pg_sleep(1)")
+				require.NoError(t, err)
+				_, err = tx.Exec("SELECT 1")
+				require.NoError(t, err)
+				err = tx.Commit()
+				require.NoError(t, err)
+			},
+		},
+		{
+			name:     "prepared statement",
+			stmtLats: map[string]float64{"SELECT $1::INT8": 0.1},
+			txnLat:   0.2,
+			ops: func(t *testing.T, db *gosql.DB) {
+				stmt, err := db.Prepare("SELECT $1::INT")
+				require.NoError(t, err)
+				tx, err := db.Begin()
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				_, err = tx.Stmt(stmt).Exec(1)
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				err = tx.Commit()
+				require.NoError(t, err)
+			},
+		},
+		{
+			name:     "prepared statement inside transaction",
+			stmtLats: map[string]float64{"SELECT $1::INT8": 0.1},
+			txnLat:   0.2,
+			ops: func(t *testing.T, db *gosql.DB) {
+				tx, err := db.Begin()
+				require.NoError(t, err)
+				stmt, err := tx.Prepare("SELECT $1::INT")
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				_, err = stmt.Exec(1)
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				err = tx.Commit()
+				require.NoError(t, err)
+			},
+		},
+		{
+			name:     "multiple transactions",
+			stmtLats: map[string]float64{"SELECT _": 0.1},
+			txnLat:   0.2,
+			ops: func(t *testing.T, db *gosql.DB) {
+				for i := 0; i < 3; i++ {
+					tx, err := db.Begin()
+					require.NoError(t, err)
+					time.Sleep(100 * time.Millisecond)
+					_, err = tx.Exec("SELECT 1")
+					require.NoError(t, err)
+					time.Sleep(100 * time.Millisecond)
+					err = tx.Commit()
+					require.NoError(t, err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Make a separate connection to the database, to isolate the stats
+			// we'll observe.
+			// Note that we're not using pgx here because it *always* prepares
+			// statements, and we want to test our client latency measurements
+			// both with and without prepared statements.
+			dbUrl, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+			defer cleanup()
+			connector, err := pq.NewConnector(dbUrl.String())
+			require.NoError(t, err)
+			opsDB := gosql.OpenDB(connector)
+			defer func() {
+				_ = opsDB.Close()
+			}()
+
+			// Set a unique application name for our session, so we can find our stats easily.
+			appName := t.Name()
+			_, err = opsDB.Exec("SET application_name = $1", appName)
+			require.NoError(t, err)
+
+			// Run the test operations.
+			tc.ops(t, opsDB)
+
+			// Make looser timing assertions in CI, since we've seen
+			// more variability there.
+			// - Bazel test runs also use this looser delta.
+			// - Goland and `go test` use the tighter delta unless
+			//   the crdb_test build tag has been set.
+			delta := 0.003
+			if buildutil.CrdbTestBuild {
+				delta = 0.05
+			}
+
+			// Look for the latencies we expect.
+			t.Run("stmt", func(t *testing.T) {
+				actual := make(map[string]float64)
+				rows, err := db.Query(`
+					SELECT metadata->>'query', statistics->'statistics'->'idleLat'->'mean'
+					  FROM crdb_internal.statement_statistics
+					 WHERE app_name = $1`, appName)
+				require.NoError(t, err)
+				for rows.Next() {
+					var query string
+					var latency float64
+					err = rows.Scan(&query, &latency)
+					require.NoError(t, err)
+					actual[query] = latency
+				}
+				require.NoError(t, rows.Err())
+				require.InDeltaMapValues(t, tc.stmtLats, actual, delta,
+					"expected: %v\nactual: %v", tc.stmtLats, actual)
+			})
+
+			t.Run("txn", func(t *testing.T) {
+				var actual float64
+				row := db.QueryRow(`
+					SELECT statistics->'statistics'->'idleLat'->'mean'
+					  FROM crdb_internal.transaction_statistics
+					 WHERE app_name = $1`, appName)
+				err := row.Scan(&actual)
+				require.NoError(t, err)
+				require.GreaterOrEqual(t, actual, float64(0))
+				require.InDelta(t, tc.txnLat, actual, delta)
+			})
+		})
+	}
+}
+
+type indexInfo struct {
+	name  string
+	table string
+}
+
+func TestSQLStatsIndexesUsed(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	testServer, sqlConn, _ := serverutils.StartServer(t, params)
+	defer func() {
+		require.NoError(t, sqlConn.Close())
+		testServer.Stopper().Stop(ctx)
+	}()
+	testConn := sqlutils.MakeSQLRunner(sqlConn)
+	appName := "indexes-usage"
+	testConn.Exec(t, "SET application_name = $1", appName)
+
+	testCases := []struct {
+		name          string
+		tableCreation string
+		statement     string
+		fingerprint   string
+		indexes       []indexInfo
+	}{
+		{
+			name:          "buildScan",
+			tableCreation: "CREATE TABLE t1 (k INT)",
+			statement:     "SELECT * FROM t1",
+			fingerprint:   "SELECT * FROM t1",
+			indexes:       []indexInfo{{name: "t1_pkey", table: "t1"}},
+		},
+		{
+			name:          "buildIndexJoin",
+			tableCreation: "CREATE TABLE t2 (x INT, y INT, INDEX x_idx (x))",
+			statement:     "SELECT * FROM t2@x_idx",
+			fingerprint:   "SELECT * FROM t2@x_idx",
+			indexes: []indexInfo{
+				{name: "t2_pkey", table: "t2"},
+				{name: "x_idx", table: "t2"}},
+		},
+		{
+			name:          "buildLookupJoin",
+			tableCreation: "CREATE TABLE t3 (x INT, y INT, INDEX x_idx (x)); CREATE TABLE t4 (u INT, v INT)",
+			statement:     "SELECT * FROM t4 INNER LOOKUP JOIN t3 ON u = x",
+			fingerprint:   "SELECT * FROM t4 INNER LOOKUP JOIN t3 ON u = x",
+			indexes: []indexInfo{
+				{name: "t3_pkey", table: "t3"},
+				{name: "t4_pkey", table: "t4"},
+				{name: "x_idx", table: "t3"}},
+		},
+		{
+			name:          "buildZigZag",
+			tableCreation: "CREATE TABLE t5 (a INT, b INT, INDEX a_idx(a), INDEX b_idx(b))",
+			statement:     "SELECT * FROM t5@{FORCE_ZIGZAG} WHERE a = 1 AND b = 1",
+			fingerprint:   "SELECT * FROM t5@{FORCE_ZIGZAG} WHERE (a = _) AND (b = _)",
+			indexes: []indexInfo{
+				{name: "a_idx", table: "t5"},
+				{name: "b_idx", table: "t5"}},
+		},
+		{
+			name:          "buildInvertedJoin",
+			tableCreation: "CREATE TABLE t6 (k INT, j JSON, INVERTED INDEX j_idx (j))",
+			statement:     "SELECT * FROM t6 INNER INVERTED JOIN t6 AS t6_2 ON t6.j @> t6_2.j",
+			fingerprint:   "SELECT * FROM t6 INNER INVERTED JOIN t6 AS t6_2 ON t6.j @> t6_2.j",
+			indexes: []indexInfo{
+				{name: "j_idx", table: "t6"},
+				{name: "t6_pkey", table: "t6"}},
+		},
+	}
+
+	var indexesString string
+	var indexes []string
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testConn.Exec(t, tc.tableCreation)
+			testConn.Exec(t, tc.statement)
+
+			rows := testConn.QueryRow(t, "SELECT statistics -> 'statistics' ->> 'indexes' "+
+				"FROM CRDB_INTERNAL.STATEMENT_STATISTICS WHERE app_name = $1 "+
+				"AND metadata ->> 'query'=$2", appName, tc.fingerprint)
+			rows.Scan(&indexesString)
+
+			err := json.Unmarshal([]byte(indexesString), &indexes)
+			require.NoError(t, err)
+			require.Equal(t, len(tc.indexes), len(indexes))
+			require.Equal(t, tc.indexes, convertIDsToNames(t, testConn, indexes))
+		})
+	}
+}
+
+func convertIDsToNames(t *testing.T, testConn *sqlutils.SQLRunner, indexes []string) []indexInfo {
+	var indexesInfo []indexInfo
+	var tableName string
+	var indexName string
+	for _, idx := range indexes {
+		tableID := strings.Split(idx, "@")[0]
+		idxID := strings.Split(idx, "@")[1]
+
+		rows := testConn.QueryRow(t, "SELECT descriptor_name, index_name FROM "+
+			"crdb_internal.table_indexes WHERE descriptor_id =$1 AND index_id=$2", tableID, idxID)
+		rows.Scan(&tableName, &indexName)
+		indexesInfo = append(indexesInfo, indexInfo{name: indexName, table: tableName})
+	}
+
+	sort.Slice(indexesInfo, func(i, j int) bool {
+		return indexesInfo[i].name < indexesInfo[j].name
+	})
+	return indexesInfo
+}
+
+func TestSQLStatsLatencyInfo(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	testServer, sqlConn, _ := serverutils.StartServer(t, params)
+	defer func() {
+		require.NoError(t, sqlConn.Close())
+		testServer.Stopper().Stop(ctx)
+	}()
+	testConn := sqlutils.MakeSQLRunner(sqlConn)
+	appName := "latency-info"
+	testConn.Exec(t, "SET application_name = $1", appName)
+	testConn.Exec(t, "CREATE TABLE t1 (k INT)")
+
+	testCases := []struct {
+		name        string
+		statement   string
+		fingerprint string
+	}{
+		{
+			name:        "select on table",
+			statement:   "SELECT * FROM t1",
+			fingerprint: "SELECT * FROM t1",
+		},
+		{
+			name:        "select sleep(0.06)",
+			statement:   "SELECT pg_sleep(0.06)",
+			fingerprint: "SELECT pg_sleep(_)",
+		},
+		{
+			name:        "select sleep(0.1)",
+			statement:   "SELECT pg_sleep(0.1)",
+			fingerprint: "SELECT pg_sleep(_)",
+		},
+		{
+			name:        "select sleep(0.07)",
+			statement:   "SELECT pg_sleep(0.07)",
+			fingerprint: "SELECT pg_sleep(_)",
+		},
+	}
+
+	var min float64
+	var max float64
+	var p50 float64
+	var p90 float64
+	var p99 float64
+	stopwatch := timeutil.NewStopWatch()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+
+			stopwatch.Start()
+			testConn.Exec(t, tc.statement)
+			stopwatch.Stop()
+
+			rows := testConn.QueryRow(t, "SELECT statistics -> 'statistics' -> 'latencyInfo' ->> 'min',"+
+				"statistics -> 'statistics' -> 'latencyInfo' ->> 'max',"+
+				"statistics -> 'statistics' -> 'latencyInfo' ->> 'p50',"+
+				"statistics -> 'statistics' -> 'latencyInfo' ->> 'p90',"+
+				"statistics -> 'statistics' -> 'latencyInfo' ->> 'p99' "+
+				"FROM CRDB_INTERNAL.STATEMENT_STATISTICS WHERE app_name = $1 "+
+				"AND metadata ->> 'query'=$2", appName, "SELECT * FROM t1")
+			rows.Scan(&min, &max, &p50, &p90, &p99)
+
+			require.Positivef(t, min, "expected min latency %f greater than 0", min)
+			require.Positivef(t, max, "expected max latency %f greater than 0", max)
+			require.GreaterOrEqualf(t, max, min, "expected max latency %f greater than min latency %f", max, min)
+			require.LessOrEqualf(t, max, stopwatch.Elapsed().Seconds(), "expected max latency %f less or equal %f",
+				max, stopwatch.Elapsed().Seconds())
+			require.GreaterOrEqualf(t, p99, p90, "expected p99 latency %f greater or equal p90 latency %f", p99, p90)
+			require.GreaterOrEqualf(t, p90, p50, "expected p90 latency %f greater or equal p50 latency %f", p90, p50)
+			require.LessOrEqualf(t, p99, max, "expected p99 latency %f less or equal max latency %f", p99, max)
+		})
+	}
+}
+
+func TestSQLStatsRegions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		name     string
+		locality roachpb.Locality
+		expected string
+	}{{
+		name:     "locality not set",
+		locality: roachpb.Locality{},
+		expected: `[]`,
+	}, {
+		name:     "locality set",
+		locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "us-east1"}}},
+		expected: `["us-east1"]`,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			params, _ := tests.CreateTestServerParams()
+			params.Locality = tc.locality
+			s, conn, _ := serverutils.StartServer(t, params)
+			defer s.Stopper().Stop(ctx)
+
+			db := sqlutils.MakeSQLRunner(conn)
+			db.Exec(t, "SET application_name = $1", t.Name())
+			db.Exec(t, "SELECT 1")
+
+			row := db.QueryRow(t, `
+				SELECT statistics->'statistics'->>'regions'
+				  FROM crdb_internal.statement_statistics
+				 WHERE app_name = $1`, t.Name())
+			var actual string
+			row.Scan(&actual)
+			require.Equal(t, tc.expected, actual)
+		})
+	}
 }

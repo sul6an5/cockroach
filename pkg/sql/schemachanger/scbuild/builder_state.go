@@ -12,15 +12,15 @@ package scbuild
 
 import (
 	"sort"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -55,45 +55,160 @@ func (b *builderState) QueryByID(id catid.DescID) scbuildstmt.ElementResultSet {
 }
 
 // Ensure implements the scbuildstmt.BuilderState interface.
-func (b *builderState) Ensure(
-	current scpb.Status, target scpb.TargetStatus, e scpb.Element, meta scpb.TargetMetadata,
-) {
+func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scpb.TargetMetadata) {
+	dst := b.getExistingElementState(e)
+	switch target {
+	case scpb.ToAbsent, scpb.ToPublic, scpb.Transient:
+		// Sanity check.
+	default:
+		panic(errors.AssertionFailedf("unsupported target %s", target.Status()))
+	}
+	if dst == nil {
+		// We're adding both a new element and a target for it.
+		if target == scpb.ToAbsent {
+			// Ignore targets to remove something that doesn't exist yet.
+			return
+		}
+		b.addNewElementState(elementState{
+			element:  e,
+			initial:  scpb.Status_ABSENT,
+			current:  scpb.Status_ABSENT,
+			target:   target,
+			metadata: meta,
+		})
+		return
+	}
+	// At this point, we're setting a new target to an existing element.
+	if dst.target == target {
+		// Ignore no-op changes.
+		return
+	}
+	// Henceforth all possibilities lead to the target and metadata being
+	// overwritten. See below for explanations as to why this is legal.
+	oldTarget := dst.target
+	dst.target = target
+	dst.metadata = meta
+	if dst.metadata.Size() == 0 {
+		// The element has never had a target set before.
+		// We can freely overwrite it.
+		return
+	}
+	if dst.metadata.StatementID == meta.StatementID {
+		// The element has had a target set before, but it was in the same build.
+		// We can freely overwrite it or unset it.
+		if target.Status() == dst.initial {
+			// We're undoing the earlier target, as if it were never set
+			// in the first place.
+			dst.metadata.Reset()
+		}
+		return
+	}
+	// At this point, the element has had a target set in a previous build.
+	// The element may since have transitioned towards the target which we now
+	// want to overwrite as a result of executing at least one statement stage.
+	// As a result, we may no longer unset the target, even if it is a no-op
+	// one we reach the pre-commit phase.
+	switch oldTarget {
+	case scpb.ToPublic:
+		// Here the new target is either to-absent, which effectively undoes the
+		// incumbent target, or it's transient, which to-public targets can
+		// straightforwardly be promoted to (the public opgen path is a subset
+		// of the transient one when both exist, which must be the case here).
+		return
+	case scpb.ToAbsent:
+		// Here the new target is either to-public, which effectively undoes the
+		// incumbent target, or it's transient. The to-absent path is a subset of
+		// the transient path so it can be done but we must take care to migrate
+		// the current status to its transient equivalent if need be in order to
+		// avoid the possibility of a future transition to PUBLIC.
+		if target == scpb.Transient {
+			var ok bool
+			dst.current, ok = scpb.GetTransientEquivalent(dst.current)
+			if !ok {
+				panic(errors.AssertionFailedf(
+					"cannot promote to-absent target for %s to transient, "+
+						"current status %s has no transient equivalent",
+					screl.ElementString(e), dst.current))
+			}
+		}
+		return
+	case scpb.Transient:
+		// Here the new target is either to-absent, which effectively undoes the
+		// incumbent target, or it's to-public. In both cases if the current
+		// status is TRANSIENT_ we need to migrate it to its non-transient
+		// equivalent because TRANSIENT_ statuses aren't featured on either the
+		// to-absent or the to-public opgen path.
+		if nonTransient, ok := scpb.GetNonTransientEquivalent(dst.current); ok {
+			dst.current = nonTransient
+		}
+		return
+	}
+	panic(errors.AssertionFailedf("unsupported incumbent target %s", oldTarget.Status()))
+}
+
+func (b *builderState) upsertElementState(es elementState) {
+	if existing := b.getExistingElementState(es.element); existing != nil {
+		if err := b.localMemAcc.Grow(b.ctx, es.byteSize()-existing.byteSize()); err != nil {
+			panic(err)
+		}
+		*existing = es
+	} else {
+		b.addNewElementState(es)
+	}
+}
+
+func (b *builderState) getExistingElementState(e scpb.Element) *elementState {
 	if e == nil {
 		panic(errors.AssertionFailedf("cannot define target for nil element"))
 	}
 	id := screl.GetDescID(e)
 	b.ensureDescriptor(id)
 	c := b.descCache[id]
-	key := screl.ElementString(e)
-	if i, ok := c.elementIndexMap[key]; ok {
-		es := &b.output[i]
-		if !screl.EqualElements(es.element, e) {
-			panic(errors.AssertionFailedf("element key %v does not match element: %s",
-				key, screl.ElementString(es.element)))
-		}
-		if current != scpb.Status_UNKNOWN {
-			es.current = current
-		}
-		es.target = target
-		es.element = e
-		es.metadata = meta
-	} else {
-		if current == scpb.Status_UNKNOWN {
-			if target == scpb.ToAbsent {
-				panic(errors.AssertionFailedf("element not found: %s", screl.ElementString(e)))
-			}
-			current = scpb.Status_ABSENT
-		}
-		c.ers.indexes = append(c.ers.indexes, len(b.output))
-		c.elementIndexMap[key] = len(b.output)
-		b.output = append(b.output, elementState{
-			element:  e,
-			target:   target,
-			current:  current,
-			metadata: meta,
-		})
-	}
 
+	key := screl.ElementString(e)
+	i, ok := c.elementIndexMap[key]
+	if !ok {
+		return nil
+	}
+	es := &b.output[i]
+	if !screl.EqualElementKeys(es.element, e) {
+		panic(errors.AssertionFailedf("actual element key %v does not match expected %s",
+			key, screl.ElementString(es.element)))
+	}
+	return es
+}
+
+func (b *builderState) addNewElementState(es elementState) {
+	if err := b.localMemAcc.Grow(b.ctx, es.byteSize()); err != nil {
+		panic(err)
+	}
+	id := screl.GetDescID(es.element)
+	key := screl.ElementString(es.element)
+	c := b.descCache[id]
+	c.ers.indexes = append(c.ers.indexes, len(b.output))
+	c.elementIndexMap[key] = len(b.output)
+	b.output = append(b.output, es)
+}
+
+// LogEventForExistingTarget implements the scbuildstmt.BuilderState interface.
+func (b *builderState) LogEventForExistingTarget(e scpb.Element) {
+	id := screl.GetDescID(e)
+	key := screl.ElementString(e)
+
+	c, ok := b.descCache[id]
+	if !ok {
+		panic(errors.AssertionFailedf(
+			"elements for descriptor ID %d not found in builder state, %s expected", id, key))
+	}
+	i, ok := c.elementIndexMap[key]
+	if !ok {
+		panic(errors.AssertionFailedf("element %s expected in builder state but not found", key))
+	}
+	es := &b.output[i]
+	if es.target == scpb.InvalidTarget {
+		panic(errors.AssertionFailedf("no target set for element %s in builder state", key))
+	}
+	es.withLogEvent = true
 }
 
 // ForEachElementStatus implements the scpb.ElementStatusIterator interface.
@@ -169,6 +284,10 @@ func (b *builderState) CurrentUserHasAdminOrIsMemberOf(role username.SQLUsername
 	}
 	_, ok := memberships[b.evalCtx.SessionData().User()]
 	return ok
+}
+
+func (b *builderState) CurrentUser() username.SQLUsername {
+	return b.evalCtx.SessionData().User()
 }
 
 var _ scbuildstmt.TableHelpers = (*builderState)(nil)
@@ -295,7 +414,7 @@ func (b *builderState) nextIndexID(id catid.DescID) (ret catid.IndexID) {
 // IndexPartitioningDescriptor implements the scbuildstmt.TableHelpers
 // interface.
 func (b *builderState) IndexPartitioningDescriptor(
-	index *scpb.Index, partBy *tree.PartitionBy,
+	indexName string, index *scpb.Index, columns []*scpb.IndexColumn, partBy *tree.PartitionBy,
 ) catpb.PartitioningDescriptor {
 	b.ensureDescriptor(index.TableID)
 	bd := b.descCache[index.TableID]
@@ -314,12 +433,13 @@ func (b *builderState) IndexPartitioningDescriptor(
 		oldNumImplicitColumns = int(p.PartitioningDescriptor.NumImplicitColumns)
 	})
 
-	var keyColumns []*scpb.IndexColumn
-	scpb.ForEachIndexColumn(bd.ers, func(_ scpb.Status, _ scpb.TargetStatus, e *scpb.IndexColumn) {
-		if e.IndexID == index.IndexID && e.Kind == scpb.IndexColumn_KEY {
-			keyColumns = append(keyColumns, e)
+	keyColumns := make([]*scpb.IndexColumn, 0, len(columns))
+	for _, column := range columns {
+		if column.Kind != scpb.IndexColumn_KEY {
+			continue
 		}
-	})
+		keyColumns = append(keyColumns, column)
+	}
 	sort.Slice(keyColumns, func(i, j int) bool {
 		return keyColumns[i].OrdinalInKind < keyColumns[j].OrdinalInKind
 	})
@@ -338,19 +458,39 @@ func (b *builderState) IndexPartitioningDescriptor(
 			allowedNewColumnNames = append(allowedNewColumnNames, tree.Name(cn.Name))
 		}
 	})
+	allowImplicitPartitioning := b.evalCtx.SessionData().ImplicitColumnPartitioningEnabled ||
+		tbl.IsLocalityRegionalByRow()
 	_, ret, err := b.createPartCCL(
 		b.ctx,
 		b.clusterSettings,
 		b.evalCtx,
-		tbl.FindColumnWithName,
+		func(name tree.Name) (catalog.Column, error) {
+			return catalog.MustFindColumnByTreeName(tbl, name)
+		},
 		oldNumImplicitColumns,
 		oldKeyColumnNames,
 		partBy,
 		allowedNewColumnNames,
-		true, /* allowImplicitPartitioning */
+		allowImplicitPartitioning, /* allowImplicitPartitioning */
 	)
 	if err != nil {
 		panic(err)
+	}
+	// Validate the index partitioning descriptor.
+	partitionNames := make(map[string]struct{})
+	for _, rangePart := range ret.Range {
+		if _, ok := partitionNames[rangePart.Name]; ok {
+			panic(pgerror.Newf(pgcode.InvalidObjectDefinition, "PARTITION %s: name must be unique (used twice in index %q)",
+				rangePart.Name, indexName))
+		}
+		partitionNames[rangePart.Name] = struct{}{}
+	}
+	for _, listPart := range ret.List {
+		if _, ok := partitionNames[listPart.Name]; ok {
+			panic(pgerror.Newf(pgcode.InvalidObjectDefinition, "PARTITION %s: name must be unique (used twice in index %q)",
+				listPart.Name, indexName))
+		}
+		partitionNames[listPart.Name] = struct{}{}
 	}
 	return ret
 }
@@ -365,15 +505,7 @@ func (b *builderState) ResolveTypeRef(ref tree.ResolvableTypeReference) scpb.Typ
 }
 
 func newTypeT(t *types.T) scpb.TypeT {
-	m, err := typedesc.GetTypeDescriptorClosure(t)
-	if err != nil {
-		panic(err)
-	}
-	var ids catalog.DescriptorIDSet
-	for id := range m {
-		ids.Add(id)
-	}
-	return scpb.TypeT{Type: t, ClosedTypeIDs: ids.Ordered()}
+	return scpb.TypeT{Type: t, ClosedTypeIDs: typedesc.GetTypeDescriptorClosure(t).Ordered()}
 }
 
 // WrapExpression implements the scbuildstmt.TableHelpers interface.
@@ -398,10 +530,7 @@ func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scp
 			if !types.IsOIDUserDefinedType(oid) {
 				continue
 			}
-			id, err := typedesc.UserDefinedTypeOIDToID(oid)
-			if err != nil {
-				panic(err)
-			}
+			id := typedesc.UserDefinedTypeOIDToID(oid)
 			b.ensureDescriptor(id)
 			desc := b.descCache[id].desc
 			// Implicit record types will lead to table references, which will be
@@ -425,13 +554,7 @@ func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scp
 			if err != nil {
 				panic(err)
 			}
-			ids, err := typ.GetIDClosure()
-			if err != nil {
-				panic(err)
-			}
-			for id = range ids {
-				typeIDs.Add(id)
-			}
+			typ.GetIDClosure().ForEach(typeIDs.Add)
 		}
 	}
 	// Collect sequence IDs.
@@ -466,18 +589,13 @@ func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scp
 			}
 		}
 	}
-	cachedDesc, ok := b.descCache[tableID]
-	if !ok {
-		panic(errors.AssertionFailedf("failed to get descriptor for table %d", tableID))
+	// Collect function IDs
+	fnIDs, err := schemaexpr.GetUDFIDs(expr)
+	if err != nil {
+		panic(err)
 	}
-	tableDesc, ok := cachedDesc.desc.(catalog.TableDescriptor)
-	if !ok {
-		panic(errors.AssertionFailedf(
-			"descriptor %d should be a table but is %v",
-			tableID, cachedDesc.desc.DescriptorType(),
-		))
-	}
-	ids, err := schemaexpr.ExtractColumnIDs(tableDesc, expr)
+
+	ids, err := scbuildstmt.ExtractColumnIDsInExpr(b, tableID, expr)
 	if err != nil {
 		panic(err)
 	}
@@ -485,6 +603,7 @@ func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scp
 		Expr:                catpb.Expression(tree.Serialize(expr)),
 		UsesSequenceIDs:     seqIDs.Ordered(),
 		UsesTypeIDs:         typeIDs.Ordered(),
+		UsesFunctionIDs:     fnIDs.Ordered(),
 		ReferencedColumnIDs: ids.Ordered(),
 	}
 	return ret
@@ -501,8 +620,9 @@ func (b *builderState) ComputedColumnExpression(tbl *scpb.Table, d *tree.ColumnT
 		b.descCache[tbl.TableID].desc.(catalog.TableDescriptor),
 		d,
 		&tn,
-		"computed column",
+		tree.ComputedColumnExprContext(d.IsVirtual()),
 		b.semaCtx,
+		b.clusterSettings.Version.ActiveVersion(b.ctx),
 	)
 	if err != nil {
 		// This may be referencing newly added columns, so cheat and return
@@ -511,6 +631,40 @@ func (b *builderState) ComputedColumnExpression(tbl *scpb.Table, d *tree.ColumnT
 			"computed column validation error"))
 	}
 	parsedExpr, err := parser.ParseExpr(expr)
+	if err != nil {
+		panic(err)
+	}
+	return parsedExpr
+}
+
+// PartialIndexPredicateExpression implements the scbuildstmt.TableHelpers interface.
+func (b *builderState) PartialIndexPredicateExpression(
+	tableID catid.DescID, expr tree.Expr,
+) tree.Expr {
+	// Ensure that an namespace entry exists for the table.
+	_, _, ns := scpb.FindNamespace(b.QueryByID(tableID))
+	if ns == nil {
+		panic(errors.AssertionFailedf("unable to find namespace for %d.", tableID))
+	}
+	tn := tree.MakeTableNameFromPrefix(b.NamePrefix(ns), tree.Name(ns.Name))
+	// Confirm that we have a table descriptor.
+	if _, ok := b.descCache[tableID].desc.(catalog.TableDescriptor); !ok {
+		panic(errors.AssertionFailedf("descriptor %d is not a table.", tableID))
+	}
+	// TODO(fqazi): this doesn't work when referencing newly added columns, this
+	// is not problematic today since declarative schema changer is only enabled
+	// for single statement transactions.
+	validatedExpr, err := schemaexpr.ValidatePartialIndexPredicate(
+		b.ctx,
+		b.descCache[tableID].desc.(catalog.TableDescriptor),
+		expr,
+		&tn,
+		b.semaCtx,
+		b.clusterSettings.Version.ActiveVersion(b.ctx))
+	if err != nil {
+		panic(err)
+	}
+	parsedExpr, err := parser.ParseExpr(validatedExpr)
 	if err != nil {
 		panic(err)
 	}
@@ -543,18 +697,7 @@ func (b *builderState) BackReferences(id catid.DescID) scbuildstmt.ElementResult
 	{
 		b.ensureDescriptor(id)
 		c := b.descCache[id]
-		// Eagerly load comments of backref schemas of db or backrefs tables of
-		// schema into comment cache before element walking.
-		switch c.desc.DescriptorType() {
-		case catalog.Database:
-			if err := b.commentCache.LoadCommentsForObjects(b.ctx, c.backrefs.Ordered()); err != nil {
-				panic(err)
-			}
-		case catalog.Schema:
-			if err := b.commentCache.LoadCommentsForObjects(b.ctx, c.backrefs.Ordered()); err != nil {
-				panic(err)
-			}
-		}
+		b.resolveBackReferences(c)
 		c.backrefs.ForEach(ids.Add)
 		c.backrefs.ForEach(b.ensureDescriptor)
 		for i := range b.output {
@@ -619,21 +762,42 @@ func (b *builderState) ResolveSchema(
 		}
 		panic(sqlerrors.NewUndefinedSchemaError(name.Schema()))
 	}
+	b.mustBeValidSchema(name, sc, p)
+	return b.descCache[sc.GetID()].ers
+}
+
+// ResolvePrefix implements the scbuildstmt.NameResolver interface.
+func (b *builderState) ResolvePrefix(
+	prefix tree.ObjectNamePrefix, requiredSchemaPriv privilege.Kind,
+) (dbElts scbuildstmt.ElementResultSet, scElts scbuildstmt.ElementResultSet) {
+	db, sc := b.cr.MustResolvePrefix(b.ctx, prefix)
+	b.ensureDescriptor(db.GetID())
+	b.ensureDescriptor(sc.GetID())
+	b.mustBeValidSchema(prefix, sc, scbuildstmt.ResolveParams{RequiredPrivilege: requiredSchemaPriv})
+	return b.descCache[db.GetID()].ers, b.descCache[sc.GetID()].ers
+}
+
+func (b *builderState) mustBeValidSchema(
+	name tree.ObjectNamePrefix, sc catalog.SchemaDescriptor, p scbuildstmt.ResolveParams,
+) {
 	switch sc.SchemaKind() {
 	case catalog.SchemaPublic, catalog.SchemaVirtual, catalog.SchemaTemporary:
 		panic(pgerror.Newf(pgcode.InsufficientPrivilege,
 			"%s permission denied for schema %q", p.RequiredPrivilege.String(), name))
 	case catalog.SchemaUserDefined:
 		b.ensureDescriptor(sc.GetID())
-		b.mustOwn(sc.GetID())
+		if p.RequireOwnership {
+			b.mustOwn(sc.GetID())
+		} else {
+			b.checkPrivilege(sc.GetID(), p.RequiredPrivilege)
+		}
 	default:
 		panic(errors.AssertionFailedf("unknown schema kind %d", sc.SchemaKind()))
 	}
-	return b.descCache[sc.GetID()].ers
 }
 
-// ResolveEnumType implements the scbuildstmt.NameResolver interface.
-func (b *builderState) ResolveEnumType(
+// ResolveUserDefinedTypeType implements the scbuildstmt.NameResolver interface.
+func (b *builderState) ResolveUserDefinedTypeType(
 	name *tree.UnresolvedObjectName, p scbuildstmt.ResolveParams,
 ) scbuildstmt.ElementResultSet {
 	prefix, typ := b.cr.MayResolveType(b.ctx, *name)
@@ -655,6 +819,9 @@ func (b *builderState) ResolveEnumType(
 			"%q is a multi-region enum and cannot be modified directly", typeName.FQString()),
 			"try ALTER DATABASE %s DROP REGION %s", prefix.Database.GetName(), typ.GetName()))
 	case descpb.TypeDescriptor_ENUM:
+		b.ensureDescriptor(typ.GetID())
+		b.mustOwn(typ.GetID())
+	case descpb.TypeDescriptor_COMPOSITE:
 		b.ensureDescriptor(typ.GetID())
 		b.mustOwn(typ.GetID())
 	case descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE:
@@ -811,10 +978,24 @@ func (b *builderState) ResolveIndex(
 	})
 }
 
-// ResolveTableIndexBestEffort implements the scbuildstmt.NameResolver interface.
+// ResolveIndexByName implements the scbuildstmt.NameResolver interface.
 func (b *builderState) ResolveIndexByName(
 	tableIndexName *tree.TableIndexName, p scbuildstmt.ResolveParams,
 ) scbuildstmt.ElementResultSet {
+	// If a table name is specified, confirm its not a systme table first.
+	if tableIndexName.Table.ObjectName != "" {
+		desc := b.resolveRelation(tableIndexName.Table.ToUnresolvedObjectName(), p)
+		if desc == nil {
+			return nil
+		}
+		tableDesc := desc.desc.(catalog.TableDescriptor)
+		b.ensureDescriptor(tableDesc.GetParentSchemaID())
+		if catalog.IsSystemDescriptor(tableDesc) {
+			schemaDesc := b.descCache[tableDesc.GetParentSchemaID()].desc
+			panic(catalog.NewMutableAccessToVirtualSchemaError(schemaDesc.(catalog.SchemaDescriptor)))
+		}
+	}
+
 	found, prefix, tbl, idx := b.cr.MayResolveIndex(b.ctx, *tableIndexName)
 	if !found {
 		if !p.IsExistenceOptional {
@@ -862,7 +1043,7 @@ func (b *builderState) ResolveConstraint(
 	c := b.descCache[relationID]
 	rel := c.desc.(catalog.TableDescriptor)
 	var constraintID catid.ConstraintID
-	scpb.ForEachConstraintName(c.ers, func(status scpb.Status, _ scpb.TargetStatus, e *scpb.ConstraintName) {
+	scpb.ForEachConstraintWithoutIndexName(c.ers, func(status scpb.Status, _ scpb.TargetStatus, e *scpb.ConstraintWithoutIndexName) {
 		if e.TableID == relationID && tree.Name(e.Name) == constraintName {
 			constraintID = e.ConstraintID
 		}
@@ -893,8 +1074,7 @@ func (b *builderState) ResolveConstraint(
 		if p.IsExistenceOptional {
 			return nil
 		}
-		panic(pgerror.Newf(pgcode.UndefinedObject,
-			"constraint %q of relation %q does not exist", constraintName, rel.GetName()))
+		panic(sqlerrors.NewUndefinedConstraintError(string(constraintName), rel.GetName()))
 	}
 
 	return c.ers.Filter(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) bool {
@@ -903,17 +1083,131 @@ func (b *builderState) ResolveConstraint(
 	})
 }
 
-func (b *builderState) ensureDescriptor(id catid.DescID) {
-	if _, found := b.descCache[id]; found {
-		return
+func (b *builderState) ResolveUDF(
+	fnObj *tree.FuncObj, p scbuildstmt.ResolveParams,
+) scbuildstmt.ElementResultSet {
+	fd, err := b.cr.ResolveFunction(b.ctx, fnObj.FuncName.ToUnresolvedObjectName().ToUnresolvedName(), b.semaCtx.SearchPath)
+	if err != nil {
+		if p.IsExistenceOptional && errors.Is(err, tree.ErrFunctionUndefined) {
+			return nil
+		}
+		panic(err)
 	}
-	c := &cachedDesc{
+
+	paramTypes, err := fnObj.ParamTypes(b.ctx, b.cr)
+	if err != nil {
+		return nil
+	}
+	ol, err := fd.MatchOverload(paramTypes, fnObj.FuncName.Schema(), b.semaCtx.SearchPath)
+	if err != nil {
+		if p.IsExistenceOptional && errors.Is(err, tree.ErrFunctionUndefined) {
+			return nil
+		}
+		panic(err)
+	}
+
+	// ResolveUDF is not concerned with builtin functions that are defined using
+	// a SQL string, so we don't check ol.HasSQLBody() here.
+	if !ol.IsUDF {
+		panic(
+			errors.Errorf(
+				"cannot perform schema change on function %s%s because it is required by the database system",
+				fnObj.FuncName.Object(), ol.Signature(true),
+			),
+		)
+	}
+
+	fnID := funcdesc.UserDefinedFunctionOIDToID(ol.Oid)
+	b.mustOwn(fnID)
+	b.ensureDescriptor(fnID)
+	return b.descCache[fnID].ers
+}
+
+func (b *builderState) newCachedDesc(id descpb.ID) *cachedDesc {
+	return &cachedDesc{
 		desc:            b.readDescriptor(id),
 		privileges:      make(map[privilege.Kind]error),
 		hasOwnership:    b.hasAdmin,
 		ers:             &elementResultSet{b: b},
 		elementIndexMap: map[string]int{},
 	}
+}
+
+func (b *builderState) newCachedDescForNewDesc() *cachedDesc {
+	return &cachedDesc{
+		privileges:      make(map[privilege.Kind]error),
+		hasOwnership:    true,
+		ers:             &elementResultSet{b: b},
+		elementIndexMap: map[string]int{},
+	}
+}
+
+// resolveBackReferences resolves any back references that will take
+// additional look ups. This type of scan operation is expensive, so
+// limit to when its actually needed.
+func (b *builderState) resolveBackReferences(c *cachedDesc) {
+	// Already resolved, no need for extra work.
+	if c.backrefsResolved {
+		return
+	}
+	// Name prefix and namespace lookups.
+	switch d := c.desc.(type) {
+	case catalog.DatabaseDescriptor:
+		if !d.HasPublicSchemaWithDescriptor() {
+			panic(scerrors.NotImplementedErrorf(nil, /* n */
+				"database %q (%d) with a descriptorless public schema",
+				d.GetName(), d.GetID()))
+		}
+		// Handle special case of database children, which may include temporary
+		// schemas, which aren't explicitly referenced in the database's schemas
+		// map.
+		childSchemas := b.cr.GetAllSchemasInDatabase(b.ctx, d)
+		_ = childSchemas.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			sc, err := catalog.AsSchemaDescriptor(desc)
+			if err != nil {
+				panic(err)
+			}
+			switch sc.SchemaKind() {
+			case catalog.SchemaVirtual:
+				return nil
+			case catalog.SchemaTemporary:
+				b.tempSchemas[sc.GetID()] = sc
+			}
+			c.backrefs.Add(sc.GetID())
+			return nil
+		})
+	case catalog.SchemaDescriptor:
+		b.ensureDescriptor(c.desc.GetParentID())
+		db := b.descCache[c.desc.GetParentID()].desc
+		// Handle special case of schema children, which have to be added to
+		// the back-referenced ID set but which aren't explicitly referenced in
+		// the schema descriptor itself.
+		objects := b.cr.GetAllObjectsInSchema(b.ctx, db.(catalog.DatabaseDescriptor), d)
+		_ = objects.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			c.backrefs.Add(desc.GetID())
+			return nil
+		})
+	default:
+		// These are always done
+	}
+	c.backrefsResolved = true
+}
+
+// ensureDescriptor ensures descriptor `id` is "tracked" inside the builder state,
+// as a *cacheDesc.
+// For newly created descriptors, it merely creates a zero-valued *cacheDesc entry;
+// For existing descriptors, it creates and populate the *cacheDesc entry and
+// decompose it into elements (as tracked in b.output).
+func (b *builderState) ensureDescriptor(id catid.DescID) {
+	if _, found := b.descCache[id]; found {
+		return
+	}
+	if b.newDescriptors.Contains(id) {
+		b.descCache[id] = b.newCachedDescForNewDesc()
+		return
+	}
+
+	c := b.newCachedDesc(id)
 	// Collect privileges
 	if !c.hasOwnership {
 		var err error
@@ -928,56 +1222,25 @@ func (b *builderState) ensureDescriptor(id catid.DescID) {
 		return b.readDescriptor(id)
 	}
 	visitorFn := func(status scpb.Status, e scpb.Element) {
-		c.ers.indexes = append(c.ers.indexes, len(b.output))
-		key := screl.ElementString(e)
-		c.elementIndexMap[key] = len(b.output)
-		b.output = append(b.output, elementState{
+		b.addNewElementState(elementState{
 			element: e,
-			target:  scpb.AsTargetStatus(status),
+			initial: status,
 			current: status,
+			target:  scpb.AsTargetStatus(status),
 		})
 	}
 
-	if err := b.commentCache.LoadCommentsForObjects(b.ctx, []descpb.ID{c.desc.GetID()}); err != nil {
-		panic(err)
-	}
-	c.backrefs = scdecomp.WalkDescriptor(b.ctx, c.desc, crossRefLookupFn, visitorFn, b.commentCache, b.zoneConfigReader)
+	c.backrefs = scdecomp.WalkDescriptor(b.ctx, c.desc, crossRefLookupFn, visitorFn,
+		b.commentGetter, b.zoneConfigReader, b.evalCtx.Settings.Version.ActiveVersion(b.ctx))
 	// Name prefix and namespace lookups.
-	switch d := c.desc.(type) {
+	switch c.desc.(type) {
 	case catalog.DatabaseDescriptor:
-		if !d.HasPublicSchemaWithDescriptor() {
-			panic(scerrors.NotImplementedErrorf(nil, /* n */
-				"database %q (%d) with a descriptorless public schema",
-				d.GetName(), d.GetID()))
-		}
-		// Handle special case of database children, which may include temporary
-		// schemas, which aren't explicitly referenced in the database's schemas
-		// map.
-		childSchemas := b.cr.MustGetSchemasForDatabase(b.ctx, d)
-		for schemaID, schemaName := range childSchemas {
-			c.backrefs.Add(schemaID)
-			if strings.HasPrefix(schemaName, catconstants.PgTempSchemaName) {
-				b.tempSchemas[schemaID] = schemadesc.NewTemporarySchema(schemaName, schemaID, d.GetID())
-			}
-		}
+		// Nothing to do here.
 	case catalog.SchemaDescriptor:
 		b.ensureDescriptor(c.desc.GetParentID())
 		db := b.descCache[c.desc.GetParentID()].desc
 		c.prefix.CatalogName = tree.Name(db.GetName())
 		c.prefix.ExplicitCatalog = true
-		// Handle special case of schema children, which have to be added to
-		// the back-referenced ID set but which aren't explicitly referenced in
-		// the schema descriptor itself.
-		_, objectIDs := b.cr.ReadObjectNamesAndIDs(b.ctx, db.(catalog.DatabaseDescriptor), d)
-		for _, objectID := range objectIDs {
-			c.backrefs.Add(objectID)
-		}
-		if err := d.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-			c.backrefs.Add(overload.ID)
-			return nil
-		}); err != nil {
-			panic(err)
-		}
 	default:
 		b.ensureDescriptor(c.desc.GetParentID())
 		db := b.descCache[c.desc.GetParentID()].desc
@@ -1001,6 +1264,232 @@ func (b *builderState) readDescriptor(id catid.DescID) catalog.Descriptor {
 		return tempSchema
 	}
 	return b.cr.MustReadDescriptor(b.ctx, id)
+}
+
+func (b *builderState) GenerateUniqueDescID() catid.DescID {
+	id, err := b.evalCtx.DescIDGenerator.GenerateUniqueDescID(b.ctx)
+	if err != nil {
+		panic(err)
+	}
+	b.newDescriptors.Add(id)
+	return id
+}
+
+func (b *builderState) BuildReferenceProvider(stmt tree.Statement) scbuildstmt.ReferenceProvider {
+	provider, err := b.referenceProviderFactory.NewReferenceProvider(b.ctx, stmt)
+	if err != nil {
+		panic(err)
+	}
+	return provider
+}
+
+func (b *builderState) BuildUserPrivilegesFromDefaultPrivileges(
+	db *scpb.Database, sc *scpb.Schema, descID descpb.ID, objType privilege.TargetObjectType,
+) (*scpb.Owner, []*scpb.UserPrivileges) {
+	b.ensureDescriptor(db.DatabaseID)
+	b.ensureDescriptor(sc.SchemaID)
+	dbDesc, err := catalog.AsDatabaseDescriptor(b.descCache[db.DatabaseID].desc)
+	if err != nil {
+		panic(err)
+	}
+	scDesc, err := catalog.AsSchemaDescriptor(b.descCache[sc.SchemaID].desc)
+	if err != nil {
+		panic(err)
+	}
+	pd, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		dbDesc.GetDefaultPrivilegeDescriptor(),
+		scDesc.GetDefaultPrivilegeDescriptor(),
+		db.DatabaseID,
+		b.CurrentUser(),
+		objType,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	owner := &scpb.Owner{
+		DescriptorID: descID,
+		Owner:        pd.Owner().Normalized(),
+	}
+
+	ups := make([]*scpb.UserPrivileges, 0, len(pd.Users))
+	for _, up := range pd.Users {
+		ups = append(ups, &scpb.UserPrivileges{
+			DescriptorID:    descID,
+			UserName:        up.User().Normalized(),
+			Privileges:      up.Privileges,
+			WithGrantOption: up.WithGrantOption,
+		})
+	}
+	sort.Slice(ups, func(i, j int) bool {
+		return ups[i].UserName < ups[j].UserName
+	})
+	return owner, ups
+}
+
+func (b *builderState) WrapFunctionBody(
+	fnID descpb.ID,
+	bodyStr string,
+	lang catpb.Function_Language,
+	refProvider scbuildstmt.ReferenceProvider,
+) *scpb.FunctionBody {
+	bodyStr = b.replaceSeqNamesWithIDs(bodyStr)
+	bodyStr = b.serializeUserDefinedTypes(bodyStr)
+	fnBody := &scpb.FunctionBody{
+		FunctionID: fnID,
+		Body:       bodyStr,
+		Lang:       catpb.FunctionLanguage{Lang: lang},
+	}
+	if err := refProvider.ForEachTableReference(func(tblID descpb.ID, idxID descpb.IndexID, colIDs descpb.ColumnIDs) error {
+		fnBody.UsesTables = append(
+			fnBody.UsesTables,
+			scpb.FunctionBody_TableReference{
+				TableID:   tblID,
+				ColumnIDs: colIDs,
+				IndexID:   idxID,
+			},
+		)
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+
+	if err := refProvider.ForEachViewReference(func(viewID descpb.ID, colIDs descpb.ColumnIDs) error {
+		fnBody.UsesViews = append(
+			fnBody.UsesViews,
+			scpb.FunctionBody_ViewReference{
+				ViewID:    viewID,
+				ColumnIDs: colIDs,
+			},
+		)
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+
+	fnBody.UsesSequenceIDs = refProvider.ReferencedSequences().Ordered()
+	fnBody.UsesTypeIDs = refProvider.ReferencedTypes().Ordered()
+	return fnBody
+}
+
+func (b *builderState) replaceSeqNamesWithIDs(queryStr string) string {
+	replaceSeqFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		seqIdentifiers, err := seqexpr.GetUsedSequences(expr)
+		if err != nil {
+			return false, expr, err
+		}
+		seqNameToID := make(map[string]descpb.ID)
+		for _, seqIdentifier := range seqIdentifiers {
+			if seqIdentifier.IsByID() {
+				continue
+			}
+			seq := b.getSequenceFromName(seqIdentifier.SeqName)
+			seqNameToID[seqIdentifier.SeqName] = seq.SequenceID
+		}
+		newExpr, err = seqexpr.ReplaceSequenceNamesWithIDs(expr, seqNameToID)
+		if err != nil {
+			return false, expr, err
+		}
+		return false, newExpr, nil
+	}
+
+	parsedStmts, err := parser.Parse(queryStr)
+	if err != nil {
+		panic(err)
+	}
+
+	stmts := make(tree.Statements, len(parsedStmts))
+	for i, s := range parsedStmts {
+		stmts[i] = s.AST
+	}
+
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	for i, stmt := range stmts {
+		newStmt, err := tree.SimpleStmtVisit(stmt, replaceSeqFunc)
+		if err != nil {
+			panic(err)
+		}
+		if i > 0 {
+			fmtCtx.WriteString("\n")
+		}
+		fmtCtx.FormatNode(newStmt)
+		fmtCtx.WriteString(";")
+	}
+
+	return fmtCtx.String()
+
+}
+
+func (b *builderState) getSequenceFromName(seqName string) *scpb.Sequence {
+	parsedName, err := parser.ParseTableName(seqName)
+	if err != nil {
+		panic(err)
+	}
+	elts := b.ResolveSequence(parsedName, scbuildstmt.ResolveParams{RequiredPrivilege: privilege.SELECT})
+	_, _, seq := scpb.FindSequence(elts)
+	return seq
+}
+
+func (b *builderState) serializeUserDefinedTypes(queryStr string) string {
+	replaceFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		var innerExpr tree.Expr
+		var typRef tree.ResolvableTypeReference
+		switch n := expr.(type) {
+		case *tree.CastExpr:
+			innerExpr = n.Expr
+			typRef = n.Type
+		case *tree.AnnotateTypeExpr:
+			innerExpr = n.Expr
+			typRef = n.Type
+		default:
+			return true, expr, nil
+		}
+		// semaCtx may be nil if this is a virtual view being created at
+		// init time.
+		var typ *types.T
+		typ, err = tree.ResolveType(b.ctx, typRef, b.semaCtx.TypeResolver)
+		if err != nil {
+			return false, expr, err
+		}
+		if !typ.UserDefined() {
+			return true, expr, nil
+		}
+		texpr, err := innerExpr.TypeCheck(b.ctx, b.semaCtx, typ)
+		if err != nil {
+			return false, expr, err
+		}
+		s := tree.Serialize(texpr)
+		parsedExpr, err := parser.ParseExpr(s)
+		if err != nil {
+			return false, expr, err
+		}
+		return false, parsedExpr, nil
+	}
+
+	var stmts tree.Statements
+	parsedStmts, err := parser.Parse(queryStr)
+	if err != nil {
+		panic(err)
+	}
+	stmts = make(tree.Statements, len(parsedStmts))
+	for i, stmt := range parsedStmts {
+		stmts[i] = stmt.AST
+	}
+
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	for i, stmt := range stmts {
+		newStmt, err := tree.SimpleStmtVisit(stmt, replaceFunc)
+		if err != nil {
+			panic(err)
+		}
+		if i > 0 {
+			fmtCtx.WriteString("\n")
+		}
+		fmtCtx.FormatNode(newStmt)
+		fmtCtx.WriteString(";")
+	}
+	return fmtCtx.CloseAndGetString()
+
 }
 
 type elementResultSet struct {

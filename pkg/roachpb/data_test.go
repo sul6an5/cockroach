@@ -39,7 +39,7 @@ import (
 	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 func makeClockTS(walltime int64, logical int32) hlc.ClockTimestamp {
@@ -1251,6 +1251,13 @@ func TestSpanCombine(t *testing.T) {
 // or key range is contained within the span.
 func TestSpanContains(t *testing.T) {
 	s := Span{Key: []byte("a"), EndKey: []byte("b")}
+	sp := func(start, end string) Span {
+		res := Span{Key: Key(start)}
+		if end != "" {
+			res.EndKey = Key(end)
+		}
+		return res
+	}
 
 	testData := []struct {
 		start, end string
@@ -1317,8 +1324,8 @@ func TestSpanSplitOnKey(t *testing.T) {
 		// Simple split.
 		{
 			[]byte("bb"),
-			sp("b", "bb"),
-			sp("bb", "c"),
+			Span{Key: Key("b"), EndKey: Key("bb")},
+			Span{Key: Key("bb"), EndKey: Key("c")},
 		},
 	}
 	for testIdx, test := range testData {
@@ -1482,7 +1489,7 @@ func TestRSpanIntersect(t *testing.T) {
 		desc.StartKey = test.startKey
 		desc.EndKey = test.endKey
 
-		actual, err := rs.Intersect(&desc)
+		actual, err := rs.Intersect(desc.RSpan())
 		if err != nil {
 			t.Error(err)
 			continue
@@ -1504,7 +1511,7 @@ func TestRSpanIntersect(t *testing.T) {
 		desc := RangeDescriptor{}
 		desc.StartKey = test.startKey
 		desc.EndKey = test.endKey
-		if _, err := rs.Intersect(&desc); err == nil {
+		if _, err := rs.Intersect(desc.RSpan()); err == nil {
 			t.Errorf("%d: unexpected success", i)
 		}
 	}

@@ -11,8 +11,10 @@
 package colinfo
 
 import (
+	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -68,7 +70,7 @@ func (ti ColTypeInfo) Type(idx int) *types.T {
 
 // ValidateColumnDefType returns an error if the type of a column definition is
 // not valid. It is checked when a column is created or altered.
-func ValidateColumnDefType(t *types.T) error {
+func ValidateColumnDefType(ctx context.Context, version clusterversion.Handle, t *types.T) error {
 	switch t.Family() {
 	case types.StringFamily, types.CollatedStringFamily:
 		if t.Family() == types.CollatedStringFamily {
@@ -100,13 +102,27 @@ func ValidateColumnDefType(t *types.T) error {
 		if err := types.CheckArrayElementType(t.ArrayContents()); err != nil {
 			return err
 		}
-		return ValidateColumnDefType(t.ArrayContents())
+		return ValidateColumnDefType(ctx, version, t.ArrayContents())
 
 	case types.BitFamily, types.IntFamily, types.FloatFamily, types.BoolFamily, types.BytesFamily, types.DateFamily,
 		types.INetFamily, types.IntervalFamily, types.JsonFamily, types.OidFamily, types.TimeFamily,
 		types.TimestampFamily, types.TimestampTZFamily, types.UuidFamily, types.TimeTZFamily,
 		types.GeographyFamily, types.GeometryFamily, types.EnumFamily, types.Box2DFamily:
-		// These types are OK.
+	// These types are OK.
+
+	case types.TupleFamily:
+		if !t.UserDefined() {
+			return pgerror.New(pgcode.InvalidTableDefinition, "cannot use anonymous record type as table column")
+		}
+		if t.TypeMeta.ImplicitRecordType {
+			return unimplemented.NewWithIssue(70099, "cannot use table record type as table column")
+		}
+
+	case types.TSQueryFamily, types.TSVectorFamily:
+		if !version.IsActive(ctx, clusterversion.V23_1) {
+			return pgerror.Newf(pgcode.FeatureNotSupported,
+				"TSVector/TSQuery not supported until version 23.1")
+		}
 
 	default:
 		return pgerror.Newf(pgcode.InvalidTableDefinition,
@@ -130,7 +146,7 @@ func ColumnTypeIsIndexable(t *types.T) bool {
 // using an inverted index.
 func ColumnTypeIsInvertedIndexable(t *types.T) bool {
 	switch t.Family() {
-	case types.StringFamily:
+	case types.ArrayFamily, types.StringFamily:
 		return true
 	}
 	return ColumnTypeIsOnlyInvertedIndexable(t)
@@ -142,11 +158,14 @@ func ColumnTypeIsOnlyInvertedIndexable(t *types.T) bool {
 	if t.IsAmbiguous() || t.Family() == types.TupleFamily {
 		return false
 	}
+	if t.Family() == types.ArrayFamily {
+		t = t.ArrayContents()
+	}
 	switch t.Family() {
 	case types.JsonFamily:
-	case types.ArrayFamily:
 	case types.GeographyFamily:
 	case types.GeometryFamily:
+	case types.TSVectorFamily:
 	default:
 		return false
 	}
@@ -165,6 +184,8 @@ func MustBeValueEncoded(semanticType *types.T) bool {
 			return MustBeValueEncoded(semanticType.ArrayContents())
 		}
 	case types.JsonFamily, types.TupleFamily, types.GeographyFamily, types.GeometryFamily:
+		return true
+	case types.TSVectorFamily, types.TSQueryFamily:
 		return true
 	}
 	return false

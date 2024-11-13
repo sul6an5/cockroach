@@ -11,6 +11,8 @@
 package opt
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
@@ -172,6 +174,10 @@ type TableMeta struct {
 	// Computed columns with non-immutable operators are omitted.
 	ComputedCols map[ColumnID]ScalarExpr
 
+	// ColsInComputedColsExpressions is the set of all columns referenced in the
+	// expressions used to build the column data of computed columns.
+	ColsInComputedColsExpressions ColSet
+
 	// partialIndexPredicates is a map from index ordinals on the table to
 	// *FiltersExprs representing the predicate on the corresponding partial
 	// index. If an index is not a partial index, it will not have an entry in
@@ -247,6 +253,7 @@ func (tm *TableMeta) copyFrom(from *TableMeta, copyScalarFn func(Expr) Expr) {
 		for col, e := range from.ComputedCols {
 			tm.ComputedCols[col] = copyScalarFn(e).(ScalarExpr)
 		}
+		tm.ColsInComputedColsExpressions = from.ColsInComputedColsExpressions
 	}
 
 	if from.partialIndexPredicates != nil {
@@ -333,12 +340,15 @@ func (tm *TableMeta) SetConstraints(constraints ScalarExpr) {
 	tm.Constraints = constraints
 }
 
-// AddComputedCol adds a computed column expression to the table's metadata.
-func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr) {
+// AddComputedCol adds a computed column expression to the table's metadata and
+// also adds any referenced columns in the `computedCol` expression to the
+// table's metadata.
+func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr, outerCols ColSet) {
 	if tm.ComputedCols == nil {
 		tm.ComputedCols = make(map[ColumnID]ScalarExpr)
 	}
 	tm.ComputedCols[colID] = computedCol
+	tm.ColsInComputedColsExpressions.UnionWith(outerCols)
 }
 
 // ComputedColExpr returns the computed expression for the given column, if it
@@ -376,13 +386,22 @@ func (tm *TableMeta) OrigCheckConstraintsStats(
 	return nil, false
 }
 
-// AddIndexPartitionLocality adds a PrefixSorter to the table's metadata for the
-// index with IndexOrdinal ord.
-func (tm *TableMeta) AddIndexPartitionLocality(ord cat.IndexOrdinal, ps partition.PrefixSorter) {
-	if tm.indexPartitionLocalities == nil {
-		tm.indexPartitionLocalities = make([]partition.PrefixSorter, tm.Table.IndexCount())
+// CacheIndexPartitionLocalities caches locality prefix sorters in the table
+// metadata for indexes that have a mix of local and remote partitions. It can
+// be called multiple times if necessary to update with new indexes.
+func (tm *TableMeta) CacheIndexPartitionLocalities(evalCtx *eval.Context) {
+	tab := tm.Table
+	if cap(tm.indexPartitionLocalities) < tab.IndexCount() {
+		tm.indexPartitionLocalities = make([]partition.PrefixSorter, tab.IndexCount())
 	}
-	tm.indexPartitionLocalities[ord] = ps
+	tm.indexPartitionLocalities = tm.indexPartitionLocalities[:tab.IndexCount()]
+	for indexOrd, n := 0, tab.IndexCount(); indexOrd < n; indexOrd++ {
+		index := tab.Index(indexOrd)
+		if localPartitions, ok := partition.HasMixOfLocalAndRemotePartitions(evalCtx, index); ok {
+			ps := partition.GetSortedPrefixes(index, localPartitions, evalCtx)
+			tm.indexPartitionLocalities[indexOrd] = ps
+		}
+	}
 }
 
 // IndexPartitionLocality returns the given index's PrefixSorter. An empty
@@ -390,6 +409,11 @@ func (tm *TableMeta) AddIndexPartitionLocality(ord cat.IndexOrdinal, ps partitio
 // partitions.
 func (tm *TableMeta) IndexPartitionLocality(ord cat.IndexOrdinal) (ps partition.PrefixSorter) {
 	if tm.indexPartitionLocalities != nil {
+		if ord >= len(tm.indexPartitionLocalities) {
+			panic(errors.AssertionFailedf(
+				"index ordinal %d greater than length of indexPartitionLocalities", ord,
+			))
+		}
 		ps := tm.indexPartitionLocalities[ord]
 		return ps
 	}
@@ -445,11 +469,11 @@ func (tm *TableMeta) VirtualComputedColumns() ColSet {
 }
 
 // GetRegionsInDatabase finds the full set of regions in the multiregion
-// database owning the table described by `tm`, or returns ok=false if not
-// multiregion. The result is cached in TableMeta.
+// database owning the table described by `tm`, or returns hasRegionName=false
+// if not multiregion. The result is cached in TableMeta.
 func (tm *TableMeta) GetRegionsInDatabase(
-	planner eval.Planner,
-) (regionNames catpb.RegionNames, ok bool) {
+	ctx context.Context, planner eval.Planner,
+) (regionNames catpb.RegionNames, hasRegionNames bool) {
 	multiregionConfig, ok := tm.TableAnnotation(regionConfigAnnID).(*multiregion.RegionConfig)
 	if ok {
 		if multiregionConfig == nil {
@@ -458,14 +482,21 @@ func (tm *TableMeta) GetRegionsInDatabase(
 		return multiregionConfig.Regions(), true
 	}
 	dbID := tm.Table.GetDatabaseID()
-	if dbID == 0 {
-		tm.SetTableAnnotation(regionConfigAnnID, nil)
+	defer func() {
+		if !hasRegionNames {
+			tm.SetTableAnnotation(
+				regionConfigAnnID,
+				// Use a nil pointer to a RegionConfig, which is distinct from the
+				// untyped nil and will be detected in the type assertion above.
+				(*multiregion.RegionConfig)(nil),
+			)
+		}
+	}()
+	if dbID == 0 || !tm.Table.IsMultiregion() {
 		return nil /* regionNames */, false
 	}
-
-	regionConfig, ok := planner.GetMultiregionConfig(dbID)
+	regionConfig, ok := planner.GetMultiregionConfig(ctx, dbID)
 	if !ok {
-		tm.SetTableAnnotation(regionConfigAnnID, nil)
 		return nil /* regionNames */, false
 	}
 	multiregionConfig, _ = regionConfig.(*multiregion.RegionConfig)
@@ -477,7 +508,7 @@ func (tm *TableMeta) GetRegionsInDatabase(
 // owning the table described by `tm`, or returns ok=false if not multiregion.
 // The result is cached in TableMeta.
 func (tm *TableMeta) GetDatabaseSurvivalGoal(
-	planner eval.Planner,
+	ctx context.Context, planner eval.Planner,
 ) (survivalGoal descpb.SurvivalGoal, ok bool) {
 	// If planner is nil, we could be running an internal query or something else
 	// which is not a user query, so make sure we don't error out this case.
@@ -492,9 +523,21 @@ func (tm *TableMeta) GetDatabaseSurvivalGoal(
 		return multiregionConfig.SurvivalGoal(), true
 	}
 	dbID := tm.Table.GetDatabaseID()
-	regionConfig, ok := planner.GetMultiregionConfig(dbID)
+	defer func() {
+		if !ok {
+			tm.SetTableAnnotation(
+				regionConfigAnnID,
+				// Use a nil pointer to a RegionConfig, which is distinct from the
+				// untyped nil and will be detected in the type assertion above.
+				(*multiregion.RegionConfig)(nil),
+			)
+		}
+	}()
+	if dbID == 0 || !tm.Table.IsMultiregion() {
+		return descpb.SurvivalGoal_ZONE_FAILURE /* regionNames */, false
+	}
+	regionConfig, ok := planner.GetMultiregionConfig(ctx, dbID)
 	if !ok {
-		tm.SetTableAnnotation(regionConfigAnnID, nil)
 		return descpb.SurvivalGoal_ZONE_FAILURE /* survivalGoal */, false
 	}
 	multiregionConfig, _ = regionConfig.(*multiregion.RegionConfig)

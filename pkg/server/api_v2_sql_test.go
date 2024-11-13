@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
@@ -29,9 +30,11 @@ import (
 
 func TestExecSQL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	sqlAPIClock = timeutil.NewManualTime(timeutil.FromUnixMicros(0))
+	defer log.Scope(t).Close(t)
+
+	SQLAPIClock = timeutil.NewManualTime(timeutil.FromUnixMicros(0))
 	defer func() {
-		sqlAPIClock = timeutil.DefaultTimeSource{}
+		SQLAPIClock = timeutil.DefaultTimeSource{}
 	}()
 
 	server, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
@@ -41,7 +44,7 @@ func TestExecSQL(t *testing.T) {
 	adminClient, err := server.GetAdminHTTPClient()
 	require.NoError(t, err)
 
-	nonAdminClient, err := server.GetAuthenticatedHTTPClient(false)
+	nonAdminClient, err := server.GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
 	require.NoError(t, err)
 
 	datadriven.RunTest(t, "testdata/api_v2_sql",

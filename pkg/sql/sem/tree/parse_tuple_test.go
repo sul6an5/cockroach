@@ -44,6 +44,7 @@ var tupleOfTwoInts = types.MakeTuple([]*types.T{types.Int, types.Int})
 var tupleOfTwoStrings = types.MakeTuple([]*types.T{types.String, types.String})
 var tupleOfTuples = types.MakeTuple([]*types.T{tupleOfTwoInts, tupleOfTwoStrings})
 var tupleComplex = types.MakeTuple([]*types.T{types.String, types.TimeTZ, types.Jsonb})
+var tupleOfTSVectorTSQuery = types.MakeTuple([]*types.T{types.TSVector, types.TSQuery})
 
 func TestParseTuple(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -55,6 +56,11 @@ func TestParseTuple(t *testing.T) {
 
 	escapedJsonString := `{"")N}."": [false], ""UA%t"": [""foobar""]}`
 	jsonVal, err := jsonb.ParseJSON(`{")N}.": [false], "UA%t": ["foobar"]}`)
+	require.NoError(t, err)
+
+	tsv, err := tree.ParseDTSVector("a b")
+	require.NoError(t, err)
+	tsq, err := tree.ParseDTSQuery("c")
 	require.NoError(t, err)
 
 	testData := []struct {
@@ -180,6 +186,16 @@ func TestParseTuple(t *testing.T) {
 			tree.NewDTuple(tupleOfStringAndInt, tree.NewDString("\\n"), tree.NewDInt(4)),
 		},
 		{
+			`(a b, c)`,
+			tupleOfTSVectorTSQuery,
+			tree.NewDTuple(tupleOfTSVectorTSQuery, tsv, tsq),
+		},
+		{
+			`("a b", c)`,
+			tupleOfTSVectorTSQuery,
+			tree.NewDTuple(tupleOfTSVectorTSQuery, tsv, tsq),
+		},
+		{
 			fmt.Sprintf(`(0s{mlRk#, %s, "%s")`, timeTZString, escapedJsonString),
 			tupleComplex,
 			tree.NewDTuple(
@@ -276,7 +292,7 @@ func TestParseTupleRandomDatums(t *testing.T) {
 		conv := sessiondatapb.DataConversionConfig{
 			ExtraFloatDigits: 1,
 		}
-		tupString := tree.AsStringWithFlags(tup, tree.FmtPgwireText, tree.FmtDataConversionConfig(conv))
+		tupString := tree.AsStringWithFlags(tup, tree.FmtPgwireText, tree.FmtDataConversionConfig(conv), tree.FmtLocation(time.UTC))
 
 		evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		parsed, _, err := tree.ParseDTupleFromString(

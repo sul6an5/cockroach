@@ -10,6 +10,7 @@ CONFIGS="-c grep.column=false -c grep.lineNumber=false -c grep.fullName=false"
 GIT_GREP="git $CONFIGS grep"
 
 EXISTING_GO_GENERATE_COMMENTS="
+pkg/config/field.go://go:generate stringer --type=Field --linecomment
 pkg/roachprod/vm/aws/config.go://go:generate go-bindata -mode 0600 -modtime 1400000000 -pkg aws -o embedded.go config.json old.json
 pkg/roachprod/vm/aws/config.go://go:generate gofmt -s -w embedded.go
 pkg/roachprod/vm/aws/config.go://go:generate goimports -w embedded.go
@@ -22,8 +23,8 @@ pkg/kv/kvclient/rangecache/range_cache.go://go:generate mockgen -package=rangeca
 pkg/kv/kvclient/rangefeed/rangefeed.go://go:generate mockgen -destination=mocks_generated_test.go --package=rangefeed . DB
 pkg/kv/kvserver/concurrency/lock_table.go://go:generate ../../../util/interval/generic/gen.sh *lockState concurrency
 pkg/kv/kvserver/spanlatch/manager.go://go:generate ../../../util/interval/generic/gen.sh *latch spanlatch
-pkg/roachpb/api.go://go:generate mockgen -package=roachpbmock -destination=roachpbmock/mocks_generated.go . InternalClient,Internal_RangeFeedClient,Internal_MuxRangeFeedClient
-pkg/roachpb/batch.go://go:generate go run gen/main.go --filename batch_generated.go *.pb.go
+pkg/kv/kvpb/api.go://go:generate mockgen -package=kvpbmock -destination=kvpbmock/mocks_generated.go . InternalClient,Internal_RangeFeedClient,Internal_MuxRangeFeedClient
+pkg/kv/kvpb/batch.go://go:generate go run gen/main.go --filename batch_generated.go *.pb.go
 pkg/security/certmgr/cert.go://go:generate mockgen -package=certmgr -destination=mocks_generated_test.go . Cert
 pkg/security/securitytest/securitytest.go://go:generate go-bindata -mode 0600 -modtime 1400000000 -pkg securitytest -o embedded.go -ignore README.md -ignore regenerate.sh test_certs
 pkg/security/securitytest/securitytest.go://go:generate gofmt -s -w embedded.go
@@ -35,7 +36,8 @@ pkg/sql/opt/optgen/lang/gen.go://go:generate langgen -out expr.og.go exprs lang.
 pkg/sql/opt/optgen/lang/gen.go://go:generate langgen -out operator.og.go ops lang.opt
 pkg/sql/schemachanger/scexec/exec_backfill_test.go://go:generate mockgen -package scexec_test -destination=mocks_generated_test.go --self_package scexec . Catalog,Dependencies,Backfiller,Merger,BackfillerTracker,IndexSpanSplitter,PeriodicProgressFlusher
 pkg/sql/schemachanger/scop/backfill.go://go:generate go run ./generate_visitor.go scop Backfill backfill.go backfill_visitor_generated.go
-pkg/sql/schemachanger/scop/mutation.go://go:generate go run ./generate_visitor.go scop Mutation mutation.go mutation_visitor_generated.go
+pkg/sql/schemachanger/scop/immediate_mutation.go://go:generate go run ./generate_visitor.go scop ImmediateMutation immediate_mutation.go immediate_mutation_visitor_generated.go
+pkg/sql/schemachanger/scop/deferred_mutation.go://go:generate go run ./generate_visitor.go scop DeferredMutation deferred_mutation.go deferred_mutation_visitor_generated.go
 pkg/sql/schemachanger/scop/validation.go://go:generate go run ./generate_visitor.go scop Validation validation.go validation_visitor_generated.go
 pkg/sql/schemachanger/scpb/state.go://go:generate go run element_generator.go --in elements.proto --out elements_generated.go
 pkg/sql/schemachanger/scpb/state.go://go:generate go run element_uml_generator.go --out uml/table.puml
@@ -51,17 +53,16 @@ pkg/util/timeutil/zoneinfo.go://go:generate go run gen/main.go
 "
 
 EXISTING_BROKEN_TESTS_IN_BAZEL="
-pkg/acceptance/BUILD.bazel
-pkg/cmd/cockroach-oss/BUILD.bazel
-pkg/cmd/github-post/BUILD.bazel
 pkg/cmd/prereqs/BUILD.bazel
-pkg/cmd/roachtest/BUILD.bazel
-pkg/cmd/teamcity-trigger/BUILD.bazel
 "
 
 EXISTING_CRDB_TEST_BUILD_CONSTRAINTS="
 pkg/util/buildutil/crdb_test_off.go://go:build !crdb_test || crdb_test_off
 pkg/util/buildutil/crdb_test_on.go://go:build crdb_test && !crdb_test_off
+pkg/kv/kvnemesis/kvnemesisutil/crdb_test_off.go://go:build !crdb_test || crdb_test_off
+pkg/kv/kvnemesis/kvnemesisutil/crdb_test_on.go://go:build crdb_test && !crdb_test_off
+pkg/storage/pebbleiter/crdb_test_off.go://go:build !crdb_test || crdb_test_off
+pkg/storage/pebbleiter/crdb_test_on.go://go:build crdb_test && !crdb_test_off
 "
 
 if [ -z "${COCKROACH_BAZEL_CHECK_FAST:-}" ]; then

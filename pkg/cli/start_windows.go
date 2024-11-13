@@ -16,8 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 )
 
-// drainSignals are the signals that will cause the server to drain and exit.
-var drainSignals = []os.Signal{os.Interrupt}
+// DrainSignals are the signals that will cause the server to drain and exit.
+var DrainSignals = []os.Signal{os.Interrupt}
 
 // termSignal is the signal that causes an idempotent graceful
 // shutdown (i.e. second occurrence does not incur hard shutdown).
@@ -44,4 +44,9 @@ func maybeRerunBackground() (bool, error) {
 
 func disableOtherPermissionBits() {
 	// No-op on windows, which does not support umask.
+}
+
+func closeAllSockets() {
+	// No-op on windows.
+	// TODO(jackson): Is there something else we can do on Windows?
 }

@@ -65,6 +65,8 @@ var nativeCastInfos = []supportedNativeCastInfo{
 	{types.Decimal, types.Int, getDecimalToIntCastFunc(anyWidth)},
 	{types.Decimal, types.String, decimalToString},
 
+	{types.AnyEnum, types.String, enumToString},
+
 	{types.Float, types.Bool, numToBool},
 	{types.Float, types.Decimal, floatToDecimal},
 	{types.Float, types.Int2, floatToInt(16, 64 /* floatWidth */)},
@@ -99,6 +101,7 @@ var nativeCastInfos = []supportedNativeCastInfo{
 	{types.String, types.Bytes, stringToBytes},
 	{types.String, types.Date, stringToDate},
 	{types.String, types.Decimal, stringToDecimal},
+	{types.String, types.AnyEnum, stringToEnum},
 	{types.String, types.Float, stringToFloat},
 	{types.String, types.Int2, getStringToIntCastFunc(16)},
 	{types.String, types.Int4, getStringToIntCastFunc(32)},
@@ -285,6 +288,17 @@ func floatToString(to, from, evalCtx, toType, _ string) string {
 	return toString(fmt.Sprintf(convStr, to, from, evalCtx), to, toType)
 }
 
+func enumToString(to, from, _, toType, _ string) string {
+	conv := `
+		_, logical, err := tree.GetEnumComponentsFromPhysicalRep(fromType, %[2]s)
+		if err != nil {
+			colexecerror.ExpectedError(err)
+		}
+		%[1]s = []byte(logical)
+`
+	return toString(fmt.Sprintf(conv, to, from), to, toType)
+}
+
 func intToDecimal(to, from, _, toType, _ string) string {
 	conv := `
 		%[1]s.SetInt64(int64(%[2]s))
@@ -395,7 +409,8 @@ func stringToDate(to, from, evalCtx, _, _ string) string {
 	convStr := `
 		_now := %[3]s.GetRelativeParseTime()
 		_dateStyle := %[3]s.GetDateStyle()
-		_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(%[2]s))
+		_ph := &%[3]s.ParseHelper
+		_d, _, err := pgdate.ParseDate(_now, _dateStyle, string(%[2]s), _ph)
 		if err != nil {
 			colexecerror.ExpectedError(err)
 		}
@@ -424,6 +439,19 @@ func stringToDecimal(to, from, _, toType, _ string) string {
 		}
 `
 	return toDecimal(fmt.Sprintf(convStr, to, from), to, toType)
+}
+
+func stringToEnum(to, from, _, toType, _ string) string {
+	// String value is treated as the logical representation of the enum.
+	convStr := `
+		_logical := string(%[2]s)
+		var err error
+		%[1]s, _, err = tree.GetEnumComponentsFromLogicalRep(%[3]s, _logical)
+		if err != nil {
+			colexecerror.ExpectedError(err)
+		}
+`
+	return fmt.Sprintf(convStr, to, from, toType)
 }
 
 func stringToFloat(to, from, _, toType, _ string) string {
@@ -584,20 +612,18 @@ func stringToUUID(to, from, _, _, _ string) string {
 }
 
 func timestampToString(to, from, _, toType, _ string) string {
-	return toString(fmt.Sprintf("%s = []byte(tree.FormatTimestamp(%s))", to, from), to, toType)
+	return toString(fmt.Sprintf("%s = tree.PGWireFormatTimestamp(%s, nil, r)", to, from), to, toType)
 }
 
 func timestampTZToString(to, from, evalCtx, toType, buf string) string {
 	convStr := `
 		// Convert to context timezone for correct display.
-		_t := %[2]s.In(%[3]s.GetLocation())
-		%[5]s
-		%[4]s.Reset()
-		tree.FormatTimestampTZ(_t, %[4]s)
-		%[1]s = []byte(%[4]s.String())
+		_t := %[2]s
+		%[4]s
+		r = tree.PGWireFormatTimestamp(_t, %[3]s.GetLocation(), r)
 `
 	roundT := roundTimestamp("_t", "_t", "time.Microsecond")
-	return toString(fmt.Sprintf(convStr, to, from, evalCtx, buf, roundT), to, toType)
+	return toString(fmt.Sprintf(convStr, to, from, evalCtx, roundT), to, toType)
 }
 
 func uuidToString(to, from, _, toType, _ string) string {
@@ -619,7 +645,7 @@ func getDatumToNativeCastFunc(nonDatumPhysicalRepresentation string) castFunc {
 	return func(to, from, evalCtx, toType, _ string) string {
 		convStr := `
 		{
-			_castedDatum, err := eval.PerformCast(%[3]s, %[2]s.(tree.Datum), %[4]s)
+			_castedDatum, err := eval.PerformCast(c.Ctx, %[3]s, %[2]s.(tree.Datum), %[4]s)
 			if err != nil {
 				colexecerror.ExpectedError(err)
 			}
@@ -633,7 +659,7 @@ func getDatumToNativeCastFunc(nonDatumPhysicalRepresentation string) castFunc {
 func datumToDatum(to, from, evalCtx, toType, _ string) string {
 	convStr := `
 		{
-			_castedDatum, err := eval.PerformCast(%[3]s, %[2]s.(tree.Datum), %[4]s)
+			_castedDatum, err := eval.PerformCast(c.Ctx, %[3]s, %[2]s.(tree.Datum), %[4]s)
 			if err != nil {
 				colexecerror.ExpectedError(err)
 			}
@@ -732,6 +758,11 @@ func (i castFromWidthTmplInfo) VecMethod() string {
 }
 
 func getTypeName(typ *types.T) string {
+	if typ.Family() == types.EnumFamily {
+		// Special case for enums since we're use types.AnyEnum as the
+		// representative type.
+		return "Enum"
+	}
 	// typ.Name() returns the type name in the lowercase. We want to capitalize
 	// the first letter (and all type names start with a letter).
 	name := []byte(typ.Name())

@@ -12,8 +12,9 @@ import { connect } from "react-redux";
 import { bindActionCreators } from "redux";
 import { createSelector } from "reselect";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import * as protos from "src/js/protos";
 import {
+  refreshNodes,
+  refreshDatabases,
   refreshStatementDiagnosticsRequests,
   refreshStatements,
   refreshUserSQLRoles,
@@ -21,27 +22,30 @@ import {
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState, AppDispatch } from "src/redux/state";
 import { StatementsResponseMessage } from "src/util/api";
-import { appAttr, unset } from "src/util/constants";
 import { PrintTime } from "src/views/reports/containers/range/print";
 import { selectDiagnosticsReportsPerStatement } from "src/redux/statements/statementsSelectors";
 import {
   createStatementDiagnosticsAlertLocalSetting,
   cancelStatementDiagnosticsAlertLocalSetting,
 } from "src/redux/alerts";
-import { selectHasViewActivityRedactedRole } from "src/redux/user";
-import { queryByName } from "src/util/query";
+import {
+  selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
+} from "src/redux/user";
 
 import {
-  AggregateStatistics,
   Filters,
   defaultFilters,
   util,
   StatementsPageRoot,
-  ActiveStatementsViewStateProps,
+  RecentStatementsViewStateProps,
   StatementsPageStateProps,
-  ActiveStatementsViewDispatchProps,
+  RecentStatementsViewDispatchProps,
   StatementsPageDispatchProps,
   StatementsPageRootProps,
+  api,
+  selectStmtsAllApps,
+  selectStmtsCombiner,
 } from "@cockroachlabs/cluster-ui";
 import {
   cancelStatementDiagnosticsReportAction,
@@ -50,6 +54,7 @@ import {
   setGlobalTimeScaleAction,
 } from "src/redux/statements";
 import {
+  trackApplySearchCriteriaAction,
   trackCancelDiagnosticsBundleAction,
   trackDownloadDiagnosticsBundleAction,
   trackStatementsPaginationAction,
@@ -58,189 +63,37 @@ import { resetSQLStatsAction } from "src/redux/sqlStats";
 import { LocalSetting } from "src/redux/localsettings";
 import { nodeRegionsByIDSelector } from "src/redux/nodes";
 import {
-  activeStatementsViewActions,
-  mapStateToActiveStatementViewProps,
-} from "./activeStatementsSelectors";
+  recentStatementsViewActions,
+  mapStateToRecentStatementViewProps,
+} from "./recentStatementsSelectors";
 import { selectTimeScale } from "src/redux/timeScale";
-import { selectStatementsLastUpdated } from "src/selectors/executionFingerprintsSelectors";
-
-type ICollectedStatementStatistics =
-  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
-type IStatementDiagnosticsReport =
-  protos.cockroach.server.serverpb.IStatementDiagnosticsReport;
-
-const {
-  aggregateStatementStats,
-  combineStatementStats,
-  flattenStatementStats,
-  statementKey,
-} = util;
-
-type ExecutionStatistics = util.ExecutionStatistics;
-type StatementStatistics = util.StatementStatistics;
-
-interface StatementsSummaryData {
-  statementFingerprintID: string;
-  statementFingerprintHexID: string;
-  statement: string;
-  statementSummary: string;
-  aggregatedTs: number;
-  aggregationInterval: number;
-  implicitTxn: boolean;
-  fullScan: boolean;
-  database: string;
-  stats: StatementStatistics[];
-}
+import {
+  selectStatementsLastUpdated,
+  selectStatementsDataValid,
+  selectStatementsDataInFlight,
+} from "src/selectors/executionFingerprintsSelectors";
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 
 // selectStatements returns the array of AggregateStatistics to show on the
 // StatementsPage, based on if the appAttr route parameter is set.
 export const selectStatements = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
+  (state: AdminUIState) => state.cachedData.statements?.data,
   (_state: AdminUIState, props: RouteComponentProps) => props,
   selectDiagnosticsReportsPerStatement,
-  (
-    state: CachedDataReducerState<StatementsResponseMessage>,
-    props: RouteComponentProps<any>,
-    diagnosticsReportsPerStatement,
-  ): AggregateStatistics[] => {
-    if (!state.data || !state.valid) {
-      return null;
-    }
-    let statements = flattenStatementStats(state.data.statements);
-    const app = queryByName(props.location, appAttr);
-    const isInternal = (statement: ExecutionStatistics) =>
-      statement.app.startsWith(state.data.internal_app_name_prefix);
-
-    if (app && app !== "All") {
-      const criteria = decodeURIComponent(app).split(",");
-      let showInternal = false;
-      if (criteria.includes(state.data.internal_app_name_prefix)) {
-        showInternal = true;
-      }
-      if (criteria.includes(unset)) {
-        criteria.push("");
-      }
-
-      statements = statements.filter(
-        (statement: ExecutionStatistics) =>
-          (showInternal && isInternal(statement)) ||
-          criteria.includes(statement.app),
-      );
-    } else {
-      // We don't want to show internal statements by default.
-      statements = statements.filter(
-        (statement: ExecutionStatistics) => !isInternal(statement),
-      );
-    }
-
-    const statsByStatementKey: {
-      [statement: string]: StatementsSummaryData;
-    } = {};
-    statements.forEach(stmt => {
-      const key = statementKey(stmt);
-      if (!(key in statsByStatementKey)) {
-        statsByStatementKey[key] = {
-          statementFingerprintID: stmt.statement_fingerprint_id?.toString(),
-          statementFingerprintHexID:
-            stmt.statement_fingerprint_id?.toString(16),
-          statement: stmt.statement,
-          statementSummary: stmt.statement_summary,
-          aggregatedTs: stmt.aggregated_ts,
-          aggregationInterval: stmt.aggregation_interval,
-          implicitTxn: stmt.implicit_txn,
-          fullScan: stmt.full_scan,
-          database: stmt.database,
-          stats: [],
-        };
-      }
-      statsByStatementKey[key].stats.push(stmt.stats);
-    });
-
-    return Object.keys(statsByStatementKey).map(key => {
-      const stmt = statsByStatementKey[key];
-      return {
-        aggregatedFingerprintID: stmt.statementFingerprintID,
-        aggregatedFingerprintHexID: stmt.statementFingerprintHexID,
-        label: stmt.statement,
-        summary: stmt.statementSummary,
-        aggregatedTs: stmt.aggregatedTs,
-        aggregationInterval: stmt.aggregationInterval,
-        implicitTxn: stmt.implicitTxn,
-        fullScan: stmt.fullScan,
-        database: stmt.database,
-        stats: combineStatementStats(stmt.stats),
-        diagnosticsReports: diagnosticsReportsPerStatement[stmt.statement],
-      };
-    });
-  },
+  selectStmtsCombiner,
 );
 
-// selectApps returns the array of all apps with statement statistics present
-// in the data.
-export const selectApps = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
-  (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
-      return [];
-    }
-
-    let sawBlank = false;
-    let sawInternal = false;
-    const apps: { [app: string]: boolean } = {};
-    state.data.statements.forEach(
-      (statement: ICollectedStatementStatistics) => {
-        if (
-          state.data.internal_app_name_prefix &&
-          statement.key.key_data.app.startsWith(
-            state.data.internal_app_name_prefix,
-          )
-        ) {
-          sawInternal = true;
-        } else if (statement.key.key_data.app) {
-          apps[statement.key.key_data.app] = true;
-        } else {
-          sawBlank = true;
-        }
-      },
-    );
-    return []
-      .concat(sawInternal ? [state.data.internal_app_name_prefix] : [])
-      .concat(sawBlank ? [unset] : [])
-      .concat(Object.keys(apps))
-      .sort();
-  },
-);
-
-// selectDatabases returns the array of all databases with statement statistics present
-// in the data.
+// selectDatabases returns the array of all databases in the cluster.
 export const selectDatabases = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
-  (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
+  (state: AdminUIState) => state.cachedData.databases,
+  (state: CachedDataReducerState<clusterUiApi.DatabasesListResponse>) => {
+    if (!state?.data) {
       return [];
     }
-    return Array.from(
-      new Set(
-        state.data.statements.map(s =>
-          s.key.key_data.database ? s.key.key_data.database : unset,
-        ),
-      ),
-    )
+
+    return state.data.databases
       .filter((dbName: string) => dbName !== null && dbName.length > 0)
       .sort();
-  },
-);
-
-// selectTotalFingerprints returns the count of distinct statement fingerprints
-// present in the data.
-export const selectTotalFingerprints = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
-  (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
-      return 0;
-    }
-    const aggregated = aggregateStatementStats(state.data.statements);
-    return aggregated.length;
   },
 );
 
@@ -249,7 +102,7 @@ export const selectTotalFingerprints = createSelector(
 export const selectLastReset = createSelector(
   (state: AdminUIState) => state.cachedData.statements,
   (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
+    if (!state?.data) {
       return "unknown";
     }
     return PrintTime(util.TimestampToMoment(state.data.last_reset));
@@ -263,7 +116,7 @@ export const statementColumnsLocalSetting = new LocalSetting(
 );
 
 export const sortSettingLocalSetting = new LocalSetting(
-  "sortSetting/StatementsPage",
+  "tableSortSetting/StatementsPage",
   (state: AdminUIState) => state.localSettings,
   { ascending: false, columnTitle: "executionCount" },
 );
@@ -280,10 +133,24 @@ export const searchLocalSetting = new LocalSetting(
   null,
 );
 
+export const reqSortSetting = new LocalSetting(
+  "reqSortSetting/StatementsPage",
+  (state: AdminUIState) => state.localSettings,
+  api.DEFAULT_STATS_REQ_OPTIONS.sortStmt,
+);
+
+export const limitSetting = new LocalSetting(
+  "reqLimitSetting/StatementsPage",
+  (state: AdminUIState) => state.localSettings,
+  api.DEFAULT_STATS_REQ_OPTIONS.limit,
+);
+
 const fingerprintsPageActions = {
-  refreshStatements,
+  refreshStatements: refreshStatements,
+  refreshDatabases: refreshDatabases,
   onTimeScaleChange: setGlobalTimeScaleAction,
   refreshStatementDiagnosticsRequests,
+  refreshNodes,
   refreshUserSQLRoles,
   resetSQLStats: resetSQLStatsAction,
   dismissAlertMessage: () => {
@@ -296,7 +163,14 @@ const fingerprintsPageActions = {
       );
     };
   },
-  onActivateStatementDiagnostics: createStatementDiagnosticsReportAction,
+  onActivateStatementDiagnostics: (
+    insertStmtDiagnosticRequest: clusterUiApi.InsertStmtDiagnosticRequest,
+  ) => {
+    return (dispatch: AppDispatch) =>
+      dispatch(
+        createStatementDiagnosticsReportAction(insertStmtDiagnosticRequest),
+      );
+  },
   onDiagnosticsModalOpen: createOpenDiagnosticsModalAction,
   onSearchComplete: (query: string) => searchLocalSetting.set(query),
   onPageChanged: trackStatementsPaginationAction,
@@ -311,13 +185,15 @@ const fingerprintsPageActions = {
     }),
   onFilterChange: (filters: Filters) => filtersLocalSetting.set(filters),
   onSelectDiagnosticsReportDropdownOption: (
-    report: IStatementDiagnosticsReport,
+    report: clusterUiApi.StatementDiagnosticsReport,
   ) => {
     if (report.completed) {
       return trackDownloadDiagnosticsBundleAction(report.statement_fingerprint);
     } else {
       return (dispatch: AppDispatch) => {
-        dispatch(cancelStatementDiagnosticsReportAction(report.id));
+        dispatch(
+          cancelStatementDiagnosticsReportAction({ requestId: report.id }),
+        );
         dispatch(
           trackCancelDiagnosticsBundleAction(report.statement_fingerprint),
         );
@@ -332,16 +208,19 @@ const fingerprintsPageActions = {
     statementColumnsLocalSetting.set(
       value.length === 0 ? " " : value.join(","),
     ),
+  onChangeLimit: (newLimit: number) => limitSetting.set(newLimit),
+  onChangeReqSort: (sort: api.SqlStatsSortType) => reqSortSetting.set(sort),
+  onApplySearchCriteria: trackApplySearchCriteriaAction,
 };
 
 type StateProps = {
   fingerprintsPageProps: StatementsPageStateProps;
-  activePageProps: ActiveStatementsViewStateProps;
+  activePageProps: RecentStatementsViewStateProps;
 };
 
 type DispatchProps = {
   fingerprintsPageProps: StatementsPageDispatchProps;
-  activePageProps: ActiveStatementsViewDispatchProps;
+  activePageProps: RecentStatementsViewDispatchProps;
 };
 
 export default withRouter(
@@ -354,7 +233,7 @@ export default withRouter(
     (state: AdminUIState, props: RouteComponentProps) => ({
       fingerprintsPageProps: {
         ...props,
-        apps: selectApps(state),
+        apps: selectStmtsAllApps(state.cachedData.statements?.data),
         columns: statementColumnsLocalSetting.selectorToArray(state),
         databases: selectDatabases(state),
         timeScale: selectTimeScale(state),
@@ -364,20 +243,26 @@ export default withRouter(
         search: searchLocalSetting.selector(state),
         sortSetting: sortSettingLocalSetting.selector(state),
         statements: selectStatements(state, props),
+        isDataValid: selectStatementsDataValid(state),
+        isReqInFlight: selectStatementsDataInFlight(state),
         lastUpdated: selectStatementsLastUpdated(state),
         statementsError: state.cachedData.statements.lastError,
-        totalFingerprints: selectTotalFingerprints(state),
         hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+        hasAdminRole: selectHasAdminRole(state),
+        limit: limitSetting.selector(state),
+        reqSortSetting: reqSortSetting.selector(state),
+        stmtsTotalRuntimeSecs:
+          state.cachedData?.statements?.data?.stmts_total_runtime_secs ?? 0,
       },
-      activePageProps: mapStateToActiveStatementViewProps(state),
+      activePageProps: mapStateToRecentStatementViewProps(state),
     }),
-    dispatch => ({
+    (dispatch: AppDispatch): DispatchProps => ({
       fingerprintsPageProps: bindActionCreators(
         fingerprintsPageActions,
         dispatch,
       ),
       activePageProps: bindActionCreators(
-        activeStatementsViewActions,
+        recentStatementsViewActions,
         dispatch,
       ),
     }),

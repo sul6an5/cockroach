@@ -7,58 +7,41 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
-import React, { useContext } from "react";
+import React, { useEffect, useRef } from "react";
 import Helmet from "react-helmet";
 import { RouteComponentProps } from "react-router-dom";
 import { ArrowLeft } from "@cockroachlabs/icons";
-import { Heading } from "@cockroachlabs/ui-components";
-import { Col, Row } from "antd";
+import { Tabs } from "antd";
 import "antd/lib/col/style";
 import "antd/lib/row/style";
-import moment from "moment";
+import "antd/lib/tabs/style";
 import { Button } from "src/button";
-import { Loading } from "src/loading";
-import { SqlBox, SqlBoxSize } from "src/sql";
-import { SummaryCard, SummaryCardItem } from "src/summaryCard";
-import { DATE_FORMAT_24_UTC } from "src/util/format";
 import { getMatchParamByName } from "src/util/query";
-import {
-  WaitTimeInsightsLabels,
-  WaitTimeInsightsPanel,
-} from "src/detailsPanels/waitTimeInsightsPanel";
-import {
-  TransactionInsightEventDetailsRequest,
-  TransactionInsightEventDetailsResponse,
-} from "src/api";
-import {
-  InsightsSortedTable,
-  makeInsightsColumns,
-} from "src/insightsTable/insightsTable";
-import { WaitTimeDetailsTable } from "./insightDetailsTables";
-import { getTransactionInsightEventDetailsFromState } from "../utils";
-import {
-  EventExecution,
-  InsightNameEnum,
-  InsightRecommendation,
-} from "../types";
+import { TxnInsightDetailsRequest, TxnInsightDetailsReqErrs } from "src/api";
+import { InsightNameEnum, TxnInsightDetails } from "../types";
 
-import classNames from "classnames/bind";
 import { commonStyles } from "src/common";
-import insightTableStyles from "src/insightsTable/insightsTable.module.scss";
-import { CockroachCloudContext } from "../../contexts";
-import { InsightsError } from "../insightsErrorComponent";
-
-const tableCx = classNames.bind(insightTableStyles);
+import { TimeScale } from "../../timeScaleDropdown";
+import { idAttr } from "src/util";
+import { TransactionInsightDetailsOverviewTab } from "./transactionInsightDetailsOverviewTab";
+import { TransactionInsightsDetailsStmtsTab } from "./transactionInsightDetailsStmtsTab";
+import { timeScaleRangeToObj } from "src/timeScaleDropdown/utils";
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import { insights } from "src/util";
+import { Anchor } from "src/anchor";
 
 export interface TransactionInsightDetailsStateProps {
-  insightEventDetails: TransactionInsightEventDetailsResponse;
-  insightError: Error | null;
+  insightDetails: TxnInsightDetails;
+  insightError: TxnInsightDetailsReqErrs | null;
+  timeScale?: TimeScale;
+  hasAdminRole: boolean;
+  maxSizeApiReached?: boolean;
 }
 
 export interface TransactionInsightDetailsDispatchProps {
-  refreshTransactionInsightDetails: (
-    req: TransactionInsightEventDetailsRequest,
-  ) => void;
+  refreshTransactionInsightDetails: (req: TxnInsightDetailsRequest) => void;
+  setTimeScale: (ts: TimeScale) => void;
+  refreshUserSQLRoles: () => void;
 }
 
 export type TransactionInsightDetailsProps =
@@ -66,166 +49,149 @@ export type TransactionInsightDetailsProps =
     TransactionInsightDetailsDispatchProps &
     RouteComponentProps<unknown>;
 
-export class TransactionInsightDetails extends React.Component<TransactionInsightDetailsProps> {
-  constructor(props: TransactionInsightDetailsProps) {
-    super(props);
-  }
-
-  private refresh(): void {
-    this.props.refreshTransactionInsightDetails({
-      id: getMatchParamByName(this.props.match, "id"),
-    });
-  }
-
-  componentDidMount(): void {
-    this.refresh();
-  }
-
-  componentDidUpdate(): void {
-    this.refresh();
-  }
-
-  prevPage = (): void => this.props.history.goBack();
-
-  renderContent = (): React.ReactElement => {
-    const insightDetails = getTransactionInsightEventDetailsFromState(
-      this.props.insightEventDetails,
-    );
-    if (!insightDetails) {
-      return null;
-    }
-    const insightQueries = insightDetails.queries.join("");
-    const isCockroachCloud = useContext(CockroachCloudContext);
-    const insightsColumns = makeInsightsColumns(isCockroachCloud);
-
-    function insightsTableData(): InsightRecommendation[] {
-      const recs: InsightRecommendation[] = [];
-      let rec: InsightRecommendation;
-      insightDetails.insights.forEach(insight => {
-        switch (insight.name) {
-          case InsightNameEnum.highContention:
-            rec = {
-              type: "HighContention",
-              details: {
-                duration: insightDetails.elapsedTime,
-                description: insight.description,
-              },
-            };
-            break;
-        }
-      });
-      recs.push(rec);
-      return recs;
-    }
-
-    const tableData = insightsTableData();
-    const blockingExecutions: EventExecution[] = [
-      {
-        executionID: insightDetails.blockingExecutionID,
-        fingerprintID: insightDetails.blockingFingerprintID,
-        queries: insightDetails.blockingQueries,
-        startTime: insightDetails.startTime,
-        elapsedTime: insightDetails.elapsedTime,
-        execType: insightDetails.execType,
-      },
-    ];
-    return (
-      <>
-        <section className={tableCx("section")}>
-          <Row gutter={24}>
-            <Col className="gutter-row" span={24}>
-              <SqlBox value={insightQueries} size={SqlBoxSize.custom} />
-            </Col>
-          </Row>
-          <Row gutter={24}>
-            <Col className="gutter-row" span={12}>
-              <SummaryCard>
-                <SummaryCardItem
-                  label="Start Time"
-                  value={insightDetails.startTime.format(DATE_FORMAT_24_UTC)}
-                />
-              </SummaryCard>
-            </Col>
-            <Col className="gutter-row" span={12}>
-              <SummaryCard>
-                <SummaryCardItem
-                  label="Transaction Fingerprint ID"
-                  value={String(insightDetails.fingerprintID)}
-                />
-              </SummaryCard>
-            </Col>
-          </Row>
-          <Row gutter={24} className={tableCx("margin-bottom")}>
-            <InsightsSortedTable columns={insightsColumns} data={tableData} />
-          </Row>
-        </section>
-        <section className={tableCx("section")}>
-          <WaitTimeInsightsPanel
-            execType={insightDetails.execType}
-            executionID={insightDetails.executionID}
-            schemaName={insightDetails.schemaName}
-            tableName={insightDetails.tableName}
-            indexName={insightDetails.indexName}
-            databaseName={insightDetails.databaseName}
-            contendedKey={String(insightDetails.contendedKey)}
-            waitTime={moment.duration(insightDetails.elapsedTime)}
-            waitingExecutions={[]}
-            blockingExecutions={[]}
-          />
-          <Row gutter={24}>
-            <Col>
-              <Row>
-                <Heading type="h5">
-                  {WaitTimeInsightsLabels.BLOCKED_TXNS_TABLE_TITLE(
-                    insightDetails.executionID,
-                    insightDetails.execType,
-                  )}
-                </Heading>
-                <div className={tableCx("margin-bottom-large")}>
-                  <WaitTimeDetailsTable
-                    data={blockingExecutions}
-                    execType={insightDetails.execType}
-                  />
-                </div>
-              </Row>
-            </Col>
-          </Row>
-        </section>
-      </>
-    );
-  };
-
-  render(): React.ReactElement {
-    return (
-      <div>
-        <Helmet title={"Details | Insight"} />
-        <div>
-          <Button
-            onClick={this.prevPage}
-            type="unstyled-link"
-            size="small"
-            icon={<ArrowLeft fontSize={"10px"} />}
-            iconPosition="left"
-            className={commonStyles("small-margin")}
-          >
-            Insights
-          </Button>
-          <h3
-            className={commonStyles("base-heading", "no-margin-bottom")}
-          >{`Transaction Execution ID: ${String(
-            getMatchParamByName(this.props.match, "id"),
-          )}`}</h3>
-        </div>
-        <section>
-          <Loading
-            loading={this.props.insightEventDetails == null}
-            page={"Transaction Insight details"}
-            error={this.props.insightError}
-            render={this.renderContent}
-            renderError={() => InsightsError()}
-          />
-        </section>
-      </div>
-    );
-  }
+enum TabKeysEnum {
+  OVERVIEW = "overview",
+  STATEMENTS = "statements",
 }
+
+const MAX_REQ_ATTEMPTS = 3;
+
+export const TransactionInsightDetails: React.FC<
+  TransactionInsightDetailsProps
+> = ({
+  refreshTransactionInsightDetails,
+  setTimeScale,
+  history,
+  insightDetails,
+  insightError,
+  timeScale,
+  match,
+  hasAdminRole,
+  refreshUserSQLRoles,
+  maxSizeApiReached,
+}) => {
+  const fetches = useRef<number>(0);
+  const executionID = getMatchParamByName(match, idAttr);
+
+  useEffect(() => {
+    refreshUserSQLRoles();
+  }, [refreshUserSQLRoles]);
+
+  useEffect(() => {
+    if (fetches.current === MAX_REQ_ATTEMPTS) {
+      return;
+    }
+
+    const txnDetails = insightDetails.txnDetails;
+    const stmts = insightDetails.statements;
+    const contentionInfo = insightDetails.blockingContentionDetails;
+
+    const stmtsComplete =
+      stmts != null && stmts.length === txnDetails?.stmtExecutionIDs?.length;
+
+    const contentionComplete =
+      contentionInfo != null ||
+      (txnDetails != null &&
+        txnDetails.insights.find(
+          i => i.name === InsightNameEnum.highContention,
+        ) == null);
+
+    if (!stmtsComplete || !contentionComplete || txnDetails == null) {
+      // Only fetch if we are missing some information.
+      // Note that we will attempt to refetch if we are stll missing some
+      // information only if the results differ from what we already have,
+      // with the maximum number of retries capped at MAX_REQ_ATTEMPTS.
+      const execReq = timeScaleRangeToObj(timeScale);
+      const req = {
+        mergeResultWith: insightDetails,
+        start: execReq.start,
+        end: execReq.end,
+        txnExecutionID: executionID,
+        excludeTxn: txnDetails != null,
+        excludeStmts: stmtsComplete,
+        excludeContention: contentionComplete,
+      };
+      refreshTransactionInsightDetails(req);
+      fetches.current += 1;
+    }
+  }, [
+    timeScale,
+    executionID,
+    refreshTransactionInsightDetails,
+    insightDetails,
+  ]);
+
+  const prevPage = (): void => history.goBack();
+
+  return (
+    <div>
+      <Helmet title={"Details | Insight"} />
+      <div>
+        <Button
+          onClick={prevPage}
+          type="unstyled-link"
+          size="small"
+          icon={<ArrowLeft fontSize={"10px"} />}
+          iconPosition="left"
+          className={commonStyles("small-margin")}
+        >
+          Previous page
+        </Button>
+        <h3
+          className={commonStyles("base-heading", "no-margin-bottom")}
+        >{`Transaction Execution ID: ${String(
+          getMatchParamByName(match, idAttr),
+        )}`}</h3>
+      </div>
+      <section>
+        <Tabs
+          className={commonStyles("cockroach--tabs")}
+          defaultActiveKey={TabKeysEnum.OVERVIEW}
+        >
+          <Tabs.TabPane tab="Overview" key={TabKeysEnum.OVERVIEW}>
+            <TransactionInsightDetailsOverviewTab
+              maxRequestsReached={fetches.current === MAX_REQ_ATTEMPTS}
+              errors={insightError}
+              statements={insightDetails.statements}
+              txnDetails={insightDetails.txnDetails}
+              contentionDetails={insightDetails.blockingContentionDetails}
+              setTimeScale={setTimeScale}
+              hasAdminRole={hasAdminRole}
+              maxApiSizeReached={maxSizeApiReached}
+            />
+          </Tabs.TabPane>
+          {(insightDetails.txnDetails?.stmtExecutionIDs?.length ||
+            insightDetails.statements?.length) && (
+            <Tabs.TabPane
+              tab="Statement Executions"
+              key={TabKeysEnum.STATEMENTS}
+            >
+              <TransactionInsightsDetailsStmtsTab
+                isLoading={
+                  insightDetails.statements == null &&
+                  fetches.current < MAX_REQ_ATTEMPTS
+                }
+                error={insightError?.statementsErr}
+                statements={insightDetails?.statements}
+              />
+              {maxSizeApiReached && (
+                <InlineAlert
+                  intent="info"
+                  title={
+                    <>
+                      Not all statements are displayed because the maximum
+                      number of statements was reached in the console.&nbsp;
+                      <Anchor href={insights} target="_blank">
+                        Learn more
+                      </Anchor>
+                    </>
+                  }
+                />
+              )}
+            </Tabs.TabPane>
+          )}
+        </Tabs>
+      </section>
+    </div>
+  );
+};

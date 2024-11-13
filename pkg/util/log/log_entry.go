@@ -18,11 +18,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/cockroachdb/redact/interfaces"
@@ -37,7 +39,7 @@ import (
 // formatters. logpb.Entry, in comparison, was tailored specifically
 // to the legacy crdb-v1 formatter, and is a lossy representation.
 type logEntry struct {
-	idPayload
+	serverident.IDPayload
 
 	// The entry timestamp.
 	ts int64
@@ -189,10 +191,10 @@ func makeUnsafePayload(ctx context.Context, m string) entryPayload {
 
 // makeEntry creates a logEntry.
 func makeEntry(ctx context.Context, s Severity, c Channel, depth int) (res logEntry) {
-	ids := getIdentificationPayload(ctx)
+	ids := serverident.GetIdentificationPayload(ctx)
 
 	res = logEntry{
-		idPayload: ids,
+		IDPayload: ids,
 		ts:        timeutil.Now().UnixNano(),
 		sev:       s,
 		ch:        c,
@@ -242,10 +244,29 @@ func makeUnstructuredEntry(
 		} else {
 			buf.Printf(format, args...)
 		}
+		// Collect and append the hints, if any.
+		for _, a := range args {
+			if e, ok := a.(error); ok {
+				h := errors.FlattenHints(e)
+				if h != "" {
+					buf.Printf("\nHINT: %s", h)
+				}
+			}
+		}
 		res.payload = makeRedactablePayload(ctx, buf.RedactableString())
 	} else {
 		var buf strings.Builder
 		formatArgs(&buf, format, args...)
+		// Collect and append the hints, if any.
+		for _, a := range args {
+			if e, ok := a.(error); ok {
+				h := errors.FlattenHints(e)
+				if h != "" {
+					buf.WriteString("\nHINT:")
+					buf.WriteString(h)
+				}
+			}
+		}
 		res.payload = makeUnsafePayload(ctx, buf.String())
 	}
 
@@ -305,6 +326,7 @@ func (e logEntry) convertToLegacy() (res logpb.Entry) {
 		Counter:    e.counter,
 		Redactable: e.payload.redactable,
 		Message:    e.payload.message,
+		TenantID:   e.TenantID(),
 	}
 
 	if e.payload.tags != nil {

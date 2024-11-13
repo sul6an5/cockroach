@@ -37,9 +37,12 @@ import {
   hoverOff,
 } from "src/redux/hover";
 import {
-  nodesSummarySelector,
-  NodesSummary,
   LivenessStatus,
+  nodeDisplayNameByIDSelector,
+  livenessStatusByNodeIDSelector,
+  nodeIDsSelector,
+  nodeIDsStringifiedSelector,
+  selectStoreIDsByNodeID,
 } from "src/redux/nodes";
 import Alerts from "src/views/shared/containers/alerts";
 import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
@@ -61,6 +64,7 @@ import hardwareDashboard from "./dashboards/hardware";
 import changefeedsDashboard from "./dashboards/changefeeds";
 import overloadDashboard from "./dashboards/overload";
 import ttlDashboard from "./dashboards/ttl";
+import crossClusterReplicationDashboard from "./dashboards/crossClusterReplication";
 import { getMatchParamByName } from "src/util/query";
 import { PayloadAction } from "src/interfaces/action";
 import {
@@ -77,29 +81,74 @@ import {
   TimeScale,
 } from "@cockroachlabs/cluster-ui";
 import { reduceStorageOfTimeSeriesDataOperationalFlags } from "src/util/docs";
-import moment from "moment";
+import moment from "moment-timezone";
 import {
   selectResolution10sStorageTTL,
   selectResolution30mStorageTTL,
+  selectCrossClusterReplicationEnabled,
 } from "src/redux/clusterSettings";
+import { getDataFromServer } from "src/util/dataFromServer";
+
 interface GraphDashboard {
   label: string;
   component: (props: GraphDashboardProps) => React.ReactElement<any>[];
+  isKvDashboard: boolean;
 }
 
 const dashboards: { [key: string]: GraphDashboard } = {
-  overview: { label: "Overview", component: overviewDashboard },
-  hardware: { label: "Hardware", component: hardwareDashboard },
-  runtime: { label: "Runtime", component: runtimeDashboard },
-  sql: { label: "SQL", component: sqlDashboard },
-  storage: { label: "Storage", component: storageDashboard },
-  replication: { label: "Replication", component: replicationDashboard },
-  distributed: { label: "Distributed", component: distributedDashboard },
-  queues: { label: "Queues", component: queuesDashboard },
-  requests: { label: "Slow Requests", component: requestsDashboard },
-  changefeeds: { label: "Changefeeds", component: changefeedsDashboard },
-  overload: { label: "Overload", component: overloadDashboard },
-  ttl: { label: "TTL", component: ttlDashboard },
+  overview: {
+    label: "Overview",
+    component: overviewDashboard,
+    isKvDashboard: false,
+  },
+  hardware: {
+    label: "Hardware",
+    component: hardwareDashboard,
+    isKvDashboard: true,
+  },
+  runtime: {
+    label: "Runtime",
+    component: runtimeDashboard,
+    isKvDashboard: true,
+  },
+  sql: { label: "SQL", component: sqlDashboard, isKvDashboard: false },
+  storage: {
+    label: "Storage",
+    component: storageDashboard,
+    isKvDashboard: false,
+  },
+  replication: {
+    label: "Replication",
+    component: replicationDashboard,
+    isKvDashboard: true,
+  },
+  distributed: {
+    label: "Distributed",
+    component: distributedDashboard,
+    isKvDashboard: true,
+  },
+  queues: { label: "Queues", component: queuesDashboard, isKvDashboard: true },
+  requests: {
+    label: "Slow Requests",
+    component: requestsDashboard,
+    isKvDashboard: true,
+  },
+  changefeeds: {
+    label: "Changefeeds",
+    component: changefeedsDashboard,
+    isKvDashboard: false,
+  },
+  overload: {
+    label: "Overload",
+    component: overloadDashboard,
+    isKvDashboard: true,
+  },
+  ttl: { label: "TTL", component: ttlDashboard, isKvDashboard: false },
+  crossClusterReplication: {
+    label: "Cross-Cluster Replication",
+    component: crossClusterReplicationDashboard,
+    isKvDashboard: true,
+  },
 };
 
 const defaultDashboard = "overview";
@@ -108,15 +157,24 @@ const dashboardDropdownOptions = _.map(dashboards, (dashboard, key) => {
   return {
     value: key,
     label: dashboard.label,
+    isKvDashboard: dashboard.isKvDashboard,
   };
 });
 
 type MapStateToProps = {
-  nodesSummary: NodesSummary;
   hoverState: HoverState;
   resolution10sStorageTTL: moment.Duration;
   resolution30mStorageTTL: moment.Duration;
   timeScale: TimeScale;
+  nodeDropdownOptions: ReturnType<
+    typeof nodeDropdownOptionsSelector.resultFunc
+  >;
+  nodeIds: string[];
+  storeIDsByNodeID: ReturnType<typeof selectStoreIDsByNodeID.resultFunc>;
+  nodeDisplayNameByID: ReturnType<
+    typeof nodeDisplayNameByIDSelector.resultFunc
+  >;
+  crossClusterReplicationEnabled: boolean;
 };
 
 type MapDispatchToProps = {
@@ -145,36 +203,6 @@ export class NodeGraphs extends React.Component<
   NodeGraphsProps,
   NodeGraphsState
 > {
-  /**
-   * Selector to compute node dropdown options from the current node summary
-   * collection.
-   */
-  private nodeDropdownOptions = createSelector(
-    (summary: NodesSummary) => summary.nodeStatuses,
-    (summary: NodesSummary) => summary.nodeDisplayNameByID,
-    (summary: NodesSummary) => summary.livenessStatusByNodeID,
-    (
-      nodeStatuses,
-      nodeDisplayNameByID,
-      livenessStatusByNodeID,
-    ): DropdownOption[] => {
-      const base = [{ value: "", label: "Cluster" }];
-      return base.concat(
-        _.chain(nodeStatuses)
-          .filter(
-            ns =>
-              livenessStatusByNodeID[ns.desc.node_id] !==
-              LivenessStatus.NODE_STATUS_DECOMMISSIONED,
-          )
-          .map(ns => ({
-            value: ns.desc.node_id.toString(),
-            label: nodeDisplayNameByID[ns.desc.node_id],
-          }))
-          .value(),
-      );
-    },
-  );
-
   constructor(props: NodeGraphsProps) {
     super(props);
     this.state = {
@@ -186,6 +214,7 @@ export class NodeGraphs extends React.Component<
   refresh = () => {
     this.props.refreshNodes();
     this.props.refreshLiveness();
+    this.props.refreshNodeSettings();
   };
 
   setClusterPath(nodeID: string, dashboardName: string) {
@@ -257,9 +286,20 @@ export class NodeGraphs extends React.Component<
   };
 
   render() {
-    const { match, nodesSummary } = this.props;
+    const {
+      match,
+      nodeDropdownOptions,
+      storeIDsByNodeID,
+      nodeDisplayNameByID,
+      nodeIds,
+    } = this.props;
+    const canViewKvGraphs =
+      getDataFromServer().FeatureFlags.can_view_kv_metric_dashboards;
     const { showLowResolutionAlert, showDeletedDataAlert } = this.state;
-    const selectedDashboard = getMatchParamByName(match, dashboardNameAttr);
+    let selectedDashboard = getMatchParamByName(match, dashboardNameAttr);
+    if (dashboards[selectedDashboard].isKvDashboard && !canViewKvGraphs) {
+      selectedDashboard = defaultDashboard;
+    }
     const dashboard = _.has(dashboards, selectedDashboard)
       ? selectedDashboard
       : defaultDashboard;
@@ -271,13 +311,13 @@ export class NodeGraphs extends React.Component<
     // node in the cluster using the nodeIDs collection. However, if a specific
     // node is already selected, these per-node graphs should only display data
     // only for the selected node.
-    const nodeIDs = nodeSources ? nodeSources : nodesSummary.nodeIDs;
+    const nodeIDs = nodeSources ? nodeSources : nodeIds;
 
     // If a single node is selected, we need to restrict the set of stores
     // queried for per-store metrics (only stores that belong to that node will
     // be queried).
     const storeSources = nodeSources
-      ? storeIDsForNode(nodesSummary, nodeSources[0])
+      ? storeIDsForNode(storeIDsByNodeID, nodeSources[0])
       : null;
 
     // tooltipSelection is a string used in tooltips to reference the currently
@@ -290,10 +330,11 @@ export class NodeGraphs extends React.Component<
 
     const dashboardProps: GraphDashboardProps = {
       nodeIDs,
-      nodesSummary,
       nodeSources,
       storeSources,
       tooltipSelection,
+      nodeDisplayNameByID,
+      storeIDsByNodeID,
     };
 
     const forwardParams = {
@@ -304,7 +345,9 @@ export class NodeGraphs extends React.Component<
 
     // Generate graphs for the current dashboard, wrapping each one in a
     // MetricsDataProvider with a unique key.
-    const graphs = dashboards[dashboard].component(dashboardProps);
+    const graphs = dashboards[dashboard]
+      .component(dashboardProps)
+      .filter(d => canViewKvGraphs || !d.props.isKvGraph);
     const graphComponents = _.map(graphs, (graph, idx) => {
       const key = `nodes.${dashboard}.${idx}`;
       return (
@@ -329,6 +372,15 @@ export class NodeGraphs extends React.Component<
     // as we have 3 columns, we divide node amount on 3
     const paddingBottom =
       nodeIDs.length > 8 ? 90 + Math.ceil(nodeIDs.length / 3) * 10 : 50;
+    const filteredDropdownOptions = dashboardDropdownOptions
+      // Don't show KV dashboards if the logged-in user doesn't have permission to view them.
+      .filter(option => canViewKvGraphs || !option.isKvDashboard)
+      // Don't show the replication dashboard if not enabled.
+      .filter(
+        option =>
+          this.props.crossClusterReplicationEnabled ||
+          option.label !== "Cross-Cluster Replication",
+      );
 
     return (
       <div style={{ paddingBottom }}>
@@ -338,7 +390,7 @@ export class NodeGraphs extends React.Component<
           <PageConfigItem>
             <Dropdown
               title="Graph"
-              options={this.nodeDropdownOptions(this.props.nodesSummary)}
+              options={nodeDropdownOptions}
               selected={selectedNode}
               onChange={this.nodeChange}
             />
@@ -346,7 +398,7 @@ export class NodeGraphs extends React.Component<
           <PageConfigItem>
             <Dropdown
               title="Dashboard"
-              options={dashboardDropdownOptions}
+              options={filteredDropdownOptions}
               selected={dashboard}
               onChange={this.dashChange}
               className="full-size"
@@ -409,10 +461,7 @@ export class NodeGraphs extends React.Component<
             <div className="chart-group l-columns__left">{graphComponents}</div>
             <div className="l-columns__right">
               <Alerts />
-              <ClusterSummaryBar
-                nodesSummary={this.props.nodesSummary}
-                nodeSources={nodeSources}
-              />
+              <ClusterSummaryBar nodeSources={nodeSources} />
             </div>
           </div>
         </section>
@@ -421,12 +470,42 @@ export class NodeGraphs extends React.Component<
   }
 }
 
+/**
+ * Selector to compute node dropdown options from the current node summary
+ * collection.
+ */
+const nodeDropdownOptionsSelector = createSelector(
+  nodeIDsSelector,
+  nodeDisplayNameByIDSelector,
+  livenessStatusByNodeIDSelector,
+  (nodeIds, nodeDisplayNameByID, livenessStatusByNodeID): DropdownOption[] => {
+    const base = [{ value: "", label: "Cluster" }];
+    return base.concat(
+      _.chain(nodeIds)
+        .filter(
+          id =>
+            livenessStatusByNodeID[id] !==
+            LivenessStatus.NODE_STATUS_DECOMMISSIONED,
+        )
+        .map(id => ({
+          value: id.toString(),
+          label: nodeDisplayNameByID[id],
+        }))
+        .value(),
+    );
+  },
+);
+
 const mapStateToProps = (state: AdminUIState): MapStateToProps => ({
-  nodesSummary: nodesSummarySelector(state),
   hoverState: hoverStateSelector(state),
   resolution10sStorageTTL: selectResolution10sStorageTTL(state),
   resolution30mStorageTTL: selectResolution30mStorageTTL(state),
   timeScale: selectTimeScale(state),
+  nodeIds: nodeIDsStringifiedSelector(state),
+  storeIDsByNodeID: selectStoreIDsByNodeID(state),
+  nodeDropdownOptions: nodeDropdownOptionsSelector(state),
+  nodeDisplayNameByID: nodeDisplayNameByIDSelector(state),
+  crossClusterReplicationEnabled: selectCrossClusterReplicationEnabled(state),
 });
 
 const mapDispatchToProps: MapDispatchToProps = {

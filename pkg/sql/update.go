@@ -119,6 +119,10 @@ type updateRun struct {
 	// columns of the target table being returned, that we must pass through
 	// from the input node.
 	numPassthrough int
+
+	// regionLocalInfo handles erroring out the UPDATE when the
+	// enforce_home_region setting is on.
+	regionLocalInfo regionLocalInfoType
 }
 
 func (u *updateNode) startExec(params runParams) error {
@@ -127,7 +131,7 @@ func (u *updateNode) startExec(params runParams) error {
 
 	if u.run.rowsNeeded {
 		u.run.tu.rows = rowcontainer.NewRowContainer(
-			params.EvalContext().Mon.MakeBoundAccount(),
+			params.p.Mon().MakeBoundAccount(),
 			colinfo.ColTypeInfoFromResCols(u.columns),
 		)
 	}
@@ -264,7 +268,7 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 		// prevent computed columns from depending on other computed columns.
 		params.EvalContext().PushIVarContainer(&u.run.iVarContainerForComputedCols)
 		for i := range u.run.computedCols {
-			d, err := eval.Expr(params.EvalContext(), u.run.computeExprs[i])
+			d, err := eval.Expr(params.ctx, params.EvalContext(), u.run.computeExprs[i])
 			if err != nil {
 				params.EvalContext().IVarContainer = nil
 				name := u.run.computedCols[i].GetName()
@@ -308,6 +312,12 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 		if err != nil {
 			return err
 		}
+	}
+
+	// Error out the update if the enforce_home_region session setting is on and
+	// the row's locality doesn't match the gateway region.
+	if err := u.run.regionLocalInfo.checkHomeRegion(u.run.updateValues); err != nil {
+		return err
 	}
 
 	// Queue the insert in the KV batch.

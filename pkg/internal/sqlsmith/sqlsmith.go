@@ -20,6 +20,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/randident"
+	"github.com/cockroachdb/cockroach/pkg/util/randident/randidentcfg"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -65,7 +67,8 @@ type Smither struct {
 	tables           []*tableRef
 	columns          map[tree.TableName]map[tree.Name]*tree.ColumnTableDef
 	indexes          map[tree.TableName]map[tree.Name]*tree.CreateIndex
-	nameCounts       map[string]int
+	nameGens         map[string]*nameGenInfo
+	nameGenCfg       randidentcfg.Config
 	activeSavepoints []string
 	types            *typeInfo
 
@@ -93,10 +96,14 @@ type Smither struct {
 	unlikelyConstantPredicate  bool
 	favorCommonData            bool
 	unlikelyRandomNulls        bool
+	stringConstPrefix          string
+	disableJoins               bool
 	disableCrossJoins          bool
 	disableIndexHints          bool
 	lowProbWhereWithJoinTables bool
 	disableInsertSelect        bool
+	disableDivision            bool
+	disableDecimals            bool
 
 	bulkSrv     *httptest.Server
 	bulkFiles   map[string][]byte
@@ -117,7 +124,8 @@ func NewSmither(db *gosql.DB, rnd *rand.Rand, opts ...SmitherOption) (*Smither, 
 	s := &Smither{
 		rnd:        rnd,
 		db:         db,
-		nameCounts: map[string]int{},
+		nameGens:   map[string]*nameGenInfo{},
+		nameGenCfg: randident.DefaultNameGeneratorConfig(),
 
 		stmtWeights:       allStatements,
 		alterWeights:      alters,
@@ -129,6 +137,7 @@ func NewSmither(db *gosql.DB, rnd *rand.Rand, opts ...SmitherOption) (*Smither, 
 		complexity:       0.2,
 		scalarComplexity: 0.2,
 	}
+	s.nameGenCfg.Finalize()
 	for _, opt := range opts {
 		opt.Apply(s)
 	}
@@ -185,12 +194,23 @@ func (s *Smither) GenerateExpr() tree.TypedExpr {
 	return makeScalar(s, s.randScalarType(), nil)
 }
 
+type nameGenInfo struct {
+	g     randident.NameGenerator
+	count int
+}
+
 func (s *Smither) name(prefix string) tree.Name {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	s.nameCounts[prefix]++
-	count := s.nameCounts[prefix]
-	return tree.Name(fmt.Sprintf("%s_%d", prefix, count))
+	g := s.nameGens[prefix]
+	if g == nil {
+		g = &nameGenInfo{
+			g: randident.NewNameGenerator(&s.nameGenCfg, s.rnd, prefix),
+		}
+		s.nameGens[prefix] = g
+	}
+	g.count++
+	return tree.Name(g.g.GenerateOne(g.count))
 }
 
 // SmitherOption is an option for the Smither client.
@@ -244,6 +264,11 @@ func (o option) Apply(s *Smither) {
 	o.apply(s)
 }
 
+// DisableEverything disables every kind of statement.
+var DisableEverything = simpleOption("disable every kind of statement", func(s *Smither) {
+	s.stmtWeights = nil
+})
+
 // DisableMutations causes the Smither to not emit statements that could
 // mutate any on-disk data.
 var DisableMutations = simpleOption("disable mutations", func(s *Smither) {
@@ -295,6 +320,17 @@ var DisableDDLs = simpleOption("disable DDLs", func(s *Smither) {
 	}
 })
 
+// OnlySingleDMLs causes the Smither to only emit single-statement DML (SELECT,
+// INSERT, UPDATE, DELETE).
+var OnlySingleDMLs = simpleOption("only single DMLs", func(s *Smither) {
+	s.stmtWeights = []statementWeight{
+		{20, makeSelect},
+		{5, makeInsert},
+		{5, makeUpdate},
+		{1, makeDelete},
+	}
+})
+
 // OnlyNoDropDDLs causes the Smither to only emit DDLs, but won't ever drop
 // a table.
 var OnlyNoDropDDLs = simpleOption("only DDLs", func(s *Smither) {
@@ -312,6 +348,11 @@ var OnlyNoDropDDLs = simpleOption("only DDLs", func(s *Smither) {
 // MultiRegionDDLs causes the Smither to enable multiregion features.
 var MultiRegionDDLs = simpleOption("include multiregion DDLs", func(s *Smither) {
 	s.alterWeights = append(s.alterWeights, alterMultiregion...)
+})
+
+// EnableAlters enables ALTER statements.
+var EnableAlters = simpleOption("include ALTER statements", func(s *Smither) {
+	s.stmtWeights = append(s.stmtWeights, statementWeight{1, makeAlter})
 })
 
 // DisableWith causes the Smither to not emit WITH clauses.
@@ -411,6 +452,22 @@ var UnlikelyRandomNulls = simpleOption("unlikely random nulls", func(s *Smither)
 	s.unlikelyRandomNulls = true
 })
 
+// PrefixStringConsts causes the Smither to add a prefix to all generated
+// string constants.
+func PrefixStringConsts(prefix string) SmitherOption {
+	return option{
+		name: fmt.Sprintf("prefix string constants with: %q", prefix),
+		apply: func(s *Smither) {
+			s.stringConstPrefix = prefix
+		},
+	}
+}
+
+// DisableJoins causes the Smither to disable joins.
+var DisableJoins = simpleOption("disable joins", func(s *Smither) {
+	s.disableJoins = true
+})
+
 // DisableCrossJoins causes the Smither to disable cross joins.
 var DisableCrossJoins = simpleOption("disable cross joins", func(s *Smither) {
 	s.disableCrossJoins = true
@@ -434,6 +491,18 @@ var LowProbabilityWhereClauseWithJoinTables = simpleOption("low probability wher
 // source expression is nullable and the target column is not.
 var DisableInsertSelect = simpleOption("disable insert select", func(s *Smither) {
 	s.disableInsertSelect = true
+})
+
+// DisableDivision disables generation of the division operator (/) and the
+// floor division operator (//).
+// TODO(mgartner): Remove this once #86790 is addressed.
+var DisableDivision = simpleOption("disable division", func(s *Smither) {
+	s.disableDivision = true
+})
+
+// DisableDecimals disables use of decimal type columns in the query.
+var DisableDecimals = simpleOption("disable decimals", func(s *Smither) {
+	s.disableDecimals = true
 })
 
 // CompareMode causes the Smither to generate statements that have

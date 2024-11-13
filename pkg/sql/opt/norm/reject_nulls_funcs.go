@@ -14,7 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -124,7 +124,7 @@ func (c *CustomFuncs) NullRejectProjections(
 // are randomly disabled for testing. It is used to prevent propagating the
 // RejectNullCols property when the corresponding column-pruning normalization
 // rule is disabled. This prevents rule cycles during testing.
-func DeriveRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.ColSet {
+func DeriveRejectNullCols(in memo.RelExpr, disabledRules intsets.Fast) opt.ColSet {
 	// Lazily calculate and store the RejectNullCols value.
 	relProps := in.Relational()
 	if relProps.IsAvailable(props.RejectNullCols) {
@@ -135,6 +135,14 @@ func DeriveRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.Co
 	// TODO(andyk): Add other operators to make null rejection more comprehensive.
 	switch in.Op() {
 	case opt.InnerJoinOp, opt.InnerJoinApplyOp:
+		if disabledRules.Contains(int(opt.MergeSelectInnerJoin)) ||
+			disabledRules.Contains(int(opt.PushFilterIntoJoinLeft)) ||
+			disabledRules.Contains(int(opt.PushFilterIntoJoinRight)) ||
+			disabledRules.Contains(int(opt.MapFilterIntoJoinLeft)) ||
+			disabledRules.Contains(int(opt.MapFilterIntoJoinRight)) {
+			// Avoid rule cycles.
+			break
+		}
 		// Pass through null-rejecting columns from both inputs.
 		if in.Child(0).(memo.RelExpr).Relational().OuterCols.Empty() {
 			relProps.Rule.RejectNullCols.UnionWith(
@@ -148,12 +156,13 @@ func DeriveRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.Co
 		}
 
 	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
-		if disabledRules.Contains(int(opt.RejectNullsLeftJoin)) {
+		if disabledRules.Contains(int(opt.RejectNullsLeftJoin)) ||
+			disabledRules.Contains(int(opt.PushSelectCondLeftIntoJoinLeftAndRight)) {
 			// Avoid rule cycles.
 			break
 		}
-		// Pass through null-rejection columns from left input, and request null-
-		// rejection on right columns.
+		// Pass through null-rejection columns from left input, and request
+		// null-rejection on right columns.
 		if in.Child(0).(memo.RelExpr).Relational().OuterCols.Empty() {
 			relProps.Rule.RejectNullCols.UnionWith(
 				DeriveRejectNullCols(in.Child(0).(memo.RelExpr), disabledRules),
@@ -162,12 +171,13 @@ func DeriveRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.Co
 		relProps.Rule.RejectNullCols.UnionWith(in.Child(1).(memo.RelExpr).Relational().OutputCols)
 
 	case opt.RightJoinOp:
-		if disabledRules.Contains(int(opt.RejectNullsRightJoin)) {
+		if disabledRules.Contains(int(opt.RejectNullsRightJoin)) ||
+			disabledRules.Contains(int(opt.CommuteRightJoin)) {
 			// Avoid rule cycles.
 			break
 		}
-		// Pass through null-rejection columns from right input, and request null-
-		// rejection on left columns.
+		// Pass through null-rejection columns from right input, and request
+		// null-rejection on left columns.
 		relProps.Rule.RejectNullCols.UnionWith(in.Child(0).(memo.RelExpr).Relational().OutputCols)
 		if in.Child(1).(memo.RelExpr).Relational().OuterCols.Empty() {
 			relProps.Rule.RejectNullCols.UnionWith(
@@ -185,14 +195,16 @@ func DeriveRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.Co
 		relProps.Rule.RejectNullCols.UnionWith(relProps.OutputCols)
 
 	case opt.GroupByOp, opt.ScalarGroupByOp:
-		if disabledRules.Contains(int(opt.RejectNullsGroupBy)) {
+		if disabledRules.Contains(int(opt.RejectNullsGroupBy)) ||
+			disabledRules.Contains(int(opt.PushSelectIntoGroupBy)) {
 			// Avoid rule cycles.
 			break
 		}
 		relProps.Rule.RejectNullCols.UnionWith(deriveGroupByRejectNullCols(in, disabledRules))
 
 	case opt.ProjectOp:
-		if disabledRules.Contains(int(opt.RejectNullsProject)) {
+		if disabledRules.Contains(int(opt.RejectNullsProject)) ||
+			disabledRules.Contains(int(opt.PushSelectIntoProject)) {
 			// Avoid rule cycles.
 			break
 		}
@@ -202,9 +214,10 @@ func DeriveRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.Co
 		relProps.Rule.RejectNullCols.UnionWith(deriveScanRejectNullCols(in))
 	}
 
-	if relProps.Rule.RejectNullCols.Intersects(relProps.NotNullCols) {
-		panic(errors.AssertionFailedf("null rejection requested on non-null column"))
-	}
+	// Don't attempt to request null-rejection for non-null cols. This can happen
+	// if normalization failed to null-reject, and then exploration "uncovered"
+	// the possibility for null-rejection of a column.
+	relProps.Rule.RejectNullCols.DifferenceWith(relProps.NotNullCols)
 
 	return relProps.Rule.RejectNullCols
 }
@@ -219,7 +232,7 @@ func DeriveRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.Co
 //  2. The aggregate function returns null if its input is empty. And since
 //     by #1, the presence of nulls does not alter the result, the aggregate
 //     function would return null if its input contains only null values.
-func deriveGroupByRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.ColSet {
+func deriveGroupByRejectNullCols(in memo.RelExpr, disabledRules intsets.Fast) opt.ColSet {
 	input := in.Child(0).(memo.RelExpr)
 	aggs := *in.Child(1).(*memo.AggregationsExpr)
 
@@ -298,7 +311,7 @@ func (c *CustomFuncs) MakeNullRejectFilters(nullRejectCols opt.ColSet) memo.Filt
 //
 //  1. The projection "transmits" nulls - it returns NULL when one or more of
 //     its inputs is NULL.
-func deriveProjectRejectNullCols(in memo.RelExpr, disabledRules util.FastIntSet) opt.ColSet {
+func deriveProjectRejectNullCols(in memo.RelExpr, disabledRules intsets.Fast) opt.ColSet {
 	rejectNullCols := DeriveRejectNullCols(in.Child(0).(memo.RelExpr), disabledRules)
 	projections := *in.Child(1).(*memo.ProjectionsExpr)
 	var projectionsRejectCols opt.ColSet

@@ -14,7 +14,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
@@ -30,7 +32,7 @@ import (
 //
 //	VERSION=...
 //	roachprod create local
-//	roachprod wipe localÅ
+//	roachprod wipe local
 //	roachprod stage local release ${VERSION}
 //	roachprod start local
 //	roachprod sql local:1 -- -e "$(cat pkg/ccl/backupccl/testdata/restore_old_sequences/create.sql)"
@@ -41,7 +43,7 @@ func TestRestoreOldSequences(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	var (
-		testdataBase = testutils.TestDataPath(t, "restore_old_sequences")
+		testdataBase = datapathutils.TestDataPath(t, "restore_old_sequences")
 		exportDirs   = testdataBase + "/exports"
 	)
 
@@ -66,6 +68,8 @@ func TestRestoreOldSequences(t *testing.T) {
 func restoreOldSequencesTest(exportDir string, isSchemaOnly bool) func(t *testing.T) {
 	return func(t *testing.T) {
 		params := base.TestServerArgs{}
+		params.Settings = cluster.MakeTestingClusterSettingsWithVersions(clusterversion.TestingBinaryVersion,
+			clusterversion.TestingBinaryMinSupportedVersion, false /* initializeVersion */)
 		const numAccounts = 1000
 		_, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
 			InitManualReplication, base.TestClusterArgs{ServerArgs: params})
@@ -75,9 +79,18 @@ func restoreOldSequencesTest(exportDir string, isSchemaOnly bool) func(t *testin
 		sqlDB.Exec(t, `CREATE DATABASE test`)
 		var unused string
 		var importedRows int
-		restoreQuery := `RESTORE test.* FROM $1`
+		// The restore queries are run with `UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
+		// option to ensure the restore is successful on development branches. This
+		// is because, while the backups were generated on release branches and have
+		// versions such as 22.2 in their manifest, the development branch will have
+		// a BinaryMinSupportedVersion offset by the clusterversion.DevOffset
+		// described in `pkg/clusterversion/cockroach_versions.go`. This will mean
+		// that the manifest version is always less than the
+		// BinaryMinSupportedVersion which will in turn fail the restore unless we
+		// pass in the specified option to elide the compatability check.
+		restoreQuery := `RESTORE test.* FROM LATEST IN $1 WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
 		if isSchemaOnly {
-			restoreQuery = restoreQuery + " with schema_only"
+			restoreQuery = restoreQuery + ", schema_only"
 		}
 		sqlDB.QueryRow(t, restoreQuery, localFoo).Scan(
 			&unused, &unused, &unused, &importedRows, &unused, &unused,

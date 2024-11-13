@@ -14,6 +14,7 @@ import (
 	"context"
 	"reflect"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraph"
@@ -81,17 +82,21 @@ func IterateTransitions(
 
 // BuildGraph constructs a graph with operation edges populated from an initial
 // state.
-func BuildGraph(cs scpb.CurrentState) (*scgraph.Graph, error) {
-	return opRegistry.buildGraph(cs)
+func BuildGraph(
+	ctx context.Context, activeVersion clusterversion.ClusterVersion, cs scpb.CurrentState,
+) (*scgraph.Graph, error) {
+	return opRegistry.buildGraph(ctx, activeVersion, cs)
 }
 
-func (r *registry) buildGraph(cs scpb.CurrentState) (_ *scgraph.Graph, err error) {
+func (r *registry) buildGraph(
+	ctx context.Context, activeVersion clusterversion.ClusterVersion, cs scpb.CurrentState,
+) (_ *scgraph.Graph, err error) {
 	start := timeutil.Now()
 	defer func() {
-		if err != nil || !log.V(2) {
+		if err != nil || !log.ExpensiveLogEnabled(ctx, 2) {
 			return
 		}
-		log.Infof(context.TODO(), "operation graph generation took %v", timeutil.Since(start))
+		log.Infof(ctx, "operation graph generation took %v", timeutil.Since(start))
 	}()
 	g, err := scgraph.New(cs)
 	if err != nil {
@@ -105,7 +110,7 @@ func (r *registry) buildGraph(cs scpb.CurrentState) (_ *scgraph.Graph, err error
 		n *screl.Node
 	}
 	var edgesToAdd []toAdd
-	md := makeTargetsWithElementMap(cs)
+	md := makeOpgenContext(activeVersion, cs)
 	for _, t := range r.targets {
 		edgesToAdd = edgesToAdd[:0]
 		if err := t.iterateFunc(g.Database(), func(n *screl.Node) error {
@@ -142,7 +147,14 @@ func (r *registry) buildGraph(cs scpb.CurrentState) (_ *scgraph.Graph, err error
 // InitialStatus returns the status at the source of an op-edge path.
 func InitialStatus(e scpb.Element, target scpb.Status) scpb.Status {
 	if t, found := findTarget(e, target); found {
-		return t.transitions[0].from
+		for _, tstn := range t.transitions {
+			if tstn.isEquiv {
+				continue
+			}
+			return tstn.from
+		}
+		// All transitions results from `equiv(xxx)` specs. Return `to` of the last transition.
+		return target
 	}
 	return scpb.Status_UNKNOWN
 }

@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"strings"
@@ -25,8 +26,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/startupmigrations"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/mozillazg/go-slugify"
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
 )
@@ -139,7 +141,10 @@ func runGenAutocompleteCmd(cmd *cobra.Command, args []string) error {
 var aesSize int
 var overwriteKey bool
 
-var genEncryptionKeyCmd = &cobra.Command{
+// GenEncryptionKeyCmd is a command to generate a store key for Encryption At
+// Rest.
+// Exported to allow use by CCL code.
+var GenEncryptionKeyCmd = &cobra.Command{
 	Use:   "encryption-key <key-file>",
 	Short: "generate store key for encryption at rest",
 	Long: `Generate store key for encryption at rest.
@@ -207,13 +212,20 @@ Output the list of cluster settings known to this binary.
 			return s
 		}
 
+		wrapDivSlug := func(s string) string {
+			if sqlExecCtx.TableDisplayFormat == clisqlexec.TableDisplayRawHTML {
+				return fmt.Sprintf(`<div id="setting-%s" class="anchored">%s</div>`, slugify.Slugify(s), wrapCode(s))
+			}
+			return s
+		}
+
 		// Fill a Values struct with the defaults.
 		s := cluster.MakeTestingClusterSettings()
 		settings.NewUpdater(&s.SV).ResetRemaining(context.Background())
 
 		var rows [][]string
 		for _, name := range settings.Keys(settings.ForSystemTenant) {
-			setting, ok := settings.Lookup(name, settings.LookupForLocalAccess, settings.ForSystemTenant)
+			setting, ok := settings.LookupForLocalAccess(name, settings.ForSystemTenant)
 			if !ok {
 				panic(fmt.Sprintf("could not find setting %q", name))
 			}
@@ -236,22 +248,27 @@ Output the list of cluster settings known to this binary.
 				defaultVal = sm.SettingsListDefault()
 			} else {
 				defaultVal = setting.String(&s.SV)
-				if override, ok := startupmigrations.SettingsDefaultOverrides[name]; ok {
+				if override, ok := upgrades.SettingsDefaultOverrides[name]; ok {
 					defaultVal = override
 				}
 			}
 
 			settingDesc := setting.Description()
+			alterRoleLink := "ALTER ROLE... SET: https://www.cockroachlabs.com/docs/stable/alter-role.html"
+			if sqlExecCtx.TableDisplayFormat == clisqlexec.TableDisplayRawHTML {
+				settingDesc = html.EscapeString(settingDesc)
+				alterRoleLink = `<a href="alter-role.html"><code>ALTER ROLE... SET</code></a>`
+			}
 			if strings.Contains(name, "sql.defaults") {
 				settingDesc = fmt.Sprintf(`%s
 This cluster setting is being kept to preserve backwards-compatibility.
-This session variable default should now be configured using ALTER ROLE... SET: %s`,
-					setting.Description(),
-					"https://www.cockroachlabs.com/docs/stable/alter-role.html",
+This session variable default should now be configured using %s`,
+					settingDesc,
+					alterRoleLink,
 				)
 			}
 
-			row := []string{wrapCode(name), typ, wrapCode(defaultVal), settingDesc}
+			row := []string{wrapDivSlug(name), typ, wrapCode(defaultVal), settingDesc}
 			rows = append(rows, row)
 		}
 
@@ -274,7 +291,7 @@ var genCmds = []*cobra.Command{
 	genExamplesCmd,
 	genHAProxyCmd,
 	genSettingsListCmd,
-	genEncryptionKeyCmd,
+	GenEncryptionKeyCmd,
 }
 
 func init() {
@@ -285,9 +302,9 @@ func init() {
 	genHAProxyCmd.PersistentFlags().StringVar(&haProxyPath, "out", "haproxy.cfg",
 		"path to generated haproxy configuration file")
 	cliflagcfg.VarFlag(genHAProxyCmd.Flags(), &haProxyLocality, cliflags.Locality)
-	genEncryptionKeyCmd.PersistentFlags().IntVarP(&aesSize, "size", "s", 128,
+	GenEncryptionKeyCmd.PersistentFlags().IntVarP(&aesSize, "size", "s", 128,
 		"AES key size for encryption at rest (one of: 128, 192, 256)")
-	genEncryptionKeyCmd.PersistentFlags().BoolVar(&overwriteKey, "overwrite", false,
+	GenEncryptionKeyCmd.PersistentFlags().BoolVar(&overwriteKey, "overwrite", false,
 		"Overwrite key if it exists")
 	genSettingsListCmd.PersistentFlags().BoolVar(&includeReservedSettings, "include-reserved", false,
 		"include undocumented 'reserved' settings")

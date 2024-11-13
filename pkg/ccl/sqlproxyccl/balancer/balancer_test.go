@@ -100,7 +100,7 @@ func TestRebalancer_processQueue(t *testing.T) {
 	// any request.
 	assertNoRunningRequests := func(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
-			runningReq := b.metrics.rebalanceReqRunning.Value()
+			runningReq := b.metrics.RebalanceReqRunning.Value()
 			if runningReq != 0 {
 				return errors.Newf("expected no running requests, but got %d", runningReq)
 			}
@@ -115,7 +115,7 @@ func TestRebalancer_processQueue(t *testing.T) {
 			conn: &testConnHandle{
 				onTransferConnection: func() error {
 					count++
-					require.Equal(t, int64(1), b.metrics.rebalanceReqRunning.Value())
+					require.Equal(t, int64(1), b.metrics.RebalanceReqRunning.Value())
 					return errors.New("cannot transfer")
 				},
 			},
@@ -139,7 +139,7 @@ func TestRebalancer_processQueue(t *testing.T) {
 			conn: &testConnHandle{
 				onTransferConnection: func() error {
 					count++
-					require.Equal(t, int64(1), b.metrics.rebalanceReqRunning.Value())
+					require.Equal(t, int64(1), b.metrics.RebalanceReqRunning.Value())
 					return nil
 				},
 			},
@@ -163,7 +163,7 @@ func TestRebalancer_processQueue(t *testing.T) {
 			conn: &testConnHandle{
 				onTransferConnection: func() error {
 					count++
-					require.Equal(t, int64(1), b.metrics.rebalanceReqRunning.Value())
+					require.Equal(t, int64(1), b.metrics.RebalanceReqRunning.Value())
 					return context.Canceled
 				},
 			},
@@ -217,7 +217,7 @@ func TestRebalancer_processQueue(t *testing.T) {
 						// concurrent rebalances defined.
 						newCount := atomic.AddInt32(&count, 1)
 						require.True(t, newCount <= 2)
-						require.True(t, b.metrics.rebalanceReqRunning.Value() <= 2)
+						require.True(t, b.metrics.RebalanceReqRunning.Value() <= 2)
 						return nil
 					},
 				},
@@ -233,7 +233,7 @@ func TestRebalancer_processQueue(t *testing.T) {
 
 		// We should only transfer once for every connection.
 		require.Equal(t, int32(0), count)
-		require.Equal(t, int64(reqCount), b.metrics.rebalanceReqTotal.Count())
+		require.Equal(t, int64(reqCount), b.metrics.RebalanceReqTotal.Count())
 	})
 }
 
@@ -265,7 +265,7 @@ func TestRebalancer_rebalanceLoop(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	tenantID := roachpb.MakeTenantID(30)
+	tenantID := roachpb.MustMakeTenantID(30)
 	drainingPod := &tenant.Pod{TenantID: tenantID.ToUint64(), Addr: "127.0.0.30:80", State: tenant.DRAINING}
 	require.True(t, directoryCache.upsertPod(drainingPod))
 	runningPods := []*tenant.Pod{
@@ -422,7 +422,7 @@ func TestRebalancer_rebalance(t *testing.T) {
 			// been removed from the cache.
 			name: "no pods",
 			handlesFn: func(t *testing.T) []ConnectionHandle {
-				tenant10 := roachpb.MakeTenantID(10)
+				tenant10 := roachpb.MustMakeTenantID(10)
 
 				// Use a random IP since tenant-10 doesn't have a pod, and it
 				// does not matter.
@@ -438,7 +438,7 @@ func TestRebalancer_rebalance(t *testing.T) {
 			// there's nothing to transfer to.
 			name: "no running pods",
 			handlesFn: func(t *testing.T) []ConnectionHandle {
-				tenant20 := roachpb.MakeTenantID(20)
+				tenant20 := roachpb.MustMakeTenantID(20)
 
 				handle := makeTestHandle()
 				sa := NewServerAssignment(tenant20, b.connTracker, handle, pods[0].Addr)
@@ -452,7 +452,7 @@ func TestRebalancer_rebalance(t *testing.T) {
 			// because minDrainPeriod hasn't elapsed.
 			name: "draining/recently drained pod",
 			handlesFn: func(t *testing.T) []ConnectionHandle {
-				tenant30 := roachpb.MakeTenantID(30)
+				tenant30 := roachpb.MustMakeTenantID(30)
 
 				activeHandle := makeTestHandle()
 				sa := NewServerAssignment(tenant30, b.connTracker, activeHandle, recentlyDrainedPod.Addr)
@@ -505,7 +505,7 @@ func TestRebalancer_rebalance(t *testing.T) {
 				for _, c := range conns {
 					handle := makeTestHandle()
 					sa := NewServerAssignment(
-						roachpb.MakeTenantID(c.TenantID),
+						roachpb.MustMakeTenantID(c.TenantID),
 						b.connTracker,
 						handle,
 						c.Addr,
@@ -518,8 +518,8 @@ func TestRebalancer_rebalance(t *testing.T) {
 				handles[len(handles)-2].(*testConnHandle).setIdle(true)
 
 				// Refresh partitions, and validate idle connections.
-				e30 := b.connTracker.getEntry(roachpb.MakeTenantID(30), false)
-				e40 := b.connTracker.getEntry(roachpb.MakeTenantID(40), false)
+				e30 := b.connTracker.getEntry(roachpb.MustMakeTenantID(30), false)
+				e40 := b.connTracker.getEntry(roachpb.MustMakeTenantID(40), false)
 				e30.refreshPartitions()
 				e40.refreshPartitions()
 				_, idleList30 := e30.listAssignments()
@@ -554,7 +554,7 @@ func TestRebalancer_rebalance(t *testing.T) {
 				for _, c := range conns {
 					handle := makeTestHandle()
 					sa := NewServerAssignment(
-						roachpb.MakeTenantID(c.TenantID),
+						roachpb.MustMakeTenantID(c.TenantID),
 						b.connTracker,
 						handle,
 						c.Addr,
@@ -567,7 +567,7 @@ func TestRebalancer_rebalance(t *testing.T) {
 				}
 
 				// Refresh partitions, and validate idle connection.
-				e60 := b.connTracker.getEntry(roachpb.MakeTenantID(60), false)
+				e60 := b.connTracker.getEntry(roachpb.MustMakeTenantID(60), false)
 				e60.refreshPartitions()
 				_, idleList60 := e60.listAssignments()
 				require.Len(t, idleList60, 30)
@@ -633,7 +633,7 @@ func TestRebalancer_rebalance(t *testing.T) {
 				for _, c := range conns {
 					handle := makeTestHandle()
 					sa := NewServerAssignment(
-						roachpb.MakeTenantID(c.TenantID),
+						roachpb.MustMakeTenantID(c.TenantID),
 						b.connTracker,
 						handle,
 						c.Addr,
@@ -647,8 +647,8 @@ func TestRebalancer_rebalance(t *testing.T) {
 				handles[len(handles)-3].(*testConnHandle).setIdle(true)
 
 				// Refresh partitions, and validate idle connections.
-				e40 := b.connTracker.getEntry(roachpb.MakeTenantID(40), false)
-				e60 := b.connTracker.getEntry(roachpb.MakeTenantID(60), false)
+				e40 := b.connTracker.getEntry(roachpb.MustMakeTenantID(40), false)
+				e60 := b.connTracker.getEntry(roachpb.MustMakeTenantID(60), false)
 				e40.refreshPartitions()
 				e60.refreshPartitions()
 				_, idleList40 := e40.listAssignments()
@@ -741,7 +741,7 @@ func TestBalancer_RebalanceTenant_WithRebalancingDisabled(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	tenantID := roachpb.MakeTenantID(10)
+	tenantID := roachpb.MustMakeTenantID(10)
 	pods := []*tenant.Pod{
 		{TenantID: tenantID.ToUint64(), Addr: "127.0.0.30:80", State: tenant.DRAINING},
 		{TenantID: tenantID.ToUint64(), Addr: "127.0.0.30:81", State: tenant.RUNNING},
@@ -816,7 +816,7 @@ func TestBalancer_RebalanceTenant_WithDefaultDelay(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	tenantID := roachpb.MakeTenantID(10)
+	tenantID := roachpb.MustMakeTenantID(10)
 	pods := []*tenant.Pod{
 		{TenantID: tenantID.ToUint64(), Addr: "127.0.0.30:80", State: tenant.DRAINING},
 		{TenantID: tenantID.ToUint64(), Addr: "127.0.0.30:81", State: tenant.RUNNING},
@@ -1257,13 +1257,13 @@ func TestRebalancerQueue(t *testing.T) {
 
 	// Enqueue in a specific order. req3 overrides req1; req2 is a no-op.
 	q.enqueue(req1)
-	require.Equal(t, int64(1), q.metrics.rebalanceReqQueued.Value())
+	require.Equal(t, int64(1), q.metrics.RebalanceReqQueued.Value())
 	q.enqueue(req3)
-	require.Equal(t, int64(1), q.metrics.rebalanceReqQueued.Value())
+	require.Equal(t, int64(1), q.metrics.RebalanceReqQueued.Value())
 	q.enqueue(req2)
 	require.Len(t, q.elements, 1)
 	require.Equal(t, 1, q.queue.Len())
-	require.Equal(t, int64(1), q.metrics.rebalanceReqQueued.Value())
+	require.Equal(t, int64(1), q.metrics.RebalanceReqQueued.Value())
 
 	// Create another request.
 	conn2 := &testConnHandle{}
@@ -1272,7 +1272,7 @@ func TestRebalancerQueue(t *testing.T) {
 		conn:      conn2,
 	}
 	q.enqueue(req4)
-	require.Equal(t, int64(2), q.metrics.rebalanceReqQueued.Value())
+	require.Equal(t, int64(2), q.metrics.RebalanceReqQueued.Value())
 	require.Len(t, q.elements, 2)
 	require.Equal(t, 2, q.queue.Len())
 
@@ -1280,11 +1280,11 @@ func TestRebalancerQueue(t *testing.T) {
 	item, err := q.dequeue(ctx)
 	require.NoError(t, err)
 	require.Equal(t, req3, item)
-	require.Equal(t, int64(1), q.metrics.rebalanceReqQueued.Value())
+	require.Equal(t, int64(1), q.metrics.RebalanceReqQueued.Value())
 	item, err = q.dequeue(ctx)
 	require.NoError(t, err)
 	require.Equal(t, req4, item)
-	require.Equal(t, int64(0), q.metrics.rebalanceReqQueued.Value())
+	require.Equal(t, int64(0), q.metrics.RebalanceReqQueued.Value())
 	require.Empty(t, q.elements)
 	require.Equal(t, 0, q.queue.Len())
 
@@ -1293,7 +1293,7 @@ func TestRebalancerQueue(t *testing.T) {
 	req4, err = q.dequeue(ctx)
 	require.EqualError(t, err, context.Canceled.Error())
 	require.Nil(t, req4)
-	require.Equal(t, int64(0), q.metrics.rebalanceReqQueued.Value())
+	require.Equal(t, int64(0), q.metrics.RebalanceReqQueued.Value())
 }
 
 // TestRebalancerQueueBlocking tests the blocking behavior when invoking
@@ -1380,7 +1380,7 @@ func (r *testDirectoryCache) upsertPod(pod *tenant.Pod) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	tenantID := roachpb.MakeTenantID(pod.TenantID)
+	tenantID := roachpb.MustMakeTenantID(pod.TenantID)
 	pods := r.mu.pods[tenantID]
 	for i, existing := range pods {
 		if existing.Addr == pod.Addr {

@@ -57,7 +57,9 @@ var ErrorFnFormatStringIndex = map[string]int{
 	"github.com/cockroachdb/errors.NewAssertionErrorWithWrappedErrf": 1,
 	"github.com/cockroachdb/errors.WithSafeDetails":                  1,
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb.NewErrorf": 0,
+	"github.com/cockroachdb/cockroach/pkg/security.makeErrorf": 1,
+
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb.NewErrorf": 0,
 
 	"github.com/cockroachdb/cockroach/pkg/sql/importer.makeRowErr": 3,
 	"github.com/cockroachdb/cockroach/pkg/sql/importer.wrapRowErr": 4,

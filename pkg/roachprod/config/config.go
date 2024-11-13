@@ -12,9 +12,11 @@ package config
 
 import (
 	"context"
+	"os"
 	"os/user"
 	"regexp"
 
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -27,7 +29,12 @@ var (
 	// OSUser TODO(peter): document
 	OSUser *user.User
 	// Quiet is used to disable fancy progress output.
-	Quiet = true
+	Quiet = false
+	// The default roachprod logger.
+	// N.B. When roachprod is used via CLI, this logger is used for all output.
+	//	When roachprod is used via API (e.g. from roachtest), this logger is used only in the few cases,
+	//	during bootstrapping, at which time the caller has not yet had a chance to configure a custom logger.
+	Logger *logger.Logger
 	// MaxConcurrency specifies the maximum number of operations
 	// to execute on nodes concurrently, set to zero for infinite.
 	MaxConcurrency = 32
@@ -40,6 +47,13 @@ func init() {
 	OSUser, err = user.Current()
 	if err != nil {
 		log.Fatalf(context.Background(), "Unable to determine OS user: %v", err)
+	}
+
+	loggerCfg := logger.Config{Stdout: os.Stdout, Stderr: os.Stderr}
+	var loggerError error
+	Logger, loggerError = loggerCfg.NewLogger("")
+	if loggerError != nil {
+		log.Fatalf(context.Background(), "unable to configure logger: %v", loggerError)
 	}
 }
 
@@ -82,12 +96,12 @@ const (
 // See 'generateStartCmd' which sets 'ENV_VARS' for the systemd startup script (start.sh).
 func DefaultEnvVars() []string {
 	return []string{
-		// RPC compressions costs around 5% on kv95, so we disable it. It might help
-		// when moving snapshots around, though.
-		// (For other perf. related knobs, see https://github.com/cockroachdb/cockroach/issues/17165)
-		"COCKROACH_ENABLE_RPC_COMPRESSION=false",
-		// Get rid of an annoying popup in the UI.
-		"COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true",
+		// We set the following environment variable to pretend that the
+		// current development build is the next binary release (which
+		// disables version offsetting). In upgrade tests, we're interested
+		// in testing the upgrade logic that users would actually run when
+		// they upgrade from one release to another.
+		"COCKROACH_TESTING_FORCE_RELEASE_BRANCH=true",
 	}
 }
 

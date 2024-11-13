@@ -29,8 +29,8 @@ import (
 
 const (
 	// NumWorkersPerWarehouse is the default number of workers per warehouse.
-	NumWorkersPerWarehouse = 10 // 10
-	numConnsPerWarehouse   = 2 //2
+	NumWorkersPerWarehouse = 10
+	numConnsPerWarehouse   = 2
 )
 
 // tpccTX is an interface for running a TPCC transaction.

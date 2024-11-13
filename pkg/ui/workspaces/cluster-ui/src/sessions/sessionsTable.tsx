@@ -16,11 +16,16 @@ import {
   DurationToNumber,
   TimestampToMoment,
 } from "src/util/convert";
-import { BytesWithPrecision } from "src/util/format";
+import {
+  BytesWithPrecision,
+  Count,
+  DATE_FORMAT,
+  DATE_FORMAT_24_TZ,
+} from "src/util/format";
 import { Link } from "react-router-dom";
 import React from "react";
 
-import moment from "moment";
+import moment from "moment-timezone";
 
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 type ISession = cockroach.server.serverpb.Session;
@@ -44,6 +49,7 @@ import {
   statisticsTableTitles,
   StatisticType,
 } from "../statsTableUtil/statsTableUtil";
+import { Timestamp } from "../timestamp";
 
 const cx = classNames.bind(styles);
 
@@ -104,23 +110,20 @@ const StatementTableCell = (props: { session: ISession }) => {
   );
 };
 
-function formatSessionStart(session: ISession): string {
-  const formatStr = "MMM DD, YYYY [at] H:mm";
+function formatSessionStart(session: ISession) {
   const start = moment.unix(Number(session.start.seconds)).utc();
-
-  return start.format(formatStr);
+  return <Timestamp time={start} format={DATE_FORMAT} />;
 }
 
-function formatStatementStart(session: ISession): string {
+function formatStatementStart(session: ISession) {
   if (session.active_queries.length == 0) {
-    return "N/A";
+    return <>N/A</>;
   }
-  const formatStr = "MMM DD, YYYY [at] H:mm";
   const start = moment
     .unix(Number(session.active_queries[0].start.seconds))
     .utc();
 
-  return start.format(formatStr);
+  return <Timestamp time={start} format={DATE_FORMAT} />;
 }
 
 export function getStatusString(status: Status): string {
@@ -224,7 +227,7 @@ export function makeSessionsColumns(
       name: "sessionTxnCount",
       title: statisticsTableTitles.sessionTxnCount(statType),
       className: cx("cl-table__col-session"),
-      cell: session => session.session?.num_txns_executed,
+      cell: session => Count(session.session?.num_txns_executed),
       sort: session => session.session?.num_txns_executed,
     },
     {

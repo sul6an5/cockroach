@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -40,8 +42,9 @@ type StoreTestingKnobs struct {
 	TxnWaitKnobs            txnwait.TestingKnobs
 	ConsistencyTestingKnobs ConsistencyTestingKnobs
 	TenantRateKnobs         tenantrate.TestingKnobs
-	StorageKnobs            storage.TestingKnobs
+	EngineKnobs             []storage.ConfigOption
 	AllocatorKnobs          *allocator.TestingKnobs
+	GossipTestingKnobs      StoreGossipTestingKnobs
 
 	// TestingRequestFilter is called before evaluating each request on a
 	// replica. The filter is run before the request acquires latches, so
@@ -61,16 +64,25 @@ type StoreTestingKnobs struct {
 	// reproposed due to ticks.
 	TestingProposalSubmitFilter func(*ProposalData) (drop bool, err error)
 
-	// TestingApplyFilter is called before applying the results of a command on
+	// TestingApplyCalledTwiceFilter is called before applying the results of a command on
 	// each replica assuming the command was cleared for application (i.e. no
 	// forced error occurred; the supplied AppliedFilterArgs will have a nil
 	// ForcedError field). If this function returns an error, it is treated as
 	// a forced error and the command will not be applied. If it returns an error
 	// on some replicas but not others, the behavior is poorly defined. The
 	// returned int is interpreted as a proposalReevaluationReason.
-	TestingApplyFilter kvserverbase.ReplicaApplyFilter
-	// TestingApplyForcedErrFilter is like TestingApplyFilter, but it is only
-	// invoked when there is a pre-existing forced error. The returned int and
+	//
+	// Users have to expect the filter to be invoked twice for each command, once
+	// from ephemerealReplicaAppBatch.Stage, and once from replicaAppBatch.Stage;
+	// this has to do with wanting to early-ack successful proposals. The second
+	// call is conditional on the first call succeeding.
+	//
+	// Consider using a TestPostApplyFilter instead, and use a
+	// TestingApplyCalledTwiceFilter only to inject forced errors.
+	TestingApplyCalledTwiceFilter kvserverbase.ReplicaApplyFilter
+	// TestingApplyForcedErrFilter is like TestingApplyCalledTwiceFilter, but it
+	// is only invoked when there is a pre-existing forced error (and in
+	// particular, it will be invoked only once per command). The returned int and
 	// *Error replace the existing proposalReevaluationReason (if initially zero
 	// only) and forced error.
 	TestingApplyForcedErrFilter kvserverbase.ReplicaApplyFilter
@@ -78,11 +90,15 @@ type StoreTestingKnobs struct {
 	// TestingPostApplyFilter is called after a command is applied to
 	// rocksdb but before in-memory side effects have been processed.
 	// It is only called on the replica the proposed the command.
+	//
+	// Filters need to handle the case in which the command applies
+	// with a forced error. That is, the "command" will apply as a
+	// no-op write, and the ForcedError field will be set.
 	TestingPostApplyFilter kvserverbase.ReplicaApplyFilter
 
 	// TestingResponseErrorEvent is called when an error is returned applying
 	// a command.
-	TestingResponseErrorEvent func(context.Context, *roachpb.BatchRequest, error)
+	TestingResponseErrorEvent func(context.Context, *kvpb.BatchRequest, error)
 
 	// TestingResponseFilter is called after the replica processes a
 	// command in order for unittests to modify the batch response,
@@ -91,7 +107,7 @@ type StoreTestingKnobs struct {
 
 	// SlowReplicationThresholdOverride is an interceptor that allows setting a
 	// per-Batch SlowReplicationThreshold.
-	SlowReplicationThresholdOverride func(ba *roachpb.BatchRequest) time.Duration
+	SlowReplicationThresholdOverride func(ba *kvpb.BatchRequest) time.Duration
 
 	// TestingRangefeedFilter is called before a replica processes a rangefeed
 	// in order for unit tests to modify the request, error returned to the client
@@ -109,13 +125,13 @@ type StoreTestingKnobs struct {
 	// should get rid of such practices once we make TestServer take a
 	// ManualClock.
 	DisableMaxOffsetCheck bool
-	// DisableAutomaticLeaseRenewal enables turning off the background worker
-	// that attempts to automatically renew expiration-based leases.
+	// DisableAutomaticLeaseRenewal disables eager renewal of expiration-based
+	// leases.
 	DisableAutomaticLeaseRenewal bool
 	// LeaseRequestEvent, if set, is called when replica.requestLeaseLocked() is
 	// called to acquire a new lease. This can be used to assert that a request
 	// triggers a lease acquisition.
-	LeaseRequestEvent func(ts hlc.Timestamp, storeID roachpb.StoreID, rangeID roachpb.RangeID) *roachpb.Error
+	LeaseRequestEvent func(ts hlc.Timestamp, storeID roachpb.StoreID, rangeID roachpb.RangeID) *kvpb.Error
 	// PinnedLeases can be used to prevent all but one store from acquiring leases on a given range.
 	PinnedLeases *PinnedLeasesKnob
 	// LeaseTransferBlockedOnExtensionEvent, if set, is called when
@@ -225,7 +241,7 @@ type StoreTestingKnobs struct {
 	// of Raft group ticks.
 	RefreshReasonTicksPeriod int
 	// DisableProcessRaft disables the process raft loop.
-	DisableProcessRaft bool
+	DisableProcessRaft func(roachpb.StoreID) bool
 	// DisableLastProcessedCheck disables checking on replica queue last processed times.
 	DisableLastProcessedCheck bool
 	// ReplicateQueueAcceptsUnsplit allows the replication queue to
@@ -238,11 +254,6 @@ type StoreTestingKnobs struct {
 	// SkipMinSizeCheck, if set, makes the store creation process skip the check
 	// for a minimum size.
 	SkipMinSizeCheck bool
-	// DisableLeaseCapacityGossip disables the ability of a changing number of
-	// leases to trigger the store to gossip its capacity. With this enabled,
-	// only changes in the number of replicas can cause the store to gossip its
-	// capacity.
-	DisableLeaseCapacityGossip bool
 	// SystemLogsGCPeriod is used to override the period of GC of system logs.
 	SystemLogsGCPeriod time.Duration
 	// SystemLogsGCGCDone is used to notify when system logs GC is done.
@@ -270,7 +281,7 @@ type StoreTestingKnobs struct {
 
 	// SendSnapshot is run after receiving a DelegateRaftSnapshot request but
 	// before any throttling or sending logic.
-	SendSnapshot func()
+	SendSnapshot func(*kvserverpb.DelegateSendSnapshotRequest)
 	// ReceiveSnapshot is run after receiving a snapshot header but before
 	// acquiring snapshot quota or doing shouldAcceptSnapshotData checks. If an
 	// error is returned from the hook, it's sent as an ERROR SnapshotResponse.
@@ -317,7 +328,7 @@ type StoreTestingKnobs struct {
 	BeforeSnapshotSSTIngestion func(IncomingSnapshot, kvserverpb.SnapshotRequest_Type, []string) error
 	// OnRelocatedOne intercepts the return values of s.relocateOne after they
 	// have successfully been put into effect.
-	OnRelocatedOne func(_ []roachpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget)
+	OnRelocatedOne func(_ []kvpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget)
 	// DontIgnoreFailureToTransferLease makes `AdminRelocateRange` return an error
 	// to its client if it failed to transfer the lease to the first voting
 	// replica in the set of relocation targets.
@@ -340,10 +351,6 @@ type StoreTestingKnobs struct {
 	// heartbeats and then expect other replicas to take the lease without
 	// worrying about Raft).
 	AllowLeaseRequestProposalsWhenNotLeader bool
-	// AllowLeaseTransfersWhenTargetMayNeedSnapshot, if set, makes the Replica
-	// and proposal buffer allow lease request proposals even when the proposer
-	// cannot prove that the lease transfer target does not need a Raft snapshot.
-	AllowLeaseTransfersWhenTargetMayNeedSnapshot bool
 	// LeaseTransferRejectedRetryLoopCount, if set, configures the maximum number
 	// of retries for the retry loop used during lease transfers. This retry loop
 	// retries after transfer attempts are rejected because the transfer is deemed
@@ -373,10 +380,6 @@ type StoreTestingKnobs struct {
 	// bootstrapping ranges. This is used for testing the migration
 	// infrastructure.
 	InitialReplicaVersionOverride *roachpb.Version
-	// GossipWhenCapacityDeltaExceedsFraction specifies the fraction from the last
-	// gossiped store capacity values which need be exceeded before the store will
-	// gossip immediately without waiting for the periodic gossip interval.
-	GossipWhenCapacityDeltaExceedsFraction float64
 	// TimeSeriesDataStore is an interface used by the store's time series
 	// maintenance queue to dispatch individual maintenance tasks.
 	TimeSeriesDataStore TimeSeriesDataStore
@@ -394,6 +397,12 @@ type StoreTestingKnobs struct {
 	// renewing expiration based leases.
 	LeaseRenewalDurationOverride time.Duration
 
+	// RangefeedValueHeaderFilter, if set, is invoked before each value emitted on
+	// the rangefeed, be it in steady state or during the catch-up scan.
+	//
+	// TODO(before merge): plumb the seqno through the rangefeed.
+	RangefeedValueHeaderFilter func(key, endKey roachpb.Key, ts hlc.Timestamp, vh enginepb.MVCCValueHeader)
+
 	// MakeSystemConfigSpanUnavailableToQueues makes the system config span
 	// unavailable to queues that ask for it.
 	MakeSystemConfigSpanUnavailableToQueues bool
@@ -404,6 +413,8 @@ type StoreTestingKnobs struct {
 	// TODO(irfansharif): Get rid of this knob, maybe by first moving
 	// DisableSpanConfigs into a testing knob instead of a server arg.
 	UseSystemConfigSpanForQueues bool
+	// ConfReaderInterceptor intercepts calls to get a span config reader.
+	ConfReaderInterceptor func() spanconfig.StoreReader
 	// IgnoreStrictGCEnforcement is used by tests to op out of strict GC
 	// enforcement.
 	IgnoreStrictGCEnforcement bool
@@ -415,10 +426,9 @@ type StoreTestingKnobs struct {
 	// AfterSendSnapshotThrottle intercepts replicas after receiving a spot in the
 	// send snapshot semaphore.
 	AfterSendSnapshotThrottle func()
-
-	// This method, if set, gets to see (and mutate, if desired) any local
-	// StoreDescriptor before it is being sent out on the Gossip network.
-	StoreGossipIntercept func(descriptor *roachpb.StoreDescriptor)
+	// SelectDelegateSnapshotSender returns an ordered list of replica which will
+	// be used as delegates for sending a snapshot.
+	SelectDelegateSnapshotSender func(*roachpb.RangeDescriptor) []roachpb.ReplicaDescriptor
 
 	// EnqueueReplicaInterceptor intercepts calls to `store.Enqueue()`.
 	EnqueueReplicaInterceptor func(queueName string, replica *Replica)
@@ -434,6 +444,36 @@ type StoreTestingKnobs struct {
 	// - rangefeed.TestingKnobs.IgnoreOnDeleteRangeError
 	// - kvserverbase.BatchEvalTestingKnobs.DisableInitPutFailOnTombstones
 	GlobalMVCCRangeTombstone bool
+
+	// LeaseUpgradeInterceptor intercepts leases that get upgraded to
+	// epoch-based ones.
+	LeaseUpgradeInterceptor func(*roachpb.Lease)
+
+	// MVCCGCQueueLeaseCheckInterceptor intercepts calls to Replica.LeaseStatusAt when
+	// making high priority replica scans.
+	MVCCGCQueueLeaseCheckInterceptor func(ctx context.Context, replica *Replica, now hlc.ClockTimestamp) bool
+
+	// DisableCanAckBeforeApplication disables acknowledging committed entries
+	// before they apply. This can simplify some tests by making sure that a write
+	// is on the engine when the request returns.
+	DisableCanAckBeforeApplication bool
+
+	// SmallEngineBlocks will configure the engine with a very small block size of
+	// 1 byte, resulting in each key having its own block. This can provoke bugs
+	// in time-bound iterators.
+	SmallEngineBlocks bool
+
+	// PreStorageSnapshotButChecksCompleteInterceptor intercepts calls to
+	// Replica.executeReadOnlyBatch after checks have successfully determined
+	// execution can proceed but a storage snapshot has not been acquired.
+	PreStorageSnapshotButChecksCompleteInterceptor func(replica *Replica)
+
+	// DisableMergeWaitForReplicasInit skips the waitForReplicasInit calls
+	// during merges. Useful for testContext tests that want to use merges.
+	DisableMergeWaitForReplicasInit bool
+
+	// RangeLeaseAcquireTimeoutOverride overrides RaftConfig.RangeLeaseAcquireTimeout().
+	RangeLeaseAcquireTimeoutOverride time.Duration
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -487,7 +527,7 @@ func (p *PinnedLeasesKnob) PinLease(rangeID roachpb.RangeID, storeID roachpb.Sto
 // rejectLeaseIfPinnedElsewhere is called when r is trying to acquire a lease.
 // It returns a NotLeaseholderError if the lease is pinned on another store.
 // r.mu needs to be rlocked.
-func (p *PinnedLeasesKnob) rejectLeaseIfPinnedElsewhere(r *Replica) *roachpb.Error {
+func (p *PinnedLeasesKnob) rejectLeaseIfPinnedElsewhere(r *Replica) *kvpb.Error {
 	if p == nil {
 		return nil
 	}
@@ -501,10 +541,10 @@ func (p *PinnedLeasesKnob) rejectLeaseIfPinnedElsewhere(r *Replica) *roachpb.Err
 
 	repDesc, err := r.getReplicaDescriptorRLocked()
 	if err != nil {
-		return roachpb.NewError(err)
+		return kvpb.NewError(err)
 	}
 	pinned, _ := r.descRLocked().GetReplicaDescriptor(pinnedStore)
-	return roachpb.NewError(&roachpb.NotLeaseHolderError{
+	return kvpb.NewError(&kvpb.NotLeaseHolderError{
 		Replica: repDesc,
 		Lease: &roachpb.Lease{
 			Replica: pinned,

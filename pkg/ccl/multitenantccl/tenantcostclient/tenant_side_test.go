@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/blobs"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl" // ccl init hooks
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl/tenantcostclient"
@@ -34,20 +33,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantio"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -67,7 +68,7 @@ import (
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		defer leaktest.AfterTest(t)()
 		defer log.Scope(t).Close(t)
 
@@ -132,7 +133,7 @@ func (ts *testState) start(t *testing.T) {
 	ts.provider = newTestProvider()
 	ts.controller, err = tenantcostclient.TestingTenantSideCostController(
 		ts.settings,
-		roachpb.MakeTenantID(5),
+		roachpb.MustMakeTenantID(5),
 		ts.provider,
 		ts.timeSrc,
 		ts.eventWait,
@@ -163,11 +164,12 @@ func (ts *testState) stop() {
 }
 
 type cmdArgs struct {
-	count  int64
-	bytes  int64
-	repeat int64
-	label  string
-	wait   bool
+	count        int64
+	bytes        int64
+	repeat       int64
+	label        string
+	wait         bool
+	ruMultiplier float64
 }
 
 func parseBytesVal(arg datadriven.CmdArg) (int64, error) {
@@ -230,6 +232,16 @@ func parseArgs(t *testing.T, d *datadriven.TestData) cmdArgs {
 			default:
 				d.Fatalf(t, "invalid wait value")
 			}
+
+		case "ruMultiplier":
+			if len(args.Vals) != 1 {
+				d.Fatalf(t, "expected one value for ruMultiplier")
+			}
+			val, err := strconv.ParseFloat(args.Vals[0], 64)
+			if err != nil {
+				d.Fatalf(t, "invalid ruMultiplier value")
+			}
+			res.ruMultiplier = val
 		}
 	}
 	return res
@@ -299,17 +311,27 @@ func (ts *testState) request(
 		repeat = 1
 	}
 
-	for ; repeat > 0; repeat-- {
-		var writeCount, readCount, writeBytes, readBytes int64
-		if isWrite {
-			writeCount = args.count
-			writeBytes = args.bytes
-		} else {
-			readCount = args.count
-			readBytes = args.bytes
+	var writeCount, readCount, writeBytes, readBytes int64
+	var writeRUMultiplier, readRUMultiplier tenantcostmodel.RUMultiplier
+	if isWrite {
+		writeCount = args.count
+		writeBytes = args.bytes
+		writeRUMultiplier = tenantcostmodel.RUMultiplier(args.ruMultiplier)
+		if writeRUMultiplier == 0 {
+			writeRUMultiplier = 1
 		}
-		reqInfo := tenantcostmodel.TestingRequestInfo(1, writeCount, writeBytes)
-		respInfo := tenantcostmodel.TestingResponseInfo(!isWrite, readCount, readBytes)
+	} else {
+		readCount = args.count
+		readBytes = args.bytes
+		readRUMultiplier = tenantcostmodel.RUMultiplier(args.ruMultiplier)
+		if readRUMultiplier == 0 {
+			readRUMultiplier = 1
+		}
+	}
+	reqInfo := tenantcostmodel.TestingRequestInfo(1, writeCount, writeBytes, writeRUMultiplier)
+	respInfo := tenantcostmodel.TestingResponseInfo(!isWrite, readCount, readBytes, readRUMultiplier)
+
+	for ; repeat > 0; repeat-- {
 		ts.runOperation(t, d, args.label, func() {
 			if err := ts.controller.OnRequestWait(ctx); err != nil {
 				t.Errorf("OnRequestWait error: %v", err)
@@ -322,7 +344,7 @@ func (ts *testState) request(
 	return ""
 }
 
-func (ts *testState) externalIngress(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) externalIngress(t *testing.T, _ *datadriven.TestData, args cmdArgs) string {
 	usage := multitenant.ExternalIOUsage{IngressBytes: args.bytes}
 	if err := ts.controller.OnExternalIOWait(context.Background(), usage); err != nil {
 		t.Errorf("OnExternalIOWait error: %s", err)
@@ -341,12 +363,12 @@ func (ts *testState) externalEgress(t *testing.T, d *datadriven.TestData, args c
 	return ""
 }
 
-func (ts *testState) enableRUAccounting(t *testing.T, _ *datadriven.TestData, _ cmdArgs) string {
+func (ts *testState) enableRUAccounting(_ *testing.T, _ *datadriven.TestData, _ cmdArgs) string {
 	tenantcostclient.ExternalIORUAccountingMode.Override(context.Background(), &ts.settings.SV, "on")
 	return ""
 }
 
-func (ts *testState) disableRUAccounting(t *testing.T, _ *datadriven.TestData, _ cmdArgs) string {
+func (ts *testState) disableRUAccounting(_ *testing.T, _ *datadriven.TestData, _ cmdArgs) string {
 	tenantcostclient.ExternalIORUAccountingMode.Override(context.Background(), &ts.settings.SV, "off")
 	return ""
 }
@@ -424,7 +446,7 @@ func (ts *testState) advance(t *testing.T, d *datadriven.TestData, args cmdArgs)
 
 // waitForEvent waits until the tenant controller reports the given event
 // type(s), at the current time.
-func (ts *testState) waitForEvent(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) waitForEvent(t *testing.T, d *datadriven.TestData, _ cmdArgs) string {
 	typs := make(map[string]tenantcostclient.TestEventType)
 	for ev, evStr := range eventTypeStr {
 		typs[evStr] = ev
@@ -444,7 +466,7 @@ func (ts *testState) waitForEvent(t *testing.T, d *datadriven.TestData, args cmd
 
 // unblockRequest resumes a token bucket request that was blocked by the
 // "blockRequest" configuration option.
-func (ts *testState) unblockRequest(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) unblockRequest(t *testing.T, _ *datadriven.TestData, _ cmdArgs) string {
 	ts.provider.unblockRequest(t)
 	return ""
 }
@@ -461,7 +483,7 @@ func (ts *testState) unblockRequest(t *testing.T, d *datadriven.TestData, args c
 //	----
 //	00:00:01.000
 //	00:00:02.000
-func (ts *testState) timers(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) timers(t *testing.T, d *datadriven.TestData, _ cmdArgs) string {
 	// If we are rewriting the test, just sleep a bit before returning the
 	// timers.
 	if d.Rewrite {
@@ -491,7 +513,7 @@ func timesToString(times []time.Time) string {
 }
 
 // configure the test provider.
-func (ts *testState) configure(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) configure(t *testing.T, d *datadriven.TestData, _ cmdArgs) string {
 	var cfg testProviderConfig
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &cfg); err != nil {
 		d.Fatalf(t, "failed to parse request yaml: %v", err)
@@ -501,13 +523,13 @@ func (ts *testState) configure(t *testing.T, d *datadriven.TestData, args cmdArg
 }
 
 // tokenBucket dumps the current state of the tenant's token bucket.
-func (ts *testState) tokenBucket(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) tokenBucket(*testing.T, *datadriven.TestData, cmdArgs) string {
 	return tenantcostclient.TestingTokenBucketString(ts.controller)
 }
 
 // cpu adds CPU usage which will be observed by the controller on the next main
 // loop tick.
-func (ts *testState) cpu(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) cpu(t *testing.T, d *datadriven.TestData, _ cmdArgs) string {
 	duration, err := time.ParseDuration(d.Input)
 	if err != nil {
 		d.Fatalf(t, "error parsing cpu duration: %v", err)
@@ -518,7 +540,7 @@ func (ts *testState) cpu(t *testing.T, d *datadriven.TestData, args cmdArgs) str
 
 // pgwire adds PGWire egress usage which will be observed by the controller on the next
 // main loop tick.
-func (ts *testState) pgwireEgress(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) pgwireEgress(t *testing.T, d *datadriven.TestData, _ cmdArgs) string {
 	bytes, err := strconv.Atoi(d.Input)
 	if err != nil {
 		d.Fatalf(t, "error parsing pgwire bytes value: %v", err)
@@ -529,7 +551,7 @@ func (ts *testState) pgwireEgress(t *testing.T, d *datadriven.TestData, args cmd
 
 // usage prints out the latest consumption. Callers are responsible for
 // triggering calls to the token bucket provider and waiting for responses.
-func (ts *testState) usage(t *testing.T, d *datadriven.TestData, args cmdArgs) string {
+func (ts *testState) usage(*testing.T, *datadriven.TestData, cmdArgs) string {
 	c := ts.provider.consumption()
 	return fmt.Sprintf(""+
 		"RU:  %.2f\n"+
@@ -610,7 +632,7 @@ func (ew *eventWaiter) WaitForEvent(typ tenantcostclient.TestEventType) bool {
 type testProvider struct {
 	mu struct {
 		syncutil.Mutex
-		consumption roachpb.TenantConsumption
+		consumption kvpb.TenantConsumption
 
 		lastSeqNum int64
 
@@ -663,7 +685,7 @@ func (tp *testProvider) waitForRequest(t *testing.T) {
 	}
 }
 
-func (tp *testProvider) consumption() roachpb.TenantConsumption {
+func (tp *testProvider) consumption() kvpb.TenantConsumption {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
 	return tp.mu.consumption
@@ -671,7 +693,7 @@ func (tp *testProvider) consumption() roachpb.TenantConsumption {
 
 // waitForConsumption waits for the next TokenBucket request and returns the
 // total consumption.
-func (tp *testProvider) waitForConsumption(t *testing.T) roachpb.TenantConsumption {
+func (tp *testProvider) waitForConsumption(t *testing.T) kvpb.TenantConsumption {
 	tp.waitForRequest(t)
 	// it is possible that the TokenBucket request was in the process of being
 	// prepared; we have to wait for another one to make sure the latest
@@ -695,8 +717,8 @@ func (tp *testProvider) unblockRequest(t *testing.T) {
 
 // TokenBucket implements the kvtenant.TokenBucketProvider interface.
 func (tp *testProvider) TokenBucket(
-	ctx context.Context, in *roachpb.TokenBucketRequest,
-) (*roachpb.TokenBucketResponse, error) {
+	_ context.Context, in *kvpb.TokenBucketRequest,
+) (*kvpb.TokenBucketResponse, error) {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
 	select {
@@ -722,7 +744,7 @@ func (tp *testProvider) TokenBucket(
 	}
 
 	tp.mu.consumption.Add(&in.ConsumptionSinceLastRequest)
-	res := &roachpb.TokenBucketResponse{}
+	res := &kvpb.TokenBucketResponse{}
 
 	rate := tp.mu.cfg.Throttle
 	if rate >= 0 {
@@ -765,7 +787,7 @@ func TestWaitingRU(t *testing.T) {
 
 	// Immediately consume the initial 10K RUs.
 	require.NoError(t, ctrl.OnResponseWait(ctx,
-		tenantcostmodel.TestingRequestInfo(1, 1, 10237952), tenantcostmodel.ResponseInfo{}))
+		tenantcostmodel.TestingRequestInfo(1, 1, 10237952, 1), tenantcostmodel.ResponseInfo{}))
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -783,20 +805,25 @@ func TestWaitingRU(t *testing.T) {
 	// Send 20 KV requests for 1K RU each.
 	const count = 20
 	const fillRate = 100
-	req := tenantcostmodel.TestingRequestInfo(1, 1, 1021952)
-	resp := tenantcostmodel.TestingResponseInfo(false, 0, 0)
+	req := tenantcostmodel.TestingRequestInfo(1, 1, 1021952, 1)
+	resp := tenantcostmodel.TestingResponseInfo(false, 0, 0, 0)
 
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		tenantcostclient.TestingSetRate(ctrl, fillRate)
 
 		var doneCount int64
 		for i := 0; i < count; i++ {
+			require.NoError(t, ctrl.OnRequestWait(ctx))
+		}
+		for i := 0; i < count; i++ {
 			go func(i int) {
-				require.NoError(t, ctrl.OnRequestWait(ctx))
 				require.NoError(t, ctrl.OnResponseWait(ctx, req, resp))
 				atomic.AddInt64(&doneCount, 1)
 			}(i)
 		}
+
+		// Allow some responses to queue up before refilling the available RUs.
+		time.Sleep(time.Millisecond)
 
 		// If available RUs drop below -1K, then multiple responses must be waiting.
 		succeeded := false
@@ -830,14 +857,15 @@ func TestWaitingRU(t *testing.T) {
 				timeSource.Now(), timesToString(timeSource.Timers()))
 		}, timeout)
 
+		const allowedDelta = 0.01
 		available := tenantcostclient.TestingAvailableRU(ctrl)
 		if succeeded {
-			require.Equal(t, tenantcostmodel.RU(0), available)
+			require.InDelta(t, 0, float64(available), allowedDelta)
 			return nil
 		}
 
 		return errors.Errorf("RUs did not drop below 1K: %0.2f", available)
-	})
+	}, 2*time.Minute)
 }
 
 // TestConsumption verifies consumption reporting from a tenant server process.
@@ -855,9 +883,8 @@ func TestConsumption(t *testing.T) {
 	testProvider := newTestProvider()
 
 	_, tenantDB := serverutils.StartTenant(t, hostServer, base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		Settings:                    st,
-		AllowSettingClusterSettings: true,
+		TenantID: serverutils.TestTenantID(),
+		Settings: st,
 		TestingKnobs: base.TestingKnobs{
 			TenantTestingKnobs: &sql.TenantTestingKnobs{
 				OverrideTokenBucketProvider: func(kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider {
@@ -923,26 +950,25 @@ func TestSQLLivenessExemption(t *testing.T) {
 
 	// Create a tenant with ridiculously low resource limits.
 	host := sqlutils.MakeSQLRunner(hostDB)
-	host.Exec(t, "SELECT crdb_internal.create_tenant($1)", tenantID.ToUint64())
-	host.Exec(t, "SELECT crdb_internal.update_tenant_resource_limits($1, 0, 0.001, 0, now(), 0)", tenantID.ToUint64())
+	host.Exec(t, "SELECT crdb_internal.create_tenant($1::INT)", tenantID.ToUint64())
+	host.Exec(t, "SELECT crdb_internal.update_tenant_resource_limits($1::INT, 0, 0.001, 0, now(), 0)", tenantID.ToUint64())
 
 	st := cluster.MakeTestingClusterSettings()
 	// Make the tenant heartbeat like crazy.
 	ctx := context.Background()
-	//slinstance.DefaultTTL.Override(ctx, &st.SV, 20*time.Millisecond)
-	slinstance.DefaultHeartBeat.Override(ctx, &st.SV, time.Millisecond)
+	slinstance.DefaultHeartBeat.Override(ctx, &st.SV, 10*time.Millisecond)
 
 	_, tenantDB := serverutils.StartTenant(t, hostServer, base.TestTenantArgs{
-		TenantID:                    tenantID,
-		Settings:                    st,
-		AllowSettingClusterSettings: true,
+		TenantID: tenantID,
+		Settings: st,
 	})
 
 	r := sqlutils.MakeSQLRunner(tenantDB)
 	_ = r
 
 	codec := keys.MakeSQLCodec(tenantID)
-	key := codec.IndexPrefix(keys.SqllivenessID, 1)
+	indexID := uint32(systemschema.SqllivenessTable().GetPrimaryIndexID())
+	key := codec.IndexPrefix(keys.SqllivenessID, indexID)
 
 	// livenessValue returns the KV value for the one row in the
 	// system.sqlliveness table. The value contains the session expiration time
@@ -960,7 +986,6 @@ func TestSQLLivenessExemption(t *testing.T) {
 
 	// Verify that heartbeats can go through and update the expiration time.
 	val := livenessValue()
-	time.Sleep(2 * time.Millisecond)
 	testutils.SucceedsSoon(
 		t,
 		func() error {
@@ -996,9 +1021,8 @@ func TestScheduledJobsConsumption(t *testing.T) {
 	var tenantServer serverutils.TestTenantInterface
 	var tenantDB *gosql.DB
 	tenantServer, tenantDB = serverutils.StartTenant(t, hostServer, base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		Settings:                    st,
-		AllowSettingClusterSettings: true,
+		TenantID: serverutils.TestTenantID(),
+		Settings: st,
 		TestingKnobs: base.TestingKnobs{
 			TenantTestingKnobs: &sql.TenantTestingKnobs{
 				OverrideTokenBucketProvider: func(kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider {
@@ -1083,9 +1107,8 @@ func TestConsumptionChangefeeds(t *testing.T) {
 	testProvider := newTestProvider()
 
 	_, tenantDB := serverutils.StartTenant(t, hostServer, base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		Settings:                    st,
-		AllowSettingClusterSettings: true,
+		TenantID: serverutils.TestTenantID(),
+		Settings: st,
 		TestingKnobs: base.TestingKnobs{
 			TenantTestingKnobs: &sql.TenantTestingKnobs{
 				OverrideTokenBucketProvider: func(kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider {
@@ -1140,7 +1163,6 @@ func TestConsumptionExternalStorage(t *testing.T) {
 
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
-	blobClientFactory := blobs.NewLocalOnlyBlobClientFactory(dir)
 	hostServer, hostDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Test fails when run within the default tenant. Tracked with #76378.
 		DisableDefaultTestTenant: true,
@@ -1155,14 +1177,10 @@ func TestConsumptionExternalStorage(t *testing.T) {
 
 	testProvider := newTestProvider()
 	_, tenantDB := serverutils.StartTenant(t, hostServer, base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		Settings:                    st,
-		AllowSettingClusterSettings: true,
-		ExternalIODir:               dir,
+		TenantID:      serverutils.TestTenantID(),
+		Settings:      st,
+		ExternalIODir: dir,
 		TestingKnobs: base.TestingKnobs{
-			Server: &server.TestingKnobs{
-				BlobClientFactory: blobClientFactory,
-			},
 			TenantTestingKnobs: &sql.TenantTestingKnobs{
 				OverrideTokenBucketProvider: func(kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider {
 					return testProvider
@@ -1228,7 +1246,7 @@ func TestConsumptionExternalStorage(t *testing.T) {
 		nodelocal.LocalRequiresExternalIOAccounting = true
 		defer func() { nodelocal.LocalRequiresExternalIOAccounting = false }()
 		before := testProvider.waitForConsumption(t)
-		r.Exec(t, "BACKUP t INTO 'nodelocal://0/backups/tenant'")
+		r.Exec(t, "BACKUP t INTO 'nodelocal://1/backups/tenant'")
 		c := testProvider.waitForConsumption(t)
 		c.Sub(&before)
 		require.NotEqual(t, uint64(0), c.ExternalIOEgressBytes)
@@ -1239,7 +1257,7 @@ func TestConsumptionExternalStorage(t *testing.T) {
 		nodelocal.LocalRequiresExternalIOAccounting = true
 		defer func() { nodelocal.LocalRequiresExternalIOAccounting = false }()
 		before := testProvider.waitForConsumption(t)
-		hostSQL.Exec(t, "BACKUP t INTO 'nodelocal://0/backups/host'")
+		hostSQL.Exec(t, "BACKUP t INTO 'nodelocal://1/backups/host'")
 		c := testProvider.waitForConsumption(t)
 		c.Sub(&before)
 		require.Equal(t, uint64(0), c.ExternalIOEgressBytes)
@@ -1262,9 +1280,8 @@ func BenchmarkExternalIOAccounting(b *testing.B) {
 	st := cluster.MakeTestingClusterSettings()
 	tenantcostmodel.ExternalIOEgressCostPerMiB.Override(context.Background(), &st.SV, 0.0)
 	tenantS, _ := serverutils.StartTenant(b, hostServer, base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		Settings:                    st,
-		AllowSettingClusterSettings: true,
+		TenantID: serverutils.TestTenantID(),
+		Settings: st,
 	})
 
 	nullsink.NullRequiresExternalIOAccounting = true

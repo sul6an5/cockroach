@@ -12,8 +12,8 @@ package kvcoord
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -138,8 +139,8 @@ type txnSpanRefresher struct {
 
 // SendLocked implements the lockedSender interface.
 func (sr *txnSpanRefresher) SendLocked(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	// Set the batch's CanForwardReadTimestamp flag.
 	ba.CanForwardReadTimestamp = sr.canForwardReadTimestampWithoutRefresh(ba.Txn)
 
@@ -164,11 +165,11 @@ func (sr *txnSpanRefresher) SendLocked(
 	// Iterate over and aggregate refresh spans in the requests, qualified by
 	// possible resume spans in the responses.
 	if err := sr.assertRefreshSpansAtInvalidTimestamp(br.Txn.ReadTimestamp); err != nil {
-		return nil, roachpb.NewError(err)
+		return nil, kvpb.NewError(err)
 	}
 	if !sr.refreshInvalid {
 		if err := sr.appendRefreshSpans(ctx, ba, br); err != nil {
-			return nil, roachpb.NewError(err)
+			return nil, kvpb.NewError(err)
 		}
 		// Check whether we should condense the refresh spans.
 		sr.maybeCondenseRefreshSpans(ctx, br.Txn)
@@ -214,8 +215,8 @@ func (sr *txnSpanRefresher) maybeCondenseRefreshSpans(
 // catches serializable errors and attempts to avoid them by refreshing the txn
 // at a larger timestamp.
 func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
-	ctx context.Context, ba roachpb.BatchRequest, maxRefreshAttempts int,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest, maxRefreshAttempts int,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	if ba.Txn.WriteTooOld {
 		// The WriteTooOld flag is not supposed to be set on requests. It's only set
 		// by the server and it's terminated by this interceptor on the client.
@@ -223,6 +224,13 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 			ba.String(), ba.Txn.String())
 	}
 	br, pErr := sr.wrapped.SendLocked(ctx, ba)
+
+	// We might receive errors with the WriteTooOld flag set. This interceptor
+	// wants to always terminate that flag. In the case of an error, we can just
+	// ignore it.
+	if pErr != nil && pErr.GetTxn() != nil {
+		pErr.GetTxn().WriteTooOld = false
+	}
 
 	if pErr == nil && br.Txn.WriteTooOld {
 		// If we got a response with the WriteTooOld flag set, then we pretend that
@@ -249,8 +257,8 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 		// chances that the refresh fails.
 		bumpedTxn := br.Txn.Clone()
 		bumpedTxn.WriteTooOld = false
-		pErr = roachpb.NewErrorWithTxn(
-			roachpb.NewTransactionRetryError(roachpb.RETRY_WRITE_TOO_OLD,
+		pErr = kvpb.NewErrorWithTxn(
+			kvpb.NewTransactionRetryError(kvpb.RETRY_WRITE_TOO_OLD,
 				"WriteTooOld flag converted to WriteTooOldError"),
 			bumpedTxn)
 		br = nil
@@ -262,8 +270,8 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 			log.VEventf(ctx, 2, "not checking error for refresh; refresh attempts exhausted")
 		}
 	}
-	if err := sr.forwardRefreshTimestampOnResponse(&ba, br, pErr); err != nil {
-		return nil, roachpb.NewError(err)
+	if err := sr.forwardRefreshTimestampOnResponse(ba, br, pErr); err != nil {
+		return nil, kvpb.NewError(err)
 	}
 	return br, pErr
 }
@@ -273,15 +281,15 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 // txn timestamp, it recurses into sendLockedWithRefreshAttempts and retries the
 // batch. If the refresh fails, the input pErr is returned.
 func (sr *txnSpanRefresher) maybeRefreshAndRetrySend(
-	ctx context.Context, ba roachpb.BatchRequest, pErr *roachpb.Error, maxRefreshAttempts int,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest, pErr *kvpb.Error, maxRefreshAttempts int,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	txn := pErr.GetTxn()
 	if txn == nil || !sr.canForwardReadTimestamp(txn) {
 		return nil, pErr
 	}
 	// Check for an error which can be refreshed away to avoid a client-side
 	// transaction restart.
-	ok, refreshTS := roachpb.TransactionRefreshTimestamp(pErr)
+	ok, refreshTS := kvpb.TransactionRefreshTimestamp(pErr)
 	if !ok {
 		return nil, pErr
 	}
@@ -301,6 +309,7 @@ func (sr *txnSpanRefresher) maybeRefreshAndRetrySend(
 	// We've refreshed all of the read spans successfully and bumped
 	// ba.Txn's timestamps. Attempt the request again.
 	log.Eventf(ctx, "refresh succeeded; retrying original request")
+	ba = ba.ShallowCopy()
 	ba.UpdateTxn(refreshToTxn)
 	sr.refreshAutoRetries.Inc(1)
 
@@ -314,8 +323,8 @@ func (sr *txnSpanRefresher) maybeRefreshAndRetrySend(
 	// of writes in the batch and then rejected wholesale when the EndTxn tries
 	// to evaluate the pushed batch. When split, the writes will be pushed but
 	// succeed, the transaction will be refreshed, and the EndTxn will succeed.
-	args, hasET := ba.GetArg(roachpb.EndTxn)
-	if len(ba.Requests) > 1 && hasET && !args.(*roachpb.EndTxnRequest).Require1PC {
+	args, hasET := ba.GetArg(kvpb.EndTxn)
+	if len(ba.Requests) > 1 && hasET && !args.(*kvpb.EndTxnRequest).Require1PC {
 		log.Eventf(ctx, "sending EndTxn separately from rest of batch on retry")
 		return sr.splitEndTxnAndRetrySend(ctx, ba)
 	}
@@ -335,8 +344,8 @@ func (sr *txnSpanRefresher) maybeRefreshAndRetrySend(
 // only the EndTxn request. It then issues the two partial batches in order,
 // stitching their results back together at the end.
 func (sr *txnSpanRefresher) splitEndTxnAndRetrySend(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	// NOTE: call back into SendLocked with each partial batch, not into
 	// sendLockedWithRefreshAttempts. This ensures that we properly set
 	// CanForwardReadTimestamp on each partial batch and that we provide
@@ -344,7 +353,7 @@ func (sr *txnSpanRefresher) splitEndTxnAndRetrySend(
 
 	// Issue a batch up to but not including the EndTxn request.
 	etIdx := len(ba.Requests) - 1
-	baPrefix := ba
+	baPrefix := ba.ShallowCopy()
 	baPrefix.Requests = ba.Requests[:etIdx]
 	brPrefix, pErr := sr.SendLocked(ctx, baPrefix)
 	if pErr != nil {
@@ -352,7 +361,7 @@ func (sr *txnSpanRefresher) splitEndTxnAndRetrySend(
 	}
 
 	// Issue a batch containing only the EndTxn request.
-	baSuffix := ba
+	baSuffix := ba.ShallowCopy()
 	baSuffix.Requests = ba.Requests[etIdx:]
 	baSuffix.UpdateTxn(brPrefix.Txn)
 	brSuffix, pErr := sr.SendLocked(ctx, baSuffix)
@@ -362,9 +371,9 @@ func (sr *txnSpanRefresher) splitEndTxnAndRetrySend(
 
 	// Combine the responses.
 	br := brPrefix
-	br.Responses = append(br.Responses, roachpb.ResponseUnion{})
-	if err := br.Combine(brSuffix, []int{etIdx}); err != nil {
-		return nil, roachpb.NewError(err)
+	br.Responses = append(br.Responses, kvpb.ResponseUnion{})
+	if err := br.Combine(ctx, brSuffix, []int{etIdx}, ba); err != nil {
+		return nil, kvpb.NewError(err)
 	}
 	return br, nil
 }
@@ -377,8 +386,8 @@ func (sr *txnSpanRefresher) splitEndTxnAndRetrySend(
 // If the force flag is true, the refresh will be attempted even if a refresh
 // is not inevitable.
 func (sr *txnSpanRefresher) maybeRefreshPreemptivelyLocked(
-	ctx context.Context, ba roachpb.BatchRequest, force bool,
-) (roachpb.BatchRequest, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest, force bool,
+) (*kvpb.BatchRequest, *kvpb.Error) {
 	// If we know that the transaction will need a refresh at some point because
 	// its write timestamp has diverged from its read timestamp, consider doing
 	// so preemptively. We perform a preemptive refresh if either a) doing so
@@ -427,8 +436,8 @@ func (sr *txnSpanRefresher) maybeRefreshPreemptivelyLocked(
 	refreshFree := ba.CanForwardReadTimestamp
 
 	// If true, this batch is guaranteed to fail without a refresh.
-	args, hasET := ba.GetArg(roachpb.EndTxn)
-	refreshInevitable := hasET && args.(*roachpb.EndTxnRequest).Commit
+	args, hasET := ba.GetArg(kvpb.EndTxn)
+	refreshInevitable := hasET && args.(*kvpb.EndTxnRequest).Commit
 
 	// If neither condition is true, defer the refresh.
 	if !refreshFree && !refreshInevitable && !force {
@@ -438,7 +447,7 @@ func (sr *txnSpanRefresher) maybeRefreshPreemptivelyLocked(
 	// If the transaction cannot change its read timestamp, no refresh is
 	// possible.
 	if !sr.canForwardReadTimestamp(ba.Txn) {
-		return ba, newRetryErrorOnFailedPreemptiveRefresh(ba.Txn, nil)
+		return nil, newRetryErrorOnFailedPreemptiveRefresh(ba.Txn, nil)
 	}
 
 	refreshFrom := ba.Txn.ReadTimestamp
@@ -450,31 +459,33 @@ func (sr *txnSpanRefresher) maybeRefreshPreemptivelyLocked(
 	// Try refreshing the txn spans at a timestamp that will allow us to commit.
 	if refreshErr := sr.tryRefreshTxnSpans(ctx, refreshFrom, refreshToTxn); refreshErr != nil {
 		log.Eventf(ctx, "preemptive refresh failed; propagating retry error")
-		return roachpb.BatchRequest{}, newRetryErrorOnFailedPreemptiveRefresh(ba.Txn, refreshErr)
+		return nil, newRetryErrorOnFailedPreemptiveRefresh(ba.Txn, refreshErr)
 	}
 
 	log.Eventf(ctx, "preemptive refresh succeeded")
+	ba = ba.ShallowCopy()
 	ba.UpdateTxn(refreshToTxn)
 	return ba, nil
 }
 
 func newRetryErrorOnFailedPreemptiveRefresh(
-	txn *roachpb.Transaction, refreshErr *roachpb.Error,
-) *roachpb.Error {
-	reason := roachpb.RETRY_SERIALIZABLE
+	txn *roachpb.Transaction, refreshErr *kvpb.Error,
+) *kvpb.Error {
+	reason := kvpb.RETRY_SERIALIZABLE
 	if txn.WriteTooOld {
-		reason = roachpb.RETRY_WRITE_TOO_OLD
+		reason = kvpb.RETRY_WRITE_TOO_OLD
 	}
-	msg := "failed preemptive refresh"
+	msg := redact.StringBuilder{}
+	msg.SafeString("failed preemptive refresh")
 	if refreshErr != nil {
-		if refreshErr, ok := refreshErr.GetDetail().(*roachpb.RefreshFailedError); ok {
-			msg = fmt.Sprintf("%s due to a conflict: %s on key %s", msg, refreshErr.FailureReason(), refreshErr.Key)
+		if refreshErr, ok := refreshErr.GetDetail().(*kvpb.RefreshFailedError); ok {
+			msg.Printf(" due to a conflict: %s on key %s", refreshErr.FailureReason(), refreshErr.Key)
 		} else {
-			msg = fmt.Sprintf("%s - unknown error: %s", msg, refreshErr)
+			msg.Printf(" - unknown error: %s", refreshErr)
 		}
 	}
-	retryErr := roachpb.NewTransactionRetryError(reason, msg)
-	return roachpb.NewErrorWithTxn(retryErr, txn)
+	retryErr := kvpb.NewTransactionRetryError(reason, msg.RedactableString())
+	return kvpb.NewErrorWithTxn(retryErr, txn)
 }
 
 // tryRefreshTxnSpans sends Refresh and RefreshRange commands to all spans read
@@ -486,7 +497,7 @@ func newRetryErrorOnFailedPreemptiveRefresh(
 // its ReadTimestamp adjusted by the Refresh() method.
 func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 	ctx context.Context, refreshFrom hlc.Timestamp, refreshToTxn *roachpb.Transaction,
-) (err *roachpb.Error) {
+) (err *kvpb.Error) {
 	// Track the result of the refresh in metrics.
 	defer func() {
 		if err == nil {
@@ -501,7 +512,7 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 
 	if sr.refreshInvalid {
 		log.VEvent(ctx, 2, "can't refresh txn spans; not valid")
-		return roachpb.NewError(errors.AssertionFailedf("can't refresh txn spans; not valid"))
+		return kvpb.NewError(errors.AssertionFailedf("can't refresh txn spans; not valid"))
 	} else if sr.refreshFootprint.empty() {
 		log.VEvent(ctx, 2, "there are no txn spans to refresh")
 		sr.forwardRefreshTimestampOnRefresh(refreshToTxn)
@@ -510,7 +521,7 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 
 	// Refresh all spans (merge first).
 	// TODO(nvanbenschoten): actually merge spans.
-	refreshSpanBa := roachpb.BatchRequest{}
+	refreshSpanBa := &kvpb.BatchRequest{}
 	refreshSpanBa.Txn = refreshToTxn
 	addRefreshes := func(refreshes *condensableSpanSet) {
 		// We're going to check writes between the previous refreshed timestamp, if
@@ -525,15 +536,15 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 		// we simply used txn.OrigTimestamp here), could cause false-positives that
 		// would fail the refresh.
 		for _, u := range refreshes.asSlice() {
-			var req roachpb.Request
+			var req kvpb.Request
 			if len(u.EndKey) == 0 {
-				req = &roachpb.RefreshRequest{
-					RequestHeader: roachpb.RequestHeaderFromSpan(u),
+				req = &kvpb.RefreshRequest{
+					RequestHeader: kvpb.RequestHeaderFromSpan(u),
 					RefreshFrom:   refreshFrom,
 				}
 			} else {
-				req = &roachpb.RefreshRangeRequest{
-					RequestHeader: roachpb.RequestHeaderFromSpan(u),
+				req = &kvpb.RefreshRangeRequest{
+					RequestHeader: kvpb.RequestHeaderFromSpan(u),
 					RefreshFrom:   refreshFrom,
 				}
 			}
@@ -557,10 +568,11 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 // appendRefreshSpans appends refresh spans from the supplied batch request,
 // qualified by the batch response where appropriate.
 func (sr *txnSpanRefresher) appendRefreshSpans(
-	ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse,
+	ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse,
 ) error {
+	expLogEnabled := log.ExpensiveLogEnabled(ctx, 3)
 	return ba.RefreshSpanIterate(br, func(span roachpb.Span) {
-		if log.ExpensiveLogEnabled(ctx, 3) {
+		if expLogEnabled {
 			log.VEventf(ctx, 3, "recording span to refresh: %s", span.String())
 		}
 		sr.refreshFootprint.insert(span)
@@ -605,7 +617,7 @@ func (sr *txnSpanRefresher) forwardRefreshTimestampOnRefresh(refreshToTxn *roach
 // refreshedTimestamp to stay in sync with "server-side refreshes", where the
 // transaction's read timestamp is updated during the evaluation of a batch.
 func (sr *txnSpanRefresher) forwardRefreshTimestampOnResponse(
-	ba *roachpb.BatchRequest, br *roachpb.BatchResponse, pErr *roachpb.Error,
+	ba *kvpb.BatchRequest, br *kvpb.BatchResponse, pErr *kvpb.Error,
 ) error {
 	baTxn := ba.Txn
 	var brTxn *roachpb.Transaction
@@ -674,9 +686,9 @@ func (sr *txnSpanRefresher) populateLeafFinalState(tfs *roachpb.LeafTxnFinalStat
 // importLeafFinalState is part of the txnInterceptor interface.
 func (sr *txnSpanRefresher) importLeafFinalState(
 	ctx context.Context, tfs *roachpb.LeafTxnFinalState,
-) {
+) error {
 	if err := sr.assertRefreshSpansAtInvalidTimestamp(tfs.Txn.ReadTimestamp); err != nil {
-		log.Fatalf(ctx, "%s", err)
+		return err
 	}
 	if tfs.RefreshInvalid {
 		sr.refreshInvalid = true
@@ -686,6 +698,7 @@ func (sr *txnSpanRefresher) importLeafFinalState(
 		// Check whether we should condense the refresh spans.
 		sr.maybeCondenseRefreshSpans(ctx, &tfs.Txn)
 	}
+	return nil
 }
 
 // epochBumpedLocked implements the txnInterceptor interface.

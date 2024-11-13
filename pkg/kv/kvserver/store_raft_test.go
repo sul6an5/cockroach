@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 func TestRaftReceiveQueue(t *testing.T) {
@@ -44,11 +44,11 @@ func TestRaftReceiveQueue(t *testing.T) {
 	qs.Load(r5)
 	require.Zero(t, m.AllocBytes())
 
-	q1, loaded := qs.LoadOrCreate(r1)
+	q1, loaded := qs.LoadOrCreate(r1, 10 /* maxLen */)
 	require.Zero(t, m.AllocBytes())
 	require.False(t, loaded)
 	{
-		q1x, loadedx := qs.LoadOrCreate(r1)
+		q1x, loadedx := qs.LoadOrCreate(r1, 10 /* maxLen */)
 		require.True(t, loadedx)
 		require.Equal(t, q1, q1x)
 	}
@@ -99,7 +99,7 @@ func TestRaftReceiveQueue(t *testing.T) {
 	}
 
 	// Now interleave creation of a second queue.
-	q5, loaded := qs.LoadOrCreate(r5)
+	q5, loaded := qs.LoadOrCreate(r5, 1 /* maxLen */)
 	{
 		require.False(t, loaded)
 		require.Zero(t, q5.acc.Used())

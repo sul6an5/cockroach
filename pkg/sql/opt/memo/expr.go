@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -282,13 +282,33 @@ func (n FiltersExpr) Difference(other FiltersExpr) FiltersExpr {
 // NoOpDistribution returns true if a DistributeExpr has the same distribution
 // as its input.
 func (e *DistributeExpr) NoOpDistribution() bool {
+	if target, source, ok := e.GetDistributions(); ok {
+		return target.Equals(source)
+	}
+	return false
+}
+
+// GetDistributions returns the target and source Distributions of this
+// `DistributeExpr`, if the provided physical properties have been built.
+func (e *DistributeExpr) GetDistributions() (target, source physical.Distribution, ok bool) {
 	distributionProvidedPhysical := e.ProvidedPhysical()
 	inputDistributionProvidedPhysical := e.Input.ProvidedPhysical()
-
 	if distributionProvidedPhysical != nil && inputDistributionProvidedPhysical != nil {
-		distribution := distributionProvidedPhysical.Distribution
+		target = distributionProvidedPhysical.Distribution
+		source = inputDistributionProvidedPhysical.Distribution
+		return target, source, true
+	}
+	return physical.Distribution{}, physical.Distribution{}, false
+}
+
+// HasHomeRegion returns true if the operation tree being distributed has a home
+// region.
+func (e *DistributeExpr) HasHomeRegion() bool {
+	inputDistributionProvidedPhysical := e.Input.ProvidedPhysical()
+
+	if inputDistributionProvidedPhysical != nil {
 		inputDistribution := inputDistributionProvidedPhysical.Distribution
-		return distribution.Equals(inputDistribution)
+		return len(inputDistribution.Regions) == 1
 	}
 	return false
 }
@@ -422,7 +442,7 @@ type ScanFlags struct {
 
 	// ZigzagIndexes makes planner prefer a zigzag with particular indexes.
 	// ForceZigzag must also be true.
-	ZigzagIndexes util.FastIntSet
+	ZigzagIndexes intsets.Fast
 }
 
 // Empty returns true if there are no flags set.
@@ -706,6 +726,8 @@ func (f *WindowFrame) String() string {
 
 // IsCanonical returns true if the ScanPrivate indicates an original unaltered
 // primary index Scan operator (i.e. unconstrained and not limited).
+// s.InvertedConstraint is implicitly nil because a primary index cannot
+// be inverted.
 func (s *ScanPrivate) IsCanonical() bool {
 	return s.Index == cat.PrimaryIndex &&
 		s.Constraint == nil &&
@@ -847,6 +869,30 @@ func (lj *LookupJoinPrivate) GetConstPrefixFilter(md *opt.Metadata) (pos int, ok
 		}
 	}
 	return 0, false
+}
+
+// ColIsEquivalentWithLookupIndexPrefix returns true if there is a term in
+// `LookupExpr` equating the first column in the lookup index with `col`.
+func (lj *LookupJoinPrivate) ColIsEquivalentWithLookupIndexPrefix(
+	md *opt.Metadata, col opt.ColumnID,
+) bool {
+	lookupTable := md.Table(lj.Table)
+	lookupIndex := lookupTable.Index(lj.Index)
+
+	idxCol := lj.Table.IndexColumnID(lookupIndex, 0)
+	var desiredEquivalentCols opt.ColSet
+	desiredEquivalentCols.Add(idxCol)
+	desiredEquivalentCols.Add(col)
+
+	for i := range lj.LookupExpr {
+		props := lj.LookupExpr[i].ScalarProps()
+
+		equivCols := props.FuncDeps.ComputeEquivGroup(idxCol)
+		if desiredEquivalentCols.SubsetOf(equivCols) {
+			return true
+		}
+	}
+	return false
 }
 
 // NeedResults returns true if the mutation operator can return the rows that
@@ -1280,4 +1326,85 @@ func (g *GroupingPrivate) GroupingOrderType(required *props.OrderingChoice) Grou
 		return NoStreaming
 	}
 	return PartialStreaming
+}
+
+// IsConstantsAndPlaceholders returns true if all values in the list are
+// constant, placeholders or tuples containing constants, placeholders or other
+// such nested tuples.
+func (v *ValuesExpr) IsConstantsAndPlaceholders() bool {
+	// Constant expressions should be leak-proof, so this is a quick test to
+	// determine if the ValuesExpr even needs to be checked.
+	if !v.Relational().VolatilitySet.IsLeakproof() {
+		return false
+	}
+	// Another quick check for something other than constants
+	if !v.Relational().OuterCols.Empty() {
+		return false
+	}
+	// A safety check
+	if len(v.Rows) == 0 {
+		return false
+	}
+	if !v.Rows.IsConstantsAndPlaceholders() {
+		return false
+	}
+	return true
+}
+
+// IsConstantsAndPlaceholders returns true if all scalar expressions in the list
+// are constants, placeholders or tuples containing constants or placeholders.
+// If a tuple nested within a tuple is found, false is returned.
+func (e ScalarListExpr) IsConstantsAndPlaceholders() bool {
+	return e.isConstantsAndPlaceholders(false /* insideTuple */)
+}
+
+func (e ScalarListExpr) isConstantsAndPlaceholders(insideTuple bool) bool {
+	for _, scalarExpr := range e {
+		if tupleExpr, ok := scalarExpr.(*TupleExpr); ok {
+			if insideTuple {
+				return false
+			}
+			if !tupleExpr.Elems.isConstantsAndPlaceholders(true) {
+				return false
+			}
+		} else {
+			if scalarExpr == nil {
+				panic(errors.AssertionFailedf("nil scalar expression in list"))
+			}
+			if !opt.IsConstValueOp(scalarExpr) && scalarExpr.Op() != opt.PlaceholderOp {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// IsConstantsAndPlaceholdersAndVariables returns true if all scalar expressions
+// in the list are constants, placeholders, variables, or tuples containing
+// constants, placeholders, or variables. If a tuple nested within a tuple is
+// found, false is returned.
+func (e ScalarListExpr) IsConstantsAndPlaceholdersAndVariables() bool {
+	return e.isConstantsAndPlaceholdersAndVariables(false /* insideTuple */)
+}
+
+func (e ScalarListExpr) isConstantsAndPlaceholdersAndVariables(insideTuple bool) bool {
+	for _, scalarExpr := range e {
+		if tupleExpr, ok := scalarExpr.(*TupleExpr); ok {
+			if insideTuple {
+				return false
+			}
+			if !tupleExpr.Elems.isConstantsAndPlaceholdersAndVariables(true) {
+				return false
+			}
+		} else {
+			if scalarExpr == nil {
+				panic(errors.AssertionFailedf("nil scalar expression in list"))
+			}
+			if !opt.IsConstValueOp(scalarExpr) && scalarExpr.Op() != opt.PlaceholderOp &&
+				scalarExpr.Op() != opt.VariableOp {
+				return false
+			}
+		}
+	}
+	return true
 }

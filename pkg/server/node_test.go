@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"runtime/pprof"
 	"sort"
 	"testing"
 
@@ -24,10 +25,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -63,7 +67,7 @@ func TestBootstrapCluster(t *testing.T) {
 	ctx := context.Background()
 	e := storage.NewDefaultInMemForTesting()
 	defer e.Close()
-	require.NoError(t, kvserver.WriteClusterVersion(ctx, e, clusterversion.TestingClusterVersion))
+	require.NoError(t, kvstorage.WriteClusterVersion(ctx, e, clusterversion.TestingClusterVersion))
 
 	initCfg := initServerCfg{
 		binaryMinSupportedVersion: clusterversion.TestingBinaryMinSupportedVersion,
@@ -248,7 +252,7 @@ func TestCorruptedClusterID(t *testing.T) {
 	defer e.Close()
 
 	cv := clusterversion.TestingClusterVersion
-	require.NoError(t, kvserver.WriteClusterVersion(ctx, e, cv))
+	require.NoError(t, kvstorage.WriteClusterVersion(ctx, e, cv))
 
 	initCfg := initServerCfg{
 		binaryMinSupportedVersion: clusterversion.TestingBinaryMinSupportedVersion,
@@ -491,7 +495,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	// were multiple replicas, more care would need to be taken in the initial
 	// syncFeed().
 	forceWriteStatus := func() {
-		if err := ts.node.computePeriodicMetrics(ctx, 0); err != nil {
+		if err := ts.node.computeMetricsPeriodically(ctx, map[*kvserver.Store]*storage.MetricsForInterval{}, 0); err != nil {
 			t.Fatalf("error publishing store statuses: %s", err)
 		}
 
@@ -545,7 +549,11 @@ func TestNodeStatusWritten(t *testing.T) {
 	// ========================================
 
 	// Split the range.
-	if err := ts.db.AdminSplit(context.Background(), splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := ts.db.AdminSplit(
+		context.Background(),
+		splitKey,
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -636,8 +644,8 @@ func TestNodeSendUnknownBatchRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ba := roachpb.BatchRequest{
-		Requests: make([]roachpb.RequestUnion, 1),
+	ba := kvpb.BatchRequest{
+		Requests: make([]kvpb.RequestUnion, 1),
 	}
 	n := &Node{}
 	br, err := n.batchInternal(context.Background(), roachpb.SystemTenantID, &ba)
@@ -647,9 +655,76 @@ func TestNodeSendUnknownBatchRequest(t *testing.T) {
 	if br.Error == nil {
 		t.Fatal("no batch error returned")
 	}
-	if _, ok := br.Error.GetDetail().(*roachpb.UnsupportedRequestError); !ok {
+	if _, ok := br.Error.GetDetail().(*kvpb.UnsupportedRequestError); !ok {
 		t.Fatalf("expected unsupported request, not %v", br.Error)
 	}
+}
+
+// TestNodeBatchRequestPProfLabels tests that node.Batch copies pprof labels
+// from the BatchRequest and applies them to the root context if CPU profiling
+// with labels is enabled.
+func TestNodeBatchRequestPProfLabels(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	observedProfileLabels := make(map[string]string)
+	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, _ *kvpb.BatchResponse) *kvpb.Error {
+					var foundBatch bool
+					for _, ru := range ba.Requests {
+						switch r := ru.GetInner().(type) {
+						case *kvpb.PutRequest:
+							if r.Header().Key.Equal(roachpb.Key("a")) {
+								foundBatch = true
+							}
+						}
+					}
+					if foundBatch {
+						pprof.ForLabels(ctx, func(key, value string) bool {
+							observedProfileLabels[key] = value
+							return true
+						})
+					}
+					return nil
+				},
+			},
+		},
+	})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.(*TestServer)
+	n := ts.GetNode()
+
+	var ba kvpb.BatchRequest
+	ba.RangeID = 1
+	ba.Replica.StoreID = 1
+	expectedProfileLabels := map[string]string{"key": "value", "key2": "value2"}
+	ba.ProfileLabels = func() []string {
+		var labels []string
+		for k, v := range expectedProfileLabels {
+			labels = append(labels, k, v)
+		}
+		return labels
+	}()
+
+	gr := kvpb.NewGet(roachpb.Key("a"), false)
+	pr := kvpb.NewPut(gr.Header().Key, roachpb.Value{})
+	ba.Add(gr, pr)
+
+	// If CPU profiling with labels is not enabled, we should not observe any
+	// pprof labels on the context.
+	ctx := context.Background()
+	_, _ = n.Batch(ctx, &ba)
+	require.Equal(t, map[string]string{}, observedProfileLabels)
+
+	require.NoError(t, ts.ClusterSettings().SetCPUProfiling(cluster.CPUProfileWithLabels))
+	_, _ = n.Batch(ctx, &ba)
+
+	require.Len(t, observedProfileLabels, 3)
+	// Delete the labels for the range_str.
+	delete(observedProfileLabels, "range_str")
+	require.Equal(t, expectedProfileLabels, observedProfileLabels)
 }
 
 func TestNodeBatchRequestMetricsInc(t *testing.T) {
@@ -662,15 +737,15 @@ func TestNodeBatchRequestMetricsInc(t *testing.T) {
 
 	n := ts.GetNode()
 	bCurr := n.metrics.BatchCount.Count()
-	getCurr := n.metrics.MethodCounts[roachpb.Get].Count()
-	putCurr := n.metrics.MethodCounts[roachpb.Put].Count()
+	getCurr := n.metrics.MethodCounts[kvpb.Get].Count()
+	putCurr := n.metrics.MethodCounts[kvpb.Put].Count()
 
-	var ba roachpb.BatchRequest
+	var ba kvpb.BatchRequest
 	ba.RangeID = 1
 	ba.Replica.StoreID = 1
 
-	gr := roachpb.NewGet(roachpb.Key("a"), false)
-	pr := roachpb.NewPut(gr.Header().Key, roachpb.Value{})
+	gr := kvpb.NewGet(roachpb.Key("a"), false)
+	pr := kvpb.NewPut(gr.Header().Key, roachpb.Value{})
 	ba.Add(gr, pr)
 
 	_, _ = n.Batch(context.Background(), &ba)
@@ -679,8 +754,8 @@ func TestNodeBatchRequestMetricsInc(t *testing.T) {
 	putCurr++
 
 	require.GreaterOrEqual(t, n.metrics.BatchCount.Count(), bCurr)
-	require.GreaterOrEqual(t, n.metrics.MethodCounts[roachpb.Get].Count(), getCurr)
-	require.GreaterOrEqual(t, n.metrics.MethodCounts[roachpb.Put].Count(), putCurr)
+	require.GreaterOrEqual(t, n.metrics.MethodCounts[kvpb.Get].Count(), getCurr)
+	require.GreaterOrEqual(t, n.metrics.MethodCounts[kvpb.Put].Count(), putCurr)
 }
 
 func TestGetTenantWeights(t *testing.T) {
@@ -718,8 +793,12 @@ func TestGetTenantWeights(t *testing.T) {
 	// another tenant, which will cause that tenant to have a weight of 1 in the
 	// relevant store(s).
 	const otherTenantID = 5
-	prefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(otherTenantID))
-	require.NoError(t, s.DB().AdminSplit(ctx, prefix, hlc.MaxTimestamp))
+	prefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(otherTenantID))
+	require.NoError(t, s.DB().AdminSplit(
+		ctx,
+		prefix,           /* splitKey */
+		hlc.MaxTimestamp, /* expirationTime */
+	))
 	// The range can have replicas on multiple stores, so wait for the split to
 	// be applied everywhere.
 	stores := s.GetStores().(*kvserver.Stores)

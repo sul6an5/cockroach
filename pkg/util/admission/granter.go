@@ -14,20 +14,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
-)
-
-// EnabledSoftSlotGranting can be set to false to disable soft slot granting.
-var EnabledSoftSlotGranting = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"admission.soft_slot_granting.enabled",
-	"soft slot granting is disabled if this setting is set to false",
-	true,
 )
 
 // noGrantChain is a sentinel value representing that the grant is not
@@ -40,68 +31,24 @@ type requesterClose interface {
 	close()
 }
 
-// For the cpu-bound slot case we have background activities (like Pebble
-// compactions) that would like to utilize additional slots if available (e.g.
-// to do concurrent compression of ssblocks). These activities do not want to
-// wait for a slot, since they can proceed without the slot at their usual
-// slower pace (e.g. without doing concurrent compression). They also are
-// sensitive to small overheads in their tight loops, and cannot afford the
-// overhead of interacting with admission control at a fine granularity (like
-// asking for a slot when compressing each ssblock). A coarse granularity
-// interaction causes a delay in returning slots to admission control, and we
-// don't want that delay to cause admission delay for normal work. Hence, we
-// model slots granted to background activities as "soft-slots". Think of
-// regular used slots as "hard-slots", in that we assume that the holder of
-// the slot is still "using" it, while a soft-slot is "squishy" and in some
-// cases we can pretend that it is not being used. Say we are allowed
-// to allocate up to M slots. In this scheme, when allocating a soft-slot
-// one must conform to usedSoftSlots+usedSlots <= M, and when allocating
-// a regular (hard) slot one must conform to usedSlots <= M.
-//
-// That is, soft-slots allow for over-commitment until the soft-slots are
-// returned, which may mean some additional queueing in the goroutine
-// scheduler.
-//
-// We have another wrinkle in that we do not want to maintain a single M. For
-// these optional background activities we desire to do them only when the
-// load is low enough. This is because at high load, all work suffers from
-// additional queueing in the goroutine scheduler. So we want to make sure
-// regular work does not suffer such goroutine scheduler queueing because we
-// granted too many soft-slots and caused CPU utilization to be high. So we
-// maintain two kinds of M, totalHighLoadSlots and totalModerateLoadSlots.
-// totalHighLoadSlots are estimated so as to allow CPU utilization to be high,
-// while totalModerateLoadSlots are trying to keep queuing in the goroutine
-// scheduler to a lower level. So the revised equations for allocation are:
-// - Allocating a soft-slot: usedSoftSlots+usedSlots <= totalModerateLoadSlots
-// - Allocating a regular slot: usedSlots <= totalHighLoadSlots
-//
-// NB: we may in the future add other kinds of background activities that do
-// not have a lag in interacting with admission control, but want to schedule
-// them only under moderate load. Those activities will be counted in
-// usedSlots but when granting a slot to such an activity, the equation will
-// be usedSoftSlots+usedSlots <= totalModerateLoadSlots.
-//
-// That is, let us not confuse that moderate load slot allocation is only for
-// soft-slots. Soft-slots are introduced only for squishiness.
-//
 // slotGranter implements granterWithLockedCalls.
 type slotGranter struct {
-	coord                  *GrantCoordinator
-	workKind               WorkKind
-	requester              requester
-	usedSlots              int
-	usedSoftSlots          int
-	totalHighLoadSlots     int
-	totalModerateLoadSlots int
-	skipSlotEnforcement    bool
+	coord               *GrantCoordinator
+	workKind            WorkKind
+	requester           requester
+	usedSlots           int
+	totalSlots          int
+	skipSlotEnforcement bool
 
 	// Optional. Nil for a slotGranter used for KVWork since the slots for that
 	// slotGranter are directly adjusted by the kvSlotAdjuster (using the
 	// kvSlotAdjuster here would provide a redundant identical signal).
 	cpuOverload cpuOverloadIndicator
 
-	usedSlotsMetric     *metric.Gauge
-	usedSoftSlotsMetric *metric.Gauge
+	usedSlotsMetric *metric.Gauge
+	// Non-nil for KV slots.
+	slotsExhaustedDurationMetric *metric.Counter
+	exhaustedStart               time.Time
 }
 
 var _ granterWithLockedCalls = &slotGranter{}
@@ -125,8 +72,11 @@ func (sg *slotGranter) tryGetLocked(count int64, _ int8) grantResult {
 	if sg.cpuOverload != nil && sg.cpuOverload.isOverloaded() {
 		return grantFailDueToSharedResource
 	}
-	if sg.usedSlots < sg.totalHighLoadSlots || sg.skipSlotEnforcement {
+	if sg.usedSlots < sg.totalSlots || sg.skipSlotEnforcement {
 		sg.usedSlots++
+		if sg.usedSlots == sg.totalSlots && sg.slotsExhaustedDurationMetric != nil {
+			sg.exhaustedStart = timeutil.Now()
+		}
 		sg.usedSlotsMetric.Update(int64(sg.usedSlots))
 		return grantSuccess
 	}
@@ -141,36 +91,15 @@ func (sg *slotGranter) returnGrant(count int64) {
 	sg.coord.returnGrant(sg.workKind, count, 0 /*arbitrary*/)
 }
 
-func (sg *slotGranter) tryGetSoftSlots(count int) int {
-	sg.coord.mu.Lock()
-	defer sg.coord.mu.Unlock()
-	spareModerateLoadSlots := sg.totalModerateLoadSlots - sg.usedSoftSlots - sg.usedSlots
-	if spareModerateLoadSlots <= 0 {
-		return 0
-	}
-	allocatedSlots := count
-	if allocatedSlots > spareModerateLoadSlots {
-		allocatedSlots = spareModerateLoadSlots
-	}
-	sg.usedSoftSlots += allocatedSlots
-	sg.usedSoftSlotsMetric.Update(int64(sg.usedSoftSlots))
-	return allocatedSlots
-}
-
-func (sg *slotGranter) returnSoftSlots(count int) {
-	sg.coord.mu.Lock()
-	defer sg.coord.mu.Unlock()
-	sg.usedSoftSlots -= count
-	sg.usedSoftSlotsMetric.Update(int64(sg.usedSoftSlots))
-	if sg.usedSoftSlots < 0 {
-		panic("used soft slots is negative")
-	}
-}
-
 // returnGrantLocked implements granterWithLockedCalls.
 func (sg *slotGranter) returnGrantLocked(count int64, _ int8) {
 	if count != 1 {
 		panic(errors.AssertionFailedf("unexpected count: %d", count))
+	}
+	if sg.usedSlots == sg.totalSlots && sg.slotsExhaustedDurationMetric != nil {
+		now := timeutil.Now()
+		exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
+		sg.slotsExhaustedDurationMetric.Inc(exhaustedMicros)
 	}
 	sg.usedSlots--
 	if sg.usedSlots < 0 {
@@ -190,6 +119,9 @@ func (sg *slotGranter) tookWithoutPermissionLocked(count int64, _ int8) {
 		panic(errors.AssertionFailedf("unexpected count: %d", count))
 	}
 	sg.usedSlots++
+	if sg.usedSlots == sg.totalSlots && sg.slotsExhaustedDurationMetric != nil {
+		sg.exhaustedStart = timeutil.Now()
+	}
 	sg.usedSlotsMetric.Update(int64(sg.usedSlots))
 }
 
@@ -217,6 +149,32 @@ func (sg *slotGranter) tryGrantLocked(grantChainID grantChainID) grantResult {
 		}
 	}
 	return res
+}
+
+//gcassert:inline
+func (sg *slotGranter) setTotalSlotsLocked(totalSlots int) {
+	// Mid-stack inlining.
+	if totalSlots == sg.totalSlots {
+		return
+	}
+	sg.setTotalSlotsLockedInternal(totalSlots)
+}
+
+func (sg *slotGranter) setTotalSlotsLockedInternal(totalSlots int) {
+	if sg.slotsExhaustedDurationMetric != nil {
+		if totalSlots > sg.totalSlots {
+			if sg.totalSlots <= sg.usedSlots && totalSlots > sg.usedSlots {
+				now := timeutil.Now()
+				exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
+				sg.slotsExhaustedDurationMetric.Inc(exhaustedMicros)
+			}
+		} else if totalSlots < sg.totalSlots {
+			if sg.totalSlots > sg.usedSlots && totalSlots <= sg.usedSlots {
+				sg.exhaustedStart = timeutil.Now()
+			}
+		}
+	}
+	sg.totalSlots = totalSlots
 }
 
 // tokenGranter implements granterWithLockedCalls.
@@ -314,19 +272,6 @@ func (tg *tokenGranter) tryGrantLocked(grantChainID grantChainID) grantResult {
 	return res
 }
 
-type workClass int8
-
-const (
-	// regularWorkClass is for work corresponding to workloads that are
-	// throughput and latency sensitive.
-	regularWorkClass workClass = iota
-	// elasticWorkClass is for work corresponding to workloads that can handle
-	// reduced throughput, possibly by taking longer to finish a workload. It is
-	// not latency sensitive.
-	elasticWorkClass
-	numWorkClasses
-)
-
 // kvStoreTokenGranter implements granterWithLockedCalls. It is used for
 // grants to KVWork to a store, that is limited by IO tokens. It encapsulates
 // two granter-requester pairs, for the two workClasses. The granter in these
@@ -347,19 +292,23 @@ type kvStoreTokenGranter struct {
 	coord            *GrantCoordinator
 	regularRequester requester
 	elasticRequester requester
-	// There is no rate limiting in granting these tokens. That is, they are all
-	// burst tokens.
-	availableIOTokens int64
+
+	coordMu struct { // holds fields protected by coord.mu.Lock
+		// There is no rate limiting in granting these tokens. That is, they are
+		// all burst tokens.
+		availableIOTokens int64
+		// Disk bandwidth tokens.
+		elasticDiskBWTokensAvailable int64
+
+		diskBWTokensUsed [admissionpb.NumWorkClasses]int64
+	}
+
 	// startingIOTokens is the number of tokens set by
-	// setAvailableIOTokensLocked. It is used to compute the tokens used, by
+	// setAvailableTokens. It is used to compute the tokens used, by
 	// computing startingIOTokens-availableIOTokens.
 	startingIOTokens                int64
 	ioTokensExhaustedDurationMetric *metric.Counter
 	exhaustedStart                  time.Time
-
-	// Disk bandwidth tokens.
-	elasticDiskBWTokensAvailable int64
-	diskBWTokensUsed             [numWorkClasses]int64
 
 	// Estimation models.
 	l0WriteLM, l0IngestLM, ingestLM tokensLinearModel
@@ -371,7 +320,7 @@ var _ granterWithIOTokens = &kvStoreTokenGranter{}
 // kvStoreTokenChildGranter handles a particular workClass. Its methods
 // pass-through to the parent after adding the workClass as a parameter.
 type kvStoreTokenChildGranter struct {
-	workClass workClass
+	workClass admissionpb.WorkClass
 	parent    *kvStoreTokenGranter
 }
 
@@ -410,13 +359,13 @@ func (cg *kvStoreTokenChildGranter) storeWriteDone(
 	return cg.parent.storeWriteDone(cg.workClass, originalTokens, doneInfo)
 }
 
-func (sg *kvStoreTokenGranter) tryGet(workClass workClass, count int64) bool {
+func (sg *kvStoreTokenGranter) tryGet(workClass admissionpb.WorkClass, count int64) bool {
 	return sg.coord.tryGet(KVWork, count, int8(workClass))
 }
 
 // tryGetLocked implements granterWithLockedCalls.
 func (sg *kvStoreTokenGranter) tryGetLocked(count int64, demuxHandle int8) grantResult {
-	wc := workClass(demuxHandle)
+	wc := admissionpb.WorkClass(demuxHandle)
 	// NB: ideally if regularRequester.hasWaitingRequests() returns true and
 	// wc==elasticWorkClass we should reject this request, since it means that
 	// more important regular work is waiting. However, we rely on the
@@ -425,62 +374,62 @@ func (sg *kvStoreTokenGranter) tryGetLocked(count int64, demuxHandle int8) grant
 	// elasticWorkClass is when the queue is empty, this case should be rare
 	// (and not cause a performance isolation failure).
 	switch wc {
-	case regularWorkClass:
-		if sg.availableIOTokens > 0 {
-			sg.subtractTokens(count, false)
-			sg.diskBWTokensUsed[wc] += count
+	case admissionpb.RegularWorkClass:
+		if sg.coordMu.availableIOTokens > 0 {
+			sg.subtractTokensLocked(count, false)
+			sg.coordMu.diskBWTokensUsed[wc] += count
 			return grantSuccess
 		}
-	case elasticWorkClass:
-		if sg.elasticDiskBWTokensAvailable > 0 && sg.availableIOTokens > 0 {
-			sg.elasticDiskBWTokensAvailable -= count
-			sg.subtractTokens(count, false)
-			sg.diskBWTokensUsed[wc] += count
+	case admissionpb.ElasticWorkClass:
+		if sg.coordMu.elasticDiskBWTokensAvailable > 0 && sg.coordMu.availableIOTokens > 0 {
+			sg.coordMu.elasticDiskBWTokensAvailable -= count
+			sg.subtractTokensLocked(count, false)
+			sg.coordMu.diskBWTokensUsed[wc] += count
 			return grantSuccess
 		}
 	}
 	return grantFailLocal
 }
 
-func (sg *kvStoreTokenGranter) returnGrant(workClass workClass, count int64) {
+func (sg *kvStoreTokenGranter) returnGrant(workClass admissionpb.WorkClass, count int64) {
 	sg.coord.returnGrant(KVWork, count, int8(workClass))
 }
 
 // returnGrantLocked implements granterWithLockedCalls.
 func (sg *kvStoreTokenGranter) returnGrantLocked(count int64, demuxHandle int8) {
-	wc := workClass(demuxHandle)
+	wc := admissionpb.WorkClass(demuxHandle)
 	// Return count tokens to the "IO tokens".
-	sg.subtractTokens(-count, false)
-	if wc == elasticWorkClass {
+	sg.subtractTokensLocked(-count, false)
+	if wc == admissionpb.ElasticWorkClass {
 		// Return count tokens to the elastic disk bandwidth tokens.
-		sg.elasticDiskBWTokensAvailable += count
+		sg.coordMu.elasticDiskBWTokensAvailable += count
 	}
-	sg.diskBWTokensUsed[wc] -= count
+	sg.coordMu.diskBWTokensUsed[wc] -= count
 }
 
-func (sg *kvStoreTokenGranter) tookWithoutPermission(workClass workClass, count int64) {
+func (sg *kvStoreTokenGranter) tookWithoutPermission(workClass admissionpb.WorkClass, count int64) {
 	sg.coord.tookWithoutPermission(KVWork, count, int8(workClass))
 }
 
 // tookWithoutPermissionLocked implements granterWithLockedCalls.
 func (sg *kvStoreTokenGranter) tookWithoutPermissionLocked(count int64, demuxHandle int8) {
-	wc := workClass(demuxHandle)
-	sg.subtractTokens(count, false)
-	if wc == elasticWorkClass {
-		sg.elasticDiskBWTokensAvailable -= count
+	wc := admissionpb.WorkClass(demuxHandle)
+	sg.subtractTokensLocked(count, false)
+	if wc == admissionpb.ElasticWorkClass {
+		sg.coordMu.elasticDiskBWTokensAvailable -= count
 	}
-	sg.diskBWTokensUsed[wc] += count
+	sg.coordMu.diskBWTokensUsed[wc] += count
 }
 
-// subtractTokens is a helper function that subtracts count tokens (count can
-// be negative, in which case this is really an addition).
-func (sg *kvStoreTokenGranter) subtractTokens(count int64, forceTickMetric bool) {
-	avail := sg.availableIOTokens
-	sg.availableIOTokens -= count
-	if count > 0 && avail > 0 && sg.availableIOTokens <= 0 {
+// subtractTokensLocked is a helper function that subtracts count tokens (count
+// can be negative, in which case this is really an addition).
+func (sg *kvStoreTokenGranter) subtractTokensLocked(count int64, forceTickMetric bool) {
+	avail := sg.coordMu.availableIOTokens
+	sg.coordMu.availableIOTokens -= count
+	if count > 0 && avail > 0 && sg.coordMu.availableIOTokens <= 0 {
 		// Transition from > 0 to <= 0.
 		sg.exhaustedStart = timeutil.Now()
-	} else if count < 0 && avail <= 0 && (sg.availableIOTokens > 0 || forceTickMetric) {
+	} else if count < 0 && avail <= 0 && (sg.coordMu.availableIOTokens > 0 || forceTickMetric) {
 		// Transition from <= 0 to > 0, or forced to tick the metric. The latter
 		// ensures that if the available tokens stay <= 0, we don't show a sudden
 		// change in the metric after minutes of exhaustion (we had observed such
@@ -488,7 +437,7 @@ func (sg *kvStoreTokenGranter) subtractTokens(count int64, forceTickMetric bool)
 		now := timeutil.Now()
 		exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
 		sg.ioTokensExhaustedDurationMetric.Inc(exhaustedMicros)
-		if sg.availableIOTokens <= 0 {
+		if sg.coordMu.availableIOTokens <= 0 {
 			sg.exhaustedStart = now
 		}
 	}
@@ -502,9 +451,9 @@ func (sg *kvStoreTokenGranter) requesterHasWaitingRequests() bool {
 // tryGrantLocked implements granterWithLockedCalls.
 func (sg *kvStoreTokenGranter) tryGrantLocked(grantChainID grantChainID) grantResult {
 	// First try granting to regular requester.
-	for wc := range sg.diskBWTokensUsed {
+	for wc := range sg.coordMu.diskBWTokensUsed {
 		req := sg.regularRequester
-		if workClass(wc) == elasticWorkClass {
+		if admissionpb.WorkClass(wc) == admissionpb.ElasticWorkClass {
 			req = sg.elasticRequester
 		}
 		if req.hasWaitingRequests() {
@@ -535,44 +484,49 @@ func (sg *kvStoreTokenGranter) tryGrantLocked(grantChainID grantChainID) grantRe
 	return grantFailLocal
 }
 
-// setAvailableIOTokensLocked implements granterWithIOTokens.
-func (sg *kvStoreTokenGranter) setAvailableIOTokensLocked(tokens int64) (tokensUsed int64) {
-	tokensUsed = sg.startingIOTokens - sg.availableIOTokens
+// setAvailableTokens implements granterWithIOTokens.
+func (sg *kvStoreTokenGranter) setAvailableTokens(
+	ioTokens int64, elasticDiskBandwidthTokens int64,
+) (ioTokensUsed int64) {
+	sg.coord.mu.Lock()
+	defer sg.coord.mu.Unlock()
+	ioTokensUsed = sg.startingIOTokens - sg.coordMu.availableIOTokens
 	// It is possible for availableIOTokens to be negative because of
 	// tookWithoutPermission or because tryGet will satisfy requests until
 	// availableIOTokens become <= 0. We want to remember this previous
 	// over-allocation.
-	sg.subtractTokens(-tokens, true)
-	if sg.availableIOTokens > tokens {
+	sg.subtractTokensLocked(-ioTokens, true)
+	if sg.coordMu.availableIOTokens > ioTokens {
 		// Clamp to tokens.
-		sg.availableIOTokens = tokens
+		sg.coordMu.availableIOTokens = ioTokens
 	}
-	sg.startingIOTokens = tokens
-	return tokensUsed
-}
+	sg.startingIOTokens = ioTokens
 
-// setAvailableElasticDiskBandwidthTokensLocked implements
-// granterWithIOTokens.
-func (sg *kvStoreTokenGranter) setAvailableElasticDiskBandwidthTokensLocked(tokens int64) {
-	sg.elasticDiskBWTokensAvailable += tokens
-	if sg.elasticDiskBWTokensAvailable > tokens {
-		sg.elasticDiskBWTokensAvailable = tokens
+	sg.coordMu.elasticDiskBWTokensAvailable += elasticDiskBandwidthTokens
+	if sg.coordMu.elasticDiskBWTokensAvailable > elasticDiskBandwidthTokens {
+		sg.coordMu.elasticDiskBWTokensAvailable = elasticDiskBandwidthTokens
 	}
+
+	return ioTokensUsed
 }
 
 // getDiskTokensUsedAndResetLocked implements granterWithIOTokens.
-func (sg *kvStoreTokenGranter) getDiskTokensUsedAndResetLocked() [numWorkClasses]int64 {
-	result := sg.diskBWTokensUsed
-	for i := range sg.diskBWTokensUsed {
-		sg.diskBWTokensUsed[i] = 0
+func (sg *kvStoreTokenGranter) getDiskTokensUsedAndReset() [admissionpb.NumWorkClasses]int64 {
+	sg.coord.mu.Lock()
+	defer sg.coord.mu.Unlock()
+	result := sg.coordMu.diskBWTokensUsed
+	for i := range sg.coordMu.diskBWTokensUsed {
+		sg.coordMu.diskBWTokensUsed[i] = 0
 	}
 	return result
 }
 
 // setAdmittedModelsLocked implements granterWithIOTokens.
-func (sg *kvStoreTokenGranter) setAdmittedDoneModelsLocked(
+func (sg *kvStoreTokenGranter) setAdmittedDoneModels(
 	l0WriteLM tokensLinearModel, l0IngestLM tokensLinearModel, ingestLM tokensLinearModel,
 ) {
+	sg.coord.mu.Lock()
+	defer sg.coord.mu.Unlock()
 	sg.l0WriteLM = l0WriteLM
 	sg.l0IngestLM = l0IngestLM
 	sg.ingestLM = ingestLM
@@ -580,7 +534,7 @@ func (sg *kvStoreTokenGranter) setAdmittedDoneModelsLocked(
 
 // storeWriteDone implements granterWithStoreWriteDone.
 func (sg *kvStoreTokenGranter) storeWriteDone(
-	wc workClass, originalTokens int64, doneInfo StoreWorkDoneInfo,
+	wc admissionpb.WorkClass, originalTokens int64, doneInfo StoreWorkDoneInfo,
 ) (additionalTokens int64) {
 	// Normally, we follow the structure of a foo() method calling into a foo()
 	// method on the GrantCoordinator, which then calls fooLocked() on the
@@ -592,32 +546,32 @@ func (sg *kvStoreTokenGranter) storeWriteDone(
 	// For storeWriteDone we don't bother with this structure involving the
 	// GrantCoordinator (which has served us well across various methods and
 	// various granter implementations), since the decision on when the
-	// GrantCoordinator should call tryGrant is more complicated. And since this
+	// GrantCoordinator should call tryGrantLocked is more complicated. And since this
 	// storeWriteDone is unique to the kvStoreTokenGranter (and not implemented
 	// by other granters) this approach seems acceptable.
 
 	// Reminder: coord.mu protects the state in the kvStoreTokenGranter.
 	sg.coord.mu.Lock()
 	exhaustedFunc := func() bool {
-		return sg.availableIOTokens <= 0 ||
-			(wc == elasticWorkClass && sg.elasticDiskBWTokensAvailable <= 0)
+		return sg.coordMu.availableIOTokens <= 0 ||
+			(wc == admissionpb.ElasticWorkClass && sg.coordMu.elasticDiskBWTokensAvailable <= 0)
 	}
 	wasExhausted := exhaustedFunc()
 	actualL0WriteTokens := sg.l0WriteLM.applyLinearModel(doneInfo.WriteBytes)
 	actualL0IngestTokens := sg.l0IngestLM.applyLinearModel(doneInfo.IngestedBytes)
 	actualL0Tokens := actualL0WriteTokens + actualL0IngestTokens
 	additionalL0TokensNeeded := actualL0Tokens - originalTokens
-	sg.subtractTokens(additionalL0TokensNeeded, false)
+	sg.subtractTokensLocked(additionalL0TokensNeeded, false)
 	actualIngestTokens := sg.ingestLM.applyLinearModel(doneInfo.IngestedBytes)
 	additionalDiskBWTokensNeeded := (actualL0WriteTokens + actualIngestTokens) - originalTokens
-	if wc == elasticWorkClass {
-		sg.elasticDiskBWTokensAvailable -= additionalDiskBWTokensNeeded
+	if wc == admissionpb.ElasticWorkClass {
+		sg.coordMu.elasticDiskBWTokensAvailable -= additionalDiskBWTokensNeeded
 	}
-	sg.diskBWTokensUsed[wc] += additionalDiskBWTokensNeeded
+	sg.coordMu.diskBWTokensUsed[wc] += additionalDiskBWTokensNeeded
 	if additionalL0TokensNeeded < 0 || additionalDiskBWTokensNeeded < 0 {
 		isExhausted := exhaustedFunc()
 		if wasExhausted && !isExhausted {
-			sg.coord.tryGrant()
+			sg.coord.tryGrantLocked()
 		}
 	}
 	sg.coord.mu.Unlock()
@@ -640,10 +594,9 @@ type IOThresholdConsumer interface {
 
 // StoreMetrics are the metrics for a store.
 type StoreMetrics struct {
-	StoreID int32
+	StoreID roachpb.StoreID
 	*pebble.Metrics
 	WriteStallCount int64
-	*pebble.InternalIntervalMetrics
 	// Optional.
 	DiskStats DiskStats
 }
@@ -673,12 +626,6 @@ var (
 		Measurement: "Slots",
 		Unit:        metric.Unit_COUNT,
 	}
-	totalModerateSlots = metric.Metadata{
-		Name:        "admission.granter.total_moderate_slots.kv",
-		Help:        "Total moderate load slots for low priority work",
-		Measurement: "Slots",
-		Unit:        metric.Unit_COUNT,
-	}
 	usedSlots = metric.Metadata{
 		// Note: we append a WorkKind string to this name.
 		Name:        "admission.granter.used_slots.",
@@ -686,9 +633,39 @@ var (
 		Measurement: "Slots",
 		Unit:        metric.Unit_COUNT,
 	}
-	usedSoftSlots = metric.Metadata{
-		Name:        "admission.granter.used_soft_slots.kv",
-		Help:        "Used soft slots",
+	// NB: this metric is independent of whether slots enforcement is happening
+	// or not.
+	kvSlotsExhaustedDuration = metric.Metadata{
+		Name:        "admission.granter.slots_exhausted_duration.kv",
+		Help:        "Total duration when KV slots were exhausted, in micros",
+		Measurement: "Microseconds",
+		Unit:        metric.Unit_COUNT,
+	}
+	// We have a metric for both short and long period. These metrics use the
+	// period provided in CPULoad and not wall time. So if the sum of the rate
+	// of these two is < 1sec/sec, the CPULoad ticks are not happening at the
+	// expected frequency (this could happen due to CPU overload).
+	kvCPULoadShortPeriodDuration = metric.Metadata{
+		Name:        "admission.granter.cpu_load_short_period_duration.kv",
+		Help:        "Total duration when CPULoad was being called with a short period, in micros",
+		Measurement: "Microseconds",
+		Unit:        metric.Unit_COUNT,
+	}
+	kvCPULoadLongPeriodDuration = metric.Metadata{
+		Name:        "admission.granter.cpu_load_long_period_duration.kv",
+		Help:        "Total duration when CPULoad was being called with a long period, in micros",
+		Measurement: "Microseconds",
+		Unit:        metric.Unit_COUNT,
+	}
+	kvSlotAdjusterIncrements = metric.Metadata{
+		Name:        "admission.granter.slot_adjuster_increments.kv",
+		Help:        "Number of increments of the total KV slots",
+		Measurement: "Slots",
+		Unit:        metric.Unit_COUNT,
+	}
+	kvSlotAdjusterDecrements = metric.Metadata{
+		Name:        "admission.granter.slot_adjuster_decrements.kv",
+		Help:        "Number of decrements of the total KV slots",
 		Measurement: "Slots",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -718,35 +695,3 @@ var (
 // uses the term "slot" for these is that we have a completion indicator, and
 // when we do have such an indicator it can be beneficial to be able to keep
 // track of how many ongoing work items we have.
-
-// SoftSlotGranter grants soft slots without queueing. See the comment with
-// kvGranter.
-type SoftSlotGranter struct {
-	kvGranter *slotGranter
-}
-
-// MakeSoftSlotGranter constructs a SoftSlotGranter given a GrantCoordinator
-// that is responsible for KV and lower layers.
-func MakeSoftSlotGranter(gc *GrantCoordinator) (*SoftSlotGranter, error) {
-	kvGranter, ok := gc.granters[KVWork].(*slotGranter)
-	if !ok {
-		return nil, errors.Errorf("GrantCoordinator does not support soft slots")
-	}
-	return &SoftSlotGranter{
-		kvGranter: kvGranter,
-	}, nil
-}
-
-// TryGetSlots attempts to acquire count slots and returns what was acquired
-// (possibly 0).
-func (ssg *SoftSlotGranter) TryGetSlots(count int) int {
-	if !EnabledSoftSlotGranting.Get(&ssg.kvGranter.coord.settings.SV) {
-		return 0
-	}
-	return ssg.kvGranter.tryGetSoftSlots(count)
-}
-
-// ReturnSlots returns count slots (count must be >= 0).
-func (ssg *SoftSlotGranter) ReturnSlots(count int) {
-	ssg.kvGranter.returnSoftSlots(count)
-}

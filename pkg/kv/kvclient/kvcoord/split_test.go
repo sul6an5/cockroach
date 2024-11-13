@@ -109,7 +109,11 @@ func TestRangeSplitMeta(t *testing.T) {
 	for _, splitRKey := range splitKeys {
 		splitKey := roachpb.Key(splitRKey)
 		log.Infof(ctx, "starting split at key %q...", splitKey)
-		if err := s.DB.AdminSplit(ctx, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+		if err := s.DB.AdminSplit(
+			ctx,
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		); err != nil {
 			t.Fatal(err)
 		}
 		log.Infof(ctx, "split at key %q complete", splitKey)
@@ -156,7 +160,11 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 			<-txnChannel
 		}
 		log.Infof(ctx, "starting split at key %q...", splitKey)
-		if pErr := s.DB.AdminSplit(context.Background(), splitKey, hlc.MaxTimestamp /* expirationTime */); pErr != nil {
+		if pErr := s.DB.AdminSplit(
+			context.Background(),
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		); pErr != nil {
 			t.Error(pErr)
 		}
 		log.Infof(ctx, "split at key %q complete", splitKey)
@@ -251,11 +259,19 @@ func TestRangeSplitsWithSameKeyTwice(t *testing.T) {
 
 	splitKey := roachpb.Key("aa")
 	log.Infof(ctx, "starting split at key %q...", splitKey)
-	if err := s.DB.AdminSplit(ctx, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := s.DB.AdminSplit(
+		ctx,
+		splitKey,
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 	log.Infof(ctx, "split at key %q first time complete", splitKey)
-	if err := s.DB.AdminSplit(ctx, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := s.DB.AdminSplit(
+		ctx,
+		splitKey,
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -280,7 +296,11 @@ func TestRangeSplitsStickyBit(t *testing.T) {
 	descKey := keys.RangeDescriptorKey(splitKey)
 
 	// Splitting range.
-	if err := s.DB.AdminSplit(ctx, splitKey.AsRawKey(), hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := s.DB.AdminSplit(
+		ctx,
+		splitKey.AsRawKey(),
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -300,7 +320,11 @@ func TestRangeSplitsStickyBit(t *testing.T) {
 	}
 
 	// Splitting range.
-	if err := s.DB.AdminSplit(ctx, splitKey.AsRawKey(), hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := s.DB.AdminSplit(
+		ctx,
+		splitKey.AsRawKey(),
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 

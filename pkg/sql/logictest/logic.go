@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/url"
 	"os"
 	"path"
@@ -37,13 +38,17 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach-go/v2/testserver"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/externalconn/providers" // imported to register ExternalConnection providers
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -54,6 +59,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/corpus"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
@@ -68,13 +74,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/lib/pq"
@@ -150,9 +157,9 @@ import (
 // A link to the issue will be printed out if the -print-blocklist-issues flag
 // is specified.
 //
-// There is a special directive '!metamorphic' that adjusts the server to force
-// the usage of production values for some constants that might change via the
-// metamorphic testing.
+// There is a special directive '!metamorphic-batch-sizes' that adjusts the
+// server to force the usage of production values related for some constants,
+// mostly related to batch sizes, that might change via metamorphic testing.
 //
 //
 // ###########################################################
@@ -169,13 +176,24 @@ import (
 // the test is run as the system tenant.
 //
 // The directives line looks like:
-// # tenant-cluster-setting-override-opt: opt1 opt2
+// # tenant-cluster-setting-override-opt: setting_name1=setting_value1 setting_name2=setting_value2
 //
-// The options are:
-// - allow-zone-configs-for-secondary-tenants: If specified, secondary tenants
-// are allowed to alter their zone configurations.
-// - allow-multi-region-abstractions-for-secondary-tenants: If specified,
-// secondary tenants are allowed to make use of multi-region abstractions.
+//
+// ###########################################################
+//           TENANT CAPABILITY OVERRIDE OPTION DIRECTIVES
+// ###########################################################
+//
+// Test files can also contain tenant capability override directives around
+// the beginning of the file. These directives can be used to configure tenant
+// capability overrides during setup. This can be useful for altering
+// tenant capabilities for configurations that run their tests as
+// secondary tenants (eg. 3node-tenant). While these directives apply to all
+// configurations under which the test will be run, it's only really meaningful
+// when the test runs as a secondary tenant; the configuration has no effect if
+// the test is run as the system tenant.
+//
+// The directives line looks like:
+// # tenant-capability-override-opt: capability_id1=capability_value1 capability_id2=capability_value2
 //
 //
 // ###########################################
@@ -270,6 +288,11 @@ import (
 //      - R for decimal
 //      - B for boolean
 //      - O for oid
+//      - _ to include the column header, but ignore the column results.
+//        This is useful to verify that a column exists when the results are
+//        non-deterministic and to avoid projecting all other columns (for
+//        example `SHOW RANGES FROM TABLE`). A "_" placeholder is written in
+//        place of actual results.
 //
 //    Options are comma separated strings from the following:
 //      - nosort (default)
@@ -290,8 +313,7 @@ import (
 //            duration. If the test succeeds at any time during that period, it
 //            is considered successful. Otherwise, it is a failure. See
 //            testutils.SucceedsSoon for more information. If run with the
-//            -rewrite flag, inserts a 500ms sleep before executing the query
-//            once.
+//            -rewrite flag, the query will be run only once after a 2s sleep.
 //      - async: runs the query asynchronously, marking it as a pending
 //            query using the label parameter as a unique name, to be completed
 //            and validated later with "awaitquery". This is intended for use
@@ -312,6 +334,7 @@ import (
 //            Cannot be combined with noticetrace.
 //      - noticetrace: runs the query and compares only the notices that
 //						appear. Cannot be combined with kvtrace.
+//      - nodeidx=N: runs the query on node N of the cluster.
 //
 //    The label is optional. If specified, the test runner stores a hash
 //    of the results of the query under the given label. If the label is
@@ -355,11 +378,15 @@ import (
 //    Changes the user for subsequent statements or queries.
 //    If nodeidx is specified, this user will connect to the node
 //    in the cluster with index N (note this is 0-indexed, while
-//    node IDs themselves are 1-indexed).
-//
+//    node IDs themselves are 1-indexed). Otherwise, it will connect
+//    to the node with index 0 (node ID 1).
 //    A "host-cluster-" prefix can be prepended to the user, which will force
 //    the user session to be against the host cluster (useful for multi-tenant
 //    configurations).
+//
+//  - upgrade N
+//    When using a cockroach-go/testserver logictest, upgrades the node at
+//    index N to the version specified by the logictest config.
 //
 //  - skipif <mysql/mssql/postgresql/cockroachdb/config CONFIG [ISSUE]>
 //    Skips the following `statement` or `query` if the argument is
@@ -381,6 +408,12 @@ import (
 //    Defines the start of a subtest. The subtest is any number of statements
 //    that occur after this command until the end of file or the next subtest
 //    command.
+//
+//  - retry
+//    Specifies that the next occurrence of a statement or query directive
+//    (including those which expect errors) will be retried for a fixed
+//    duration until the test passes, or the alloted time has elapsed.
+//    This is similar to the retry option of the query directive.
 //
 // The overall architecture of TestLogic is as follows:
 //
@@ -533,7 +566,9 @@ var (
 		"declarative-corpus", "",
 		"enables generation and storage of a declarative schema changer	corpus",
 	)
-
+	defaultWorkmem = flag.Bool("default-workmem", false,
+		"disable randomization of sql.distsql.temp_storage.workmem",
+	)
 	// globalMVCCRangeTombstone will write a global MVCC range tombstone across
 	// the entire user keyspace during cluster bootstrapping. This should not
 	// semantically affect the test data written above it, but will activate MVCC
@@ -549,6 +584,9 @@ var (
 	// writes not holding appropriate latches for range key stats update.
 	useMVCCRangeTombstonesForPointDeletes = util.ConstantWithMetamorphicTestBool(
 		"logictest-use-mvcc-range-tombstones-for-point-deletes", false)
+
+	// BackupRestoreProbability is the environment variable for `3node-backup` config.
+	backupRestoreProbability = envutil.EnvOrDefaultFloat64("COCKROACH_LOGIC_TEST_BACKUP_RESTORE_PROBABILITY", 0.0)
 )
 
 const queryRewritePlaceholderPrefix = "__async_query_rewrite_placeholder"
@@ -618,6 +656,10 @@ type pendingQuery struct {
 func (ls *logicStatement) readSQL(
 	t *logicTest, s *logictestbase.LineScanner, allowSeparator bool,
 ) (separator bool, _ error) {
+	if err := t.maybeBackupRestore(t.rng, t.cfg); err != nil {
+		return false, err
+	}
+
 	var buf bytes.Buffer
 	hasVars := false
 	for s.Scan() {
@@ -833,9 +875,6 @@ type logicQuery struct {
 	colTypes string
 	// colNames controls the inclusion of column names in the query result.
 	colNames bool
-	// retry indicates if the query should be retried in case of failure with
-	// exponential backoff up to some maximum duration.
-	retry bool
 	// some tests require the output to match modulo sorting.
 	sorter logicSorter
 	// expectedErr and expectedErrCode are as in logicStatement.
@@ -882,9 +921,9 @@ type logicQuery struct {
 	// messages.
 	rawOpts string
 
-	// roundFloatsInStrings can be set to use a regular expression to find floats
-	// that may be embedded in strings and replace them with rounded versions.
-	roundFloatsInStrings bool
+	// roundFloatsInStringsSigFigs specifies the number of significant figures
+	// to round floats embedded in strings to where zero means do not round.
+	roundFloatsInStringsSigFigs int
 }
 
 var allowedKVOpTypes = []string{
@@ -930,14 +969,15 @@ type logicTest struct {
 	clusterOpts []clusterOpt
 	// knobOpts are the options used to create testing knobs.
 	knobOpts []knobOpt
-	// tenantClusterSettingOverrideOpts are the options used by the host cluster
-	// to configure tenant setting overrides  during setup. They're persisted here
-	// because a cluster can be recreated throughout the lifetime of a test, and
-	// we should override tenant settings each time this happens.
-	tenantClusterSettingOverrideOpts []tenantClusterSettingOverrideOpt
+	// toa contains tenant overrides that are persisted here because a cluster
+	// can be recreated throughout the lifetime of a test, and we should use
+	// tenant overrides each time this happens.
+	toa tenantOverrideArgs
 	// cluster is the test cluster against which we are testing. This cluster
 	// may be reset during the lifetime of the test.
 	cluster serverutils.TestClusterInterface
+	// testserverCluster is the testserver cluster. This uses real binaries.
+	testserverCluster testserver.TestServer
 	// sharedIODir is the ExternalIO directory that is shared between all clusters
 	// created in the same logicTest. It is populated during setup() of the logic
 	// test.
@@ -948,9 +988,10 @@ type logicTest struct {
 	// If this test uses a SQL tenant server, this is its address. In this case,
 	// all clients are created against this tenant.
 	tenantAddrs []string
-	// map of built clients. Needs to be persisted so that we can
-	// re-use them and close them all on exit.
-	clients map[string]*gosql.DB
+	// map of built clients, keyed first on username and then node idx.
+	// They are persisted so that they can be reused. They are not closed
+	// until the end of a test.
+	clients map[string]map[int]*gosql.DB
 	// client currently in use. This can change during processing
 	// of a test input file when encountering the "user" directive.
 	// see setUser() for details.
@@ -1015,6 +1056,17 @@ type logicTest struct {
 	// declarativeCorpusCollector used to save declarative schema changer state
 	// to disk.
 	declarativeCorpusCollector *corpus.Collector
+
+	// forceBackupAndRestore is set to true if the user wants to run a cluster
+	// backup and restore before running the next SQL statement. This can be set
+	// to true using the `force-backup-restore` directive.
+	forceBackupAndRestore bool
+
+	// retry indicates if the statement or query should be retried in case of
+	// failure with exponential backoff up to some maximum duration. It is reset
+	// to false after every successful statement or query test point, including
+	// those which are supposed to error out.
+	retry bool
 }
 
 func (t *logicTest) t() *testing.T {
@@ -1058,7 +1110,7 @@ func (t *logicTest) substituteVars(line string) string {
 		if replace, ok := t.varMap[varName]; ok {
 			return replace
 		}
-		return line
+		return varName
 	})
 }
 
@@ -1110,33 +1162,45 @@ func (t *logicTest) outf(format string, args ...interface{}) {
 	fmt.Printf("[%s] %s\n", now, msg)
 }
 
-// setUser sets the DB client to the specified user.
-// It returns a cleanup function to be run when the credentials
-// are no longer needed.
-func (t *logicTest) setUser(user string, nodeIdxOverride int) func() {
-	if t.clients == nil {
-		t.clients = map[string]*gosql.DB{}
-	}
-	if db, ok := t.clients[user]; ok {
-		t.db = db
-		t.user = user
+// setUser sets the DB client to the specified user and connects
+// to the node in the cluster at index nodeIdx.
+func (t *logicTest) setUser(user string, nodeIdx int) {
+	db := t.getOrOpenClient(user, nodeIdx)
+	t.db = db
+	t.user = user
+	t.nodeIdx = nodeIdx
+}
 
-		// No cleanup necessary, but return a no-op func to avoid nil pointer dereference.
-		return func() {}
-	}
-
-	nodeIdx := t.nodeIdx
-	if nodeIdxOverride > 0 {
-		nodeIdx = nodeIdxOverride
+// getOrOpenClient returns the existing client for the given user and nodeIdx,
+// if one exists. Otherwise, it opens and returns a new client.
+func (t *logicTest) getOrOpenClient(user string, nodeIdx int) *gosql.DB {
+	if db, ok := t.clients[user][nodeIdx]; ok {
+		return db
 	}
 
-	addr := t.cluster.Server(nodeIdx).ServingSQLAddr()
-	if len(t.tenantAddrs) > 0 && !strings.HasPrefix(user, "host-cluster-") {
-		addr = t.tenantAddrs[nodeIdx]
-	}
+	var pgURL url.URL
 	pgUser := strings.TrimPrefix(user, "host-cluster-")
-	pgURL, cleanupFunc := sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(pgUser))
+	if t.cfg.UseCockroachGoTestserver {
+		pgURL = *t.testserverCluster.PGURLForNode(nodeIdx)
+		_, port, err := net.SplitHostPort(pgURL.Host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The host needs to use 127.0.0.1 instead of localhost, since if the node
+		// is listening on port 0, then macs only listen on ipv4 and not ipv6.
+		pgURL.Host = net.JoinHostPort("127.0.0.1", port)
+		pgURL.User = url.User(pgUser)
+	} else {
+		addr := t.cluster.Server(nodeIdx).ServingSQLAddr()
+		if len(t.tenantAddrs) > 0 && !strings.HasPrefix(user, "host-cluster-") {
+			addr = t.tenantAddrs[nodeIdx]
+		}
+		var cleanupFunc func()
+		pgURL, cleanupFunc = sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(pgUser))
+		t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, cleanupFunc)
+	}
 	pgURL.Path = "test"
+
 	db := t.openDB(pgURL)
 
 	// The default value for extra_float_digits assumed by tests is
@@ -1152,11 +1216,15 @@ func (t *logicTest) setUser(user string, nodeIdxOverride int) func() {
 	if _, err := db.Exec("SET index_recommendations_enabled = false"); err != nil {
 		t.Fatal(err)
 	}
-	t.clients[user] = db
-	t.db = db
-	t.user = pgUser
+	if t.clients == nil {
+		t.clients = make(map[string]map[int]*gosql.DB)
+	}
+	if t.clients[user] == nil {
+		t.clients[user] = make(map[int]*gosql.DB)
+	}
+	t.clients[user][nodeIdx] = db
 
-	return cleanupFunc
+	return db
 }
 
 func (t *logicTest) openDB(pgURL url.URL) *gosql.DB {
@@ -1178,16 +1246,75 @@ func (t *logicTest) openDB(pgURL url.URL) *gosql.DB {
 	return gosql.OpenDB(connector)
 }
 
+// Prevent a lint failure "this value is never used" in
+// `(*logicTest).setup` when bazel.BuiltWithBazel returns false.
+var _ = ((*logicTest)(nil)).newTestServerCluster
+
+// newTestServerCluster creates a 3-node cluster using the cockroach-go library.
+// bootstrapBinaryPath is given by the config's CockroachGoBootstrapVersion.
+// upgradeBinaryPath is given by the config's CockroachGoUpgradeVersion, or
+// is the locally built version if CockroachGoUpgradeVersion was not specified.
+func (t *logicTest) newTestServerCluster(bootstrapBinaryPath string, upgradeBinaryPath string) {
+	// During config initialization, NumNodes is required to be 3.
+	opts := []testserver.TestServerOpt{
+		testserver.ThreeNodeOpt(),
+		testserver.StoreOnDiskOpt(),
+		testserver.CockroachBinaryPathOpt(bootstrapBinaryPath),
+		testserver.UpgradeCockroachBinaryPathOpt(upgradeBinaryPath),
+		testserver.PollListenURLTimeoutOpt(120),
+	}
+	if strings.Contains(upgradeBinaryPath, "cockroach-short") {
+		// If we're using a cockroach-short binary, that means it was locally
+		// built, so we need to opt-in to development upgrades.
+		opts = append(opts, testserver.EnvVarOpt([]string{
+			"COCKROACH_UPGRADE_TO_DEV_VERSION=true",
+		}))
+	}
+
+	ts, err := testserver.NewTestServer(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < t.cfg.NumNodes; i++ {
+		// Wait for each node to be reachable.
+		if err := ts.WaitForInitFinishForNode(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.testserverCluster = ts
+	t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, ts.Stop)
+
+	t.setUser(username.RootUser, 0 /* nodeIdx */)
+}
+
 // newCluster creates a new cluster. It should be called after the logic tests's
 // server args are configured. That is, either during setup() when creating the
 // initial cluster to be used in a test, or when creating additional test
 // clusters, after logicTest.setup() has been called.
 func (t *logicTest) newCluster(
-	serverArgs TestServerArgs,
-	clusterOpts []clusterOpt,
-	knobOpts []knobOpt,
-	tenantClusterSettingOverrideOpts []tenantClusterSettingOverrideOpt,
+	serverArgs TestServerArgs, clusterOpts []clusterOpt, knobOpts []knobOpt, toa tenantOverrideArgs,
 ) {
+	makeClusterSettings := func(forSystemTenant bool) *cluster.Settings {
+		var st *cluster.Settings
+		if forSystemTenant {
+			// System tenants use the constructor that doesn't initialize the
+			// cluster version (see makeTestConfigFromParams). This is needed
+			// for local-mixed-22.2-23.1 config.
+			st = cluster.MakeClusterSettings()
+		} else {
+			// Regular tenants use the constructor that initializes the cluster
+			// version (see TestServer.StartTenant).
+			st = cluster.MakeTestingClusterSettings()
+		}
+		// Disable stats collection on system tables before the cluster is
+		// started, otherwise there is a race condition where stats may be
+		// collected before we can disable them with `SET CLUSTER SETTING`. We
+		// disable stats collection on system tables in order to have
+		// deterministic tests.
+		stats.AutomaticStatisticsOnSystemTables.Override(context.Background(), &st.SV, false)
+		return st
+	}
 	var corpusCollectionCallback func(p scplan.Plan, stageIdx int) error
 	if serverArgs.DeclarativeCorpusCollection && t.declarativeCorpusCollector != nil {
 		corpusCollectionCallback = t.declarativeCorpusCollector.GetBeforeStage(t.rootT.Name(), t.t())
@@ -1199,36 +1326,28 @@ func (t *logicTest) newCluster(
 	if serverArgs.MaxSQLMemoryLimit == 0 {
 		// Specify a fixed memory limit (some test cases verify OOM conditions;
 		// we don't want those to take long on large machines).
-		serverArgs.MaxSQLMemoryLimit = 192 * 1024 * 1024
+		serverArgs.MaxSQLMemoryLimit = 256 * 1024 * 1024
 	}
 	// We have some queries that bump into 100MB default temp storage limit
 	// when run with fakedist-disk config, so we'll use a larger limit here.
 	// There isn't really a downside to doing so.
 	tempStorageDiskLimit := int64(512 << 20) /* 512 MiB */
 	// MVCC range tombstones are only available in 22.2 or newer.
-	supportsMVCCRangeTombstones := (t.cfg.BootstrapVersion.Equal(roachpb.Version{}) ||
-		!t.cfg.BootstrapVersion.Less(clusterversion.ByKey(clusterversion.SetSystemUsersUserIDColumnNotNull))) &&
-		(t.cfg.BinaryVersion.Equal(roachpb.Version{}) ||
-			!t.cfg.BinaryVersion.Less(clusterversion.ByKey(clusterversion.SetSystemUsersUserIDColumnNotNull)))
-	ignoreMVCCRangeTombstoneErrors := supportsMVCCRangeTombstones &&
-		(globalMVCCRangeTombstone || useMVCCRangeTombstonesForPointDeletes)
+	shouldUseMVCCRangeTombstonesForPointDeletes := useMVCCRangeTombstonesForPointDeletes && !serverArgs.DisableUseMVCCRangeTombstonesForPointDeletes
+	ignoreMVCCRangeTombstoneErrors := globalMVCCRangeTombstone || shouldUseMVCCRangeTombstonesForPointDeletes
 
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			SQLMemoryPoolSize: serverArgs.MaxSQLMemoryLimit,
-			TempStorageConfig: base.DefaultTestTempStorageConfigWithSize(
-				cluster.MakeTestingClusterSettings(), tempStorageDiskLimit,
-			),
+			SQLMemoryPoolSize:        serverArgs.MaxSQLMemoryLimit,
 			DisableDefaultTestTenant: t.cfg.UseTenant || t.cfg.DisableDefaultTestTenant,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					// The consistency queue makes a lot of noisy logs during logic tests.
 					DisableConsistencyQueue:  true,
-					GlobalMVCCRangeTombstone: supportsMVCCRangeTombstones && globalMVCCRangeTombstone,
+					GlobalMVCCRangeTombstone: globalMVCCRangeTombstone,
 					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-						DisableInitPutFailOnTombstones: ignoreMVCCRangeTombstoneErrors,
-						UseRangeTombstonesForPointDeletes: supportsMVCCRangeTombstones &&
-							useMVCCRangeTombstonesForPointDeletes,
+						DisableInitPutFailOnTombstones:    ignoreMVCCRangeTombstoneErrors,
+						UseRangeTombstonesForPointDeletes: shouldUseMVCCRangeTombstonesForPointDeletes,
 					},
 				},
 				SQLEvalContext: &eval.TestingKnobs{
@@ -1270,11 +1389,12 @@ func (t *logicTest) newCluster(
 	params.ServerArgs.Knobs.DistSQL = &execinfra.TestingKnobs{
 		ForceDiskSpill: cfg.SQLExecUseDisk,
 	}
-	if cfg.BootstrapVersion != (roachpb.Version{}) {
+	if cfg.BootstrapVersion != clusterversion.Key(0) {
 		if params.ServerArgs.Knobs.Server == nil {
 			params.ServerArgs.Knobs.Server = &server.TestingKnobs{}
 		}
-		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BinaryVersionOverride = cfg.BootstrapVersion
+		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BootstrapVersionKeyOverride = cfg.BootstrapVersion
+		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BinaryVersionOverride = clusterversion.ByKey(cfg.BootstrapVersion)
 	}
 	if cfg.DisableUpgrade {
 		if params.ServerArgs.Knobs.Server == nil {
@@ -1306,37 +1426,10 @@ func (t *logicTest) newCluster(
 		} else {
 			require.Lenf(t.rootT, cfg.Localities, 0, "node %d does not have a locality set", i+1)
 		}
-
-		if cfg.BinaryVersion != (roachpb.Version{}) {
-			binaryMinSupportedVersion := cfg.BinaryVersion
-			if cfg.BootstrapVersion != (roachpb.Version{}) {
-				// If we want to run a specific server version, we assume that it
-				// supports at least the bootstrap version.
-				binaryMinSupportedVersion = cfg.BootstrapVersion
-			}
-			nodeParams.Settings = cluster.MakeTestingClusterSettingsWithVersions(
-				cfg.BinaryVersion,
-				binaryMinSupportedVersion,
-				false, /* initializeVersion */
-			)
-
-			// If we're injecting fake versions, hook up logic to simulate the end
-			// version existing.
-			from := clusterversion.ClusterVersion{Version: cfg.BootstrapVersion}
-			to := clusterversion.ClusterVersion{Version: cfg.BinaryVersion}
-			if len(clusterversion.ListBetween(from, to)) == 0 {
-				mm, ok := nodeParams.Knobs.UpgradeManager.(*upgrade.TestingKnobs)
-				if !ok {
-					mm = &upgrade.TestingKnobs{}
-					nodeParams.Knobs.UpgradeManager = mm
-				}
-				mm.ListBetweenOverride = func(
-					from, to clusterversion.ClusterVersion,
-				) []clusterversion.ClusterVersion {
-					return []clusterversion.ClusterVersion{to}
-				}
-			}
-		}
+		nodeParams.Settings = makeClusterSettings(true /* forSystemTenant */)
+		nodeParams.TempStorageConfig = base.DefaultTestTempStorageConfigWithSize(
+			nodeParams.Settings, tempStorageDiskLimit,
+		)
 		paramsPerNode[i] = nodeParams
 	}
 	params.ServerArgsPerNode = paramsPerNode
@@ -1358,9 +1451,11 @@ func (t *logicTest) newCluster(
 	if cfg.UseTenant {
 		t.tenantAddrs = make([]string, cfg.NumNodes)
 		for i := 0; i < cfg.NumNodes; i++ {
+			settings := makeClusterSettings(false /* forSystemTenant */)
+			tempStorageConfig := base.DefaultTestTempStorageConfigWithSize(settings, tempStorageDiskLimit)
 			tenantArgs := base.TestTenantArgs{
-				TenantID:                    serverutils.TestTenantID(),
-				AllowSettingClusterSettings: true,
+				TenantID: serverutils.TestTenantID(),
+				Settings: settings,
 				TestingKnobs: base.TestingKnobs{
 					SQLExecutor: &sql.ExecutorTestingKnobs{
 						DeterministicExplain:            true,
@@ -1369,13 +1464,10 @@ func (t *logicTest) newCluster(
 					SQLStatsKnobs: &sqlstats.TestingKnobs{
 						AOSTClause: "AS OF SYSTEM TIME '-1us'",
 					},
-					TenantTestingKnobs: &sql.TenantTestingKnobs{
-						AllowSplitAndScatter: cfg.AllowSplitAndScatter,
-					},
 					RangeFeed: paramsPerNode[i].Knobs.RangeFeed,
 				},
 				MemoryPoolSize:    params.ServerArgs.SQLMemoryPoolSize,
-				TempStorageConfig: &params.ServerArgs.TempStorageConfig,
+				TempStorageConfig: &tempStorageConfig,
 				Locality:          paramsPerNode[i].Locality,
 				TracingDefault:    params.ServerArgs.TracingDefault,
 				// Give every tenant its own ExternalIO directory.
@@ -1425,14 +1517,12 @@ func (t *logicTest) newCluster(
 	// If we've created a tenant (either explicitly, or probabilistically and
 	// implicitly) set any necessary cluster settings to override blocked
 	// behavior.
-	clusterSettingOverrideArgs := &tenantClusterSettingOverrideArgs{}
 	if cfg.UseTenant || t.cluster.StartedDefaultTestTenant() {
-		for _, opt := range tenantClusterSettingOverrideOpts {
-			opt.apply(clusterSettingOverrideArgs)
-		}
 
 		conn := t.cluster.StorageClusterConn()
-		if clusterSettingOverrideArgs.overrideMultiTenantZoneConfigsAllowed {
+		clusterSettings := toa.clusterSettings
+		_, ok := clusterSettings[sql.SecondaryTenantZoneConfigsEnabled.Key()]
+		if ok {
 			// We reduce the closed timestamp duration on the host tenant so that the
 			// setting override can propagate to the tenant faster.
 			if _, err := conn.Exec(
@@ -1445,39 +1535,47 @@ func (t *logicTest) newCluster(
 			); err != nil {
 				t.Fatal(err)
 			}
+		}
 
-			// Allow secondary tenants to set zone configurations if the configuration
-			// indicates as such. As this is a tenant read-only cluster setting, only
-			// the operator is allowed to set it.
-			if _, err := conn.Exec(
-				"ALTER TENANT $1 SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled = true",
-				serverutils.TestTenantID().ToUint64(),
-			); err != nil {
+		tenantID := serverutils.TestTenantID()
+		for name, value := range clusterSettings {
+			query := fmt.Sprintf("ALTER TENANT [$1] SET CLUSTER SETTING %s = $2", name)
+			if _, err := conn.Exec(query, tenantID.ToUint64(), value); err != nil {
 				t.Fatal(err)
 			}
 		}
 
-		if clusterSettingOverrideArgs.overrideMultiTenantMultiRegionAbstractionsAllowed {
-			// Allow secondary tenants to make use of multi-region abstractions if the
-			// configuration indicates as such. As this is a tenant read-only cluster
-			// setting, only the operator is allowed to set it.
-			if _, err := conn.Exec(
-				fmt.Sprintf(
-					"ALTER TENANT $1 SET CLUSTER SETTING %s = true",
-					sql.SecondaryTenantsMultiRegionAbstractionsEnabledSettingName,
-				),
-				serverutils.TestTenantID().ToUint64(),
-			); err != nil {
+		capabilities := toa.capabilities
+		for name, value := range capabilities {
+			query := fmt.Sprintf("ALTER TENANT [$1] GRANT CAPABILITY %s = $2", name)
+			if _, err := conn.Exec(query, tenantID.ToUint64(), value); err != nil {
 				t.Fatal(err)
 			}
+		}
+		numCapabilities := len(capabilities)
+		if numCapabilities > 0 {
+			capabilityMap := make(map[tenantcapabilities.ID]string, numCapabilities)
+			for k, v := range capabilities {
+				capability, ok := tenantcapabilities.FromName(k)
+				if !ok {
+					t.Fatalf("cannot get capability from name %q", k)
+				}
+				capabilityMap[capability.ID()] = v
+			}
+			t.cluster.WaitForTenantCapabilities(t.t(), tenantID, capabilityMap)
 		}
 	}
 
 	var randomWorkmem int
 	if t.rng.Float64() < 0.5 && !serverArgs.DisableWorkmemRandomization {
 		// Randomize sql.distsql.temp_storage.workmem cluster setting in
-		// [10KiB, 100KiB) range.
-		randomWorkmem = 10<<10 + t.rng.Intn(90<<10)
+		// [10KiB, 100KiB) range for normal tests and even bigger for sqlite
+		// tests.
+		if *Bigtest {
+			randomWorkmem = 100<<10 + t.rng.Intn(90<<10)
+		} else {
+			randomWorkmem = 10<<10 + t.rng.Intn(90<<10)
+		}
 	}
 
 	// Set cluster settings.
@@ -1545,6 +1643,14 @@ func (t *logicTest) newCluster(
 			t.Fatal(err)
 		}
 
+		// We also disable stats forecasts to have deterministic tests. See #97003
+		// for details.
+		if _, err := conn.Exec(
+			"SET CLUSTER SETTING sql.stats.forecasts.enabled = false",
+		); err != nil {
+			t.Fatal(err)
+		}
+
 		// Update the default AS OF time for querying the system.table_statistics
 		// table to create the crdb_internal.table_row_statistics table.
 		if _, err := conn.Exec(
@@ -1559,6 +1665,14 @@ func (t *logicTest) newCluster(
 				t.Fatal(err)
 			}
 			t.outf("setting distsql_workmem='%dB';", randomWorkmem)
+		}
+
+		if serverArgs.DisableDirectColumnarScans {
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.distsql.direct_columnar_scans.enabled = false",
+			); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 
@@ -1587,22 +1701,13 @@ func (t *logicTest) newCluster(
 		})
 	}
 
-	if clusterSettingOverrideArgs.overrideMultiTenantZoneConfigsAllowed {
+	for name, value := range toa.clusterSettings {
 		t.waitForTenantReadOnlyClusterSettingToTakeEffectOrFatal(
-			"sql.zone_configs.allow_for_secondary_tenant.enabled", "true", params.ServerArgs.Insecure,
-		)
-	}
-	if clusterSettingOverrideArgs.overrideMultiTenantMultiRegionAbstractionsAllowed {
-		t.waitForTenantReadOnlyClusterSettingToTakeEffectOrFatal(
-			sql.SecondaryTenantsMultiRegionAbstractionsEnabledSettingName,
-			"true",
-			params.ServerArgs.Insecure,
+			name, value, params.ServerArgs.Insecure,
 		)
 	}
 
-	// db may change over the lifetime of this function, with intermediate
-	// values cached in t.clients and finally closed in t.close().
-	t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, t.setUser(username.RootUser, 0 /* nodeIdxOverride */))
+	t.setUser(username.RootUser, 0 /* nodeIdx */)
 }
 
 // waitForTenantReadOnlyClusterSettingToTakeEffectOrFatal waits until all tenant
@@ -1655,8 +1760,10 @@ func (t *logicTest) shutdownCluster() {
 		t.cluster = nil
 	}
 	if t.clients != nil {
-		for _, c := range t.clients {
-			c.Close()
+		for _, userClients := range t.clients {
+			for _, c := range userClients {
+				c.Close()
+			}
 		}
 		t.clients = nil
 	}
@@ -1665,6 +1772,7 @@ func (t *logicTest) shutdownCluster() {
 
 // resetCluster cleans up the current cluster, and creates a fresh one.
 func (t *logicTest) resetCluster() {
+	t.traceStop()
 	t.shutdownCluster()
 	if t.serverArgs == nil {
 		// We expect the server args to be persisted to the test during test
@@ -1672,7 +1780,7 @@ func (t *logicTest) resetCluster() {
 		t.Fatal("resetting the cluster before server args were set")
 	}
 	serverArgs := *t.serverArgs
-	t.newCluster(serverArgs, t.clusterOpts, t.knobOpts, t.tenantClusterSettingOverrideOpts)
+	t.newCluster(serverArgs, t.clusterOpts, t.knobOpts, t.toa)
 }
 
 // setup creates the initial cluster for the logic test and populates the
@@ -1684,21 +1792,60 @@ func (t *logicTest) setup(
 	serverArgs TestServerArgs,
 	clusterOpts []clusterOpt,
 	knobOpts []knobOpt,
-	tenantClusterSettingOverrideOpts []tenantClusterSettingOverrideOpt,
+	toa tenantOverrideArgs,
 ) {
 	t.cfg = cfg
 	t.serverArgs = &serverArgs
 	t.serverArgs.DeclarativeCorpusCollection = cfg.DeclarativeCorpusCollection
 	t.clusterOpts = clusterOpts[:]
 	t.knobOpts = knobOpts[:]
-	t.tenantClusterSettingOverrideOpts = tenantClusterSettingOverrideOpts[:]
+	t.toa = toa
 	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
 	// MySQL or Postgres instance.
 	tempExternalIODir, tempExternalIODirCleanup := testutils.TempDir(t.rootT)
 	t.sharedIODir = tempExternalIODir
 	t.testCleanupFuncs = append(t.testCleanupFuncs, tempExternalIODirCleanup)
 
-	t.newCluster(serverArgs, t.clusterOpts, t.knobOpts, t.tenantClusterSettingOverrideOpts)
+	if cfg.UseCockroachGoTestserver {
+		skip.UnderRace(t.t(), "test uses a different binary, so the race detector doesn't work")
+		skip.UnderStress(t.t(), "test takes a long time and downloads release artifacts")
+		if !bazel.BuiltWithBazel() {
+			skip.IgnoreLint(t.t(), "cockroach-go/testserver can only be uzed in bazel builds")
+		}
+		if cfg.NumNodes != 3 {
+			t.Fatal("cockroach-go testserver tests must use 3 nodes")
+		}
+
+		upgradeVersion, err := version.Parse(build.BinaryVersion())
+		if err != nil {
+			t.Fatal(err)
+		}
+		bootstrapVersion, err := version.PredecessorVersion(*upgradeVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bootstrapBinaryPath, err := binfetcher.Download(context.Background(), binfetcher.Options{
+			Binary:  "cockroach",
+			Dir:     tempExternalIODir,
+			Version: "v" + bootstrapVersion,
+			GOOS:    runtime.GOOS,
+			GOARCH:  runtime.GOARCH,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Prevent a lint failure "this value is never used" when
+		// bazel.BuiltWithBazel returns false above.
+		_ = bootstrapBinaryPath
+		upgradeBinaryPath, found := bazel.FindBinary("pkg/cmd/cockroach-short/cockroach-short_/", "cockroach-short")
+		if !found {
+			t.Fatal(errors.New("cockroach binary not found"))
+		}
+		t.newTestServerCluster(bootstrapBinaryPath, upgradeBinaryPath)
+	} else {
+		t.newCluster(serverArgs, t.clusterOpts, t.knobOpts, t.toa)
+	}
 
 	// Only create the test database on the initial cluster, since cluster restore
 	// expects an empty cluster.
@@ -1708,19 +1855,8 @@ CREATE DATABASE test; USE test;
 		t.Fatal(err)
 	}
 
-	if !t.cfg.BootstrapVersion.Equal(roachpb.Version{}) && t.cfg.BootstrapVersion.Less(clusterversion.ByKey(clusterversion.SetSystemUsersUserIDColumnNotNull)) {
-		// Hacky way to create user with an ID if we're on a
-		// bootstrapped binary less than 22.2. The version gate
-		// causes the regular CREATE USER to fail since it will not
-		// insert an ID.
-		if _, err := t.db.Exec(`INSERT INTO system.users VALUES ($1, '', false, $2);`,
-			username.TestUser, 100); err != nil {
-			t.Fatal(err)
-		}
-	} else {
-		if _, err := t.db.Exec(fmt.Sprintf("CREATE USER %s;", username.TestUser)); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := t.db.Exec(fmt.Sprintf("CREATE USER %s;", username.TestUser)); err != nil {
+		t.Fatal(err)
 	}
 
 	t.labelMap = make(map[string]string)
@@ -1733,48 +1869,11 @@ CREATE DATABASE test; USE test;
 	t.unsupported = 0
 }
 
-type tenantClusterSettingOverrideArgs struct {
-	// If set, the sql.zone_configs.allow_for_secondary_tenant.enabled default
-	// is set to true by the host. This is allows logic tests that run on
-	// secondary tenants to use zone configurations.
-	overrideMultiTenantZoneConfigsAllowed bool
-	// If set, the
-	// sql.multi_region.allow_abstractions_for_secondary_tenants.enabled default
-	// is set to true by the host. This allows logic tests that run on secondary
-	// tenants to make use of multi-region abstractions.
-	overrideMultiTenantMultiRegionAbstractionsAllowed bool
-}
-
-// tenantClusterSettingOverrideOpt is implemented by options for configuring
-// tenant setting overrides during setup. For tests that run on the system
-// tenant, these options have no effect.
-type tenantClusterSettingOverrideOpt interface {
-	apply(*tenantClusterSettingOverrideArgs)
-}
-
-// tenantClusterSettingOverrideMultiTenantMultiRegionAbstractionsAllowed
-// corresponds to the allow-multi-region-abstractions-for-secondary-tenants
-// directive.
-type tenantClusterSettingOverrideMultiTenantMultiRegionAbstractionsAllowed struct{}
-
-var _ tenantClusterSettingOverrideOpt = &tenantClusterSettingOverrideMultiTenantMultiRegionAbstractionsAllowed{}
-
-func (t tenantClusterSettingOverrideMultiTenantMultiRegionAbstractionsAllowed) apply(
-	args *tenantClusterSettingOverrideArgs,
-) {
-	args.overrideMultiTenantMultiRegionAbstractionsAllowed = true
-}
-
-// tenantClusterSettingOverrideMultiTenantZoneConfigsAllowed corresponds to
-// the allow-zone-configs-for-secondary-tenants directive.
-type tenantClusterSettingOverrideMultiTenantZoneConfigsAllowed struct{}
-
-var _ tenantClusterSettingOverrideOpt = tenantClusterSettingOverrideMultiTenantZoneConfigsAllowed{}
-
-func (t tenantClusterSettingOverrideMultiTenantZoneConfigsAllowed) apply(
-	args *tenantClusterSettingOverrideArgs,
-) {
-	args.overrideMultiTenantZoneConfigsAllowed = true
+// tenantOverrideArgs are the arguments used by the host cluster to configure
+// tenant overrides (eg. cluster settings, capabilities) during setup.
+type tenantOverrideArgs struct {
+	clusterSettings map[string]string
+	capabilities    map[string]string
 }
 
 // clusterOpt is implemented by options for configuring the test cluster under
@@ -1857,8 +1956,10 @@ func (c knobOptDisableCorpusGeneration) apply(args *base.TestingKnobs) {
 // invoked with each option.
 func parseDirectiveOptions(t *testing.T, path string, directiveName string, f func(opt string)) {
 	switch directiveName {
-	case "knob-opt", "cluster-opt", "tenant-cluster-setting-override-opt":
-		// Fallthrough.
+	case knobDirective,
+		clusterDirective,
+		tenantClusterSettingOverrideDirective,
+		tenantCapabilityOverrideDirective:
 	default:
 		t.Fatalf("cannot parse unknown directive %s", directiveName)
 	}
@@ -1907,31 +2008,47 @@ func parseDirectiveOptions(t *testing.T, path string, directiveName string, f fu
 	}
 }
 
-// readTenantClusterSettingOverrideArgs looks around the beginning of the file
+const (
+	tenantClusterSettingOverrideDirective = "tenant-cluster-setting-override-opt"
+	tenantCapabilityOverrideDirective     = "tenant-capability-override-opt"
+)
+
+// readTenantOverrideArgs looks around the beginning of the file
 // for a line looking like:
 // # tenant-cluster-setting-override-opt: opt1 opt2 ...
-// and parses that line into a set of tenantClusterSettingOverrideArgs that need
+// # tenant-capability-override-opt: opt1 opt2
+// and parses that line into a set of tenantOverrideArgs that need
 // to be overriden by the host cluster before the test begins.
-func readTenantClusterSettingOverrideArgs(
-	t *testing.T, path string,
-) []tenantClusterSettingOverrideOpt {
+func readTenantOverrideArgs(t *testing.T, path string) tenantOverrideArgs {
 	file, err := os.Open(path)
 	require.NoError(t, err)
 	defer file.Close()
 
-	var res []tenantClusterSettingOverrideOpt
-	parseDirectiveOptions(t, path, "tenant-cluster-setting-override-opt", func(opt string) {
-		switch opt {
-		case "allow-zone-configs-for-secondary-tenants":
-			res = append(res, tenantClusterSettingOverrideMultiTenantZoneConfigsAllowed{})
-		case "allow-multi-region-abstractions-for-secondary-tenants":
-			res = append(res, tenantClusterSettingOverrideMultiTenantMultiRegionAbstractionsAllowed{})
-		default:
-			t.Fatalf("unrecognized cluster option: %s", opt)
-		}
-	})
-	return res
+	getConfigMap := func(directiveName string, configType string) map[string]string {
+		configMap := make(map[string]string)
+		parseDirectiveOptions(t, path, directiveName, func(opt string) {
+			parts := strings.Split(opt, "=")
+			if len(parts) != 2 {
+				t.Fatalf("%s %q must be in format name=value", configType, opt)
+			}
+			name := parts[0]
+			value := parts[1]
+			_, ok := configMap[name]
+			if ok {
+				t.Fatalf("cannot set %s %q more than once", configType, name)
+			}
+			configMap[name] = value
+		})
+		return configMap
+	}
+
+	return tenantOverrideArgs{
+		clusterSettings: getConfigMap(tenantClusterSettingOverrideDirective, "cluster setting"),
+		capabilities:    getConfigMap(tenantCapabilityOverrideDirective, "capability"),
+	}
 }
+
+const knobDirective = "knob-opt"
 
 // readKnobOptions looks around the beginning of the file for a line looking like:
 // # knob-opt: opt1 opt2 ...
@@ -1939,7 +2056,7 @@ func readTenantClusterSettingOverrideArgs(
 // TestServerArgs.Knobs before the cluster is started for the respective test file.
 func readKnobOptions(t *testing.T, path string) []knobOpt {
 	var res []knobOpt
-	parseDirectiveOptions(t, path, "knob-opt", func(opt string) {
+	parseDirectiveOptions(t, path, knobDirective, func(opt string) {
 		switch opt {
 		case "disable-corpus-generation":
 			res = append(res, knobOptDisableCorpusGeneration{})
@@ -1952,13 +2069,15 @@ func readKnobOptions(t *testing.T, path string) []knobOpt {
 	return res
 }
 
+const clusterDirective = "cluster-opt"
+
 // readClusterOptions looks around the beginning of the file for a line looking like:
 // # cluster-opt: opt1 opt2 ...
 // and parses that line into a set of clusterOpts that need to be applied to the
 // TestServerArgs before the cluster is started for the respective test file.
 func readClusterOptions(t *testing.T, path string) []clusterOpt {
 	var res []clusterOpt
-	parseDirectiveOptions(t, path, "cluster-opt", func(opt string) {
+	parseDirectiveOptions(t, path, clusterDirective, func(opt string) {
 		switch opt {
 		case "disable-span-configs":
 			res = append(res, clusterOptDisableSpanConfigs{})
@@ -1980,9 +2099,6 @@ type subtestDetails struct {
 }
 
 func (t *logicTest) processTestFile(path string, config logictestbase.TestClusterConfig) error {
-	rng, seed := randutil.NewPseudoRand()
-	t.outf("rng seed: %d\n", seed)
-
 	subtests, err := fetchSubtests(path)
 	if err != nil {
 		return err
@@ -2000,7 +2116,7 @@ func (t *logicTest) processTestFile(path string, config logictestbase.TestCluste
 		// If subtest has no name, then it is not a subtest, so just run the lines
 		// in the overall test. Note that this can only happen in the first subtest.
 		if len(subtest.name) == 0 {
-			if err := t.processSubtest(subtest, path, config, rng); err != nil {
+			if err := t.processSubtest(subtest, path, config); err != nil {
 				return err
 			}
 		} else {
@@ -2010,7 +2126,7 @@ func (t *logicTest) processTestFile(path string, config logictestbase.TestCluste
 				defer func() {
 					t.subtestT = nil
 				}()
-				if err := t.processSubtest(subtest, path, config, rng); err != nil {
+				if err := t.processSubtest(subtest, path, config); err != nil {
 					t.Error(err)
 				}
 			})
@@ -2037,21 +2153,24 @@ func (t *logicTest) processTestFile(path string, config logictestbase.TestCluste
 }
 
 func (t *logicTest) hasOpenTxns(ctx context.Context) bool {
-	for _, user := range t.clients {
-		existingTxnPriority := "NORMAL"
-		err := user.QueryRow("SHOW TRANSACTION PRIORITY").Scan(&existingTxnPriority)
-		if err != nil {
-			// Ignore an error if we are unable to see transaction priority.
-			log.Warningf(ctx, "failed to check txn priority with %v", err)
-			continue
-		}
-		if _, err := user.Exec("SET TRANSACTION PRIORITY NORMAL;"); !testutils.IsError(err, "there is no transaction in progress") {
-			// Reset the txn priority to what it was before we checked for open txns.
-			_, err := user.Exec(fmt.Sprintf(`SET TRANSACTION PRIORITY %s`, existingTxnPriority))
+	for _, userClients := range t.clients {
+		for _, user := range userClients {
+			existingTxnPriority := "NORMAL"
+			err := user.QueryRow("SHOW TRANSACTION PRIORITY").Scan(&existingTxnPriority)
 			if err != nil {
-				log.Warningf(ctx, "failed to reset txn priority with %v", err)
+				// If we are unable to see transaction priority assume we're in the middle
+				// of an explicit txn.
+				log.Warningf(ctx, "failed to check txn priority with %v", err)
+				return true
 			}
-			return true
+			if _, err := user.Exec("SET TRANSACTION PRIORITY NORMAL;"); !testutils.IsError(err, "there is no transaction in progress") {
+				// Reset the txn priority to what it was before we checked for open txns.
+				_, err := user.Exec(fmt.Sprintf(`SET TRANSACTION PRIORITY %s`, existingTxnPriority))
+				if err != nil {
+					log.Warningf(ctx, "failed to reset txn priority with %v", err)
+				}
+				return true
+			}
 		}
 	}
 	return false
@@ -2064,14 +2183,13 @@ func (t *logicTest) hasOpenTxns(ctx context.Context) bool {
 func (t *logicTest) maybeBackupRestore(
 	rng *rand.Rand, config logictestbase.TestClusterConfig,
 ) error {
-	if config.BackupRestoreProbability != 0 && !config.IsCCLConfig {
-		return errors.Newf("logic test config %s specifies a backup restore probability but is not CCL",
-			config.Name)
-	}
+	defer func() {
+		t.forceBackupAndRestore = false
+	}()
 
 	// We decide if we want to take a backup here based on a probability
 	// specified in the logic test config.
-	if rng.Float64() > config.BackupRestoreProbability {
+	if rng.Float64() > config.BackupRestoreProbability && !t.forceBackupAndRestore {
 		return nil
 	}
 
@@ -2086,9 +2204,12 @@ func (t *logicTest) maybeBackupRestore(
 	}
 
 	oldUser := t.user
+	oldNodeIdx := t.nodeIdx
 	defer func() {
-		t.setUser(oldUser, 0 /* nodeIdxOverride */)
+		t.setUser(oldUser, oldNodeIdx)
 	}()
+
+	log.Info(context.Background(), "Running cluster backup and restore")
 
 	// To restore the same state in for the logic test, we need to restore the
 	// data and the session state. The session state includes things like session
@@ -2097,54 +2218,58 @@ func (t *logicTest) maybeBackupRestore(
 	// TODO(adityamaru): A better approach might be to wipe the cluster once we
 	// have a command that enables this. That way all of the session data will not
 	// be lost in the process of creating a new cluster.
-	users := make([]string, 0, len(t.clients))
-	userToHexSession := make(map[string]string, len(t.clients))
-	userToSessionVars := make(map[string]map[string]string, len(t.clients))
-	for user := range t.clients {
-		t.setUser(user, 0 /* nodeIdxOverride */)
-		users = append(users, user)
+	users := make(map[string][]int, len(t.clients))
+	userToHexSession := make(map[string]map[int]string, len(t.clients))
+	userToSessionVars := make(map[string]map[int]map[string]string, len(t.clients))
+	for user, userClients := range t.clients {
+		userToHexSession[user] = make(map[int]string)
+		userToSessionVars[user] = make(map[int]map[string]string)
+		for nodeIdx := range userClients {
+			users[user] = append(users[user], nodeIdx)
+			t.setUser(user, nodeIdx)
 
-		// Serialize session variables.
-		var userSession string
-		var err error
-		if err = t.db.QueryRow(`SELECT encode(crdb_internal.serialize_session(), 'hex')`).Scan(&userSession); err == nil {
-			userToHexSession[user] = userSession
-			continue
-		}
-		log.Warningf(context.Background(), "failed to serialize session: %+v", err)
-
-		// If we failed to serialize the session variables, lets save the output of
-		// `SHOW ALL`. This usually happens if the session contains prepared
-		// statements or portals that cause the `serialize_session()` to fail.
-		//
-		// Saving the session variables in this manner does not guarantee the test
-		// will succeed since there are no ordering semantics when we go to apply
-		// them. There are some session variables that need to be applied before
-		// others for them to be valid. Thus, it is strictly better to use
-		// `serialize/deserialize_session()`, this "hack" just gives the test one
-		// more chance to succeed.
-		userSessionVars := make(map[string]string)
-		existingSessionVars, err := t.db.Query("SHOW ALL")
-		if err != nil {
-			return err
-		}
-		for existingSessionVars.Next() {
-			var key, value string
-			if err := existingSessionVars.Scan(&key, &value); err != nil {
-				return errors.Wrap(err, "scanning session variables")
+			// Serialize session variables.
+			var userSession string
+			var err error
+			if err = t.db.QueryRow(`SELECT encode(crdb_internal.serialize_session(), 'hex')`).Scan(&userSession); err == nil {
+				userToHexSession[user][nodeIdx] = userSession
+				continue
 			}
-			userSessionVars[key] = value
+			log.Warningf(context.Background(), "failed to serialize session: %+v", err)
+
+			// If we failed to serialize the session variables, lets save the output of
+			// `SHOW ALL`. This usually happens if the session contains prepared
+			// statements or portals that cause the `serialize_session()` to fail.
+			//
+			// Saving the session variables in this manner does not guarantee the test
+			// will succeed since there are no ordering semantics when we go to apply
+			// them. There are some session variables that need to be applied before
+			// others for them to be valid. Thus, it is strictly better to use
+			// `serialize/deserialize_session()`, this "hack" just gives the test one
+			// more chance to succeed.
+			userSessionVars := make(map[string]string)
+			existingSessionVars, err := t.db.Query("SHOW ALL")
+			if err != nil {
+				return err
+			}
+			for existingSessionVars.Next() {
+				var key, value string
+				if err := existingSessionVars.Scan(&key, &value); err != nil {
+					return errors.Wrap(err, "scanning session variables")
+				}
+				userSessionVars[key] = value
+			}
+			userToSessionVars[user][nodeIdx] = userSessionVars
 		}
-		userToSessionVars[user] = userSessionVars
 	}
 
-	backupLocation := fmt.Sprintf("nodelocal://1/logic-test-backup-%s",
+	backupLocation := fmt.Sprintf("gs://cockroachdb-backup-testing/logic-test-backup-restore-nightly/%s?AUTH=implicit",
 		strconv.FormatInt(timeutil.Now().UnixNano(), 10))
 
 	// Perform the backup and restore as root.
-	t.setUser(username.RootUser, 0 /* nodeIdxOverride */)
+	t.setUser(username.RootUser, 0 /* nodeIdx */)
 
-	if _, err := t.db.Exec(fmt.Sprintf("BACKUP TO '%s'", backupLocation)); err != nil {
+	if _, err := t.db.Exec(fmt.Sprintf("BACKUP INTO '%s'", backupLocation)); err != nil {
 		return errors.Wrap(err, "backing up cluster")
 	}
 
@@ -2153,8 +2278,8 @@ func (t *logicTest) maybeBackupRestore(
 	t.resetCluster()
 
 	// Run the restore as root.
-	t.setUser(username.RootUser, 0 /* nodeIdxOverride */)
-	if _, err := t.db.Exec(fmt.Sprintf("RESTORE FROM '%s'", backupLocation)); err != nil {
+	t.setUser(username.RootUser, 0 /* nodeIdx */)
+	if _, err := t.db.Exec(fmt.Sprintf("RESTORE FROM LATEST IN '%s'", backupLocation)); err != nil {
 		return errors.Wrap(err, "restoring cluster")
 	}
 
@@ -2162,29 +2287,31 @@ func (t *logicTest) maybeBackupRestore(
 
 	// Create new connections for the existing users, and restore the session
 	// variables that we collected.
-	for _, user := range users {
-		// Call setUser for every user to create the connection for that user.
-		t.setUser(user, 0 /* nodeIdxOverride */)
+	for user, userNodeIdxs := range users {
+		for _, nodeIdx := range userNodeIdxs {
+			// Call setUser for every user to create the connection for that user.
+			t.setUser(user, nodeIdx)
 
-		if userSession, ok := userToHexSession[user]; ok {
-			if _, err := t.db.Exec(fmt.Sprintf(`SELECT crdb_internal.deserialize_session(decode('%s', 'hex'))`, userSession)); err != nil {
-				return errors.Wrapf(err, "deserializing session")
-			}
-		} else if vars, ok := userToSessionVars[user]; ok {
-			// We now attempt to restore the session variables that were set on the
-			// backing up cluster. These are not included in the backup restore and so
-			// have to be restored manually.
-			for key, value := range vars {
-				// First try setting the cluster setting as a string.
-				if _, err := t.db.Exec(fmt.Sprintf("SET %s='%s'", key, value)); err != nil {
-					// If it fails, try setting the value as an int.
-					log.Infof(context.Background(), "setting session variable as string failed (err: %v), trying as int", pretty.Formatter(err))
-					if _, err := t.db.Exec(fmt.Sprintf("SET %s=%s", key, value)); err != nil {
-						// Some cluster settings can't be set at all, so ignore these errors.
-						// If a setting that we needed could not be restored, we expect the
-						// logic test to fail and let us know.
-						log.Infof(context.Background(), "setting session variable as int failed: %v (continuing anyway)", pretty.Formatter(err))
-						continue
+			if userSession, ok := userToHexSession[user][nodeIdx]; ok {
+				if _, err := t.db.Exec(fmt.Sprintf(`SELECT crdb_internal.deserialize_session(decode('%s', 'hex'))`, userSession)); err != nil {
+					return errors.Wrapf(err, "deserializing session")
+				}
+			} else if vars, ok := userToSessionVars[user][nodeIdx]; ok {
+				// We now attempt to restore the session variables that were set on the
+				// backing up cluster. These are not included in the backup restore and so
+				// have to be restored manually.
+				for key, value := range vars {
+					// First try setting the cluster setting as a string.
+					if _, err := t.db.Exec(fmt.Sprintf("SET %s='%s'", key, value)); err != nil {
+						// If it fails, try setting the value as an int.
+						log.Infof(context.Background(), "setting session variable as string failed (err: %v), trying as int", pretty.Formatter(err))
+						if _, err := t.db.Exec(fmt.Sprintf("SET %s=%s", key, value)); err != nil {
+							// Some cluster settings can't be set at all, so ignore these errors.
+							// If a setting that we needed could not be restored, we expect the
+							// logic test to fail and let us know.
+							log.Infof(context.Background(), "setting session variable as int failed: %v (continuing anyway)", pretty.Formatter(err))
+							continue
+						}
 					}
 				}
 			}
@@ -2242,8 +2369,22 @@ func fetchSubtests(path string) ([]subtestDetails, error) {
 	return subtests, nil
 }
 
+func (t *logicTest) purgeZoneConfig() {
+	if t.cluster == nil {
+		// We can only purge zone configs for in-memory test clusters.
+		return
+	}
+	for i := 0; i < t.cluster.NumServers(); i++ {
+		sysconfigProvider := t.cluster.Server(i).SystemConfigProvider()
+		sysconfig := sysconfigProvider.GetSystemConfig()
+		if sysconfig != nil {
+			sysconfig.PurgeZoneConfigCache()
+		}
+	}
+}
+
 func (t *logicTest) processSubtest(
-	subtest subtestDetails, path string, config logictestbase.TestClusterConfig, rng *rand.Rand,
+	subtest subtestDetails, path string, config logictestbase.TestClusterConfig,
 ) error {
 	defer t.traceStop()
 
@@ -2251,6 +2392,8 @@ func (t *logicTest) processSubtest(
 	t.lastProgress = timeutil.Now()
 
 	repeat := 1
+	t.retry = false
+
 	for s.Scan() {
 		t.curPath, t.curLineNo = path, s.Line+subtest.lineLineIndexIntoFile
 		if *maxErrs > 0 && t.failures >= *maxErrs {
@@ -2273,9 +2416,6 @@ func (t *logicTest) processSubtest(
 			return errors.Errorf("%s:%d: no expected error provided",
 				path, s.Line+subtest.lineLineIndexIntoFile,
 			)
-		}
-		if err := t.maybeBackupRestore(rng, config); err != nil {
-			return err
 		}
 		switch cmd {
 		case "repeat":
@@ -2339,6 +2479,11 @@ func (t *logicTest) processSubtest(
 
 			t.success(path)
 
+		case "retry":
+			// retry is a standalone command that may precede a "statement" or "query"
+			// command. It has the same retry effect as the retry option of the query
+			// command.
+			t.retry = true
 		case "statement":
 			stmt := logicStatement{
 				pos:         fmt.Sprintf("\n%s:%d", path, s.Line+subtest.lineLineIndexIntoFile),
@@ -2369,7 +2514,19 @@ func (t *logicTest) processSubtest(
 			}
 			if !s.Skip {
 				for i := 0; i < repeat; i++ {
-					if cont, err := t.execStatement(stmt); err != nil {
+					var cont bool
+					var err error
+					if t.retry {
+						err = testutils.SucceedsSoonError(func() error {
+							t.purgeZoneConfig()
+							var tempErr error
+							cont, tempErr = t.execStatement(stmt)
+							return tempErr
+						})
+					} else {
+						cont, err = t.execStatement(stmt)
+					}
+					if err != nil {
 						if !cont {
 							return err
 						}
@@ -2404,66 +2561,10 @@ func (t *logicTest) processSubtest(
 			delete(t.pendingQueries, name)
 			t.success(path)
 
-		case "copy", "copy-error":
-			expectError := cmd == "copy-error"
-			var query logicQuery
-			query.pos = fmt.Sprintf("\n%s:%d", path, s.Line+subtest.lineLineIndexIntoFile)
-			gotsep, err := query.readSQL(t, s, true /* allowSeparator */)
-			if err != nil {
-				return err
-			}
-			if gotsep {
-				return errors.Errorf("%s: unexpected ---- separator, copy statement and data have to separated by empty line", query.pos)
-			}
-			var data bytes.Buffer
-			sep := false
-			for s.Scan() {
-				line := s.Text()
-				t.emit(line)
-				if line == "----" {
-					sep = true
-					break
-				}
-				fmt.Fprintln(&data, line)
-			}
-			if !sep {
-				return errors.Errorf("%s: expected ---- separator at end of copy data", query.pos)
-			}
-			// TODO(cucaroach): This is broken, t.cluster.Server(0) may not be
-			// the same tenant as t.db points to, for now the copy tests disable
-			// the 3node-tenant config but we should fix this. Also RunCopyFrom
-			// does an end run around the t.db connection entirely and runs
-			// copies w/o using the client protocol at all, not ideal but the go
-			// sql.DB interface doesn't support COPY so fixing it the right way
-			// that would require major surgery (ie making logictest use libpq
-			// or something low level like that).
-			rows, err := sql.RunCopyFrom(context.Background(), t.cluster.Server(0), "test", nil, query.sql, []string{data.String()}, 0 /* rowsPerBatch */, true /* atomic */)
-			result := fmt.Sprintf("%d", rows)
-			if err != nil {
-				if !expectError {
-					return err
-				}
-				result = err.Error()
-			} else if expectError {
-				return errors.Errorf("%s: copy-error expected error did not occur", query.pos)
-			}
-			if *rewriteResultsInTestfiles {
-				t.emit(result)
-			}
-			if s.Scan() {
-				exp := s.Text()
-				if !*rewriteResultsInTestfiles && result != exp {
-					return errors.Errorf("%s: got %s, expected %s", query.pos, result, exp)
-				}
-			} else if !*rewriteResultsInTestfiles {
-				return errors.Errorf("EOF looking for expected copy results")
-			}
-			t.finishOne("OK")
-			t.success(path)
-
 		case "query":
 			var query logicQuery
 			query.pos = fmt.Sprintf("\n%s:%d", path, s.Line+subtest.lineLineIndexIntoFile)
+			query.nodeIdx = t.nodeIdx
 			// Parse "query error <regexp>"
 			if m := errorRE.FindStringSubmatch(s.Text()); m != nil {
 				query.expectErrCode = m[1]
@@ -2567,7 +2668,7 @@ func (t *logicTest) processSubtest(
 							query.colNames = true
 
 						case "retry":
-							query.retry = true
+							t.retry = true
 
 						case "kvtrace":
 							// kvtrace without any arguments doesn't perform any additional
@@ -2580,13 +2681,19 @@ func (t *logicTest) processSubtest(
 						case "noticetrace":
 							query.noticetrace = true
 
-						case "round-in-strings":
-							query.roundFloatsInStrings = true
-
 						case "async":
 							query.expectAsync = true
 
 						default:
+							if strings.HasPrefix(opt, "round-in-strings") {
+								significantFigures, err := floatcmp.ParseRoundInStringsDirective(opt)
+								if err != nil {
+									return err
+								}
+								query.roundFloatsInStringsSigFigs = significantFigures
+								break
+							}
+
 							if strings.HasPrefix(opt, "nodeidx=") {
 								idx, err := strconv.ParseInt(strings.SplitN(opt, "=", 2)[1], 10, 64)
 								if err != nil {
@@ -2744,19 +2851,21 @@ func (t *logicTest) processSubtest(
 				}
 
 				for i := 0; i < repeat; i++ {
-					if query.retry && !*rewriteResultsInTestfiles {
+					if t.retry && !*rewriteResultsInTestfiles {
 						if err := testutils.SucceedsSoonError(func() error {
+							t.purgeZoneConfig()
 							return t.execQuery(query)
 						}); err != nil {
 							t.Error(err)
 						}
 					} else {
-						if query.retry && *rewriteResultsInTestfiles {
+						if t.retry && *rewriteResultsInTestfiles {
+							t.purgeZoneConfig()
 							// The presence of the retry flag indicates that we expect this
 							// query may need some time to succeed. If we are rewriting, wait
-							// 500ms before executing the query.
+							// 2s before executing the query.
 							// TODO(rytaft): We may want to make this sleep time configurable.
-							time.Sleep(time.Millisecond * 500)
+							time.Sleep(time.Second * 2)
 						}
 						if err := t.execQuery(query); err != nil {
 							t.Error(err)
@@ -2827,7 +2936,7 @@ func (t *logicTest) processSubtest(
 					nodeIdx = int(idx)
 				}
 			}
-			cleanupUserFunc := t.setUser(fields[1], nodeIdx)
+			t.setUser(fields[1], nodeIdx)
 			// In multi-tenant tests, we may need to also create database test when
 			// we switch to a different tenant.
 			if t.cfg.UseTenant && strings.HasPrefix(fields[1], "host-cluster-") {
@@ -2835,7 +2944,6 @@ func (t *logicTest) processSubtest(
 					return errors.Wrapf(err, "error creating database on admin tenant")
 				}
 			}
-			defer cleanupUserFunc()
 
 		case "skip":
 			reason := "skipped"
@@ -2843,6 +2951,10 @@ func (t *logicTest) processSubtest(
 				reason = fields[1]
 			}
 			skip.IgnoreLint(t.t(), reason)
+
+		case "force-backup-restore":
+			t.forceBackupAndRestore = true
+			continue
 
 		case "skipif":
 			if len(fields) < 2 {
@@ -2866,6 +2978,10 @@ func (t *logicTest) processSubtest(
 						issue = fields[3]
 					}
 					s.SetSkip(fmt.Sprintf("unsupported configuration %s (%s)", configName, issue))
+				}
+			case "backup-restore":
+				if config.BackupRestoreProbability > 0.0 {
+					s.SetSkip("backup-restore interferes with this check")
 				}
 				continue
 			default:
@@ -2912,6 +3028,41 @@ func (t *logicTest) processSubtest(
 			}
 			t.traceStop()
 
+		case "upgrade":
+			if len(fields) != 2 {
+				return errors.Errorf("upgrade requires a node num argument, found: %v", fields)
+			}
+			if t.testserverCluster == nil {
+				return errors.Errorf(`could not perform "upgrade", not a cockroach-go/testserver cluster`)
+			}
+			nodeIdx, err := strconv.Atoi(fields[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := t.testserverCluster.UpgradeNode(nodeIdx); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < t.cfg.NumNodes; i++ {
+				// Wait for each node to be reachable, since UpgradeNode uses `kill`
+				// to terminate nodes, and may introduce temporary unavailability in
+				// the system range.
+				if err := t.testserverCluster.WaitForInitFinishForNode(i); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The port may have changed, so we must remove all the cached connections
+			// to this node.
+			for _, m := range t.clients {
+				if c, ok := m[nodeIdx]; ok {
+					_ = c.Close()
+				}
+				delete(m, nodeIdx)
+			}
+			// If we upgraded the node we are currently on, we need to open a new
+			// connection since the previous one might now be invalid.
+			if t.nodeIdx == nodeIdx {
+				t.setUser(t.user, nodeIdx)
+			}
 		default:
 			return errors.Errorf("%s:%d: unknown command: %s",
 				path, s.Line+subtest.lineLineIndexIntoFile, cmd,
@@ -2945,12 +3096,7 @@ func (t *logicTest) verifyError(
 ) (bool, error) {
 	if expectErr == "" && expectErrCode == "" && err != nil {
 		t.maybeSkipOnRetry(err)
-		cont := t.unexpectedError(sql, pos, err)
-		if cont {
-			// unexpectedError() already reported via t.Errorf. no need for more.
-			err = nil
-		}
-		return cont, err
+		return t.unexpectedError(sql, pos, err)
 	}
 	if expectNotice != "" {
 		foundNotice := strings.Join(t.noticeBuffer, "\n")
@@ -3037,7 +3183,7 @@ func formatErr(err error) string {
 // when -allow-prepare-fail is specified. The argument "sql" is "" to indicate the
 // work is done on behalf of a statement, which always fail upon an
 // unexpected error.
-func (t *logicTest) unexpectedError(sql string, pos string, err error) bool {
+func (t *logicTest) unexpectedError(sql string, pos string, err error) (bool, error) {
 	if *allowPrepareFail && sql != "" {
 		// This is a query and -allow-prepare-fail is set.  Try to prepare
 		// the query. If prepare fails, this means we (probably) do not
@@ -3049,14 +3195,17 @@ func (t *logicTest) unexpectedError(sql string, pos string, err error) bool {
 				t.outf("\t-- fails prepare: %s", formatErr(err))
 			}
 			t.signalIgnoredError(err, pos, sql)
-			return true
+			return true, nil
 		}
 		if err := stmt.Close(); err != nil {
 			t.Errorf("%s: %s\nerror when closing prepared statement: %s", sql, pos, formatErr(err))
 		}
 	}
-	t.Errorf("%s: %s\nexpected success, but found\n%s", pos, sql, formatErr(err))
-	return false
+	// N.B. We return an error instead of calling t.Errorf because this query
+	// could be asking for a retry. We still use t.Errorf above because
+	// stmt.Close error is probably a sign of bigger issues and not
+	// something retryable.
+	return false, fmt.Errorf("%s: %s\nexpected success, but found\n%s", pos, sql, formatErr(err))
 }
 
 func (t *logicTest) execStatement(stmt logicStatement) (bool, error) {
@@ -3150,22 +3299,8 @@ func (t *logicTest) execQuery(query logicQuery) error {
 	t.noticeBuffer = nil
 
 	db := t.db
-	var closeDB func()
-	if query.nodeIdx != 0 {
-		addr := t.cluster.Server(query.nodeIdx).ServingSQLAddr()
-		if len(t.tenantAddrs) > 0 {
-			addr = t.tenantAddrs[query.nodeIdx]
-		}
-		pgURL, cleanupFunc := sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(t.user))
-		defer cleanupFunc()
-		pgURL.Path = "test"
-
-		db = t.openDB(pgURL)
-		closeDB = func() {
-			if err := db.Close(); err != nil {
-				t.Fatal(err)
-			}
-		}
+	if query.nodeIdx != t.nodeIdx {
+		db = t.getOrOpenClient(t.user, query.nodeIdx)
 	}
 
 	if query.expectAsync {
@@ -3185,9 +3320,6 @@ func (t *logicTest) execQuery(query logicQuery) error {
 
 		startedChan := make(chan struct{})
 		go func() {
-			if closeDB != nil {
-				defer closeDB()
-			}
 			startedChan <- struct{}{}
 			rows, err := db.Query(query.sql)
 			pending.resultChan <- pendingQueryResult{rows, err}
@@ -3195,8 +3327,6 @@ func (t *logicTest) execQuery(query logicQuery) error {
 
 		<-startedChan
 		return nil
-	} else if closeDB != nil {
-		defer closeDB()
 	}
 
 	rows, err := db.Query(query.sql)
@@ -3263,81 +3393,87 @@ func (t *logicTest) finishExecQuery(query logicQuery, rows *gosql.Rows, err erro
 					return err
 				}
 				for i, v := range vals {
-					if val := *v.(*interface{}); val != nil {
-						valT := reflect.TypeOf(val).Kind()
-						colT := query.colTypes[i]
-						switch colT {
-						case 'T':
-							if valT != reflect.String && valT != reflect.Slice && valT != reflect.Struct {
-								return fmt.Errorf("%s: expected text value for column %d, but found %T: %#v",
-									query.pos, i, val, val,
-								)
-							}
-						case 'I':
-							if valT != reflect.Int64 {
-								if *flexTypes && (valT == reflect.Float64 || valT == reflect.Slice) {
-									t.signalIgnoredError(
-										fmt.Errorf("result type mismatch: expected I, got %T", val), query.pos, query.sql,
-									)
-									return nil
-								}
-								return fmt.Errorf("%s: expected int value for column %d, but found %T: %#v",
-									query.pos, i, val, val,
-								)
-							}
-						case 'F', 'R':
-							if valT != reflect.Float64 && valT != reflect.Slice {
-								if *flexTypes && (valT == reflect.Int64) {
-									t.signalIgnoredError(
-										fmt.Errorf("result type mismatch: expected F or R, got %T", val), query.pos, query.sql,
-									)
-									return nil
-								}
-								return fmt.Errorf("%s: expected float/decimal value for column %d, but found %T: %#v",
-									query.pos, i, val, val,
-								)
-							}
-						case 'B':
-							if valT != reflect.Bool {
-								return fmt.Errorf("%s: expected boolean value for column %d, but found %T: %#v",
-									query.pos, i, val, val,
-								)
-							}
-						case 'O':
-							if valT != reflect.Slice {
-								return fmt.Errorf("%s: expected oid value for column %d, but found %T: %#v",
-									query.pos, i, val, val,
-								)
-							}
-						default:
-							return fmt.Errorf("%s: unknown type in type string: %c in %s",
-								query.pos, colT, query.colTypes,
+					colT := query.colTypes[i]
+					// Ignore column - useful for non-deterministic output.
+					if colT == '_' {
+						actualResultsRaw = append(actualResultsRaw, "_")
+						continue
+					}
+					val := *v.(*interface{})
+					if val == nil {
+						actualResultsRaw = append(actualResultsRaw, "NULL")
+						continue
+					}
+					valT := reflect.TypeOf(val).Kind()
+					switch colT {
+					case 'T':
+						if valT != reflect.String && valT != reflect.Slice && valT != reflect.Struct {
+							return fmt.Errorf("%s: expected text value for column %d, but found %T: %#v",
+								query.pos, i, val, val,
 							)
 						}
-
-						if byteArray, ok := val.([]byte); ok {
-							// The postgres wire protocol does not distinguish between
-							// strings and byte arrays, but our tests do. In order to do
-							// The Right Thing™, we replace byte arrays which are valid
-							// UTF-8 with strings. This allows byte arrays which are not
-							// valid UTF-8 to print as a list of bytes (e.g. `[124 107]`)
-							// while printing valid strings naturally.
-							if str := string(byteArray); utf8.ValidString(str) {
-								val = str
+					case 'I':
+						if valT != reflect.Int64 {
+							if *flexTypes && (valT == reflect.Float64 || valT == reflect.Slice) {
+								t.signalIgnoredError(
+									fmt.Errorf("result type mismatch: expected I, got %T", val), query.pos, query.sql,
+								)
+								return nil
 							}
+							return fmt.Errorf("%s: expected int value for column %d, but found %T: %#v",
+								query.pos, i, val, val,
+							)
 						}
-						// Empty strings are rendered as "·" (middle dot)
-						if val == "" {
-							val = "·"
+					case 'F', 'R':
+						if valT != reflect.Float64 && valT != reflect.Slice {
+							if *flexTypes && (valT == reflect.Int64) {
+								t.signalIgnoredError(
+									fmt.Errorf("result type mismatch: expected F or R, got %T", val), query.pos, query.sql,
+								)
+								return nil
+							}
+							return fmt.Errorf("%s: expected float/decimal value for column %d, but found %T: %#v",
+								query.pos, i, val, val,
+							)
 						}
-						s := fmt.Sprint(val)
-						if query.roundFloatsInStrings {
-							s = roundFloatsInString(s)
+					case 'B':
+						if valT != reflect.Bool {
+							return fmt.Errorf("%s: expected boolean value for column %d, but found %T: %#v",
+								query.pos, i, val, val,
+							)
 						}
-						actualResultsRaw = append(actualResultsRaw, s)
-					} else {
-						actualResultsRaw = append(actualResultsRaw, "NULL")
+					case 'O':
+						if valT != reflect.Slice {
+							return fmt.Errorf("%s: expected oid value for column %d, but found %T: %#v",
+								query.pos, i, val, val,
+							)
+						}
+					default:
+						return fmt.Errorf("%s: unknown type in type string: %c in %s",
+							query.pos, colT, query.colTypes,
+						)
 					}
+
+					if byteArray, ok := val.([]byte); ok {
+						// The postgres wire protocol does not distinguish between
+						// strings and byte arrays, but our tests do. In order to do
+						// The Right Thing™, we replace byte arrays which are valid
+						// UTF-8 with strings. This allows byte arrays which are not
+						// valid UTF-8 to print as a list of bytes (e.g. `[124 107]`)
+						// while printing valid strings naturally.
+						if str := string(byteArray); utf8.ValidString(str) {
+							val = str
+						}
+					}
+					// Empty strings are rendered as "·" (middle dot).
+					if val == "" {
+						val = "·"
+					}
+					s := fmt.Sprint(val)
+					if query.roundFloatsInStringsSigFigs > 0 {
+						s = floatcmp.RoundFloatsInString(s, query.roundFloatsInStringsSigFigs)
+					}
+					actualResultsRaw = append(actualResultsRaw, s)
 				}
 			}
 			if err := rows.Err(); err != nil {
@@ -3613,11 +3749,36 @@ func (t *logicTest) formatValues(vals []string, valsPerLine int) []string {
 	var buf bytes.Buffer
 	tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
 
-	for line := 0; line < len(vals)/valsPerLine; line++ {
+	numLines := len(vals) / valsPerLine
+	for line := 0; line < numLines; line++ {
+		maxSubLines := 0
+		lineOffset := line * valsPerLine
+
+		// Split multi-line values into sublines to output correctly formatted rows.
+		lineSubLines := make([][]string, valsPerLine)
 		for i := 0; i < valsPerLine; i++ {
-			fmt.Fprintf(tw, "%s\t", vals[line*valsPerLine+i])
+			cellSubLines := strings.Split(vals[lineOffset+i], "\n")
+			lineSubLines[i] = cellSubLines
+			numSubLines := len(cellSubLines)
+			if numSubLines > maxSubLines {
+				maxSubLines = numSubLines
+			}
 		}
-		fmt.Fprint(tw, "\n")
+
+		for j := 0; j < maxSubLines; j++ {
+			for i := 0; i < len(lineSubLines); i++ {
+				cellSubLines := lineSubLines[i]
+				// If a value's #sublines < #maxSubLines, an empty cell (just a "\t") is written to preserve columns.
+				if j < len(cellSubLines) {
+					cellSubLine := cellSubLines[j]
+					// Replace tabs with spaces to prevent them from being interpreted by tabwriter.
+					cellSubLine = strings.ReplaceAll(cellSubLine, "\t", "  ")
+					fmt.Fprint(tw, cellSubLine)
+				}
+				fmt.Fprint(tw, "\t")
+			}
+			fmt.Fprint(tw, "\n")
+		}
 	}
 	_ = tw.Flush()
 
@@ -3631,6 +3792,7 @@ func (t *logicTest) formatValues(vals []string, valsPerLine int) []string {
 }
 
 func (t *logicTest) success(file string) {
+	t.retry = false
 	t.progress++
 	now := timeutil.Now()
 	if now.Sub(t.lastProgress) >= 2*time.Second {
@@ -3646,16 +3808,18 @@ func (t *logicTest) validateAfterTestCompletion() error {
 	}
 
 	// Close all clients other than "root"
-	for username, c := range t.clients {
-		if username == "root" {
+	for user, userClients := range t.clients {
+		if user == username.RootUser {
 			continue
 		}
-		delete(t.clients, username)
-		if err := c.Close(); err != nil {
-			t.Fatalf("failed to close connection for user %s: %v", username, err)
+		for i, c := range userClients {
+			if err := c.Close(); err != nil {
+				t.Fatalf("failed to close connection to node %d for user %s: %v", i, user, err)
+			}
 		}
+		delete(t.clients, user)
 	}
-	t.setUser("root", 0 /* nodeIdxOverride */)
+	t.setUser(username.RootUser, 0 /* nodeIdx */)
 
 	// Some cleanup to make sure the following validation queries can run
 	// successfully. First we rollback in case the logic test had an uncommitted
@@ -3702,8 +3866,20 @@ func (t *logicTest) validateAfterTestCompletion() error {
 
 	// Ensure that all of the created descriptors can round-trip through json.
 	{
-		rows, err := t.db.Query(
-			`
+		// If `useCockroachGoTestserver` is true and we do an upgrade,
+		// this may fail if we're in between migrations that
+		// upgrade the descriptors.
+		//
+		// We also want to skip this check for mixed-version configurations (which
+		// have DisableUpgrade=true and an old BootstrapVersion) in case new
+		// fields are added to the descriptor in the newer version. In mixed-version
+		// test configs, nodes are bootstraped with the older version of the system
+		// tables which don't include the new fields in the protobuf, so they will
+		// fail to round-trip.
+		if !t.cfg.UseCockroachGoTestserver &&
+			!(t.cfg.DisableUpgrade && t.cfg.BootstrapVersion != clusterversion.Key(0)) {
+			rows, err := t.db.Query(
+				`
 SELECT encode(descriptor, 'hex') AS descriptor
   FROM system.descriptor
  WHERE descriptor
@@ -3716,17 +3892,18 @@ SELECT encode(descriptor, 'hex') AS descriptor
             )
         );
 `,
-		)
-		if err != nil {
-			return errors.Wrap(err, "failed to test for descriptor JSON round-trip")
-		}
-		rowsMat, err := sqlutils.RowsToStrMatrix(rows)
-		if err != nil {
-			return errors.Wrap(err, "failed read rows from descriptor JSON round-trip")
-		}
-		if len(rowsMat) > 0 {
-			return errors.Errorf("some descriptors did not round-trip:\n%s",
-				sqlutils.MatrixToStr(rowsMat))
+			)
+			if err != nil {
+				return errors.Wrap(err, "failed to test for descriptor JSON round-trip")
+			}
+			rowsMat, err := sqlutils.RowsToStrMatrix(rows)
+			if err != nil {
+				return errors.Wrap(err, "failed read rows from descriptor JSON round-trip")
+			}
+			if len(rowsMat) > 0 {
+				return errors.Errorf("some descriptors did not round-trip:\n%s",
+					sqlutils.MatrixToStr(rowsMat))
+			}
 		}
 	}
 
@@ -3831,6 +4008,14 @@ type TestServerArgs struct {
 	// DeclarativeCorpusCollection corpus will be collected for the declarative
 	// schema changer.
 	DeclarativeCorpusCollection bool
+	// If set, then we will disable the metamorphic randomization of
+	// useMVCCRangeTombstonesForPointDeletes variable.
+	DisableUseMVCCRangeTombstonesForPointDeletes bool
+	// If positive, it provides a lower bound for the default-batch-bytes-limit
+	// metamorphic constant.
+	BatchBytesLimitLowerBound int64
+	// If set, sql.distsql.direct_columnar_scans.enabled is set to false.
+	DisableDirectColumnarScans bool
 }
 
 // RunLogicTests runs logic tests for all files matching the given glob.
@@ -3868,7 +4053,8 @@ func RunLogicTest(
 	}
 
 	// Check whether the test can only be run in non-metamorphic mode.
-	_, onlyNonMetamorphic := logictestbase.ReadTestFileConfigs(t, path, logictestbase.ConfigSet{configIdx})
+	_, nonMetamorphicBatchSizes :=
+		logictestbase.ReadTestFileConfigs(t, path, logictestbase.ConfigSet{configIdx})
 	config := logictestbase.LogicTestConfigs[configIdx]
 
 	// The tests below are likely to run concurrently; `log` is shared
@@ -3907,6 +4093,13 @@ func RunLogicTest(
 		}()
 	}
 
+	// Testing sql.distsql.temp_storage.workmem metamorphically isn't needed
+	// when rewriting logic test files, so we disable workmem randomization if
+	// the --rewrite flag is present.
+	if *defaultWorkmem || *rewriteResultsInTestfiles {
+		serverArgs.DisableWorkmemRandomization = true
+	}
+
 	rng, _ := randutil.NewTestRand()
 	lt := logicTest{
 		rootT:                      t,
@@ -3920,10 +4113,31 @@ func RunLogicTest(
 	}
 	// Each test needs a copy because of Parallel
 	serverArgsCopy := serverArgs
-	serverArgsCopy.ForceProductionValues = serverArgs.ForceProductionValues || onlyNonMetamorphic
+	serverArgsCopy.ForceProductionValues = serverArgs.ForceProductionValues || nonMetamorphicBatchSizes
+	if serverArgsCopy.ForceProductionValues {
+		if err := coldata.SetBatchSizeForTests(coldata.DefaultColdataBatchSize); err != nil {
+			panic(errors.Wrapf(err, "could not set batch size for test"))
+		}
+	} else if serverArgsCopy.BatchBytesLimitLowerBound > 0 {
+		// If we're not forcing the production values, but we're asked to have a
+		// lower bound on the batch bytes limit, then check whether the lower
+		// bound is already satisfied and update the value if not.
+		min := rowinfra.BytesLimit(serverArgsCopy.BatchBytesLimitLowerBound)
+		if rowinfra.GetDefaultBatchBytesLimit(false /* forceProductionValue */) < min {
+			value := min + rowinfra.BytesLimit(rng.Intn(100<<10))
+			rowinfra.SetDefaultBatchBytesLimitForTests(value)
+		}
+	}
+	hasOverride, overriddenBackupRestoreProbability := logictestbase.ReadBackupRestoreProbabilityOverride(t, path)
+	config.BackupRestoreProbability = backupRestoreProbability
+	if hasOverride {
+		config.BackupRestoreProbability = overriddenBackupRestoreProbability
+	}
+
 	lt.setup(
-		config, serverArgsCopy, readClusterOptions(t, path), readKnobOptions(t, path), readTenantClusterSettingOverrideArgs(t, path),
+		config, serverArgsCopy, readClusterOptions(t, path), readKnobOptions(t, path), readTenantOverrideArgs(t, path),
 	)
+
 	lt.runFile(path, config)
 
 	progress.total += lt.progress
@@ -4127,14 +4341,4 @@ func (t *logicTest) printCompletion(path string, config logictestbase.TestCluste
 	}
 	t.outf("--- done: %s with config %s: %d tests, %d failures%s", path, config.Name,
 		t.progress, t.failures, unsupportedMsg)
-}
-
-func roundFloatsInString(s string) string {
-	return string(regexp.MustCompile(`(\d+\.\d+)`).ReplaceAllFunc([]byte(s), func(x []byte) []byte {
-		f, err := strconv.ParseFloat(string(x), 64)
-		if err != nil {
-			return []byte(err.Error())
-		}
-		return []byte(fmt.Sprintf("%.6g", f))
-	}))
 }

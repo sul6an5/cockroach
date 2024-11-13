@@ -21,17 +21,17 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqltranslator"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils/spanconfigtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -106,7 +106,7 @@ func TestDataDriven(t *testing.T) {
 		// test cluster).
 		ManagerDisableJobCreation: true,
 	}
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				// Test fails when run within a tenant. More investigation
@@ -125,7 +125,7 @@ func TestDataDriven(t *testing.T) {
 
 		var tenant *spanconfigtestcluster.Tenant
 		if strings.Contains(path, "tenant") {
-			tenantID := roachpb.MakeTenantID(10)
+			tenantID := roachpb.MustMakeTenantID(10)
 			tenant = spanConfigTestCluster.InitializeTenant(ctx, tenantID)
 			spanConfigTestCluster.AllowSecondaryTenantToSetZoneConfigurations(t, tenantID)
 			spanConfigTestCluster.EnsureTenantCanSetZoneConfigurationsOrFatal(t, tenant)
@@ -179,12 +179,12 @@ func TestDataDriven(t *testing.T) {
 
 				var records []spanconfig.Record
 				sqlTranslatorFactory := tenant.SpanConfigSQLTranslatorFactory().(*spanconfigsqltranslator.Factory)
-				err := sql.DescsTxn(ctx, &execCfg, func(
-					ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+				err := execCfg.InternalDB.DescsTxn(ctx, func(
+					ctx context.Context, txn descs.Txn,
 				) error {
-					sqlTranslator := sqlTranslatorFactory.NewSQLTranslator(txn, descsCol)
+					sqlTranslator := sqlTranslatorFactory.NewSQLTranslator(txn)
 					var err error
-					records, _, err = sqlTranslator.Translate(ctx, descIDs, generateSystemSpanConfigs)
+					records, err = sqlTranslator.Translate(ctx, descIDs, generateSystemSpanConfigs)
 					require.NoError(t, err)
 					return nil
 				})
@@ -211,12 +211,12 @@ func TestDataDriven(t *testing.T) {
 			case "full-translate":
 				sqlTranslatorFactory := tenant.SpanConfigSQLTranslatorFactory().(*spanconfigsqltranslator.Factory)
 				var records []spanconfig.Record
-				err := sql.DescsTxn(ctx, &execCfg, func(
-					ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+				err := execCfg.InternalDB.DescsTxn(ctx, func(
+					ctx context.Context, txn descs.Txn,
 				) error {
-					sqlTranslator := sqlTranslatorFactory.NewSQLTranslator(txn, descsCol)
+					sqlTranslator := sqlTranslatorFactory.NewSQLTranslator(txn)
 					var err error
-					records, _, err = spanconfig.FullTranslate(ctx, sqlTranslator)
+					records, err = spanconfig.FullTranslate(ctx, sqlTranslator)
 					require.NoError(t, err)
 					return nil
 				})
@@ -245,6 +245,20 @@ func TestDataDriven(t *testing.T) {
 				d.ScanArgs(t, "database", &dbName)
 				d.ScanArgs(t, "table", &tbName)
 				tenant.WithMutableTableDescriptor(ctx, dbName, tbName, func(mutable *tabledesc.Mutable) {
+					mutable.SetPublic()
+				})
+
+			case "mark-database-offline":
+				var dbName string
+				d.ScanArgs(t, "database", &dbName)
+				tenant.WithMutableDatabaseDescriptor(ctx, dbName, func(mutable *dbdesc.Mutable) {
+					mutable.SetOffline("for testing")
+				})
+
+			case "mark-database-public":
+				var dbName string
+				d.ScanArgs(t, "database", &dbName)
+				tenant.WithMutableDatabaseDescriptor(ctx, dbName, func(mutable *dbdesc.Mutable) {
 					mutable.SetPublic()
 				})
 

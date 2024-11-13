@@ -48,11 +48,12 @@ func DropSequence(b BuildCtx, n *tree.DropSequence) {
 			scpb.ForEachSequenceOwner(
 				undroppedBackrefs(b, seq.SequenceID),
 				func(_ scpb.Status, _ scpb.TargetStatus, so *scpb.SequenceOwner) {
-					dropElementWhenDroppingDescriptor(b, so)
+					b.Drop(so)
 				},
 			)
 			toCheckBackrefs = append(toCheckBackrefs, seq.SequenceID)
 		}
+		b.LogEventForExistingTarget(seq)
 		b.IncrementSubWorkID()
 		b.IncrementSchemaChangeDropCounter("sequence")
 	}

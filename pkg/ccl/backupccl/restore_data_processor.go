@@ -14,11 +14,13 @@ import (
 	"fmt"
 	"runtime"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -30,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	bulkutil "github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -48,7 +51,6 @@ type restoreDataProcessor struct {
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.RestoreDataSpec
 	input   execinfra.RowSource
-	output  execinfra.RowReceiver
 
 	// numWorkers is the number of workers this processor should use. Initialized
 	// at processor creation based on the cluster setting. If the cluster setting
@@ -63,14 +65,13 @@ type restoreDataProcessor struct {
 	phaseGroup           ctxgroup.Group
 	cancelWorkersAndWait func()
 
-	// sstCh is a channel that holds SSTs opened by the processor, but not yet
-	// ingested.
-	sstCh chan mergedSST
 	// Metas from the input are forwarded to the output of this processor.
 	metaCh chan *execinfrapb.ProducerMetadata
 	// progress updates are accumulated on this channel. It is populated by the
 	// concurrent workers and sent down the flow by the processor.
 	progCh chan backuppb.RestoreProgress
+
+	agg *bulkutil.TracingAggregator
 }
 
 var (
@@ -121,26 +122,26 @@ var numRestoreWorkers = settings.RegisterIntSetting(
 )
 
 func newRestoreDataProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.RestoreDataSpec,
 	post *execinfrapb.PostProcessSpec,
 	input execinfra.RowSource,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	sv := &flowCtx.Cfg.Settings.SV
+	numWorkers := int(numRestoreWorkers.Get(sv))
 
 	rd := &restoreDataProcessor{
 		flowCtx:    flowCtx,
 		input:      input,
 		spec:       spec,
-		output:     output,
 		progCh:     make(chan backuppb.RestoreProgress, maxConcurrentRestoreWorkers),
-		metaCh:     make(chan *execinfrapb.ProducerMetadata, 1),
-		numWorkers: int(numRestoreWorkers.Get(sv)),
+		metaCh:     make(chan *execinfrapb.ProducerMetadata, numWorkers),
+		numWorkers: numWorkers,
 	}
 
-	if err := rd.Init(rd, post, restoreDataOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
+	if err := rd.Init(ctx, rd, post, restoreDataOutputTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -160,34 +161,24 @@ func (rd *restoreDataProcessor) Start(ctx context.Context) {
 	rd.input.Start(ctx)
 
 	ctx, cancel := context.WithCancel(ctx)
+	ctx, rd.agg = bulkutil.MakeTracingAggregatorWithSpan(ctx, fmt.Sprintf("%s-aggregator", restoreDataProcName), rd.EvalCtx.Tracer)
+
 	rd.cancelWorkersAndWait = func() {
 		cancel()
 		_ = rd.phaseGroup.Wait()
 	}
 	rd.phaseGroup = ctxgroup.WithContext(ctx)
-	log.Infof(ctx, "starting restore data")
+	log.Infof(ctx, "starting restore data processor")
 
 	entries := make(chan execinfrapb.RestoreSpanEntry, rd.numWorkers)
-	rd.sstCh = make(chan mergedSST, rd.numWorkers)
 	rd.phaseGroup.GoCtx(func(ctx context.Context) error {
 		defer close(entries)
 		return inputReader(ctx, rd.input, entries, rd.metaCh)
 	})
 
 	rd.phaseGroup.GoCtx(func(ctx context.Context) error {
-		defer close(rd.sstCh)
-		for entry := range entries {
-			if err := rd.openSSTs(ctx, entry, rd.sstCh); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-
-	rd.phaseGroup.GoCtx(func(ctx context.Context) error {
 		defer close(rd.progCh)
-		return rd.runRestoreWorkers(ctx, rd.sstCh)
+		return rd.runRestoreWorkers(ctx, entries)
 	})
 }
 
@@ -261,10 +252,8 @@ type mergedSST struct {
 }
 
 func (rd *restoreDataProcessor) openSSTs(
-	ctx context.Context, entry execinfrapb.RestoreSpanEntry, sstCh chan mergedSST,
-) error {
-	ctxDone := ctx.Done()
-
+	ctx context.Context, entry execinfrapb.RestoreSpanEntry,
+) (mergedSST, error) {
 	// TODO(msbutler): use a a map of external storage factories to avoid reopening the same dir
 	// in a given restore span entry
 	var dirs []cloud.ExternalStorage
@@ -279,25 +268,12 @@ func (rd *restoreDataProcessor) openSSTs(
 		}
 	}()
 
-	var recoverFromIterPanic bool
-	if restoreKnobs, ok := rd.flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {
-		recoverFromIterPanic = restoreKnobs.RecoverFromIterPanic
-	}
-
-	// sendIter sends a multiplexed iterator covering the currently accumulated files over the
-	// channel.
-	sendIter := func(iter storage.SimpleMVCCIterator, dirsToSend []cloud.ExternalStorage) error {
+	// getIter returns a multiplexed iterator covering the currently accumulated
+	// files over the channel.
+	getIter := func(iter storage.SimpleMVCCIterator, dirsToSend []cloud.ExternalStorage) (mergedSST, error) {
 		readAsOfIter := storage.NewReadAsOfIterator(iter, rd.spec.RestoreTime)
 
 		cleanup := func() {
-			if recoverFromIterPanic {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Errorf(ctx, "recovered from Iter panic %v", r)
-					}
-				}()
-			}
-
 			readAsOfIter.Close()
 
 			for _, dir := range dirsToSend {
@@ -313,30 +289,24 @@ func (rd *restoreDataProcessor) openSSTs(
 			cleanup: cleanup,
 		}
 
-		select {
-		case sstCh <- mSST:
-		case <-ctxDone:
-			return ctx.Err()
-		}
-
 		dirs = make([]cloud.ExternalStorage, 0)
-		return nil
+		return mSST, nil
 	}
 
 	log.VEventf(ctx, 1 /* level */, "ingesting span [%s-%s)", entry.Span.Key, entry.Span.EndKey)
 
-	storeFiles := make([]storageccl.StoreFile, 0, len(EntryFiles{}))
+	storeFiles := make([]storageccl.StoreFile, 0, len(entry.Files))
 	for _, file := range entry.Files {
 		log.VEventf(ctx, 2, "import file %s which starts at %s", file.Path, entry.Span.Key)
 
 		dir, err := rd.flowCtx.Cfg.ExternalStorage(ctx, file.Dir)
 		if err != nil {
-			return err
+			return mergedSST{}, err
 		}
 		dirs = append(dirs, dir)
 		storeFiles = append(storeFiles, storageccl.StoreFile{Store: dir, FilePath: file.Path})
-		// TODO(pbardea): When memory monitoring is added, send the currently
-		// accumulated iterators on the channel if we run into memory pressure.
+		// TODO(pbardea): When memory monitoring is added, return the currently
+		// accumulated iterators if we run into memory pressure.
 	}
 	iterOpts := storage.IterOptions{
 		RangeKeyMaskingBelow: rd.spec.RestoreTime,
@@ -346,25 +316,36 @@ func (rd *restoreDataProcessor) openSSTs(
 	}
 	iter, err := storageccl.ExternalSSTReader(ctx, storeFiles, rd.spec.Encryption, iterOpts)
 	if err != nil {
-		return err
+		return mergedSST{}, err
 	}
-	return sendIter(iter, dirs)
+	return getIter(iter, dirs)
 }
 
-func (rd *restoreDataProcessor) runRestoreWorkers(ctx context.Context, ssts chan mergedSST) error {
-	return ctxgroup.GroupWorkers(ctx, rd.numWorkers, func(ctx context.Context, _ int) error {
+func (rd *restoreDataProcessor) runRestoreWorkers(
+	ctx context.Context, entries chan execinfrapb.RestoreSpanEntry,
+) error {
+	return ctxgroup.GroupWorkers(ctx, rd.numWorkers, func(ctx context.Context, worker int) error {
 		kr, err := MakeKeyRewriterFromRekeys(rd.FlowCtx.Codec(), rd.spec.TableRekeys, rd.spec.TenantRekeys,
 			false /* restoreTenantFromStream */)
 		if err != nil {
 			return err
 		}
 
+		ctx, agg := bulkutil.MakeTracingAggregatorWithSpan(ctx,
+			fmt.Sprintf("%s-worker-%d-aggregator", restoreDataProcName, worker), rd.EvalCtx.Tracer)
+		defer agg.Close()
+
 		for {
 			done, err := func() (done bool, _ error) {
-				sstIter, ok := <-ssts
+				entry, ok := <-entries
 				if !ok {
 					done = true
 					return done, nil
+				}
+
+				sstIter, err := rd.openSSTs(ctx, entry)
+				if err != nil {
+					return done, err
 				}
 
 				summary, err := rd.processRestoreSpanEntry(ctx, kr, sstIter)
@@ -393,10 +374,10 @@ func (rd *restoreDataProcessor) runRestoreWorkers(ctx context.Context, ssts chan
 
 func (rd *restoreDataProcessor) processRestoreSpanEntry(
 	ctx context.Context, kr *KeyRewriter, sst mergedSST,
-) (roachpb.BulkOpSummary, error) {
+) (kvpb.BulkOpSummary, error) {
 	db := rd.flowCtx.Cfg.DB
 	evalCtx := rd.EvalCtx
-	var summary roachpb.BulkOpSummary
+	var summary kvpb.BulkOpSummary
 
 	entry := sst.entry
 	iter := sst.iter
@@ -417,19 +398,36 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 			writeAtBatchTS = false
 		}
 
-		// "disallowing" shadowing of anything older than logical=1 is i.e. allow all
-		// shadowing. We must allow shadowing in case the RESTORE has to retry any
-		// ingestions, but setting a (permissive) disallow like this serves to force
-		// evaluation of AddSSTable to check for overlapping keys. That in turn will
-		// result in it maintaining exact MVCC stats rather than estimates. Of course
-		// this comes at the cost of said overlap check, but in the common case of
-		// non-overlapping ingestion into empty spans, that is just one seek.
-		disallowShadowingBelow := hlc.Timestamp{Logical: 1}
+		// disallowShadowingBelow is set to an empty hlc.Timestamp in release builds
+		// i.e. allow all shadowing without AddSSTable having to check for overlapping
+		// keys. This is because RESTORE is expected to ingest into an empty keyspace.
+		// If a restore job is resumed, the un-checkpointed spans that are re-ingested
+		// will shadow (equal key, value; different ts) the already ingested keys.
+		//
+		// NB: disallowShadowingBelow used to be unconditionally set to logical=1.
+		// This permissive value would allow shadowing in case the RESTORE has to
+		// retry ingestions but served to force evaluation of AddSSTable to check for
+		// overlapping keys. It was believed that even across resumptions of a restore
+		// job, `checkForKeyCollisions` would be inexpensive because of our frequent
+		// job checkpointing. Further investigation in
+		// https://github.com/cockroachdb/cockroach/issues/81116 revealed that our
+		// progress checkpointing could significantly lag behind the spans we have
+		// ingested, making a resumed restore spend a lot of time in
+		// `checkForKeyCollisions` leading to severely degraded performance. We have
+		// *never* seen a restore fail because of the invariant enforced by setting
+		// `disallowShadowingBelow` to a non-empty value, and so we feel comfortable
+		// disabling this check entirely. A future release will work on fixing our
+		// progress checkpointing so that we do not have a buildup of un-checkpointed
+		// work, at which point we can reassess reverting to logical=1.
+		disallowShadowingBelow := hlc.Timestamp{}
+		if !build.IsRelease() {
+			disallowShadowingBelow = hlc.Timestamp{Logical: 1}
+		}
 
 		var err error
 		batcher, err = bulk.MakeSSTBatcher(ctx,
 			"restore",
-			db,
+			db.KV(),
 			evalCtx.Settings,
 			disallowShadowingBelow,
 			writeAtBatchTS,
@@ -442,6 +440,9 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		}
 	}
 	defer batcher.Close(ctx)
+
+	// Read log.V once first to avoid the vmodule mutex in the tight loop below.
+	verbose := log.V(5)
 
 	var keyScratch, valueScratch []byte
 
@@ -461,7 +462,11 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		key := iter.UnsafeKey()
 		keyScratch = append(keyScratch[:0], key.Key...)
 		key.Key = keyScratch
-		valueScratch = append(valueScratch[:0], iter.UnsafeValue()...)
+		v, err := iter.UnsafeValue()
+		if err != nil {
+			return summary, err
+		}
+		valueScratch = append(valueScratch[:0], v...)
 		value := roachpb.Value{RawBytes: valueScratch}
 
 		key.Key, ok, err = kr.RewriteKey(key.Key, key.Timestamp.WallTime)
@@ -479,7 +484,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		if !ok {
 			// If the key rewriter didn't match this key, it's not data for the
 			// table(s) we're interested in.
-			if log.V(5) {
+			if verbose {
 				log.Infof(ctx, "skipping %s %s", key.Key, value.PrettyPrint())
 			}
 			continue
@@ -489,7 +494,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		value.ClearChecksum()
 		value.InitChecksum(key.Key)
 
-		if log.V(5) {
+		if verbose {
 			log.Infof(ctx, "Put %s -> %s", key.Key, value.PrettyPrint())
 		}
 		if err := batcher.AddMVCCKey(ctx, key, value.RawBytes); err != nil {
@@ -511,7 +516,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 }
 
 func makeProgressUpdate(
-	summary roachpb.BulkOpSummary, entry execinfrapb.RestoreSpanEntry, pkIDs map[uint64]bool,
+	summary kvpb.BulkOpSummary, entry execinfrapb.RestoreSpanEntry, pkIDs map[uint64]bool,
 ) (progDetails backuppb.RestoreProgress) {
 	progDetails.Summary = countRows(summary, pkIDs)
 	progDetails.ProgressIdx = entry.ProgressIdx
@@ -544,8 +549,8 @@ func (rd *restoreDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Produce
 		prog.ProgressDetails = *details
 	case meta := <-rd.metaCh:
 		return nil, meta
-	case <-rd.Ctx.Done():
-		rd.MoveToDraining(rd.Ctx.Err())
+	case <-rd.Ctx().Done():
+		rd.MoveToDraining(rd.Ctx().Err())
 		return nil, rd.DrainHelper()
 	}
 
@@ -558,12 +563,7 @@ func (rd *restoreDataProcessor) ConsumerClosed() {
 		return
 	}
 	rd.cancelWorkersAndWait()
-	if rd.sstCh != nil {
-		// Cleanup all the remaining open SSTs that have not been consumed.
-		for sst := range rd.sstCh {
-			sst.cleanup()
-		}
-	}
+	rd.agg.Close()
 	rd.InternalClose()
 }
 
@@ -574,7 +574,7 @@ type SSTBatcherExecutor interface {
 	Reset(ctx context.Context) error
 	Flush(ctx context.Context) error
 	Close(ctx context.Context)
-	GetSummary() roachpb.BulkOpSummary
+	GetSummary() kvpb.BulkOpSummary
 }
 
 type sstBatcherNoop struct {
@@ -604,7 +604,7 @@ func (b *sstBatcherNoop) Close(ctx context.Context) {
 }
 
 // GetSummary returns this batcher's total added rows/bytes/etc.
-func (b *sstBatcherNoop) GetSummary() roachpb.BulkOpSummary {
+func (b *sstBatcherNoop) GetSummary() kvpb.BulkOpSummary {
 	return b.totalRows.BulkOpSummary
 }
 

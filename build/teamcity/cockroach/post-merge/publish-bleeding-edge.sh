@@ -9,12 +9,11 @@ dir="$(dirname $(dirname $(dirname $(dirname "${0}"))))"
 source "$dir/teamcity-support.sh"
 source "$dir/teamcity-bazel-support.sh"
 
-# s3 pushes to the "cockroach" bucket. There is no test/dev bucket fir this build type.
 gcs_bucket="cockroach-edge-artifacts-prod"
 # export the variable to avoid shell escaping
 export gcs_credentials="$GCS_CREDENTIALS_PROD"
 
-BAZEL_SUPPORT_EXTRA_DOCKER_ARGS="-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e TC_BUILDTYPE_ID -e TC_BUILD_BRANCH -e gcs_credentials -e gcs_bucket=$gcs_bucket" run_bazel << 'EOF'
+BAZEL_SUPPORT_EXTRA_DOCKER_ARGS="-e TC_BUILDTYPE_ID -e TC_BUILD_BRANCH -e gcs_credentials -e gcs_bucket=$gcs_bucket" run_bazel << 'EOF'
 bazel build --config ci //pkg/cmd/publish-artifacts
 BAZEL_BIN=$(bazel info bazel-bin --config ci)
 export google_credentials="$gcs_credentials"

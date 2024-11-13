@@ -34,6 +34,7 @@ func TestDrainingAfterRemoteError(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
 
 	// Create a disk monitor for the temp storage only with 1 byte of space.
 	// This ensures that the query will run into "out of temporary storage"
@@ -45,12 +46,12 @@ func TestDrainingAfterRemoteError(t *testing.T) {
 		nil, /* maxHist */
 		-1,  /* increment: use default block size */
 		math.MaxInt64,
-		cluster.MakeTestingClusterSettings(),
+		st,
 	)
 	diskMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(1))
 
 	// Set up a two node cluster.
-	tempStorageConfig := base.TempStorageConfig{InMemory: true, Mon: diskMonitor}
+	tempStorageConfig := base.TempStorageConfig{InMemory: true, Mon: diskMonitor, Settings: st}
 	args := base.TestClusterArgs{
 		ServerArgs:      base.TestServerArgs{TempStorageConfig: tempStorageConfig},
 		ReplicationMode: base.ReplicationManual,
@@ -100,7 +101,7 @@ func TestDrainingAfterRemoteError(t *testing.T) {
 
 	// Perform a query that uses the join reader when ordering has to be
 	// maintained. Ensure that it encounters the error that we expect.
-	sqlDB.ExpectErr(t, ".*test-disk.*", "SELECT sum(length(v)) FROM large, small WHERE small.k = large.k GROUP BY large.k;")
+	sqlDB.ExpectErr(t, ".*joinreader-disk.*", "SELECT sum(length(v)) FROM large, small WHERE small.k = large.k GROUP BY large.k;")
 	sqlDB.Exec(t, "SET tracing = off;")
 
 	// Now, the crux of the test - verify that the spans for the join reader on

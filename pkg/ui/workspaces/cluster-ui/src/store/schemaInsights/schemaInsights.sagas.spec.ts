@@ -15,8 +15,8 @@ import {
   throwError,
 } from "redux-saga-test-plan/providers";
 import * as matchers from "redux-saga-test-plan/matchers";
-import moment from "moment";
-import { getSchemaInsights } from "../../api";
+import moment from "moment-timezone";
+import { getSchemaInsights, SqlApiResponse } from "../../api";
 import {
   refreshSchemaInsightsSaga,
   requestSchemaInsightsSaga,
@@ -40,7 +40,7 @@ describe("SchemaInsights sagas", () => {
     spy.mockRestore();
   });
 
-  const schemaInsightsResponse: InsightRecommendation[] = [
+  const schemaInsights: InsightRecommendation[] = [
     {
       type: "DropIndex",
       database: "test_database",
@@ -49,10 +49,16 @@ describe("SchemaInsights sagas", () => {
         table: "test_table",
         indexName: "test_idx",
         indexID: 1,
+        schema: "public",
         lastUsed: "2022-08-22T22:30:02Z",
       },
     },
   ];
+
+  const schemaInsightsResponse: SqlApiResponse<InsightRecommendation[]> = {
+    maxSizeReached: false,
+    results: schemaInsights,
+  };
 
   const schemaInsightsAPIProvider: (EffectProviders | StaticProvider)[] = [
     [matchers.call.fn(getSchemaInsights), schemaInsightsResponse],

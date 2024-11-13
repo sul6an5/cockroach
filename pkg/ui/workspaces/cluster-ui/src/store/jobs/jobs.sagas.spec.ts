@@ -18,18 +18,17 @@ import * as matchers from "redux-saga-test-plan/matchers";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 
 import { getJobs } from "src/api/jobsApi";
-import {
-  refreshJobsSaga,
-  requestJobsSaga,
-  receivedJobsSaga,
-} from "./jobs.sagas";
+import { refreshJobsSaga, requestJobsSaga } from "./jobs.sagas";
 import { actions, reducer, JobsState } from "./jobs.reducer";
 import {
   allJobsFixture,
   earliestRetainedTime,
 } from "../../jobs/jobsPage/jobsPage.fixture";
+import moment from "moment-timezone";
 
 describe("jobs sagas", () => {
+  const lastUpdated = moment.utc(new Date("2023-02-21T12:00:00.000Z"));
+
   const payload = new cockroach.server.serverpb.JobsRequest({
     limit: 0,
     type: 0,
@@ -43,6 +42,16 @@ describe("jobs sagas", () => {
   const jobsAPIProvider: (EffectProviders | StaticProvider)[] = [
     [matchers.call.fn(getJobs), jobsResponse],
   ];
+
+  let spy: jest.SpyInstance;
+
+  beforeAll(() => {
+    spy = jest.spyOn(moment, "utc").mockImplementation(() => lastUpdated);
+  });
+
+  afterAll(() => {
+    spy.mockRestore();
+  });
 
   describe("refreshJobsSaga", () => {
     it("dispatches refresh jobs action", () => {
@@ -64,6 +73,7 @@ describe("jobs sagas", () => {
           lastError: null,
           valid: true,
           inFlight: false,
+          lastUpdated,
         })
         .run();
     });
@@ -79,30 +89,9 @@ describe("jobs sagas", () => {
           lastError: error,
           valid: false,
           inFlight: false,
+          lastUpdated,
         })
         .run();
-    });
-  });
-
-  describe("receivedJobsSaga", () => {
-    it("sets valid status to false after specified period of time", () => {
-      const timeout = 500;
-      return expectSaga(receivedJobsSaga, timeout)
-        .delay(timeout)
-        .put(actions.invalidated())
-        .withReducer(reducer, {
-          data: jobsResponse,
-          lastError: null,
-          valid: true,
-          inFlight: false,
-        })
-        .hasFinalState<JobsState>({
-          data: jobsResponse,
-          lastError: null,
-          valid: false,
-          inFlight: false,
-        })
-        .run(1000);
     });
   });
 });

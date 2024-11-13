@@ -1,7 +1,5 @@
 #! /usr/bin/env expect -f
 
-# Disabled until https://github.com/cockroachdb/cockroach/issues/76483 is resolved.
-
 source [file join [file dirname $argv0] common.tcl]
 
 start_server $argv
@@ -11,18 +9,16 @@ eexpect "defaultdb>"
 
 start_test "Check that interrupt with a partial line clears the line."
 send "asasaa"
+eexpect "asasaa"
 interrupt
 eexpect "defaultdb>"
 end_test
 
-start_test "Check that interrupt with a multiline clears the current line."
+start_test "Check that interrupt with a multiline clears the current input."
 send "select\r"
 eexpect " -> "
 send "'XXX'"
 interrupt
-send "'YYY';\r"
-eexpect "column"
-eexpect "YYY"
 eexpect "defaultdb>"
 end_test
 
@@ -40,16 +36,36 @@ interrupt
 eexpect "query execution canceled"
 eexpect "57014"
 
-# TODO(knz): we currently need to trigger a reconnection
-# before we get a healthy prompt. This will be fixed
-# in a later version.
-send "\r"
 eexpect "defaultdb>"
 end_test
 
-# Quit the SQL client, and open a unix shell.
+# Quit the SQL client.
 send_eof
 eexpect eof
+
+start_test "Check that interrupt without a line editor quits the shell."
+# regression test for #90653.
+spawn $argv sql --no-line-editor
+eexpect "defaultdb>"
+interrupt
+set timeout 1
+expect {
+    "attempting to cancel query" { exit 1 }
+    "panic: runtime error" { exit 1 }
+    timeout {}
+}
+set timeout 30
+interrupt
+expect {
+    "attempting to cancel query" { exit 1 }
+    "panic: runtime error" { exit 1 }
+    "" {}
+}
+end_test
+send "\rexit\r"
+eexpect eof
+
+# Open a unix shell.
 spawn /bin/bash
 set shell2_spawn_id $spawn_id
 send "PS1=':''/# '\r"
@@ -71,11 +87,6 @@ sleep 0.4
 interrupt
 eexpect "query execution canceled"
 eexpect "57014"
-
-# TODO(knz): we currently need to trigger a reconnection
-# before we get a healthy prompt. This will be fixed
-# in a later version.
-send "\rselect 1;\r"
 
 # Send another query, expect an error. The shell should
 # not have terminated by this point.
@@ -108,3 +119,17 @@ send "exit 0\r"
 eexpect eof
 
 stop_server $argv
+
+# Regression test for #92943.
+start_test "Check that SIGTERM sent to an interactive shell terminates the shell."
+
+spawn $argv demo --empty --pid-file=demo_pid
+eexpect "Welcome"
+eexpect root@
+eexpect "defaultdb>"
+
+system "kill -TERM `cat demo_pid`"
+
+eexpect eof
+
+end_test

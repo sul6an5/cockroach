@@ -8,8 +8,16 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
-import { executeInternalSql, SqlExecutionRequest } from "./sqlApi";
+import moment from "moment-timezone";
+import {
+  executeInternalSql,
+  LONG_TIMEOUT,
+  SqlExecutionRequest,
+  sqlResultsAreEmpty,
+  LARGE_RESULT_SIZE,
+  SqlApiResponse,
+  formatApiResult,
+} from "./sqlApi";
 
 export type ClusterLockState = {
   databaseName?: string;
@@ -43,7 +51,9 @@ type ClusterLockColumns = {
  * getClusterLocksState returns information from crdb_internal.cluster_locks
  * regarding the state of range locks in the cluster.
  */
-export function getClusterLocksState(): Promise<ClusterLocksResponse> {
+export function getClusterLocksState(): Promise<
+  SqlApiResponse<ClusterLocksResponse>
+> {
   const request: SqlExecutionRequest = {
     statements: [
       {
@@ -65,15 +75,17 @@ WHERE
       },
     ],
     execute: true,
+    timeout: LONG_TIMEOUT,
+    max_result_size: LARGE_RESULT_SIZE,
   };
 
   return executeInternalSql<ClusterLockColumns>(request).then(result => {
-    if (
-      result.execution.txn_results.length === 0 ||
-      !result.execution.txn_results[0].rows
-    ) {
-      // No data.
-      return [];
+    if (sqlResultsAreEmpty(result)) {
+      return formatApiResult<ClusterLockState[]>(
+        [],
+        result.error,
+        "retrieving cluster locks information",
+      );
     }
 
     const locks: Record<string, ClusterLockState> = {};
@@ -114,6 +126,10 @@ WHERE
       }
     });
 
-    return Object.values(locks);
+    return formatApiResult<ClusterLockState[]>(
+      Object.values(locks),
+      result.error,
+      "retrieving luster locks information",
+    );
   });
 }

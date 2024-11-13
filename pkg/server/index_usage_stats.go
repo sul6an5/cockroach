@@ -12,7 +12,7 @@ package server
 
 import (
 	"context"
-	"strings"
+	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -21,8 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -37,7 +40,7 @@ import (
 func (s *statusServer) IndexUsageStatistics(
 	ctx context.Context, req *serverpb.IndexUsageStatisticsRequest,
 ) (*serverpb.IndexUsageStatisticsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
@@ -100,7 +103,7 @@ func (s *statusServer) IndexUsageStatistics(
 	}
 
 	// Append last reset time.
-	resp.LastReset = s.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics().GetLastReset()
+	resp.LastReset = s.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics().GetClusterLastReset()
 
 	return resp, nil
 }
@@ -127,15 +130,28 @@ func indexUsageStatsLocal(
 func (s *statusServer) ResetIndexUsageStats(
 	ctx context.Context, req *serverpb.ResetIndexUsageStatsRequest,
 ) (*serverpb.ResetIndexUsageStatsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
 		return nil, err
 	}
 
+	var clusterResetStartTime time.Time
+	// If the reset time is empty in the request, set the reset time to the
+	// current time. Otherwise, use the reset time in the request. This
+	// conditional allows us to propagate a single reset time value to all nodes.
+	// The propagated reset time represents the time at which the reset was
+	// requested.
+	if req.ClusterResetStartTime.IsZero() {
+		clusterResetStartTime = timeutil.Now()
+	} else {
+		clusterResetStartTime = req.ClusterResetStartTime
+	}
+
 	localReq := &serverpb.ResetIndexUsageStatsRequest{
-		NodeID: "local",
+		NodeID:                "local",
+		ClusterResetStartTime: clusterResetStartTime,
 	}
 	resp := &serverpb.ResetIndexUsageStatsResponse{}
 
@@ -145,7 +161,7 @@ func (s *statusServer) ResetIndexUsageStats(
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 		if local {
-			s.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics().Reset()
+			s.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics().Reset(clusterResetStartTime)
 			return resp, nil
 		}
 
@@ -191,10 +207,10 @@ func (s *statusServer) ResetIndexUsageStats(
 func (s *statusServer) TableIndexStats(
 	ctx context.Context, req *serverpb.TableIndexStatsRequest,
 ) (*serverpb.TableIndexStatsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 	return getTableIndexUsageStats(ctx, req, s.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics(),
@@ -208,11 +224,11 @@ func getTableIndexUsageStats(
 	ctx context.Context,
 	req *serverpb.TableIndexStatsRequest,
 	idxUsageStatsProvider *idxusage.LocalIndexUsageStats,
-	ie *sql.InternalExecutor,
+	ie isql.Executor,
 	st *cluster.Settings,
 	execConfig *sql.ExecutorConfig,
 ) (*serverpb.TableIndexStatsResponse, error) {
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -243,9 +259,6 @@ func getTableIndexUsageStats(
  		WHERE ti.descriptor_id = $::REGCLASS`,
 		tableID,
 	)
-
-	const expectedNumDatums = 7
-
 	it, err := ie.QueryIteratorEx(ctx, "index-usage-stats", nil,
 		sessiondata.InternalExecutorOverride{
 			User:     userName,
@@ -265,14 +278,7 @@ func getTableIndexUsageStats(
 	defer func() { err = errors.CombineErrors(err, it.Close()) }()
 
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
-		var row tree.Datums
-		if row = it.Cur(); row == nil {
-			return nil, errors.New("unexpected null row")
-		}
-
-		if row.Len() != expectedNumDatums {
-			return nil, errors.Newf("expected %d columns, received %d", expectedNumDatums, row.Len())
-		}
+		row := it.Cur()
 
 		indexID := tree.MustBeDInt(row[0])
 		indexName := tree.MustBeDString(row[1])
@@ -311,7 +317,11 @@ func getTableIndexUsageStats(
 		}
 
 		statsRow := idxusage.IndexStatsRow{
-			Row:              idxStatsRow,
+			TableID:          idxStatsRow.Statistics.Key.TableID,
+			IndexID:          idxStatsRow.Statistics.Key.IndexID,
+			CreatedAt:        idxStatsRow.CreatedAt,
+			LastRead:         idxStatsRow.Statistics.Stats.LastRead,
+			IndexType:        idxStatsRow.IndexType,
 			UnusedIndexKnobs: execConfig.UnusedIndexRecommendationsKnobs,
 		}
 		recommendations := statsRow.GetRecommendationsFromIndexStats(req.Database, st)
@@ -319,7 +329,7 @@ func getTableIndexUsageStats(
 		idxUsageStats = append(idxUsageStats, idxStatsRow)
 	}
 
-	lastReset := idxUsageStatsProvider.GetLastReset()
+	lastReset := idxUsageStatsProvider.GetClusterLastReset()
 
 	resp := &serverpb.TableIndexStatsResponse{
 		Statistics:           idxUsageStats,
@@ -337,7 +347,7 @@ func getTableIDFromDatabaseAndTableName(
 	ctx context.Context,
 	database string,
 	table string,
-	ie *sql.InternalExecutor,
+	ie isql.Executor,
 	userName username.SQLUsername,
 ) (int, error) {
 	// Fully qualified table name is either database.table or database.schema.table
@@ -345,38 +355,99 @@ func getTableIDFromDatabaseAndTableName(
 	if err != nil {
 		return 0, err
 	}
-	names := strings.Split(fqtName, ".")
-	// Strip quotations marks from db and table names.
-	for idx := range names {
-		names[idx] = strings.Trim(names[idx], "\"")
-	}
-	q := makeSQLQuery()
-	q.Append(`SELECT table_id FROM crdb_internal.tables WHERE database_name = $ `, names[0])
 
-	if len(names) == 2 {
-		q.Append(`AND name = $`, names[1])
-	} else if len(names) == 3 {
-		q.Append(`AND schema_name = $ AND name = $`, names[1], names[2])
-	} else {
-		return 0, errors.Newf("expected array length 2 or 3, received %d", len(names))
-	}
-	if len(q.Errors()) > 0 {
-		return 0, combineAllErrors(q.Errors())
-	}
-
-	datums, err := ie.QueryRowEx(ctx, "get-table-id", nil,
-		sessiondata.InternalExecutorOverride{
-			User:     userName,
-			Database: database,
-		}, q.String(), q.QueryArguments()...)
-
+	row, err := ie.QueryRowEx(
+		ctx, "get-table-id", nil,
+		sessiondata.InternalExecutorOverride{User: userName, Database: database},
+		"SELECT $1::regclass::oid", table,
+	)
 	if err != nil {
 		return 0, err
 	}
-	if datums == nil {
+	if row == nil {
 		return 0, errors.Newf("expected to find table ID for table %s, but found nothing", fqtName)
 	}
+	tableID := tree.MustBeDOid(row[0]).Oid
+	return int(tableID), nil
+}
 
-	tableID := int(tree.MustBeDInt(datums[0]))
-	return tableID, nil
+func getDatabaseIndexRecommendations(
+	ctx context.Context,
+	dbName string,
+	ie isql.Executor,
+	st *cluster.Settings,
+	knobs *idxusage.UnusedIndexRecommendationTestingKnobs,
+) ([]*serverpb.IndexRecommendation, error) {
+
+	// Omit fetching index recommendations for the 'system' database.
+	if dbName == catconstants.SystemDatabaseName {
+		return []*serverpb.IndexRecommendation{}, nil
+	}
+
+	userName, err := userFromIncomingRPCContext(ctx)
+	if err != nil {
+		return []*serverpb.IndexRecommendation{}, err
+	}
+
+	escDBName := tree.NameString(dbName)
+	query := fmt.Sprintf(`
+		SELECT
+			ti.descriptor_id as table_id,
+			ti.index_id,
+			ti.index_type,
+			last_read,
+			ti.created_at
+		FROM %[1]s.crdb_internal.index_usage_statistics AS us
+		 JOIN %[1]s.crdb_internal.table_indexes AS ti ON (us.index_id = ti.index_id AND us.table_id = ti.descriptor_id AND index_type = 'secondary')
+		 JOIN %[1]s.crdb_internal.tables AS t ON (ti.descriptor_id = t.table_id AND t.database_name != 'system');`, escDBName)
+
+	it, err := ie.QueryIteratorEx(ctx, "db-index-recommendations", nil,
+		sessiondata.InternalExecutorOverride{
+			User:     userName,
+			Database: dbName,
+		}, query)
+
+	if err != nil {
+		return []*serverpb.IndexRecommendation{}, err
+	}
+
+	// We have to make sure to close the iterator since we might return from the
+	// for loop early (before Next() returns false).
+	defer func() { err = errors.CombineErrors(err, it.Close()) }()
+
+	var ok bool
+	var idxRecommendations []*serverpb.IndexRecommendation
+
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		row := it.Cur()
+
+		tableID := tree.MustBeDInt(row[0])
+		indexID := tree.MustBeDInt(row[1])
+		indexType := tree.MustBeDString(row[2])
+		lastRead := time.Time{}
+		if row[3] != tree.DNull {
+			lastRead = tree.MustBeDTimestampTZ(row[3]).Time
+		}
+		var createdAt *time.Time
+		if row[4] != tree.DNull {
+			ts := tree.MustBeDTimestamp(row[4])
+			createdAt = &ts.Time
+		}
+
+		if err != nil {
+			return []*serverpb.IndexRecommendation{}, err
+		}
+
+		statsRow := idxusage.IndexStatsRow{
+			TableID:          roachpb.TableID(tableID),
+			IndexID:          roachpb.IndexID(indexID),
+			CreatedAt:        createdAt,
+			LastRead:         lastRead,
+			IndexType:        string(indexType),
+			UnusedIndexKnobs: knobs,
+		}
+		recommendations := statsRow.GetRecommendationsFromIndexStats(dbName, st)
+		idxRecommendations = append(idxRecommendations, recommendations...)
+	}
+	return idxRecommendations, nil
 }

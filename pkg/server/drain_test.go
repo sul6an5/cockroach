@@ -17,13 +17,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -38,7 +37,6 @@ import (
 // TestDrain tests the Drain RPC.
 func TestDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.UnderRaceWithIssue(t, 86974, "flaky test")
 	defer log.Scope(t).Close(t)
 	doTestDrain(t)
 }
@@ -64,18 +62,27 @@ func doTestDrain(tt *testing.T) {
 
 	// Issue another probe. This checks that the server is still running
 	// (i.e. Shutdown: false was effective), the draining status is
-	// still properly reported, and the server slept once.
+	// still properly reported, and that the server only slept once (which only
+	// should occur on the first drain).
 	resp = t.sendProbe()
 	t.assertDraining(resp, true)
 	// probe-only has no remaining.
 	t.assertRemaining(resp, false)
 	t.assertEqual(1, drainSleepCallCount)
 
-	// Issue another drain. Verify that the remaining is zero (i.e. complete)
-	// and that the server did not sleep again.
-	resp = t.sendDrainNoShutdown()
-	t.assertDraining(resp, true)
-	t.assertRemaining(resp, false)
+	// Repeat drain commands until we verify that there are zero remaining leases
+	// (i.e. complete). Also validate that the server did not sleep again.
+	testutils.SucceedsSoon(t, func() error {
+		resp = t.sendDrainNoShutdown()
+		if !resp.IsDraining {
+			return errors.Newf("expected draining")
+		}
+		if resp.DrainRemainingIndicator > 0 {
+			return errors.Newf("still %d remaining, desc: %s", resp.DrainRemainingIndicator,
+				resp.DrainRemainingDescription)
+		}
+		return nil
+	})
 	t.assertEqual(1, drainSleepCallCount)
 
 	// Now issue a drain request without drain but with shutdown.
@@ -127,7 +134,7 @@ INSERT INTO t.test VALUES (3);
 	stats, err := ts.GetScrubbedStmtStats(ctx)
 	require.NoError(t, err)
 	require.Truef(t,
-		func(stats []roachpb.CollectedStatementStatistics) bool {
+		func(stats []appstatspb.CollectedStatementStatistics) bool {
 			for _, stat := range stats {
 				if stat.Key.Query == "INSERT INTO _ VALUES (_)" {
 					return true
@@ -299,4 +306,47 @@ func getAdminClientForServer(
 	return client, func() {
 		_ = conn.Close() // nolint:grpcconnclose
 	}, nil
+}
+
+func TestServerShutdownReleasesSession(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DisableDefaultTestTenant: true,
+	})
+	defer s.Stopper().Stop(ctx)
+
+	tenantArgs := base.TestTenantArgs{
+		TenantID: serverutils.TestTenantID(),
+	}
+
+	tenant, tenantSQLRaw := serverutils.StartTenant(t, s, tenantArgs)
+	defer tenant.Stopper().Stop(ctx)
+	tenantSQL := sqlutils.MakeSQLRunner(tenantSQLRaw)
+
+	queryOwner := func(id base.SQLInstanceID) (owner *string) {
+		tenantSQL.QueryRow(t, "SELECT session_id FROM system.sql_instances WHERE id = $1", id).Scan(&owner)
+		return owner
+	}
+
+	sessionExists := func(session string) bool {
+		rows := tenantSQL.QueryStr(t, "SELECT session_id FROM system.sqlliveness WHERE session_id = $1", session)
+		return 0 < len(rows)
+	}
+
+	tmpTenant, err := s.StartTenant(ctx, tenantArgs)
+	require.NoError(t, err)
+
+	tmpSQLInstance := tmpTenant.SQLInstanceID()
+	session := queryOwner(tmpSQLInstance)
+	require.NotNil(t, session)
+	require.True(t, sessionExists(*session))
+
+	require.NoError(t, tmpTenant.DrainClients(context.Background()))
+
+	require.False(t, sessionExists(*session), "expected session %s to be deleted from the sqlliveness table, but it still exists", *session)
+	require.Nil(t, queryOwner(tmpSQLInstance), "expected sql_instance %d to have no owning session_id", tmpSQLInstance)
 }

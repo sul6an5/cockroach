@@ -17,9 +17,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -34,12 +36,39 @@ var MergeQueueEnabled = settings.RegisterBoolSetting(
 	true,
 )
 
+// ReplicateQueueEnabled is a setting that controls whether the replicate queue
+// is enabled.
+var ReplicateQueueEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.replicate_queue.enabled",
+	"whether the replicate queue is enabled",
+	true,
+)
+
+// SplitQueueEnabled is a setting that controls whether the split queue is
+// enabled.
+var SplitQueueEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.split_queue.enabled",
+	"whether the split queue is enabled",
+	true,
+)
+
+// MVCCGCQueueEnabled is a setting that controls whether the MVCC GC queue is
+// enabled.
+var MVCCGCQueueEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.mvcc_gc_queue.enabled",
+	"whether the MVCC GC queue is enabled",
+	true,
+)
+
 // CmdIDKey is a Raft command id. This will be logged unredacted - keep it random.
 type CmdIDKey string
 
 // SafeFormat implements redact.SafeFormatter.
 func (s CmdIDKey) SafeFormat(sp redact.SafePrinter, verb rune) {
-	sp.Printf("%q", redact.SafeString(s))
+	sp.Printf("%x", redact.SafeString(s))
 }
 
 func (s CmdIDKey) String() string {
@@ -54,8 +83,8 @@ type FilterArgs struct {
 	CmdID   CmdIDKey
 	Index   int
 	Sid     roachpb.StoreID
-	Req     roachpb.Request
-	Hdr     roachpb.Header
+	Req     kvpb.Request
+	Hdr     kvpb.Header
 	Version roachpb.Version
 	Err     error // only used for TestingPostEvalFilter
 }
@@ -63,10 +92,10 @@ type FilterArgs struct {
 // ProposalFilterArgs groups the arguments to ReplicaProposalFilter.
 type ProposalFilterArgs struct {
 	Ctx        context.Context
-	Cmd        kvserverpb.RaftCommand
+	Cmd        *kvserverpb.RaftCommand
 	QuotaAlloc *quotapool.IntAlloc
 	CmdID      CmdIDKey
-	Req        roachpb.BatchRequest
+	Req        kvpb.BatchRequest
 }
 
 // ApplyFilterArgs groups the arguments to a ReplicaApplyFilter.
@@ -75,8 +104,8 @@ type ApplyFilterArgs struct {
 	CmdID       CmdIDKey
 	RangeID     roachpb.RangeID
 	StoreID     roachpb.StoreID
-	Req         *roachpb.BatchRequest // only set on the leaseholder
-	ForcedError *roachpb.Error
+	Req         *kvpb.BatchRequest // only set on the leaseholder
+	ForcedError *kvpb.Error
 }
 
 // InRaftCmd returns true if the filter is running in the context of a Raft
@@ -88,36 +117,36 @@ func (f *FilterArgs) InRaftCmd() bool {
 // ReplicaRequestFilter can be used in testing to influence the error returned
 // from a request before it is evaluated. Return nil to continue with regular
 // processing or non-nil to terminate processing with the returned error.
-type ReplicaRequestFilter func(context.Context, roachpb.BatchRequest) *roachpb.Error
+type ReplicaRequestFilter func(context.Context, *kvpb.BatchRequest) *kvpb.Error
 
 // ReplicaConcurrencyRetryFilter can be used to examine a concurrency retry
 // error before it is handled and its batch is re-evaluated.
-type ReplicaConcurrencyRetryFilter func(context.Context, roachpb.BatchRequest, *roachpb.Error)
+type ReplicaConcurrencyRetryFilter func(context.Context, *kvpb.BatchRequest, *kvpb.Error)
 
 // ReplicaCommandFilter may be used in tests through the StoreTestingKnobs to
 // intercept the handling of commands and artificially generate errors. Return
 // nil to continue with regular processing or non-nil to terminate processing
 // with the returned error.
-type ReplicaCommandFilter func(args FilterArgs) *roachpb.Error
+type ReplicaCommandFilter func(args FilterArgs) *kvpb.Error
 
 // ReplicaProposalFilter can be used in testing to influence the error returned
 // from proposals after a request is evaluated but before it is proposed.
-type ReplicaProposalFilter func(args ProposalFilterArgs) *roachpb.Error
+type ReplicaProposalFilter func(args ProposalFilterArgs) *kvpb.Error
 
 // A ReplicaApplyFilter is a testing hook into raft command application.
 // See StoreTestingKnobs.
-type ReplicaApplyFilter func(args ApplyFilterArgs) (int, *roachpb.Error)
+type ReplicaApplyFilter func(args ApplyFilterArgs) (int, *kvpb.Error)
 
 // ReplicaResponseFilter is used in unittests to modify the outbound
 // response returned to a waiting client after a replica command has
 // been processed. This filter is invoked only by the command proposer.
-type ReplicaResponseFilter func(context.Context, roachpb.BatchRequest, *roachpb.BatchResponse) *roachpb.Error
+type ReplicaResponseFilter func(context.Context, *kvpb.BatchRequest, *kvpb.BatchResponse) *kvpb.Error
 
 // ReplicaRangefeedFilter is used in unit tests to modify the request, inject
 // responses, or return errors from rangefeeds.
 type ReplicaRangefeedFilter func(
-	args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink,
-) *roachpb.Error
+	args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink,
+) *kvpb.Error
 
 // ContainsKey returns whether this range contains the specified key.
 func ContainsKey(desc *roachpb.RangeDescriptor, key roachpb.Key) bool {
@@ -149,7 +178,8 @@ func ContainsKeyRange(desc *roachpb.RangeDescriptor, start, end roachpb.Key) boo
 // into up to three pieces: A first piece which is contained in the Range,
 // and a slice of up to two further spans which are outside of the key
 // range. An span for which [Key, EndKey) is empty does not result in any
-// spans; thus intersectIntent only applies to span ranges.
+// spans; thus IntersectSpan only applies to span ranges and point keys will
+// cause the function to panic.
 //
 // A range-local span range is never split: It's returned as either
 // belonging to or outside of the descriptor's key range, and passing an
@@ -162,8 +192,7 @@ func IntersectSpan(
 ) (middle *roachpb.Span, outside []roachpb.Span) {
 	start, end := desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey()
 	if len(span.EndKey) == 0 {
-		outside = append(outside, span)
-		return
+		panic("unsupported point key")
 	}
 	if bytes.Compare(span.Key, keys.LocalRangeMax) < 0 {
 		if bytes.Compare(span.EndKey, keys.LocalRangeMax) >= 0 {
@@ -202,7 +231,7 @@ func IntersectSpan(
 
 // SplitByLoadMergeDelay wraps "kv.range_split.by_load_merge_delay".
 var SplitByLoadMergeDelay = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.range_split.by_load_merge_delay",
 	"the delay that range splits created due to load will wait before considering being merged away",
 	5*time.Minute,
@@ -215,6 +244,26 @@ var SplitByLoadMergeDelay = settings.RegisterDurationSetting(
 	},
 )
 
-// MaxCommandSizeDefault is the default for the kv.raft.command.max_size
-// cluster setting.
-const MaxCommandSizeDefault = 64 << 20
+const (
+	// MaxCommandSizeDefault is the default for the kv.raft.command.max_size
+	// cluster setting.
+	MaxCommandSizeDefault = 64 << 20 // 64 MB
+
+	// MaxCommandSizeFloor is the minimum allowed value for the
+	// kv.raft.command.max_size cluster setting.
+	MaxCommandSizeFloor = 4 << 20 // 4 MB
+)
+
+// MaxCommandSize wraps "kv.raft.command.max_size".
+var MaxCommandSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
+	"kv.raft.command.max_size",
+	"maximum size of a raft command",
+	MaxCommandSizeDefault,
+	func(size int64) error {
+		if size < MaxCommandSizeFloor {
+			return fmt.Errorf("max_size must be greater than %s", humanizeutil.IBytes(MaxCommandSizeFloor))
+		}
+		return nil
+	},
+)

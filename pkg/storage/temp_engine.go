@@ -75,6 +75,7 @@ func newPebbleTempEngine(
 	}
 
 	p, err := Open(ctx, loc,
+		tempStorage.Settings,
 		CacheSize(cacheSize),
 		func(cfg *engineConfig) error {
 			cfg.UseFileRegistry = storeSpec.UseFileRegistry
@@ -87,6 +88,7 @@ func newPebbleTempEngine(
 			cfg.Opts.Comparer = pebble.DefaultComparer
 			cfg.Opts.DisableWAL = true
 			cfg.Opts.Experimental.KeyValidationFunc = nil
+			cfg.Opts.BlockPropertyCollectors = nil
 			return nil
 		},
 	)
@@ -94,8 +96,9 @@ func newPebbleTempEngine(
 		return nil, nil, err
 	}
 
-	// Set store ID for the pebble engine.
-	p.SetStoreID(ctx, base.TempStoreID)
+	// Set store ID for the pebble engine. We are not using shared storage for
+	// temp stores so this cannot error out.
+	_ = p.SetStoreID(ctx, base.TempStoreID)
 	return &pebbleTempEngine{
 		db:     p.db,
 		closer: p.closer,

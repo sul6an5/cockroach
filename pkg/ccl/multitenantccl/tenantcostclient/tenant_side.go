@@ -14,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -25,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/errorspb"
 )
@@ -129,6 +132,9 @@ const defaultTickInterval = time.Second
 //	0.5^(1 second / tickInterval)
 const movingAvgRUPerSecFactor = 0.5
 
+// movingAvgCPUPerSecFactor is the weight applied to a new sample of CPU usage.
+const movingAvgCPUPerSecFactor = 0.5
+
 // We request more tokens when the available RUs go below a threshold. The
 // threshold is a fraction of the last granted RUs.
 const notifyFraction = 0.1
@@ -165,7 +171,7 @@ func newTenantSideCostController(
 		settings:        st,
 		tenantID:        tenantID,
 		provider:        provider,
-		responseChan:    make(chan *roachpb.TokenBucketResponse, 1),
+		responseChan:    make(chan *kvpb.TokenBucketResponse, 1),
 		lowRUNotifyChan: make(chan struct{}, 1),
 	}
 	c.limiter.Init(timeSource, c.lowRUNotifyChan)
@@ -259,7 +265,12 @@ type tenantSideCostController struct {
 		// consumption records the amount of resources consumed by the tenant.
 		// It is read and written on multiple goroutines and so must be protected
 		// by a mutex.
-		consumption roachpb.TenantConsumption
+		consumption kvpb.TenantConsumption
+
+		// avgCPUPerSec is an exponentially-weighted moving average of the CPU usage
+		// per second; used to estimate the CPU usage of a query. It is only written
+		// in the main loop, but can be read by multiple goroutines so is protected.
+		avgCPUPerSec float64
 	}
 
 	// lowRUNotifyChan is used when the number of available RUs is running low and
@@ -268,7 +279,7 @@ type tenantSideCostController struct {
 
 	// responseChan is used to receive results from token bucket requests, which
 	// are run in a separate goroutine. A nil response indicates an error.
-	responseChan chan *roachpb.TokenBucketResponse
+	responseChan chan *kvpb.TokenBucketResponse
 
 	// run contains the state that is updated by the main loop. It doesn't need a
 	// mutex since the main loop runs on a single goroutine.
@@ -279,7 +290,7 @@ type tenantSideCostController struct {
 		// externalUsage stores the last value returned by externalUsageFn.
 		externalUsage multitenant.ExternalUsage
 		// consumption stores the last value of mu.consumption.
-		consumption roachpb.TenantConsumption
+		consumption kvpb.TenantConsumption
 		// targetPeriod stores the value of the TargetPeriodSetting setting at the
 		// last update.
 		targetPeriod time.Duration
@@ -293,7 +304,7 @@ type tenantSideCostController struct {
 		// requestInProgress is the token bucket request that is in progress, or
 		// nil if there is no call in progress. It gets set to nil when we process
 		// the response (in the main loop), even in error cases.
-		requestInProgress *roachpb.TokenBucketRequest
+		requestInProgress *kvpb.TokenBucketRequest
 		// shouldSendRequest is set if the last token bucket request encountered an
 		// error. This triggers a retry attempt on the next tick.
 		//
@@ -306,7 +317,7 @@ type tenantSideCostController struct {
 		lastRequestTime time.Time
 		// lastReportedConsumption is the set of tenant resource consumption
 		// metrics last sent to the token bucket server.
-		lastReportedConsumption roachpb.TenantConsumption
+		lastReportedConsumption kvpb.TenantConsumption
 		// lastRate is the token bucket fill rate that was last configured.
 		lastRate float64
 
@@ -389,23 +400,28 @@ func (c *tenantSideCostController) onTick(ctx context.Context, newTime time.Time
 	// Update CPU consumption.
 	deltaCPU := newExternalUsage.CPUSecs - c.run.externalUsage.CPUSecs
 
-	// Subtract any allowance that we consider free background usage.
 	deltaTime := newTime.Sub(c.run.lastTick)
 	if deltaTime > 0 {
+		// Subtract any allowance that we consider free background usage.
 		allowance := CPUUsageAllowance.Get(&c.settings.SV).Seconds() * deltaTime.Seconds()
 		deltaCPU -= allowance
 
+		avgCPU := deltaCPU / deltaTime.Seconds()
+
+		c.mu.Lock()
 		// If total CPU usage is small (less than 3% of a single CPU by default)
 		// and there have been no recent read/write operations, then ignore the
 		// recent usage altogether. This is intended to minimize RU usage when the
 		// cluster is idle.
-		c.mu.Lock()
 		if deltaCPU < allowance*2 {
 			if c.mu.consumption.ReadBatches == c.run.consumption.ReadBatches &&
 				c.mu.consumption.WriteBatches == c.run.consumption.WriteBatches {
 				deltaCPU = 0
 			}
 		}
+		// Keep track of an exponential moving average of CPU usage.
+		c.mu.avgCPUPerSec *= 1 - movingAvgCPUPerSecFactor
+		c.mu.avgCPUPerSec += avgCPU * movingAvgCPUPerSecFactor
 		c.mu.Unlock()
 	}
 	if deltaCPU < 0 {
@@ -508,7 +524,7 @@ func (c *tenantSideCostController) sendTokenBucketRequest(ctx context.Context) {
 		}
 	}
 
-	req := &roachpb.TokenBucketRequest{
+	req := &kvpb.TokenBucketRequest{
 		TenantID:                    c.tenantID.ToUint64(),
 		InstanceID:                  uint32(c.instanceID),
 		InstanceLease:               c.sessionID.UnsafeBytes(),
@@ -552,7 +568,7 @@ func (c *tenantSideCostController) sendTokenBucketRequest(ctx context.Context) {
 }
 
 func (c *tenantSideCostController) handleTokenBucketResponse(
-	ctx context.Context, req *roachpb.TokenBucketRequest, resp *roachpb.TokenBucketResponse,
+	ctx context.Context, req *kvpb.TokenBucketRequest, resp *kvpb.TokenBucketResponse,
 ) {
 	if log.ExpensiveLogEnabled(ctx, 1) {
 		log.Infof(
@@ -753,7 +769,8 @@ func (c *tenantSideCostController) OnRequestWait(ctx context.Context) error {
 	return c.limiter.Wait(ctx, 0)
 }
 
-// OnResponse is part of the multitenant.TenantSideBatchInterceptor interface.
+// OnResponseWait is part of the multitenant.TenantSideBatchInterceptor
+// interface.
 func (c *tenantSideCostController) OnResponseWait(
 	ctx context.Context, req tenantcostmodel.RequestInfo, resp tenantcostmodel.ResponseInfo,
 ) error {
@@ -771,6 +788,16 @@ func (c *tenantSideCostController) OnResponseWait(
 	// it easier to stick within a constrained RU/s budget.
 	if err := c.limiter.Wait(ctx, totalRU); err != nil {
 		return err
+	}
+
+	// Record the number of RUs consumed by the IO request.
+	if multitenant.TenantRUEstimateEnabled.Get(&c.settings.SV) {
+		if sp := tracing.SpanFromContext(ctx); sp != nil &&
+			sp.RecordingType() != tracingpb.RecordingOff {
+			sp.RecordStructured(&kvpb.TenantConsumption{
+				RU: float64(totalRU),
+			})
+		}
 	}
 
 	c.mu.Lock()
@@ -814,7 +841,7 @@ func (c *tenantSideCostController) OnExternalIOWait(
 }
 
 // OnExternalIO is part of the multitenant.TenantSideExternalIORecorder
-// interface.
+// interface. TODO(drewk): collect this for queries.
 func (c *tenantSideCostController) OnExternalIO(
 	ctx context.Context, usage multitenant.ExternalIOUsage,
 ) {
@@ -852,4 +879,17 @@ func (c *tenantSideCostController) onExternalIO(
 	c.mu.Unlock()
 
 	return nil
+}
+
+// GetCPUMovingAvg is used to obtain an exponential moving average estimate
+// for the CPU usage in seconds per each second of wall-clock time.
+func (c *tenantSideCostController) GetCPUMovingAvg() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mu.avgCPUPerSec
+}
+
+// GetCostConfig is part of the multitenant.TenantSideCostController interface.
+func (c *tenantSideCostController) GetCostConfig() *tenantcostmodel.Config {
+	return &c.costCfg
 }

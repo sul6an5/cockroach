@@ -36,6 +36,7 @@ RUN apt-get update \
     git \
     gnupg2 \
     libncurses-dev \
+    llvm \
     make \
     patch \
     patchelf \
@@ -114,8 +115,8 @@ RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.20.3/cmake-
 # releases of Go will no longer be run in CI once it is changed. Consider
 # bumping the minimum allowed version of Go in /build/go-version-check.sh.
 RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends golang \
- && curl -fsSL https://storage.googleapis.com/golang/go1.19.1.src.tar.gz -o golang.tar.gz \
- && echo '27871baa490f3401414ad793fba49086f6c855b1c584385ed7771e1204c7e179  golang.tar.gz' | sha256sum -c - \
+ && curl -fsSL https://storage.googleapis.com/golang/go1.19.4.src.tar.gz -o golang.tar.gz \
+ && echo 'eda74db4ac494800a3e66ee784e495bfbb9b8e535df924a8b01b1a8028b7f368  golang.tar.gz' | sha256sum -c - \
  && tar -C /usr/local -xzf golang.tar.gz \
  && rm golang.tar.gz \
  && cd /usr/local/go/src \
@@ -197,6 +198,10 @@ RUN apt-get purge -y \
     rsync \
     texinfo \
  && apt-get autoremove -y
+
+# Replace the nm command with LLVM's version, llvm-nm, which knows how to read
+# binaries build for platforms others than Linux.
+RUN ln -sf /usr/bin/llvm-nm /usr/bin/nm
 
 RUN rm -rf /tmp/* /var/lib/apt/lists/*
 

@@ -18,10 +18,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/semenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -80,7 +82,7 @@ func TestSafeMessage(t *testing.T) {
 				`{MutationID: 3, JobID: 1234}` +
 				`], ` +
 				`Mutations: [` +
-				`{MutationID: 1, Direction: ADD, State: DELETE_AND_WRITE_ONLY, ConstraintType: FOREIGN_KEY, ForeignKey: {OriginTableID: 112, OriginColumns: [2], ReferencedTableID: 2, ReferencedColumnIDs: [3], Validity: Unvalidated, State: ADD, MutationID: 1}}, ` +
+				`{MutationID: 1, Direction: ADD, State: WRITE_ONLY, ConstraintType: FOREIGN_KEY, ForeignKey: {OriginTableID: 112, OriginColumns: [2], ReferencedTableID: 2, ReferencedColumnIDs: [3], Validity: Unvalidated, State: ADD, MutationID: 1}}, ` +
 				`{MutationID: 2, Direction: ADD, State: DELETE_ONLY, Column: {ID: 5, TypeID: 20, Null: false, State: ADD, MutationID: 2}}, ` +
 				`{MutationID: 3, Direction: ADD, State: DELETE_ONLY, ConstraintType: CHECK, NotNullColumn: 2, Check: {Columns: [2], Validity: Unvalidated, State: ADD, MutationID: 3}}, ` +
 				`{MutationID: 3, Direction: ADD, State: DELETE_ONLY, Index: {ID: 3, Unique: false, KeyColumns: [{ID: 3, Dir: ASC}, {ID: 2, Dir: DESC}], KeySuffixColumns: [1], StoreColumns: [5], State: ADD, MutationID: 3}}` +
@@ -129,8 +131,8 @@ func TestSafeMessage(t *testing.T) {
 					ReferencedColumnIDs: []descpb.ColumnID{2},
 					ReferencedTableID:   112,
 					Validity:            descpb.ConstraintValidity_Validated,
-					OnDelete:            catpb.ForeignKeyAction_CASCADE,
-					Match:               descpb.ForeignKeyReference_PARTIAL,
+					OnDelete:            semenumpb.ForeignKeyAction_CASCADE,
+					Match:               semenumpb.Match_PARTIAL,
 					ConstraintID:        3,
 				})
 				mutable.OutboundFKs = append(mutable.OutboundFKs, descpb.ForeignKeyConstraint{
@@ -140,13 +142,13 @@ func TestSafeMessage(t *testing.T) {
 					ReferencedColumnIDs: []descpb.ColumnID{1},
 					ReferencedTableID:   3,
 					Validity:            descpb.ConstraintValidity_Validated,
-					OnDelete:            catpb.ForeignKeyAction_SET_DEFAULT,
-					Match:               descpb.ForeignKeyReference_SIMPLE,
+					OnDelete:            semenumpb.ForeignKeyAction_SET_DEFAULT,
+					Match:               semenumpb.Match_SIMPLE,
 					ConstraintID:        4,
 				})
 
 				mutable.Mutations = append(mutable.Mutations, descpb.DescriptorMutation{
-					State: descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY,
+					State: descpb.DescriptorMutation_WRITE_ONLY,
 					Descriptor_: &descpb.DescriptorMutation_Constraint{
 						Constraint: &descpb.ConstraintToUpdate{
 							ConstraintType: descpb.ConstraintToUpdate_FOREIGN_KEY,
@@ -157,8 +159,8 @@ func TestSafeMessage(t *testing.T) {
 								OriginColumnIDs:     []descpb.ColumnID{2},
 								ReferencedTableID:   2,
 								ReferencedColumnIDs: []descpb.ColumnID{3},
-								Validity:            descpb.ConstraintValidity_Unvalidated, OnDelete: catpb.ForeignKeyAction_SET_NULL,
-								Match:        descpb.ForeignKeyReference_FULL,
+								Validity:            descpb.ConstraintValidity_Unvalidated, OnDelete: semenumpb.ForeignKeyAction_SET_NULL,
+								Match:        semenumpb.Match_FULL,
 								ConstraintID: 5,
 							},
 						},
@@ -208,9 +210,9 @@ func TestSafeMessage(t *testing.T) {
 								KeySuffixColumnIDs: []descpb.ColumnID{1},
 								StoreColumnIDs:     []descpb.ColumnID{5},
 								KeyColumnNames:     []string{"j_str", "j"},
-								KeyColumnDirections: []catpb.IndexColumn_Direction{
-									catpb.IndexColumn_ASC,
-									catpb.IndexColumn_DESC,
+								KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+									catenumpb.IndexColumn_ASC,
+									catenumpb.IndexColumn_DESC,
 								},
 								StoreColumnNames: []string{"c"},
 							},
@@ -237,6 +239,7 @@ func TestSafeMessage(t *testing.T) {
 				mutable.PrimaryIndex.StoreColumnNames = append(mutable.PrimaryIndex.StoreColumnNames, "c")
 				mutable.NextColumnID = 6
 				mutable.NextIndexID = 4
+				mutable.NextConstraintID = 8
 				mutable.Families[0].ColumnNames = append(mutable.Families[0].ColumnNames, "c")
 				mutable.Families[0].ColumnIDs = append(mutable.Families[0].ColumnIDs, 5)
 				mutable.ModificationTime = hlc.Timestamp{WallTime: 1e9}

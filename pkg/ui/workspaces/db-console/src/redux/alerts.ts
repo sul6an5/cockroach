@@ -14,7 +14,7 @@
  */
 
 import _ from "lodash";
-import moment from "moment";
+import moment from "moment-timezone";
 import { createSelector } from "reselect";
 import { Store, Dispatch, Action, AnyAction } from "redux";
 import { ThunkAction } from "redux-thunk";
@@ -541,13 +541,14 @@ export const clusterPreserveDowngradeOptionOvertimeSelector = createSelector(
     }
     const lastUpdatedTime = moment.unix(longToInt(lastUpdated.seconds));
     const diff = moment.duration(moment().diff(lastUpdatedTime)).asHours();
-    const maximumSetTime = 48;
-    if (diff < maximumSetTime) {
+    if (diff <= 0) {
       return undefined;
     }
     return {
       level: AlertLevel.WARNING,
-      title: `Cluster setting cluster.preserve_downgrade_option has been set for greater than ${maximumSetTime} hours`,
+      title: `Cluster setting cluster.preserve_downgrade_option has been set for ${diff.toFixed(
+        1,
+      )} hours`,
       text: `You can see a list of all nodes and their versions below.
         Once all cluster nodes have been upgraded, and you have validated the stability and performance of
         your workload on the new version, you must reset the cluster.preserve_downgrade_option cluster
@@ -652,6 +653,21 @@ export function alertDataSync(store: Store<AdminUIState>) {
 
     // Always refresh health.
     dispatch(refreshHealth());
+
+    const { Insecure } = getDataFromServer();
+    // We should not send out requests to the endpoints below if
+    // the user has not successfully logged in since the requests
+    // will always return with a 401 error.
+    // Insecure mode is an exception, where login state is irrelevant.
+    if (!Insecure) {
+      if (
+        !state.login ||
+        !state.login.loggedInUser ||
+        state.login.loggedInUser == ``
+      ) {
+        return;
+      }
+    }
 
     // Load persistent settings which have not yet been loaded.
     const uiData = state.uiData;

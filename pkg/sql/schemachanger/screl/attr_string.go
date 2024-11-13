@@ -22,11 +22,14 @@ func _() {
 	_ = x[CurrentStatus-12]
 	_ = x[Element-13]
 	_ = x[Target-14]
+	_ = x[ReferencedTypeIDs-15]
+	_ = x[ReferencedSequenceIDs-16]
+	_ = x[ReferencedFunctionIDs-17]
 }
 
-const _Attr_name = "DescIDIndexIDColumnFamilyIDColumnIDConstraintIDNameReferencedDescIDCommentTemporaryIndexIDSourceIndexIDTargetStatusCurrentStatusElementTarget"
+const _Attr_name = "DescIDIndexIDColumnFamilyIDColumnIDConstraintIDNameReferencedDescIDCommentTemporaryIndexIDSourceIndexIDTargetStatusCurrentStatusElementTargetReferencedTypeIDsReferencedSequenceIDsReferencedFunctionIDs"
 
-var _Attr_index = [...]uint8{0, 6, 13, 27, 35, 47, 51, 67, 74, 90, 103, 115, 128, 135, 141}
+var _Attr_index = [...]uint8{0, 6, 13, 27, 35, 47, 51, 67, 74, 90, 103, 115, 128, 135, 141, 158, 179, 200}
 
 func (i Attr) String() string {
 	i -= 1

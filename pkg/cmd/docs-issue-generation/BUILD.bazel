@@ -9,7 +9,10 @@ go_library(
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/cmd/docs-issue-generation",
     visibility = ["//visibility:private"],
-    deps = ["@com_github_spf13_cobra//:cobra"],
+    deps = [
+        "//pkg/util/timeutil",
+        "@com_github_spf13_cobra//:cobra",
+    ],
 )
 
 go_binary(
@@ -20,11 +23,15 @@ go_binary(
 
 go_test(
     name = "docs-issue-generation_test",
+    size = "small",
     srcs = ["docs_issue_generation_test.go"],
-    args = ["-test.timeout=295s"],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":docs-issue-generation_lib"],
-    deps = ["@com_github_stretchr_testify//assert"],
+    deps = [
+        "//pkg/testutils",
+        "@com_github_stretchr_testify//assert",
+    ],
 )
 
 get_x_data(name = "get_x_data")

@@ -12,12 +12,13 @@ package schemachange
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // schemaChangeWatchDog connection watch dog object.
@@ -31,9 +32,9 @@ type schemaChangeWatchDog struct {
 	// cmdChannel used to communicate from thread executing commands on the session.
 	cmdChannel chan chan struct{}
 	// activeQuery last active query observed on the monitored connection.
-	activeQuery string
+	activeQuery gosql.NullString
 	// txnID last active transaction ID observed on the target connection.
-	txnID string
+	txnID gosql.NullString
 	// numRetries number of transaction retries observed.
 	numRetries int
 }
@@ -93,7 +94,16 @@ func (w *schemaChangeWatchDog) watchLoop(ctx context.Context) {
 			close(responseChannel)
 			return
 		case <-ctx.Done():
-			panic("dumping stacks, we failed to terminate threads on time.")
+			// Give the connections a small amount of time to clean up, if they fail
+			// to do so, we will dump stacks.
+			select {
+			case responseChannel := <-w.cmdChannel:
+				close(responseChannel)
+				return
+			case <-time.After(time.Second * 4):
+				panic("dumping stacks, we failed to terminate threads on time.")
+
+			}
 		case <-time.After(time.Second):
 			// If the connection is making progress, the watch dog timer can be reset
 			// again.
@@ -127,8 +137,8 @@ func (w *schemaChangeWatchDog) Start(ctx context.Context, tx pgx.Tx) error {
 // reset prepares the watch dog for re-use.
 func (w *schemaChangeWatchDog) reset() {
 	w.sessionID = ""
-	w.activeQuery = ""
-	w.txnID = ""
+	w.activeQuery = gosql.NullString{}
+	w.txnID = gosql.NullString{}
 }
 
 // Stop stops monitoring the connection and waits for the watch dog thread to

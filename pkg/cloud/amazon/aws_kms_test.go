@@ -77,7 +77,10 @@ func TestEncryptDecryptAWS(t *testing.T) {
 		params.Add(KMSRegionParam, kmsRegion)
 
 		uri := fmt.Sprintf("aws:///%s?%s", keyID, params.Encode())
-		_, err := cloud.KMSFromURI(ctx, uri, &cloud.TestKMSEnv{ExternalIOConfig: &base.ExternalIODirConfig{}})
+		_, err := cloud.KMSFromURI(ctx, uri, &cloud.TestKMSEnv{
+			ExternalIOConfig: &base.ExternalIODirConfig{},
+			Settings:         awsKMSTestSettings,
+		})
 		require.EqualError(t, err, fmt.Sprintf(
 			`%s is set to '%s', but %s is not set`,
 			cloud.AuthParam,
@@ -104,7 +107,7 @@ func TestEncryptDecryptAWS(t *testing.T) {
 
 		uri := fmt.Sprintf("aws:///%s?%s", keyID, params.Encode())
 		cloud.KMSEncryptDecrypt(t, uri, &cloud.TestKMSEnv{
-			Settings:         cluster.NoSettings,
+			Settings:         awsKMSTestSettings,
 			ExternalIOConfig: &base.ExternalIODirConfig{},
 		})
 	})
@@ -115,7 +118,7 @@ func TestEncryptDecryptAWS(t *testing.T) {
 		uri := fmt.Sprintf("aws:///%s?%s", keyID, q.Encode())
 
 		cloud.KMSEncryptDecrypt(t, uri, &cloud.TestKMSEnv{
-			Settings:         cluster.NoSettings,
+			Settings:         awsKMSTestSettings,
 			ExternalIOConfig: &base.ExternalIODirConfig{},
 		})
 	})
@@ -159,7 +162,7 @@ func TestEncryptDecryptAWSAssumeRole(t *testing.T) {
 	}
 
 	testEnv := &cloud.TestKMSEnv{
-		Settings:         cluster.NoSettings,
+		Settings:         awsKMSTestSettings,
 		ExternalIOConfig: &base.ExternalIODirConfig{},
 	}
 
@@ -189,21 +192,32 @@ func TestEncryptDecryptAWSAssumeRole(t *testing.T) {
 		cloud.KMSEncryptDecrypt(t, uri, testEnv)
 	})
 
-	t.Run("role-chaining", func(t *testing.T) {
+	t.Run("role-chaining-external-id", func(t *testing.T) {
 		roleChainStr := os.Getenv("AWS_ROLE_ARN_CHAIN")
-		roleChain := strings.Split(roleChainStr, ",")
+		assumeRoleProvider, delegateRoleProviders := cloud.ParseRoleProvidersString(roleChainStr)
+		providerChain := append(delegateRoleProviders, assumeRoleProvider)
 
 		// First verify that none of the individual roles in the chain can be used
 		// to access the KMS.
-		for _, role := range roleChain {
-			q.Set(AssumeRoleParam, role)
+		for _, p := range providerChain {
+			q.Set(AssumeRoleParam, p.EncodeAsString())
 			roleURI := fmt.Sprintf("aws:///%s?%s", keyID, q.Encode())
 			cloud.CheckNoKMSAccess(t, roleURI, testEnv)
 		}
 
+		// Next check that the role chain without any external IDs cannot be used to
+		// access the KMS.
+		roleChainWithoutExternalID := make([]string, 0, len(providerChain))
+		for _, rp := range providerChain {
+			roleChainWithoutExternalID = append(roleChainWithoutExternalID, rp.Role)
+		}
+		q.Set(AssumeRoleParam, strings.Join(roleChainWithoutExternalID, ","))
+		uri := fmt.Sprintf("aws:///%s?%s", keyID, q.Encode())
+		cloud.CheckNoKMSAccess(t, uri, testEnv)
+
 		// Finally, check that the chain of roles can be used to access the KMS.
 		q.Set(AssumeRoleParam, roleChainStr)
-		uri := fmt.Sprintf("aws:///%s?%s", keyID, q.Encode())
+		uri = fmt.Sprintf("aws:///%s?%s", keyID, q.Encode())
 		cloud.KMSEncryptDecrypt(t, uri, testEnv)
 	})
 }
@@ -213,20 +227,24 @@ func TestPutAWSKMSEndpoint(t *testing.T) {
 	ctx := context.Background()
 
 	q := make(url.Values)
-	expect := map[string]string{
-		"AWS_KMS_ENDPOINT":        AWSEndpointParam,
-		"AWS_KMS_ENDPOINT_KEY":    AWSAccessKeyParam,
-		"AWS_KMS_ENDPOINT_REGION": KMSRegionParam,
-		"AWS_KMS_ENDPOINT_SECRET": AWSSecretParam,
-	}
-	for env, param := range expect {
+	expectedS3Params := []string{
+		AWSAccessKeyParam,
+		AWSSecretParam}
+	for _, param := range expectedS3Params {
+		env := NightlyEnvVarS3Params[param]
 		v := os.Getenv(env)
 		if v == "" {
 			skip.IgnoreLintf(t, "%s env var must be set", env)
 		}
 		q.Add(param, v)
 	}
-
+	for kmsParam, env := range NightlyEnvVarKMSParams {
+		v := os.Getenv(env)
+		if v == "" {
+			skip.IgnoreLintf(t, "%s env var must be set", env)
+		}
+		q.Add(kmsParam, v)
+	}
 	keyARN := os.Getenv("AWS_KMS_KEY_ARN")
 	if keyARN == "" {
 		skip.IgnoreLint(t, "AWS_KMS_KEY_ARN env var must be set")
@@ -264,7 +282,7 @@ func TestAWSKMSDisallowImplicitCredentials(t *testing.T) {
 	}
 	uri := fmt.Sprintf("aws:///%s?%s", keyARN, q.Encode())
 	_, err := cloud.KMSFromURI(ctx, uri, &cloud.TestKMSEnv{
-		Settings:         cluster.NoSettings,
+		Settings:         awsKMSTestSettings,
 		ExternalIOConfig: &base.ExternalIODirConfig{DisableImplicitCredentials: true}})
 	require.True(t, testutils.IsError(err, "implicit credentials disallowed"))
 }

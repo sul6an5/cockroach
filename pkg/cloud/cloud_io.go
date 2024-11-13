@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -56,6 +55,13 @@ var WriteChunkSize = settings.RegisterByteSizeSetting(
 	"cloudstorage.write_chunk.size",
 	"controls the size of each file chunk uploaded by the cloud storage client",
 	8<<20,
+)
+
+var retryConnectionTimedOut = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"cloudstorage.connection_timed_out_retries.enabled",
+	"retry generic connection timed out errors; use with extreme caution",
+	false,
 )
 
 // HTTPRetryOptions defines the tunable settings which control the retry of HTTP
@@ -97,19 +103,14 @@ const MaxDelayedRetryAttempts = 3
 func DelayedRetry(
 	ctx context.Context, opName string, customDelay func(error) time.Duration, fn func() error,
 ) error {
-	span := tracing.SpanFromContext(ctx)
-	attemptNumber := int32(1)
+	ctx, sp := tracing.ChildSpan(ctx, fmt.Sprintf("cloud.DelayedRetry.%s", opName))
+	defer sp.Finish()
+
 	return retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), MaxDelayedRetryAttempts, func() error {
 		err := fn()
 		if err == nil {
 			return nil
 		}
-		retryEvent := &roachpb.RetryTracingEvent{
-			Operation:     opName,
-			AttemptNumber: attemptNumber,
-			RetryError:    tracing.RedactAndTruncateError(err),
-		}
-		span.RecordStructured(retryEvent)
 		if customDelay != nil {
 			if d := customDelay(err); d > 0 {
 				select {
@@ -127,7 +128,6 @@ func DelayedRetry(
 			case <-ctx.Done():
 			}
 		}
-		attemptNumber++
 		return err
 	})
 }
@@ -154,6 +154,25 @@ func IsResumableHTTPError(err error) bool {
 		sysutil.IsErrConnectionRefused(err)
 }
 
+// ResumingReaderRetryOnErrFnForSettings returns a function that can
+// be passed as a RetryOnErrFn to NewResumingReader.
+func ResumingReaderRetryOnErrFnForSettings(
+	ctx context.Context, st *cluster.Settings,
+) func(error) bool {
+	return func(err error) bool {
+		if IsResumableHTTPError(err) {
+			return true
+		}
+
+		retryTimeouts := retryConnectionTimedOut.Get(&st.SV)
+		if retryTimeouts && sysutil.IsErrTimedOut(err) {
+			log.Warningf(ctx, "retrying connection timed out because %s = true", retryConnectionTimedOut.Key())
+			return true
+		}
+		return false
+	}
+}
+
 // Maximum number of times we can attempt to retry reading from external storage,
 // without making any progress.
 const maxNoProgressReads = 3
@@ -166,6 +185,7 @@ type ReaderOpenerAt func(ctx context.Context, pos int64) (io.ReadCloser, error)
 type ResumingReader struct {
 	Opener       ReaderOpenerAt   // Get additional content
 	Reader       io.ReadCloser    // Currently opened reader
+	Filename     string           // Used for logging
 	Pos          int64            // How much data was received so far
 	RetryOnErrFn func(error) bool // custom retry-on-error function
 	// ErrFn injects a delay between retries on errors. nil means no delay.
@@ -180,6 +200,7 @@ func NewResumingReader(
 	opener ReaderOpenerAt,
 	reader io.ReadCloser,
 	pos int64,
+	filename string,
 	retryOnErrFn func(error) bool,
 	errFn func(error) time.Duration,
 ) *ResumingReader {
@@ -187,6 +208,7 @@ func NewResumingReader(
 		Opener:       opener,
 		Reader:       reader,
 		Pos:          pos,
+		Filename:     filename,
 		RetryOnErrFn: retryOnErrFn,
 		ErrFn:        errFn,
 	}
@@ -199,15 +221,22 @@ func NewResumingReader(
 
 // Open opens the reader at its current offset.
 func (r *ResumingReader) Open(ctx context.Context) error {
-	return DelayedRetry(ctx, "ResumingReader.Opener", r.ErrFn, func() error {
+	return DelayedRetry(ctx, "Open", r.ErrFn, func() error {
 		var readErr error
+
 		r.Reader, readErr = r.Opener(ctx, r.Pos)
-		return readErr
+		if readErr != nil {
+			return errors.Wrapf(readErr, "open %s", r.Filename)
+		}
+		return nil
 	})
 }
 
 // Read implements ioctx.ReaderCtx.
 func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
+	ctx, sp := tracing.ChildSpan(ctx, "cloud.ResumingReader.Read")
+	defer sp.Finish()
+
 	var lastErr error
 	for retries := 0; lastErr == nil; retries++ {
 		if r.Reader == nil {
@@ -220,26 +249,19 @@ func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
 				r.Pos += int64(n)
 				return n, readErr
 			}
-			lastErr = readErr
+			lastErr = errors.Wrapf(readErr, "read %s", r.Filename)
 		}
 
 		if !errors.IsAny(lastErr, io.EOF, io.ErrUnexpectedEOF) {
-			log.Errorf(ctx, "Read err: %s", lastErr)
+			log.Errorf(ctx, "%s", lastErr)
 		}
 
 		// Use the configured retry-on-error decider to check for a resumable error.
 		if r.RetryOnErrFn(lastErr) {
-			span := tracing.SpanFromContext(ctx)
-			retryEvent := &roachpb.RetryTracingEvent{
-				Operation:     "ResumingReader.Reader.Read",
-				AttemptNumber: int32(retries + 1),
-				RetryError:    tracing.RedactAndTruncateError(lastErr),
-			}
-			span.RecordStructured(retryEvent)
 			if retries >= maxNoProgressReads {
-				return 0, errors.Wrap(lastErr, "multiple Read calls return no data")
+				return 0, errors.Wrapf(lastErr, "multiple Read calls (%d) return no data", retries)
 			}
-			log.Errorf(ctx, "Retry IO: error %s", lastErr)
+			log.Errorf(ctx, "Retry IO error: %s", lastErr)
 			lastErr = nil
 			if r.Reader != nil {
 				r.Reader.Close()
@@ -308,7 +330,7 @@ func BackgroundPipe(
 ) io.WriteCloser {
 	pr, pw := io.Pipe()
 	w := &backgroundPipe{w: pw, grp: ctxgroup.WithContext(ctx), ctx: ctx}
-	w.grp.GoCtx(func(ctc context.Context) error {
+	w.grp.GoCtx(func(ctx context.Context) error {
 		err := fn(ctx, pr)
 		if err != nil {
 			closeErr := pr.CloseWithError(err)

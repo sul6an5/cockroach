@@ -42,8 +42,8 @@ exports_files([
 # gazelle:resolve go github.com/grpc-ecosystem/grpc-gateway/internal @com_github_grpc_ecosystem_grpc_gateway//internal
 # gazelle:resolve proto proto errorspb/errors.proto @com_github_cockroachdb_errors//errorspb:errorspb_proto
 # gazelle:resolve proto go errorspb/errors.proto @com_github_cockroachdb_errors//errorspb
-# gazelle:resolve proto proto etcd/raft/v3/raftpb/raft.proto @io_etcd_go_etcd_raft_v3//raftpb:raftpb_proto
-# gazelle:resolve proto go etcd/raft/v3/raftpb/raft.proto @io_etcd_go_etcd_raft_v3//raftpb
+# gazelle:resolve proto proto raft/v3/raftpb/raft.proto @io_etcd_go_raft_v3//raftpb:raftpb_proto
+# gazelle:resolve proto go raft/v3/raftpb/raft.proto @io_etcd_go_raft_v3//raftpb
 # gazelle:resolve proto proto gogoproto/gogo.proto @com_github_gogo_protobuf//gogoproto:gogo_proto
 # gazelle:resolve proto go gogoproto/gogo.proto @com_github_gogo_protobuf//gogoproto
 # gazelle:resolve proto go google/api/annotations.proto @org_golang_google_genproto//googleapis/api/annotations:go_default_library
@@ -58,19 +58,18 @@ exports_files([
 # gazelle:resolve go google.golang.org/genproto/googleapis/pubsub/v1 @org_golang_google_genproto//googleapis/pubsub/v1:pubsub
 # gazelle:resolve go google.golang.org/genproto/googleapis/cloud/kms/v1 @org_golang_google_genproto//googleapis/cloud/kms/v1:kms
 
-# See pkg/roachpb/gen/BUILD.bazel for more details.
+# See pkg/kv/kvpb/gen/BUILD.bazel for more details.
 #
-# gazelle:resolve proto go roachpb/api.proto //pkg/roachpb
-# gazelle:resolve proto go roachpb/app_stats.proto //pkg/roachpb
+# gazelle:resolve proto go kv/kvpb/api.proto //pkg/kv/kvpb
+# gazelle:resolve proto go kv/kvpb/errors.proto //pkg/kv/kvpb
 # gazelle:resolve proto go roachpb/data.proto //pkg/roachpb
-# gazelle:resolve proto go roachpb/errors.proto //pkg/roachpb
 # gazelle:resolve proto go roachpb/index_usage_stats.proto //pkg/roachpb
 # gazelle:resolve proto go roachpb/internal.proto //pkg/roachpb
 # gazelle:resolve proto go roachpb/internal_raft.proto //pkg/roachpb
 # gazelle:resolve proto go roachpb/io-formats.proto //pkg/roachpb
 # gazelle:resolve proto go roachpb/metadata.proto //pkg/roachpb
 # gazelle:resolve proto go roachpb/span_config.proto //pkg/roachpb
-# gazelle:exclude pkg/roachpb/batch_generated.go
+# gazelle:exclude pkg/kv/kvpb/batch_generated.go
 
 # See pkg/sql/opt/optgen/cmd/langgen/BUILD.bazel for more details.
 #
@@ -119,6 +118,10 @@ exports_files([
 # gazelle:exclude pkg/sql/lexbase/keywords.go
 # gazelle:exclude pkg/sql/lexbase/tokens.go
 # gazelle:exclude pkg/sql/lexbase/reserved_keywords.go
+# gazelle:exclude pkg/sql/plpgsql/parser/lexbase/keywords.go
+# gazelle:exclude pkg/sql/plpgsql/parser/lexbase/tokens.go
+# gazelle:exclude pkg/sql/plpgsql/parser/lexbase/reserved_keywords.go
+# gazelle:exclude pkg/sql/scanner/token_names_test.go
 # gazelle:exclude pkg/sql/schemachanger/scexec/mocks_generated_test.go
 # gazelle:exclude pkg/cmd/prereqs/testdata
 # gazelle:exclude pkg/testutils/**/testdata/**
@@ -188,7 +191,6 @@ nogo(
             "//pkg/testutils/lint/passes/errcmp",
             "//pkg/testutils/lint/passes/errwrap",
             "//pkg/testutils/lint/passes/fmtsafe",
-            "//pkg/testutils/lint/passes/generics",
             "//pkg/testutils/lint/passes/grpcclientconnclose",
             "//pkg/testutils/lint/passes/grpcstatuswithdetails",
             "//pkg/testutils/lint/passes/hash",
@@ -196,6 +198,7 @@ nogo(
             "//pkg/testutils/lint/passes/loopvarcapture",
             "//pkg/testutils/lint/passes/nilness",
             "//pkg/testutils/lint/passes/nocopy",
+            "//pkg/testutils/lint/passes/redactcheck",
             "//pkg/testutils/lint/passes/returncheck",
             "//pkg/testutils/lint/passes/returnerrcheck",
             "//pkg/testutils/lint/passes/shadow",

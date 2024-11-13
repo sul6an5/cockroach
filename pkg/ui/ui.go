@@ -27,8 +27,30 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+)
+
+const (
+	utc int64 = iota
+	americaNewYork
+)
+
+var _ = settings.RegisterEnumSetting(
+	settings.SystemOnly,
+	"ui.display_timezone",
+	"the timezone used to format timestamps in the ui",
+	"Etc/UTC",
+	map[int64]string{
+		utc:            "Etc/UTC",
+		americaNewYork: "America/New_York",
+		// Adding new timezones?
+		// Add them to the allowlist of included timezones!
+		// See pkg/ui/workspaces/cluster-ui/webpack.config.js
+		// and pkg/ui/workspaces/db-console/webpack.config.js.
+	},
 )
 
 // Assets is used for embedded JS assets required for UI.
@@ -58,15 +80,16 @@ var indexHTML = []byte(`<!DOCTYPE html>
 `)
 
 type indexHTMLArgs struct {
-	ExperimentalUseLogin bool
-	LoginEnabled         bool
-	LoggedInUser         *string
-	Tag                  string
-	Version              string
-	NodeID               string
-	OIDCAutoLogin        bool
-	OIDCLoginEnabled     bool
-	OIDCButtonText       string
+	// Insecure means disable auth entirely - anyone can use.
+	Insecure         bool
+	LoggedInUser     *string
+	Tag              string
+	Version          string
+	NodeID           string
+	OIDCAutoLogin    bool
+	OIDCLoginEnabled bool
+	OIDCButtonText   string
+	FeatureFlags     serverpb.FeatureFlags
 }
 
 // OIDCUIConf is a variable that stores data required by the
@@ -97,11 +120,11 @@ Binary built without web UI.
 
 // Config contains the configuration parameters for Handler.
 type Config struct {
-	ExperimentalUseLogin bool
-	LoginEnabled         bool
-	NodeID               *base.NodeIDContainer
-	GetUser              func(ctx context.Context) *string
-	OIDC                 OIDCUI
+	Insecure bool
+	NodeID   *base.NodeIDContainer
+	GetUser  func(ctx context.Context) *string
+	OIDC     OIDCUI
+	Flags    serverpb.FeatureFlags
 }
 
 var uiConfigPath = regexp.MustCompile("^/uiconfig$")
@@ -133,14 +156,14 @@ func Handler(cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		oidcConf := cfg.OIDC.GetOIDCConf()
 		args := indexHTMLArgs{
-			ExperimentalUseLogin: cfg.ExperimentalUseLogin,
-			LoginEnabled:         cfg.LoginEnabled,
-			LoggedInUser:         cfg.GetUser(r.Context()),
-			Tag:                  buildInfo.Tag,
-			Version:              build.BinaryVersionPrefix(),
-			OIDCAutoLogin:        oidcConf.AutoLogin,
-			OIDCLoginEnabled:     oidcConf.Enabled,
-			OIDCButtonText:       oidcConf.ButtonText,
+			Insecure:         cfg.Insecure,
+			LoggedInUser:     cfg.GetUser(r.Context()),
+			Tag:              buildInfo.Tag,
+			Version:          build.BinaryVersionPrefix(),
+			OIDCAutoLogin:    oidcConf.AutoLogin,
+			OIDCLoginEnabled: oidcConf.Enabled,
+			OIDCButtonText:   oidcConf.ButtonText,
+			FeatureFlags:     cfg.Flags,
 		}
 		if cfg.NodeID != nil {
 			args.NodeID = cfg.NodeID.String()

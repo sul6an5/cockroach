@@ -130,7 +130,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -222,8 +221,12 @@ var none = struct{}{}
 // Add any function that cannot be automatically detected.
 var mappedPopulateFunctions = map[string]string{
 	// Currently pg_type cannot be found automatically by this code because it is
-	// not the populate function.
-	"addPGTypeRow": "PGCatalogType",
+	// not the populate function. Same for pg_proc.
+	"addPGTypeRow":           "PGCatalogType",
+	"addPgProcUDFRow":        "PGCatalogProc",
+	"addPgProcBuiltinRow":    "PgCatalogProc",
+	"addRowForTimezoneNames": "PgCatalogTimezoneNames",
+	"populatePgDescription":  "PGCatalogDescription",
 }
 
 // schemaCodeFixer have specific configurations to fix the files with virtual
@@ -551,7 +554,7 @@ func (scf schemaCodeFixer) fixCatalogGo(t *testing.T, unimplementedTables PGMeta
 			text := reader.Text()
 			trimText := strings.TrimSpace(text)
 			if trimText == scf.textForNewTableInsertion {
-				//VirtualSchemas doesn't have a particular place to start we just print
+				// VirtualSchemas doesn't have a particular place to start we just print
 				// it before virtualTablePosition.
 				output.appendString(scf.printVirtualSchemas(unimplementedTables))
 			}
@@ -586,7 +589,7 @@ func fixPgCatalogGoColumns(pgCode *pgCatalogCode) {
 			if currentPosition < len(positions) && int64(scannedUntil+count) > positions[currentPosition].insertPosition {
 				relativeIndex := int(positions[currentPosition].insertPosition-int64(scannedUntil)) - 1
 				left := text[:relativeIndex]
-				indentation := indentationRE.FindStringSubmatch(text)[1] //The way it is it should at least give ""
+				indentation := indentationRE.FindStringSubmatch(text)[1] // The way it is it should at least give ""
 				if len(strings.TrimSpace(left)) > 0 {
 					// Parenthesis is right after the last variable in this case
 					// indentation is correct.
@@ -1543,7 +1546,6 @@ func TestInformationSchemaPostgres(t *testing.T) {
 // NOTE: --catalog or --rdbms flags won't take effect on this test.
 func TestInformationSchemaMySQL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 84915, "mismatch between MySQL version and CRDB")
 	defer log.Scope(t).Close(t)
 
 	NewDiffTool(t).Catalog("information_schema").RDBMS(MySQL).Run()
@@ -1580,7 +1582,7 @@ func validatePGCatalogCodeParser(t *testing.T) {
 		constants := readAllVTableConstants(t)
 		for _, vTableConstant := range constants {
 			if _, ok := pgCode.fixableTables[vTableConstant]; !ok {
-				t.Errorf("virtual table with constant %s cannot be fixed because could not found populate function", vTableConstant)
+				t.Errorf("virtual table with constant %s cannot be fixed because we could not find the populate function", vTableConstant)
 			}
 		}
 

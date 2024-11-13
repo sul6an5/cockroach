@@ -11,6 +11,7 @@ package sqlproxyccl
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"reflect"
 	"testing"
@@ -369,15 +370,107 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		require.Nil(t, conn)
 	})
 
+	t.Run("context canceled after dial fails", func(t *testing.T) {
+		// This is a short test, and is expected to finish within ms.
+		ctx, cancel := context.WithTimeout(bgCtx, 2*time.Second)
+		defer cancel()
+
+		stopper := stop.NewStopper()
+		defer stopper.Stop(ctx)
+
+		c := &connector{
+			TenantID: roachpb.MustMakeTenantID(42),
+			DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePrometheus,
+				Metadata: metaDialTenantLatency,
+				Duration: time.Millisecond,
+				Buckets:  metric.NetworkLatencyBuckets,
+			}),
+			DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
+		}
+		dc := &testTenantDirectoryCache{}
+		c.DirectoryCache = dc
+		b, err := balancer.NewBalancer(
+			ctx,
+			stopper,
+			balancer.NewMetrics(),
+			c.DirectoryCache,
+			balancer.NoRebalanceLoop(),
+		)
+		require.NoError(t, err)
+		c.Balancer = b
+
+		var dialSQLServerCount int
+		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, error) {
+			return "127.0.0.10:42", nil
+		}
+		c.testingKnobs.dialSQLServer = func(serverAssignment *balancer.ServerAssignment) (net.Conn, error) {
+			require.Equal(t, serverAssignment.Addr(), "127.0.0.10:42")
+			dialSQLServerCount++
+
+			// Cancel context to trigger loop exit on next retry.
+			cancel()
+			return nil, markAsRetriableConnectorError(errors.New("bar"))
+		}
+
+		var reportFailureFnCount int
+
+		// Invoke dial tenant with a success to ReportFailure.
+		// ---------------------------------------------------
+		dc.reportFailureFn = func(fnCtx context.Context, tenantID roachpb.TenantID, addr string) error {
+			reportFailureFnCount++
+			require.Equal(t, ctx, fnCtx)
+			require.Equal(t, c.TenantID, tenantID)
+			require.Equal(t, "127.0.0.10:42", addr)
+			return nil
+		}
+		conn, err := c.dialTenantCluster(ctx, nil /* requester */)
+		require.EqualError(t, err, "bar")
+		require.True(t, errors.Is(err, context.Canceled))
+		require.Nil(t, conn)
+
+		// Assert existing calls.
+		require.Equal(t, 1, dialSQLServerCount)
+		require.Equal(t, 1, reportFailureFnCount)
+		count, _ := c.DialTenantLatency.Total()
+		require.Equal(t, count, int64(1))
+		require.Equal(t, c.DialTenantRetries.Count(), int64(0))
+
+		// Invoke dial tenant with a failure to ReportFailure. Final error
+		// should include the secondary failure.
+		// ---------------------------------------------------------------
+		dc.reportFailureFn = func(fnCtx context.Context, tenantID roachpb.TenantID, addr string) error {
+			reportFailureFnCount++
+			require.Equal(t, ctx, fnCtx)
+			require.Equal(t, c.TenantID, tenantID)
+			require.Equal(t, "127.0.0.10:42", addr)
+			return errors.New("failure to report")
+		}
+		conn, err = c.dialTenantCluster(ctx, nil /* requester */)
+		require.EqualError(t, err, "reporting failure: failure to report: bar")
+		require.True(t, errors.Is(err, context.Canceled))
+		require.Nil(t, conn)
+
+		// Assert existing calls.
+		require.Equal(t, 2, dialSQLServerCount)
+		require.Equal(t, 2, reportFailureFnCount)
+		count, _ = c.DialTenantLatency.Total()
+		require.Equal(t, count, int64(2))
+		require.Equal(t, c.DialTenantRetries.Count(), int64(0))
+	})
+
 	t.Run("non-transient error", func(t *testing.T) {
 		// This is a short test, and is expected to finish within ms.
 		ctx, cancel := context.WithTimeout(bgCtx, 2*time.Second)
 		defer cancel()
 
 		c := &connector{
-			DialTenantLatency: metric.NewHistogram(
-				metaDialTenantLatency, time.Millisecond, metric.NetworkLatencyBuckets,
-			),
+			DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: metaDialTenantLatency,
+				Duration: time.Millisecond,
+				Buckets:  metric.NetworkLatencyBuckets,
+			}),
 			DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		}
 		c.testingKnobs.lookupAddr = func(ctx context.Context) (string, error) {
@@ -387,8 +480,8 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		conn, err := c.dialTenantCluster(ctx, nil /* requester */)
 		require.EqualError(t, err, "baz")
 		require.Nil(t, conn)
-
-		require.Equal(t, c.DialTenantLatency.TotalCount(), int64(1))
+		count, _ := c.DialTenantLatency.Total()
+		require.Equal(t, count, int64(1))
 		require.Equal(t, c.DialTenantRetries.Count(), int64(0))
 	})
 
@@ -405,10 +498,13 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 
 		var reportFailureFnCount int
 		c := &connector{
-			TenantID: roachpb.MakeTenantID(42),
-			DialTenantLatency: metric.NewHistogram(
-				metaDialTenantLatency, time.Millisecond, metric.NetworkLatencyBuckets,
-			),
+			TenantID: roachpb.MustMakeTenantID(42),
+			DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: metaDialTenantLatency,
+				Duration: time.Millisecond,
+				Buckets:  metric.NetworkLatencyBuckets,
+			}),
 			DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		}
 		c.DirectoryCache = &testTenantDirectoryCache{
@@ -457,7 +553,8 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		require.Equal(t, 3, addrLookupFnCount)
 		require.Equal(t, 2, dialSQLServerCount)
 		require.Equal(t, 1, reportFailureFnCount)
-		require.Equal(t, c.DialTenantLatency.TotalCount(), int64(1))
+		count, _ := c.DialTenantLatency.Total()
+		require.Equal(t, count, int64(1))
 		require.Equal(t, c.DialTenantRetries.Count(), int64(2))
 	})
 
@@ -485,10 +582,10 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 			delete(mu.pods, addr)
 		}
 
-		tenantID := roachpb.MakeTenantID(42)
+		tenantID := roachpb.MustMakeTenantID(42)
 		directoryCache := &testTenantDirectoryCache{
 			lookupTenantPodsFn: func(
-				fnCtx context.Context, tenantID roachpb.TenantID, clusterName string,
+				fnCtx context.Context, tenantID roachpb.TenantID,
 			) ([]*tenant.Pod, error) {
 				mu.Lock()
 				defer mu.Unlock()
@@ -575,17 +672,16 @@ func TestConnector_lookupAddr(t *testing.T) {
 
 		c := &connector{
 			ClusterName: "my-foo",
-			TenantID:    roachpb.MakeTenantID(10),
+			TenantID:    roachpb.MustMakeTenantID(10),
 			Balancer:    balancer,
 		}
 		c.DirectoryCache = &testTenantDirectoryCache{
 			lookupTenantPodsFn: func(
-				fnCtx context.Context, tenantID roachpb.TenantID, clusterName string,
+				fnCtx context.Context, tenantID roachpb.TenantID,
 			) ([]*tenant.Pod, error) {
 				lookupTenantPodsFnCount++
 				require.Equal(t, ctx, fnCtx)
 				require.Equal(t, c.TenantID, tenantID)
-				require.Equal(t, c.ClusterName, clusterName)
 				return []*tenant.Pod{
 					{TenantID: c.TenantID.ToUint64(), Addr: "127.0.0.10:70", State: tenant.DRAINING},
 					{TenantID: c.TenantID.ToUint64(), Addr: "127.0.0.10:80", State: tenant.RUNNING},
@@ -603,17 +699,16 @@ func TestConnector_lookupAddr(t *testing.T) {
 		var lookupTenantPodsFnCount int
 		c := &connector{
 			ClusterName: "my-foo",
-			TenantID:    roachpb.MakeTenantID(10),
+			TenantID:    roachpb.MustMakeTenantID(10),
 			Balancer:    balancer,
 		}
 		c.DirectoryCache = &testTenantDirectoryCache{
 			lookupTenantPodsFn: func(
-				fnCtx context.Context, tenantID roachpb.TenantID, clusterName string,
+				fnCtx context.Context, tenantID roachpb.TenantID,
 			) ([]*tenant.Pod, error) {
 				lookupTenantPodsFnCount++
 				require.Equal(t, ctx, fnCtx)
 				require.Equal(t, c.TenantID, tenantID)
-				require.Equal(t, c.ClusterName, clusterName)
 				return nil, status.Errorf(codes.FailedPrecondition, "foo")
 			},
 		}
@@ -628,17 +723,16 @@ func TestConnector_lookupAddr(t *testing.T) {
 		var lookupTenantPodsFnCount int
 		c := &connector{
 			ClusterName: "my-foo",
-			TenantID:    roachpb.MakeTenantID(10),
+			TenantID:    roachpb.MustMakeTenantID(10),
 			Balancer:    balancer,
 		}
 		c.DirectoryCache = &testTenantDirectoryCache{
 			lookupTenantPodsFn: func(
-				fnCtx context.Context, tenantID roachpb.TenantID, clusterName string,
+				fnCtx context.Context, tenantID roachpb.TenantID,
 			) ([]*tenant.Pod, error) {
 				lookupTenantPodsFnCount++
 				require.Equal(t, ctx, fnCtx)
 				require.Equal(t, c.TenantID, tenantID)
-				require.Equal(t, c.ClusterName, clusterName)
 				return nil, status.Errorf(codes.NotFound, "foo")
 			},
 		}
@@ -653,17 +747,16 @@ func TestConnector_lookupAddr(t *testing.T) {
 		var lookupTenantPodsFnCount int
 		c := &connector{
 			ClusterName: "my-foo",
-			TenantID:    roachpb.MakeTenantID(10),
+			TenantID:    roachpb.MustMakeTenantID(10),
 			Balancer:    balancer,
 		}
 		c.DirectoryCache = &testTenantDirectoryCache{
 			lookupTenantPodsFn: func(
-				fnCtx context.Context, tenantID roachpb.TenantID, clusterName string,
+				fnCtx context.Context, tenantID roachpb.TenantID,
 			) ([]*tenant.Pod, error) {
 				lookupTenantPodsFnCount++
 				require.Equal(t, ctx, fnCtx)
 				require.Equal(t, c.TenantID, tenantID)
-				require.Equal(t, c.ClusterName, clusterName)
 				return nil, errors.New("foo")
 			},
 		}
@@ -686,7 +779,7 @@ func TestConnector_dialSQLServer(t *testing.T) {
 	tracker, err := balancer.NewConnTracker(ctx, stopper, nil /* timeSource */)
 	require.NoError(t, err)
 
-	tenantID := roachpb.MakeTenantID(10)
+	tenantID := roachpb.MustMakeTenantID(10)
 
 	t.Run("with tlsConfig", func(t *testing.T) {
 		c := &connector{
@@ -795,7 +888,7 @@ func TestConnector_dialSQLServer(t *testing.T) {
 				require.Equal(t, c.StartupMsg, msg)
 				require.Equal(t, "127.0.0.2:4567", serverAddress)
 				require.Nil(t, tlsConfig)
-				return nil, newErrorf(codeBackendDown, "bar")
+				return nil, withCode(errors.New("bar"), codeBackendDown)
 			},
 		)()
 		sa := balancer.NewServerAssignment(tenantID, tracker, nil, "127.0.0.2:4567")
@@ -818,21 +911,90 @@ func TestRetriableConnectorError(t *testing.T) {
 	require.True(t, errors.Is(err, errRetryConnectorSentinel))
 }
 
+func TestTenantTLSConfig(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	makeChains := func(commonName string, org string) [][]*x509.Certificate {
+		cert := &x509.Certificate{}
+		cert.Subject.CommonName = commonName
+		if org != "" {
+			cert.Subject.OrganizationalUnit = []string{org}
+		}
+		return [][]*x509.Certificate{{
+			cert,
+		}}
+	}
+
+	tests := []struct {
+		name       string
+		skipVerify bool
+		chains     [][]*x509.Certificate
+		err        string
+	}{{
+		name:   "okSecure",
+		chains: makeChains("10", "Tenants"),
+	}, {
+		name:       "okSkipVerify",
+		skipVerify: true,
+	}, {
+		name: "missingChains",
+		err:  "VerifyConnection called with no verified chains",
+	}, {
+		name:   "wrongTenant",
+		err:    "expected a cert for tenant {10} found '1337'",
+		chains: makeChains("1337", "Tenants"),
+	}, {
+		name:   "nodeCert",
+		err:    "certificate is not a tenant cert",
+		chains: makeChains("10", ""),
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			config := &tls.Config{
+				InsecureSkipVerify: tc.skipVerify,
+			}
+
+			config, err := tlsConfigForTenant(roachpb.MustMakeTenantID(10), "some.dns.address:123", config)
+			require.NoError(t, err)
+			require.Equal(t, config.ServerName, "some.dns.address")
+
+			err = config.VerifyConnection(tls.ConnectionState{
+				VerifiedChains: tc.chains,
+			})
+
+			if tc.err == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.err)
+			}
+		})
+	}
+}
+
 var _ tenant.DirectoryCache = &testTenantDirectoryCache{}
 
 // testTenantDirectoryCache is a test implementation of the tenant directory
 // cache.
 type testTenantDirectoryCache struct {
-	lookupTenantPodsFn    func(ctx context.Context, tenantID roachpb.TenantID, clusterName string) ([]*tenant.Pod, error)
+	lookupTenantFn        func(ctx context.Context, tenantID roachpb.TenantID) (*tenant.Tenant, error)
+	lookupTenantPodsFn    func(ctx context.Context, tenantID roachpb.TenantID) ([]*tenant.Pod, error)
 	trylookupTenantPodsFn func(ctx context.Context, tenantID roachpb.TenantID) ([]*tenant.Pod, error)
 	reportFailureFn       func(ctx context.Context, tenantID roachpb.TenantID, addr string) error
 }
 
+// LookupTenant implements the tenant.DirectoryCache interface.
+func (r *testTenantDirectoryCache) LookupTenant(
+	ctx context.Context, tenantID roachpb.TenantID,
+) (*tenant.Tenant, error) {
+	return r.lookupTenantFn(ctx, tenantID)
+}
+
 // LookupTenantPods implements the tenant.DirectoryCache interface.
 func (r *testTenantDirectoryCache) LookupTenantPods(
-	ctx context.Context, tenantID roachpb.TenantID, clusterName string,
+	ctx context.Context, tenantID roachpb.TenantID,
 ) ([]*tenant.Pod, error) {
-	return r.lookupTenantPodsFn(ctx, tenantID, clusterName)
+	return r.lookupTenantPodsFn(ctx, tenantID)
 }
 
 // TryLookupTenantPods implements the tenant.DirectoryCache interface.

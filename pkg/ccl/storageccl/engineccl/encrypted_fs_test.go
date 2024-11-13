@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -267,22 +268,22 @@ func TestPebbleEncryption(t *testing.T) {
 	stats, err := db.GetEnvStats()
 	require.NoError(t, err)
 	// Opening the DB should've created OPTIONS, CURRENT, MANIFEST and the
-	// WAL, all under the active key.
+	// WAL.
 	require.Equal(t, uint64(4), stats.TotalFiles)
-	require.Equal(t, uint64(4), stats.ActiveKeyFiles)
+	// We also created markers for the format version and the manifest.
+	require.Equal(t, uint64(6), stats.ActiveKeyFiles)
 	var s enginepbccl.EncryptionStatus
 	require.NoError(t, protoutil.Unmarshal(stats.EncryptionStatus, &s))
 	require.Equal(t, "16.key", s.ActiveStoreKey.Source)
 	require.Equal(t, int32(enginepbccl.EncryptionType_AES128_CTR), stats.EncryptionType)
 	t.Logf("EnvStats:\n%+v\n\n", *stats)
 
-	batch := db.NewUnindexedBatch(true /* writeOnly */)
+	batch := db.NewWriteBatch()
+	defer batch.Close()
 	require.NoError(t, batch.PutUnversioned(roachpb.Key("a"), []byte("a")))
 	require.NoError(t, batch.Commit(true))
 	require.NoError(t, db.Flush())
-	val, err := db.MVCCGet(storage.MVCCKey{Key: roachpb.Key("a")})
-	require.NoError(t, err)
-	require.Equal(t, "a", string(val))
+	require.Equal(t, []byte("a"), storageutils.MVCCGetRaw(t, db, storageutils.PointKey("a", 0)))
 	db.Close()
 
 	opts2 := storage.DefaultPebbleOptions()
@@ -294,6 +295,7 @@ func TestPebbleEncryption(t *testing.T) {
 		context.Background(),
 		storage.PebbleConfig{
 			StorageConfig: base.StorageConfig{
+				Settings:          cluster.MakeTestingClusterSettings(),
 				Attrs:             roachpb.Attributes{},
 				MaxSize:           512 << 20,
 				UseFileRegistry:   true,
@@ -302,9 +304,7 @@ func TestPebbleEncryption(t *testing.T) {
 			Opts: opts2,
 		})
 	require.NoError(t, err)
-	val, err = db.MVCCGet(storage.MVCCKey{Key: roachpb.Key("a")})
-	require.NoError(t, err)
-	require.Equal(t, "a", string(val))
+	require.Equal(t, []byte("a"), storageutils.MVCCGetRaw(t, db, storageutils.PointKey("a", 0)))
 
 	// Flushing should've created a new sstable under the active key.
 	stats, err = db.GetEnvStats()
@@ -382,6 +382,7 @@ func TestPebbleEncryption2(t *testing.T) {
 			context.Background(),
 			storage.PebbleConfig{
 				StorageConfig: base.StorageConfig{
+					Settings:          cluster.MakeTestingClusterSettings(),
 					Attrs:             roachpb.Attributes{},
 					MaxSize:           512 << 20,
 					UseFileRegistry:   true,

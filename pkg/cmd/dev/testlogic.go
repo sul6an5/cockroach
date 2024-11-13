@@ -23,12 +23,14 @@ import (
 )
 
 const (
-	bigtestFlag  = "bigtest"
-	filesFlag    = "files"
-	subtestsFlag = "subtests"
-	configFlag   = "config"
-	showSQLFlag  = "show-sql"
-	noGenFlag    = "no-gen"
+	bigtestFlag   = "bigtest"
+	filesFlag     = "files"
+	subtestsFlag  = "subtests"
+	configsFlag   = "config"
+	showSQLFlag   = "show-sql"
+	noGenFlag     = "no-gen"
+	flexTypesFlag = "flex-types"
+	workmemFlag   = "default-workmem"
 )
 
 func makeTestLogicCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Command {
@@ -50,7 +52,7 @@ func makeTestLogicCmd(runE func(cmd *cobra.Command, args []string) error) *cobra
 	testLogicCmd.Flags().Int(countFlag, 1, "run test the given number of times")
 	testLogicCmd.Flags().String(filesFlag, "", "run logic tests for files matching this regex")
 	testLogicCmd.Flags().String(subtestsFlag, "", "run logic test subtests matching this regex")
-	testLogicCmd.Flags().String(configFlag, "", "run logic tests under the specified config")
+	testLogicCmd.Flags().StringSlice(configsFlag, nil, "run logic tests under the specified configs")
 	testLogicCmd.Flags().Bool(bigtestFlag, false, "run long-running sqlite logic tests")
 	testLogicCmd.Flags().Bool(ignoreCacheFlag, false, "ignore cached test runs")
 	testLogicCmd.Flags().Bool(showSQLFlag, false, "show SQL statements/queries immediately before they are tested")
@@ -61,6 +63,8 @@ func makeTestLogicCmd(runE func(cmd *cobra.Command, args []string) error) *cobra
 	testLogicCmd.Flags().String(stressArgsFlag, "", "additional arguments to pass to stress")
 	testLogicCmd.Flags().String(testArgsFlag, "", "additional arguments to pass to go test binary")
 	testLogicCmd.Flags().Bool(showDiffFlag, false, "generate a diff for expectation mismatches when possible")
+	testLogicCmd.Flags().Bool(flexTypesFlag, false, "tolerate when a result column is produced with a different numeric type")
+	testLogicCmd.Flags().Bool(workmemFlag, false, "disable randomization of sql.distsql.temp_storage.workmem")
 
 	addCommonBuildFlags(testLogicCmd)
 	return testLogicCmd
@@ -71,23 +75,25 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 	ctx := cmd.Context()
 
 	var (
-		bigtest       = mustGetFlagBool(cmd, bigtestFlag)
-		config        = mustGetFlagString(cmd, configFlag)
-		files         = mustGetFlagString(cmd, filesFlag)
-		ignoreCache   = mustGetFlagBool(cmd, ignoreCacheFlag)
-		rewrite       = mustGetFlagBool(cmd, rewriteFlag)
-		streamOutput  = mustGetFlagBool(cmd, streamOutputFlag)
-		showLogs      = mustGetFlagBool(cmd, showLogsFlag)
-		subtests      = mustGetFlagString(cmd, subtestsFlag)
-		timeout       = mustGetFlagDuration(cmd, timeoutFlag)
-		verbose       = mustGetFlagBool(cmd, vFlag)
-		noGen         = mustGetFlagBool(cmd, noGenFlag)
-		showSQL       = mustGetFlagBool(cmd, showSQLFlag)
-		count         = mustGetFlagInt(cmd, countFlag)
-		stress        = mustGetFlagBool(cmd, stressFlag)
-		stressCmdArgs = mustGetFlagString(cmd, stressArgsFlag)
-		testArgs      = mustGetFlagString(cmd, testArgsFlag)
-		showDiff      = mustGetFlagBool(cmd, showDiffFlag)
+		bigtest        = mustGetFlagBool(cmd, bigtestFlag)
+		configs        = mustGetFlagStringSlice(cmd, configsFlag)
+		files          = mustGetFlagString(cmd, filesFlag)
+		ignoreCache    = mustGetFlagBool(cmd, ignoreCacheFlag)
+		rewrite        = mustGetFlagBool(cmd, rewriteFlag)
+		streamOutput   = mustGetFlagBool(cmd, streamOutputFlag)
+		showLogs       = mustGetFlagBool(cmd, showLogsFlag)
+		subtests       = mustGetFlagString(cmd, subtestsFlag)
+		timeout        = mustGetFlagDuration(cmd, timeoutFlag)
+		verbose        = mustGetFlagBool(cmd, vFlag)
+		noGen          = mustGetFlagBool(cmd, noGenFlag)
+		showSQL        = mustGetFlagBool(cmd, showSQLFlag)
+		count          = mustGetFlagInt(cmd, countFlag)
+		stress         = mustGetFlagBool(cmd, stressFlag)
+		stressCmdArgs  = mustGetFlagString(cmd, stressArgsFlag)
+		testArgs       = mustGetFlagString(cmd, testArgsFlag)
+		showDiff       = mustGetFlagBool(cmd, showDiffFlag)
+		flexTypes      = mustGetFlagBool(cmd, flexTypesFlag)
+		defaultWorkmem = mustGetFlagBool(cmd, workmemFlag)
 	)
 	if rewrite {
 		ignoreCache = true
@@ -132,15 +138,19 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 
 	var targets []string
 	args := []string{"test"}
+	var hasNonSqlite bool
 	for _, choice := range choices {
 		var testsDir string
 		switch choice {
 		case "base":
 			testsDir = "//pkg/sql/logictest/tests"
+			hasNonSqlite = true
 		case "ccl":
 			testsDir = "//pkg/ccl/logictestccl/tests"
+			hasNonSqlite = true
 		case "opt":
 			testsDir = "//pkg/sql/opt/exec/execbuilder/tests"
+			hasNonSqlite = true
 		case "sqlite":
 			testsDir = "//pkg/sql/sqlitelogictest/tests"
 			bigtest = true
@@ -152,20 +162,27 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 		// (i.e. not the subdirectory for the config). We'll need this path
 		// to properly build the writable path for rewrite.
 		baseTestsDir := strings.TrimPrefix(testsDir, "//")
-		if config != "" {
-			testsDir = testsDir + "/" + config
-			exists, err := d.os.IsDir(filepath.Join(workspace, strings.TrimPrefix(testsDir, "//")))
-			if err != nil && errors.Is(err, os.ErrNotExist) {
-				// The config isn't supported for this choice.
-				continue
-			} else if err != nil {
-				return err
-			}
-			if !exists {
-				continue
+		testsDirs := []string{testsDir}
+		if len(configs) > 0 {
+			testsDirs = nil
+			for _, config := range configs {
+				configTestsDir := testsDir + "/" + config
+				exists, err := d.os.IsDir(filepath.Join(workspace, strings.TrimPrefix(configTestsDir, "//")))
+				if err != nil && errors.Is(err, os.ErrNotExist) {
+					// The config isn't supported for this choice.
+					continue
+				} else if err != nil {
+					return err
+				}
+				if !exists {
+					continue
+				}
+				testsDirs = append(testsDirs, configTestsDir)
 			}
 		}
-		targets = append(targets, testsDir+"/...")
+		for _, testsDir := range testsDirs {
+			targets = append(targets, testsDir+"/...")
+		}
 
 		if rewrite {
 			dir := filepath.Join(filepath.Dir(baseTestsDir), "testdata")
@@ -209,6 +226,17 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 	if len(files) > 0 {
 		args = append(args, "--test_arg", "-show-sql")
 	}
+	if !hasNonSqlite {
+		// If we only have sqlite targets, then we always append --flex-types
+		// argument to simulate what we do in the CI.
+		flexTypes = true
+	}
+	if flexTypes {
+		args = append(args, "--test_arg", "-flex-types")
+	}
+	if defaultWorkmem {
+		args = append(args, "--test_arg", "-default-workmem")
+	}
 
 	if rewrite {
 		if stress {
@@ -247,7 +275,8 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 	}
 
 	if files != "" || subtests != "" {
-		args = append(args, "--test_filter", munge(files)+"/"+subtests)
+		filesRegexp := spaceSeparatedRegexpsToRegexp(files)
+		args = append(args, "--test_filter", filesRegexp+"/"+subtests)
 		args = append(args, "--test_sharding_strategy=disabled")
 	}
 	args = append(args, d.getTestOutputArgs(stress, verbose, showLogs, streamOutput)...)
@@ -257,6 +286,21 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 		return err
 	}
 	return nil
+}
+
+// We know that the regular expressions for files should not contain whitespace
+// because the file names do not contain whitespace. We support users passing
+// whitespace separated regexps for multiple files.
+func spaceSeparatedRegexpsToRegexp(s string) string {
+	s = munge(s)
+	split := strings.Fields(s)
+	if len(split) < 2 {
+		return s
+	}
+	for i, s := range split {
+		split[i] = "(" + s + ")"
+	}
+	return "(" + strings.Join(split, "|") + ")"
 }
 
 func munge(s string) string {

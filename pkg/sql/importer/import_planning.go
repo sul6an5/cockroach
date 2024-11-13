@@ -23,11 +23,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudprivilege"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -42,6 +42,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -54,6 +56,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -106,40 +109,40 @@ const (
 	runningStatusImportBundleParseSchema jobs.RunningStatus = "parsing schema on Import Bundle"
 )
 
-var importOptionExpectValues = map[string]sql.KVStringOptValidate{
-	csvDelimiter:        sql.KVStringOptRequireValue,
-	csvComment:          sql.KVStringOptRequireValue,
-	csvNullIf:           sql.KVStringOptRequireValue,
-	csvSkip:             sql.KVStringOptRequireValue,
-	csvRowLimit:         sql.KVStringOptRequireValue,
-	csvStrictQuotes:     sql.KVStringOptRequireNoValue,
-	csvAllowQuotedNulls: sql.KVStringOptRequireNoValue,
+var importOptionExpectValues = map[string]exprutil.KVStringOptValidate{
+	csvDelimiter:        exprutil.KVStringOptRequireValue,
+	csvComment:          exprutil.KVStringOptRequireValue,
+	csvNullIf:           exprutil.KVStringOptRequireValue,
+	csvSkip:             exprutil.KVStringOptRequireValue,
+	csvRowLimit:         exprutil.KVStringOptRequireValue,
+	csvStrictQuotes:     exprutil.KVStringOptRequireNoValue,
+	csvAllowQuotedNulls: exprutil.KVStringOptRequireNoValue,
 
-	mysqlOutfileRowSep:   sql.KVStringOptRequireValue,
-	mysqlOutfileFieldSep: sql.KVStringOptRequireValue,
-	mysqlOutfileEnclose:  sql.KVStringOptRequireValue,
-	mysqlOutfileEscape:   sql.KVStringOptRequireValue,
+	mysqlOutfileRowSep:   exprutil.KVStringOptRequireValue,
+	mysqlOutfileFieldSep: exprutil.KVStringOptRequireValue,
+	mysqlOutfileEnclose:  exprutil.KVStringOptRequireValue,
+	mysqlOutfileEscape:   exprutil.KVStringOptRequireValue,
 
-	importOptionSSTSize:      sql.KVStringOptRequireValue,
-	importOptionDecompress:   sql.KVStringOptRequireValue,
-	importOptionOversample:   sql.KVStringOptRequireValue,
-	importOptionSaveRejected: sql.KVStringOptRequireNoValue,
+	importOptionSSTSize:      exprutil.KVStringOptRequireValue,
+	importOptionDecompress:   exprutil.KVStringOptRequireValue,
+	importOptionOversample:   exprutil.KVStringOptRequireValue,
+	importOptionSaveRejected: exprutil.KVStringOptRequireNoValue,
 
-	importOptionSkipFKs:          sql.KVStringOptRequireNoValue,
-	importOptionDisableGlobMatch: sql.KVStringOptRequireNoValue,
-	importOptionDetached:         sql.KVStringOptRequireNoValue,
+	importOptionSkipFKs:          exprutil.KVStringOptRequireNoValue,
+	importOptionDisableGlobMatch: exprutil.KVStringOptRequireNoValue,
+	importOptionDetached:         exprutil.KVStringOptRequireNoValue,
 
-	optMaxRowSize: sql.KVStringOptRequireValue,
+	optMaxRowSize: exprutil.KVStringOptRequireValue,
 
-	avroStrict:             sql.KVStringOptRequireNoValue,
-	avroSchema:             sql.KVStringOptRequireValue,
-	avroSchemaURI:          sql.KVStringOptRequireValue,
-	avroRecordsSeparatedBy: sql.KVStringOptRequireValue,
-	avroBinRecords:         sql.KVStringOptRequireNoValue,
-	avroJSONRecords:        sql.KVStringOptRequireNoValue,
+	avroStrict:             exprutil.KVStringOptRequireNoValue,
+	avroSchema:             exprutil.KVStringOptRequireValue,
+	avroSchemaURI:          exprutil.KVStringOptRequireValue,
+	avroRecordsSeparatedBy: exprutil.KVStringOptRequireValue,
+	avroBinRecords:         exprutil.KVStringOptRequireNoValue,
+	avroJSONRecords:        exprutil.KVStringOptRequireNoValue,
 
-	pgDumpIgnoreAllUnsupported: sql.KVStringOptRequireNoValue,
-	pgDumpIgnoreShuntFileDest:  sql.KVStringOptRequireValue,
+	pgDumpIgnoreAllUnsupported: exprutil.KVStringOptRequireNoValue,
+	pgDumpIgnoreShuntFileDest:  exprutil.KVStringOptRequireValue,
 }
 
 var pgDumpMaxLoggedStmts = 1024
@@ -222,7 +225,11 @@ func validateFormatOptions(
 }
 
 func importJobDescription(
-	p sql.PlanHookState, orig *tree.Import, files []string, opts map[string]string,
+	ctx context.Context,
+	p sql.PlanHookState,
+	orig *tree.Import,
+	files []string,
+	opts map[string]string,
 ) (string, error) {
 	stmt := *orig
 	stmt.Files = nil
@@ -231,13 +238,14 @@ func importJobDescription(
 		if err != nil {
 			return "", err
 		}
+		logSanitizedImportDestination(ctx, clean)
 		stmt.Files = append(stmt.Files, tree.NewDString(clean))
 	}
 	stmt.Options = nil
 	for k, v := range opts {
 		opt := tree.KVOption{Key: tree.Name(k)}
-		val := importOptionExpectValues[k] == sql.KVStringOptRequireValue
-		val = val || (importOptionExpectValues[k] == sql.KVStringOptAny && len(v) > 0)
+		val := importOptionExpectValues[k] == exprutil.KVStringOptRequireValue
+		val = val || (importOptionExpectValues[k] == exprutil.KVStringOptAny && len(v) > 0)
 		if val {
 			opt.Value = tree.NewDString(v)
 		}
@@ -246,6 +254,10 @@ func importJobDescription(
 	sort.Slice(stmt.Options, func(i, j int) bool { return stmt.Options[i].Key < stmt.Options[j].Key })
 	ann := p.ExtendedEvalContext().Annotations
 	return tree.AsStringWithFQNames(&stmt, ann), nil
+}
+
+func logSanitizedImportDestination(ctx context.Context, destination string) {
+	log.Ops.Infof(ctx, "import planning to connect to destination %v", redact.Safe(destination))
 }
 
 func ensureRequiredPrivileges(
@@ -284,24 +296,15 @@ func resolveUDTsUsedByImportInto(
 	typeDescs := make([]catalog.TypeDescriptor, 0)
 	var dbDesc catalog.DatabaseDescriptor
 	err := sql.DescsTxn(ctx, p.ExecCfg(), func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) (err error) {
-		_, dbDesc, err = descriptors.GetImmutableDatabaseByID(ctx, txn, table.GetParentID(),
-			tree.DatabaseLookupFlags{
-				Required:    true,
-				AvoidLeased: true,
-			})
+		dbDesc, err = descriptors.ByID(txn.KV()).WithoutNonPublic().Get().Database(ctx, table.GetParentID())
 		if err != nil {
 			return err
 		}
 		typeIDs, _, err := table.GetAllReferencedTypeIDs(dbDesc,
 			func(id descpb.ID) (catalog.TypeDescriptor, error) {
-				immutDesc, err := descriptors.GetImmutableTypeByID(ctx, txn, id, tree.ObjectLookupFlags{
-					CommonLookupFlags: tree.CommonLookupFlags{
-						Required:    true,
-						AvoidLeased: true,
-					},
-				})
+				immutDesc, err := descriptors.ByID(txn.KV()).WithoutNonPublic().Get().Type(ctx, id)
 				if err != nil {
 					return nil, err
 				}
@@ -312,12 +315,7 @@ func resolveUDTsUsedByImportInto(
 		}
 
 		for _, typeID := range typeIDs {
-			immutDesc, err := descriptors.GetImmutableTypeByID(ctx, txn, typeID, tree.ObjectLookupFlags{
-				CommonLookupFlags: tree.CommonLookupFlags{
-					Required:    true,
-					AvoidLeased: true,
-				},
-			})
+			immutDesc, err := descriptors.ByID(txn.KV()).WithoutNonPublic().Get().Type(ctx, typeID)
 			if err != nil {
 				return err
 			}
@@ -326,6 +324,31 @@ func resolveUDTsUsedByImportInto(
 		return err
 	})
 	return typeDescs, err
+}
+
+func importTypeCheck(
+	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
+) (matched bool, header colinfo.ResultColumns, _ error) {
+	importStmt, ok := stmt.(*tree.Import)
+	if !ok {
+		return false, nil, nil
+	}
+	if err := exprutil.TypeCheck(
+		ctx, "IMPORT", p.SemaCtx(),
+		exprutil.KVOptions{
+			KVOptions: importStmt.Options, Validation: importOptionExpectValues,
+		},
+		exprutil.StringArrays{
+			importStmt.Files,
+		},
+	); err != nil {
+		return false, nil, err
+	}
+	header = jobs.BulkJobExecutionResultHeader
+	if importStmt.Options.HasKey(importOptionDetached) {
+		header = jobs.DetachedJobExecutionResultHeader
+	}
+	return true, header, nil
 }
 
 // importPlanHook implements sql.PlanHookFn.
@@ -341,6 +364,14 @@ func importPlanHook(
 		p.BufferClientNotice(ctx, pgnotice.Newf("IMPORT TABLE has been deprecated in 21.2, and will be removed in a future version."+
 			" Instead, use CREATE TABLE with the desired schema, and IMPORT INTO the newly created table."))
 	}
+	switch f := strings.ToUpper(importStmt.FileFormat); f {
+	case "PGDUMP", "MYSQLDUMP":
+		p.BufferClientNotice(ctx, pgnotice.Newf(
+			"IMPORT %s has been deprecated in 23.1, and will be removed in a future version. See %s for alternatives.",
+			redact.SafeString(f),
+			redact.SafeString(docs.URL("migration-overview")),
+		))
+	}
 
 	addToFileFormatTelemetry(importStmt.FileFormat, "attempted")
 
@@ -353,21 +384,39 @@ func importPlanHook(
 		return nil, nil, nil, false, err
 	}
 
-	filesFn, err := p.TypeAsStringArray(ctx, importStmt.Files, "IMPORT")
+	exprEval := p.ExprEvaluator("IMPORT")
+	opts, err := exprEval.KVOptions(
+		ctx, importStmt.Options, importOptionExpectValues,
+	)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-
-	optsFn, err := p.TypeAsStringOpts(ctx, importStmt.Options, importOptionExpectValues)
-	if err != nil {
-		return nil, nil, nil, false, err
-	}
-
-	opts, optsErr := optsFn()
 
 	var isDetached bool
 	if _, ok := opts[importOptionDetached]; ok {
 		isDetached = true
+	}
+
+	filenamePatterns, err := exprEval.StringArray(ctx, importStmt.Files)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+
+	// Certain ExternalStorage URIs require super-user access. Check all the
+	// URIs passed to the IMPORT command.
+	for _, file := range filenamePatterns {
+		_, err := cloud.ExternalStorageConfFromURI(file, p.User())
+		if err != nil {
+			// If it is a workload URI, it won't parse as a storage config, but it
+			// also doesn't have any auth concerns so just continue.
+			if _, workloadErr := parseWorkloadConfig(file); workloadErr == nil {
+				continue
+			}
+			return nil, nil, nil, false, err
+		}
+		if err := cloudprivilege.CheckDestinationPrivileges(ctx, p, []string{file}); err != nil {
+			return nil, nil, nil, false, err
+		}
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -377,32 +426,6 @@ func importPlanHook(
 
 		if !(p.ExtendedEvalContext().TxnIsSingleStmt || isDetached) {
 			return errors.Errorf("IMPORT cannot be used inside a multi-statement transaction without DETACHED option")
-		}
-
-		if optsErr != nil {
-			return optsErr
-		}
-
-		filenamePatterns, err := filesFn()
-		if err != nil {
-			return err
-		}
-
-		// Certain ExternalStorage URIs require super-user access. Check all the
-		// URIs passed to the IMPORT command.
-		for _, file := range filenamePatterns {
-			_, err := cloud.ExternalStorageConfFromURI(file, p.User())
-			if err != nil {
-				// If it is a workload URI, it won't parse as a storage config, but it
-				// also doesn't have any auth concerns so just continue.
-				if _, workloadErr := parseWorkloadConfig(file); workloadErr == nil {
-					continue
-				}
-				return err
-			}
-			if err := cloudprivilege.CheckDestinationPrivileges(ctx, p, []string{file}); err != nil {
-				return err
-			}
 		}
 
 		var files []string
@@ -492,11 +515,7 @@ func importPlanHook(
 		} else {
 			// No target table means we're importing whatever we find into the session
 			// database, so it must exist.
-			txn := p.Txn()
-			db, err = p.Accessor().GetDatabaseDesc(ctx, txn, p.SessionData().Database, tree.DatabaseLookupFlags{
-				AvoidLeased: true,
-				Required:    true,
-			})
+			db, err = p.MustGetCurrentSessionDatabase(ctx)
 			if err != nil {
 				return pgerror.Wrap(err, pgcode.UndefinedObject,
 					"could not resolve current database")
@@ -776,7 +795,7 @@ func importPlanHook(
 
 		var tableDetails []jobspb.ImportDetails_Table
 		var typeDetails []jobspb.ImportDetails_Type
-		jobDesc, err := importJobDescription(p, importStmt, filenamePatterns, opts)
+		jobDesc, err := importJobDescription(ctx, p, importStmt, filenamePatterns, opts)
 		if err != nil {
 			return err
 		}
@@ -801,7 +820,7 @@ func importPlanHook(
 			var intoCols []string
 			isTargetCol := make(map[string]bool)
 			for _, name := range importStmt.IntoCols {
-				active, err := tabledesc.FindPublicColumnsWithNames(found, tree.NameList{name})
+				active, err := catalog.MustFindPublicColumnsByNameList(found, tree.NameList{name})
 				if err != nil {
 					return errors.Wrap(err, "verifying target columns")
 				}
@@ -879,9 +898,10 @@ func importPlanHook(
 		// computed columns such as `gateway_region`.
 		var databasePrimaryRegion catpb.RegionName
 		if db.IsMultiRegion() {
-			if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn *kv.Txn,
-				descsCol *descs.Collection) error {
-				regionConfig, err := sql.SynthesizeRegionConfig(ctx, txn, db.GetID(), descsCol)
+			if err := sql.DescsTxn(ctx, p.ExecCfg(), func(
+				ctx context.Context, txn isql.Txn, descsCol *descs.Collection,
+			) error {
+				regionConfig, err := sql.SynthesizeRegionConfig(ctx, txn.KV(), db.GetID(), descsCol)
 				if err != nil {
 					return err
 				}
@@ -945,7 +965,7 @@ func importPlanHook(
 			// record. We do not wait for the job to finish.
 			jobID := p.ExecCfg().JobRegistry.MakeJobID()
 			_, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
-				ctx, jr, jobID, p.Txn())
+				ctx, jr, jobID, p.InternalSQLTxn())
 			if err != nil {
 				return err
 			}
@@ -957,7 +977,7 @@ func importPlanHook(
 
 		// We create the job record in the planner's transaction to ensure that
 		// the job record creation happens transactionally.
-		plannerTxn := p.Txn()
+		plannerTxn := p.InternalSQLTxn()
 
 		// Construct the job and commit the transaction. Perform this work in a
 		// closure to ensure that the job is cleaned up if an error occurs.
@@ -980,11 +1000,23 @@ func importPlanHook(
 			// is safe because we're in an implicit transaction. If we were in an
 			// explicit transaction the job would have to be run with the detached
 			// option and would have been handled above.
-			return plannerTxn.Commit(ctx)
+			return plannerTxn.KV().Commit(ctx)
 		}(); err != nil {
 			return err
 		}
 
+		// Release all descriptor leases here. We need to do this because we're
+		// about to kick off a job which is going to potentially write descriptors.
+		// Note that we committed the underlying transaction in the above closure
+		// -- so we're not using any leases anymore, but we might be holding some
+		// because some sql queries might have been executed by this transaction
+		// (indeed some certainly were when we created the job we're going to run).
+		//
+		// This is all a bit of a hack to deal with the fact that we want to
+		// return results as part of this statement and the usual machinery for
+		// releasing leases assumes that that does not happen during statement
+		// execution.
+		p.InternalSQLTxn().Descriptors().ReleaseAll(ctx)
 		if err := sj.Start(ctx); err != nil {
 			return err
 		}
@@ -1199,5 +1231,5 @@ func (u *unsupportedStmtLogger) flush() error {
 }
 
 func init() {
-	sql.AddPlanHook("import", importPlanHook)
+	sql.AddPlanHook("import", importPlanHook, importTypeCheck)
 }

@@ -28,7 +28,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -76,7 +77,14 @@ table_name NOT IN (
 	'cross_db_references',
 	'databases',
 	'forward_dependencies',
+	'gossip_network',
 	'index_columns',
+  'index_spans',
+	'kv_catalog_comments',
+	'kv_catalog_descriptor',
+	'kv_catalog_namespace',
+	'kv_catalog_zones',
+	'kv_dropped_relations',
 	'lost_descriptors_with_data',
 	'table_columns',
 	'table_row_statistics',
@@ -85,10 +93,17 @@ table_name NOT IN (
 	'predefined_comments',
 	'session_trace',
 	'session_variables',
+  'table_spans',
 	'tables',
 	'cluster_statement_statistics',
+	'statement_activity',
+	'statement_statistics_persisted',
+	'statement_statistics_persisted_v22_2',
 	'cluster_transaction_statistics',
 	'statement_statistics',
+	'transaction_activity',
+	'transaction_statistics_persisted',
+	'transaction_statistics_persisted_v22_2',
 	'transaction_statistics',
 	'tenant_usage_details',
   'pg_catalog_table_is_implemented'
@@ -105,8 +120,8 @@ ORDER BY name ASC`)
 	sort.Strings(tables)
 
 	var exp []string
-	exp = append(exp, debugZipTablesPerNode...)
-	for _, t := range debugZipTablesPerCluster {
+	exp = append(exp, zipInternalTablesPerNode.GetTables()...)
+	for _, t := range zipInternalTablesPerCluster.GetTables() {
 		t = strings.TrimPrefix(t, `"".`)
 		exp = append(exp, t)
 	}
@@ -141,9 +156,42 @@ func TestZip(t *testing.T) {
 
 	// We use datadriven simply to read the golden output file; we don't actually
 	// run any commands. Using datadriven allows TESTFLAGS=-rewrite.
-	datadriven.RunTest(t, testutils.TestDataPath(t, "zip", "testzip"), func(t *testing.T, td *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "testzip"), func(t *testing.T, td *datadriven.TestData) string {
 		return out
 	})
+}
+
+// This tests the operation of zip using --include-range-info.
+func TestZipIncludeRangeInfo(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	skip.UnderRace(t, "test too slow under race")
+
+	dir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	c := NewCLITest(TestCLIParams{
+		StoreSpecs: []base.StoreSpec{{
+			Path: dir,
+		}},
+	})
+	defer c.Cleanup()
+
+	out, err := c.RunWithCapture("debug zip --concurrency=1 --cpu-profile-duration=1s --include-range-info " + os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Strip any non-deterministic messages.
+	out = eraseNonDeterministicZipOutput(out)
+
+	// We use datadriven simply to read the golden output file; we don't actually
+	// run any commands. Using datadriven allows TESTFLAGS=-rewrite.
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "testzip_include_range_info"),
+		func(t *testing.T, td *datadriven.TestData) string {
+			return out
+		},
+	)
 }
 
 // This tests the operation of zip running concurrently.
@@ -193,7 +241,7 @@ func TestConcurrentZip(t *testing.T) {
 
 	// We use datadriven simply to read the golden output file; we don't actually
 	// run any commands. Using datadriven allows TESTFLAGS=-rewrite.
-	datadriven.RunTest(t, testutils.TestDataPath(t, "zip", "testzip_concurrent"), func(t *testing.T, td *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "testzip_concurrent"), func(t *testing.T, td *datadriven.TestData) string {
 		return out
 	})
 }
@@ -232,7 +280,7 @@ create table defaultdb."../system"(x int);
 	re := regexp.MustCompile(`(?m)^.*(table|database).*$`)
 	out = strings.Join(re.FindAllString(out, -1), "\n")
 
-	datadriven.RunTest(t, testutils.TestDataPath(t, "zip", "specialnames"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "specialnames"),
 		func(t *testing.T, td *datadriven.TestData) string {
 			return out
 		})
@@ -245,7 +293,6 @@ create table defaultdb."../system"(x int);
 // need the SSL certs dir to run a CLI test securely.
 func TestUnavailableZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 53306, "flaky test")
 
 	skip.UnderShort(t)
 	// Race builds make the servers so slow that they report spurious
@@ -264,7 +311,7 @@ func TestUnavailableZip(t *testing.T) {
 	close(closedCh)
 	unavailableCh.Store(closedCh)
 	knobs := &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, _ roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, _ *kvpb.BatchRequest) *kvpb.Error {
 			select {
 			case <-unavailableCh.Load().(chan struct{}):
 			case <-ctx.Done():
@@ -311,13 +358,9 @@ func TestUnavailableZip(t *testing.T) {
 
 	// Strip any non-deterministic messages.
 	out = eraseNonDeterministicZipOutput(out)
+	out = eraseNonDeterministicErrors(out)
 
-	// In order to avoid non-determinism here, we erase the output of
-	// the range retrieval.
-	re := regexp.MustCompile(`(?m)^(requesting ranges.*found|writing: debug/nodes/\d+/ranges).*\n`)
-	out = re.ReplaceAllString(out, ``)
-
-	datadriven.RunTest(t, testutils.TestDataPath(t, "zip", "unavailable"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "unavailable"),
 		func(t *testing.T, td *datadriven.TestData) string {
 			return out
 		})
@@ -336,18 +379,40 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, `dial tcp ...`)
 	re = regexp.MustCompile(`(?m)rpc error: .*$`)
 	out = re.ReplaceAllString(out, `rpc error: ...`)
+	re = regexp.MustCompile(`(?m)timed out after.*$`)
+	out = re.ReplaceAllString(out, `timed out after...`)
 	re = regexp.MustCompile(`(?m)failed to connect to .*$`)
 	out = re.ReplaceAllString(out, `failed to connect to ...`)
 
 	// The number of memory profiles previously collected is not deterministic.
 	re = regexp.MustCompile(`(?m)^\[node \d+\] \d+ heap profiles found$`)
 	out = re.ReplaceAllString(out, `[node ?] ? heap profiles found`)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] \d+ goroutine dumps found$`)
+	out = re.ReplaceAllString(out, `[node ?] ? goroutine dumps found`)
 	re = regexp.MustCompile(`(?m)^\[node \d+\] retrieving (memprof|memstats).*$` + "\n")
 	out = re.ReplaceAllString(out, ``)
 	re = regexp.MustCompile(`(?m)^\[node \d+\] writing profile.*$` + "\n")
 	out = re.ReplaceAllString(out, ``)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] writing dump.*$` + "\n")
+	out = re.ReplaceAllString(out, ``)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] retrieving goroutine_dump.*$` + "\n")
+	out = re.ReplaceAllString(out, ``)
 
-	//out = strings.ReplaceAll(out, "\n\n", "\n")
+	return out
+}
+
+func eraseNonDeterministicErrors(out string) string {
+	// In order to avoid non-determinism here, we erase the output of
+	// the range retrieval.
+	re := regexp.MustCompile(`(?m)^(requesting ranges.*found|writing: debug/nodes/\d+/ranges).*\n`)
+	out = re.ReplaceAllString(out, ``)
+
+	re = regexp.MustCompile(`(?m)^\[cluster\] requesting data for debug\/settings.*\n`)
+	out = re.ReplaceAllString(out, ``)
+
+	// In order to avoid non-determinism here, we truncate error messages.
+	re = regexp.MustCompile(`(?m)last request failed: .*$`)
+	out = re.ReplaceAllString(out, `last request failed: ...`)
 	return out
 }
 
@@ -398,7 +463,7 @@ func TestPartialZip(t *testing.T) {
 	t.Log(out)
 	out = eraseNonDeterministicZipOutput(out)
 
-	datadriven.RunTest(t, testutils.TestDataPath(t, "zip", "partial1"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "partial1"),
 		func(t *testing.T, td *datadriven.TestData) string {
 			return out
 		})
@@ -410,7 +475,7 @@ func TestPartialZip(t *testing.T) {
 	}
 
 	out = eraseNonDeterministicZipOutput(out)
-	datadriven.RunTest(t, testutils.TestDataPath(t, "zip", "partial1_excluded"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "partial1_excluded"),
 		func(t *testing.T, td *datadriven.TestData) string {
 			return out
 		})
@@ -420,7 +485,7 @@ func TestPartialZip(t *testing.T) {
 	// we're decommissioning a node in a 3-node cluster, so there's no node to
 	// up-replicate the under-replicated ranges to.
 	{
-		_, err := c.RunWithCapture(fmt.Sprintf("node decommission --wait=none %d", 2))
+		_, err := c.RunWithCapture(fmt.Sprintf("node decommission --checks=skip --wait=none %d", 2))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -436,7 +501,7 @@ func TestPartialZip(t *testing.T) {
 	// This last case may take a little while to converge. To make this work with datadriven and at the same
 	// time retain the ability to use the `-rewrite` flag, we use a retry loop within that already checks the
 	// output ahead of time and retries for some time if necessary.
-	datadriven.RunTest(t, testutils.TestDataPath(t, "zip", "partial2"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "partial2"),
 		func(t *testing.T, td *datadriven.TestData) string {
 			f := func() string {
 				out, err := c.RunWithCapture("debug zip --concurrency=1 --cpu-profile-duration=0 " + os.DevNull)
@@ -572,13 +637,9 @@ func TestToHex(t *testing.T) {
 	}
 	// Stores index and type of marshaled messages in the table row.
 	// Negative indices work from the end - this is needed because parsing the
-	// fields is not alway s precise as there can be spaces in the fields but the
+	// fields is not always precise as there can be spaces in the fields but the
 	// hex fields are always in the end of the row and they don't contain spaces.
 	hexFiles := map[string][]hexField{
-		"debug/system.jobs.txt": {
-			{idx: -2, msg: &jobspb.Payload{}},
-			{idx: -1, msg: &jobspb.Progress{}},
-		},
 		"debug/system.descriptor.txt": {
 			{idx: 2, msg: &descpb.Descriptor{}},
 		},

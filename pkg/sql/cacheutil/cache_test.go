@@ -53,12 +53,12 @@ func TestCache(t *testing.T) {
 	require.Equal(t, isEligible, true)
 
 	// In theory, only one call should happen to the func passed into
-	// LoadValueOutsideOfCache due to singleflight.
+	// LoadValueOutsideOfCacheSingleFlight due to singleflight.
 	// Testing that only one call happens is hard to synchronize, we would
 	// have to add a test hook into `DoChan` to make synchronize our calls.
 	for i := 0; i < 5; i++ {
 		go func() {
-			val, err := cache.LoadValueOutsideOfCache(ctx, "test", func(loadCtx context.Context) (interface{}, error) {
+			val, err := cache.LoadValueOutsideOfCacheSingleFlight(ctx, "test", func(loadCtx context.Context) (interface{}, error) {
 				return "val", nil
 			})
 			require.NoError(t, err)
@@ -66,13 +66,13 @@ func TestCache(t *testing.T) {
 		}()
 	}
 
-	wrote := cache.MaybeWriteBackToCache(ctx, []descpb.DescriptorVersion{2, 2}, "test", "val")
+	wrote := cache.MaybeWriteBackToCache(ctx, []descpb.DescriptorVersion{2, 2}, "test", "val", int64(len("test")+len("val")))
 	require.Equal(t, wrote, true)
 
-	wrote = cache.MaybeWriteBackToCache(ctx, []descpb.DescriptorVersion{0, 2}, "test", "val")
+	wrote = cache.MaybeWriteBackToCache(ctx, []descpb.DescriptorVersion{0, 2}, "test", "val", int64(len("test")+len("val")))
 	require.Equal(t, wrote, false)
 
-	wrote = cache.MaybeWriteBackToCache(ctx, []descpb.DescriptorVersion{2, 0}, "test", "val")
+	wrote = cache.MaybeWriteBackToCache(ctx, []descpb.DescriptorVersion{2, 0}, "test", "val", int64(len("test")+len("val")))
 	require.Equal(t, wrote, false)
 
 	val, ok := cache.GetValueLocked("test")

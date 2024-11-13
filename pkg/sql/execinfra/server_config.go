@@ -13,6 +13,7 @@
 package execinfra
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -20,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
@@ -32,16 +32,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 )
@@ -73,11 +75,7 @@ type ServerConfig struct {
 	Codec keys.SQLCodec
 
 	// DB is a handle to the cluster.
-	DB *kv.DB
-	// Executor can be used to run "internal queries". Note that Flows also have
-	// access to an executor in the EvalContext. That one is "session bound"
-	// whereas this one isn't.
-	Executor sqlutil.InternalExecutor
+	DB descs.DB
 
 	RPCContext   *rpc.Context
 	Stopper      *stop.Stopper
@@ -146,11 +144,6 @@ type ServerConfig struct {
 	// Dialer for communication between SQL nodes/pods.
 	PodNodeDialer *nodedialer.Dialer
 
-	// InternalExecutorFactory is used to construct session-bound
-	// executors. The idea is that a higher-layer binds some of the arguments
-	// required, so that users of ServerConfig don't have to care about them.
-	InternalExecutorFactory sqlutil.InternalExecutorFactory
-
 	ExternalStorage        cloud.ExternalStorageFactory
 	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
 
@@ -190,8 +183,21 @@ type ServerConfig struct {
 	// external services (such as external storage)
 	ExternalIORecorder multitenant.TenantSideExternalIORecorder
 
+	// TenantCostController is used to measure and record RU consumption.
+	TenantCostController multitenant.TenantSideCostController
+
 	// RangeStatsFetcher is used to fetch range stats for keys.
 	RangeStatsFetcher eval.RangeStatsFetcher
+
+	// AdmissionPacerFactory is used to integrate CPU-intensive work
+	// with elastic CPU control.
+	AdmissionPacerFactory admission.PacerFactory
+
+	// Allow mutation operations to trigger stats refresh.
+	StatsRefresher *stats.Refresher
+
+	// *sql.ExecutorConfig exposed as an interface (due to dependency cycles).
+	ExecutorConfig interface{}
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get
@@ -292,6 +298,16 @@ type TestingKnobs struct {
 	// ProcessorNoTracingSpan is used to disable the creation of a tracing span
 	// in ProcessorBase.StartInternal if the tracing is enabled.
 	ProcessorNoTracingSpan bool
+
+	// SetupFlowCb, when non-nil, is called by the execinfrapb.DistSQLServer
+	// when responding to SetupFlow RPCs, after the flow is set up but before it
+	// is started.
+	SetupFlowCb func(context.Context, base.SQLInstanceID, *execinfrapb.SetupFlowRequest) error
+
+	// RunBeforeCascadeAndChecks is run before any cascade or check queries are
+	// run. The associated transaction ID of the statement performing the cascade
+	// or check query is passed in as an argument.
+	RunBeforeCascadesAndChecks func(txnID uuid.UUID)
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

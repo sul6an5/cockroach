@@ -441,6 +441,27 @@ values
  ├── fd: ()-->(1)
  └── (NULL,)
 
+# Regression test for issue #87605.
+norm expect=FoldBinary
+SELECT 1.333 // 1.0
+----
+values
+ ├── columns: "?column?":1!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1)
+ └── (1,)
+
+norm expect=FoldBinary
+SELECT 2::INT // 1.0
+----
+values
+ ├── columns: "?column?":1!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1)
+ └── (2,)
+
 # --------------------------------------------------
 # FoldUnary
 # --------------------------------------------------
@@ -810,7 +831,7 @@ values
  ├── cardinality: [1 - 1]
  ├── key: ()
  ├── fd: ()-->(1)
- └── ('2020-01-01 00:00:00+00:00',)
+ └── ('2020-01-01 00:00:00+00',)
 
 norm expect=FoldCast
 SELECT 'today'::TIMESTAMPTZ
@@ -820,7 +841,25 @@ values
  ├── cardinality: [1 - 1]
  ├── key: ()
  ├── fd: ()-->(1)
- └── ('2017-05-10 00:00:00+00:00',)
+ └── ('2017-05-10 00:00:00+00',)
+
+# Regression test for #96447. FoldCast should not panic when attempting to fold
+# a typed NULL when FoldNullCast is disabled.
+norm disable=FoldNullCast
+SELECT NULL::INT::OID,
+  NULL::INT::REGTYPE,
+  NULL::INT::REGPROC,
+  NULL::INT::REGPROCEDURE,
+  NULL::INT::REGNAMESPACE,
+  NULL::STRING::REGCLASS
+----
+values
+ ├── columns: oid:1 regtype:2 regproc:3 regprocedure:4 regnamespace:5 regclass:6
+ ├── cardinality: [1 - 1]
+ ├── stable
+ ├── key: ()
+ ├── fd: ()-->(1-6)
+ └── (CAST(NULL AS INT8)::OID, CAST(NULL AS INT8)::REGTYPE, CAST(NULL AS INT8)::REGPROC, CAST(NULL AS INT8)::REGPROCEDURE, CAST(NULL AS INT8)::REGNAMESPACE, CAST(NULL AS STRING)::REGCLASS)
 
 # --------------------------------------------------
 # FoldAssignmentCast
@@ -1117,7 +1156,7 @@ values
  ├── cardinality: [1 - 1]
  ├── key: ()
  ├── fd: ()-->(1-3)
- └── ('2017-05-10 13:00:00+00:00', 'opttester', 'defaultdb')
+ └── ('2017-05-10 13:00:00+00', 'opttester', 'defaultdb')
 
 # --------------------------------------------------
 # FoldIndirection
@@ -1214,10 +1253,11 @@ SELECT j['field'] FROM a
 ----
 project
  ├── columns: j:9
+ ├── immutable
  ├── scan a
  │    └── columns: a.j:5
  └── projections
-      └── a.j:5['field'] [as=j:9, outer=(5)]
+      └── a.j:5->'field' [as=j:9, outer=(5), immutable]
 
 # Regression test for #40404.
 norm expect=FoldIndirection

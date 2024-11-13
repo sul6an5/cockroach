@@ -14,6 +14,7 @@ import (
 	"reflect"
 
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -38,9 +39,30 @@ func newEvalContext(q *Query) *evalContext {
 	return &evalContext{
 		q:     q,
 		depth: queryDepth(len(q.entities)),
-		slots: append(make([]slot, 0, len(q.slots)), q.slots...),
+		slots: cloneSlots(q.slots),
 		facts: q.facts,
 	}
+}
+
+// cloneSlots clones the slots of a query for use in an evalContext.
+func cloneSlots(slots []slot) []slot {
+	clone := append(make([]slot, 0, len(slots)), slots...)
+	for i := range clone {
+		// If there are any slots which map to a set of allowed values, we need
+		// to clone those values because during query evaluation, we'll fill in
+		// inline values in the context of the current entity set. This matters
+		// in particular for constraints related to entities or strings; their
+		// inline values depend on the entitySet.
+		if clone[i].any != nil {
+			vals := clone[i].any
+			clone[i].any = append(make([]typedValue, 0, len(vals)), vals...)
+		}
+		if clone[i].not != nil {
+			cloned := *clone[i].not
+			clone[i].not = &cloned
+		}
+	}
+	return clone
 }
 
 type evalResult evalContext
@@ -133,11 +155,9 @@ func (ec *evalContext) iterateNext() error {
 func (ec *evalContext) visit(e entity) error {
 	// Keep track of which slots were filled as part of this step in the
 	// evaluation and then unset them when we pop out of this stack frame.
-	var slotsFilled util.FastIntSet
+	var slotsFilled intsets.Fast
 	defer func() {
-		slotsFilled.ForEach(func(i int) {
-			ec.slots[i].typedValue = typedValue{}
-		})
+		slotsFilled.ForEach(func(i int) { ec.slots[i].reset() })
 	}()
 
 	// Fill in the slot corresponding to this entity. It should not be filled
@@ -292,7 +312,7 @@ func (ec *evalContext) buildWhere() (
 }
 
 // unify is like unifyReturningContradiction but it does not return the fact.
-func unify(facts []fact, s []slot, slotsFilled *util.FastIntSet) (contradictionFound bool) {
+func unify(facts []fact, s []slot, slotsFilled *intsets.Fast) (contradictionFound bool) {
 	contradictionFound, _ = unifyReturningContradiction(facts, s, slotsFilled)
 	return contradictionFound
 }
@@ -302,7 +322,7 @@ func unify(facts []fact, s []slot, slotsFilled *util.FastIntSet) (contradictionF
 // contradiction is returned. Any slots set in the process of unification
 // are recorded into the set.
 func unifyReturningContradiction(
-	facts []fact, s []slot, slotsFilled *util.FastIntSet,
+	facts []fact, s []slot, slotsFilled *intsets.Fast,
 ) (contradictionFound bool, contradicted fact) {
 	// TODO(ajwerner): As we unify we could determine that some facts are no
 	// longer relevant. When we do that we could move them to the front and keep
@@ -408,7 +428,7 @@ func (ec *evalContext) visitSubquery(query int) (done bool, _ error) {
 	defer sub.query.putEvalContext(sec)
 	defer func() { // reset the slots populated to run the subquery
 		sub.inputSlotMappings.ForEach(func(_, subSlot int) {
-			sec.slots[subSlot].typedValue = typedValue{}
+			sec.slots[subSlot].reset()
 		})
 	}()
 	if err := ec.bindSubQuerySlots(sub.inputSlotMappings, sec); err != nil {

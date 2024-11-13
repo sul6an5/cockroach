@@ -14,12 +14,13 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
@@ -33,11 +34,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scstage"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -47,17 +50,15 @@ import (
 func TestPlanDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
 	ctx := context.Background()
 
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
-		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
-			DisableDefaultTestTenant: true,
-		})
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
+		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 		defer s.Stopper().Stop(ctx)
 
 		tdb := sqlutils.MakeSQLRunner(sqlDB)
 		run := func(t *testing.T, d *datadriven.TestData) string {
+			sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
 			switch d.Cmd {
 			case "setup":
 				stmts, err := parser.Parse(d.Input)
@@ -82,11 +83,11 @@ func TestPlanDataDriven(t *testing.T) {
 					require.NoError(t, err)
 					var state scpb.CurrentState
 					for i := range stmts {
-						state, err = scbuild.Build(ctx, deps, state, stmts[i].AST)
+						state, err = scbuild.Build(ctx, deps, state, stmts[i].AST, nil /* memAcc */)
 						require.NoError(t, err)
 					}
 
-					plan = sctestutils.MakePlan(t, state, scop.EarliestPhase)
+					plan = sctestutils.MakePlan(t, state, scop.EarliestPhase, nil /* memAcc */)
 					sctestutils.TruncateJobOps(&plan)
 					validatePlan(t, &plan)
 				})
@@ -104,7 +105,7 @@ func TestPlanDataDriven(t *testing.T) {
 					stmt := stmts[0]
 					alter, ok := stmt.AST.(*tree.AlterTable)
 					require.Truef(t, ok, "not an ALTER TABLE statement: %s", stmt.SQL)
-					_, err = scbuild.Build(ctx, deps, scpb.CurrentState{}, alter)
+					_, err = scbuild.Build(ctx, deps, scpb.CurrentState{}, alter, nil /* memAcc */)
 					require.Truef(t, scerrors.HasNotImplemented(err), "expected unimplemented, got %v", err)
 				})
 				return ""
@@ -121,12 +122,17 @@ func TestPlanDataDriven(t *testing.T) {
 // an arbitrary stage in the existing plan: the results should be the same as in
 // the original plan, minus the stages prior to the selected stage.
 // This guarantees the idempotency of the planning scheme, which is a useful
-// property to have. For instance it guarantees that the output of EXPLAIN (DDL)
+// property to have. For instance, it guarantees that the output of EXPLAIN (DDL)
 // represents the plan that actually gets executed in the various execution
 // phases.
 func validatePlan(t *testing.T, plan *scplan.Plan) {
 	stages := plan.Stages
 	for i, stage := range stages {
+		if stage.IsResetPreCommitStage() {
+			// Skip the reset stage. Otherwise, the re-planned plan will also have
+			// a reset stage and the assertions won't be verified.
+			continue
+		}
 		expected := make([]scstage.Stage, len(stages[i:]))
 		for j, s := range stages[i:] {
 			if s.Phase == stage.Phase {
@@ -137,11 +143,8 @@ func validatePlan(t *testing.T, plan *scplan.Plan) {
 			expected[j] = s
 		}
 		e := marshalOps(t, plan.TargetState, expected)
-		cs := scpb.CurrentState{
-			TargetState: plan.TargetState,
-			Current:     stage.Before,
-		}
-		truncatedPlan := sctestutils.MakePlan(t, cs, stage.Phase)
+		cs := plan.CurrentState.WithCurrentStatuses(stage.Before)
+		truncatedPlan := sctestutils.MakePlan(t, cs, stage.Phase, nil /* memAcc */)
 		sctestutils.TruncateJobOps(&truncatedPlan)
 		a := marshalOps(t, plan.TargetState, truncatedPlan.Stages)
 		require.Equalf(t, e, a, "plan mismatch when re-planning %d stage(s) later", i)
@@ -239,4 +242,50 @@ func marshalOps(t *testing.T, ts scpb.TargetState, stages []scstage.Stage) strin
 		sb.WriteString(indentText(stageOps, "    "))
 	}
 	return sb.String()
+}
+
+// TestExplainPlanIsMemoryMonitored tests that explaining a plan is properly
+// memory monitored.
+// Such monitoring is important to prevent OOM for explaining a large plan as
+// it can take up a lot of memory to serialize the plan into a string.
+func TestExplainPlanIsMemoryMonitored(t *testing.T) {
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	params.SQLMemoryPoolSize = 1.049e+7 /* 10MiB */
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+	tdb := sqlutils.MakeSQLRunner(db)
+
+	tdb.Exec(t, `use defaultdb;`)
+	tdb.Exec(t, `select crdb_internal.generate_test_objects('test',  1000);`)
+	tdb.Exec(t, `use system;`)
+
+	var incumbent scpb.CurrentState
+	sctestutils.WithBuilderDependenciesFromTestServer(s, func(dependencies scbuild.Dependencies) {
+		stmt, err := parser.ParseOne(`DROP DATABASE defaultdb CASCADE`)
+		require.NoError(t, err)
+		incumbent, err = scbuild.Build(ctx, dependencies, scpb.CurrentState{}, stmt.AST, nil /* memAcc */)
+		require.NoError(t, err)
+	})
+
+	monitor := mon.NewMonitor(
+		"test-sc-plan-mon",
+		mon.MemoryResource,
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment */
+		math.MaxInt64, /* noteworthy */
+		cluster.MakeTestingClusterSettings(),
+	)
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(5.243e+6 /* 5MiB */))
+	memAcc := monitor.MakeBoundAccount()
+	plan := sctestutils.MakePlan(t, incumbent, scop.EarliestPhase, &memAcc)
+
+	_, err := plan.ExplainCompact()
+	require.Regexp(t, `test-sc-plan-mon: memory budget exceeded: .*`, err.Error())
+	memAcc.Clear(ctx)
+
+	_, err = plan.ExplainVerbose()
+	require.Regexp(t, `test-sc-plan-mon: memory budget exceeded: .*`, err.Error())
+	memAcc.Clear(ctx)
 }

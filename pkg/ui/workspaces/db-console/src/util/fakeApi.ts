@@ -10,17 +10,17 @@
 
 import * as $protobuf from "protobufjs";
 
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 import { cockroach } from "src/js/protos";
 import { API_PREFIX, STATUS_PREFIX } from "src/util/api";
 import fetchMock from "src/util/fetch-mock";
+import moment from "moment-timezone";
 
 const {
-  DatabasesResponse,
-  DatabaseDetailsResponse,
   SettingsResponse,
-  TableDetailsResponse,
   TableStatsResponse,
   TableIndexStatsResponse,
+  NodesResponse,
 } = cockroach.server.serverpb;
 
 // These test-time functions provide typesafe wrappers around fetchMock,
@@ -65,33 +65,132 @@ export function stubClusterSettings(
   );
 }
 
-export function stubDatabases(
-  response: cockroach.server.serverpb.IDatabasesResponse,
-) {
-  stubGet("/databases", DatabasesResponse.encode(response), API_PREFIX);
+export function buildSQLApiDatabasesResponse(databases: string[]) {
+  const rows: clusterUiApi.DatabasesColumns[] = databases.map(database => {
+    return {
+      database_name: database,
+    };
+  });
+  return {
+    num_statements: 1,
+    execution: {
+      txn_results: [
+        {
+          statement: 1,
+          tag: "SHOW DATABASES",
+          start: "2022-10-27T17:42:05.582744Z",
+          end: "2022-10-27T17:42:05.588454Z",
+          rows_affected: 0,
+          columns: [
+            {
+              name: "database_name",
+              type: "STRING",
+              oid: 25,
+            },
+            {
+              name: "owner",
+              type: "NAME",
+              oid: 19,
+            },
+            {
+              name: "primary_region",
+              type: "STRING",
+              oid: 25,
+            },
+            {
+              name: "secondary_region",
+              type: "STRING",
+              oid: 25,
+            },
+            {
+              name: "regions",
+              type: "STRING[]",
+              oid: 1009,
+            },
+            {
+              name: "survival_goal",
+              type: "STRING",
+              oid: 25,
+            },
+          ],
+          rows: rows,
+        },
+      ],
+    },
+  };
 }
 
-export function stubDatabaseDetails(
-  database: string,
-  response: cockroach.server.serverpb.IDatabaseDetailsResponse,
-) {
-  stubGet(
-    `/databases/${database}?include_stats=true`,
-    DatabaseDetailsResponse.encode(response),
-    API_PREFIX,
-  );
+export function buildSQLApiEventsResponse(events: clusterUiApi.EventsResponse) {
+  return {
+    num_statements: 1,
+    execution: {
+      txn_results: [
+        {
+          statement: 1,
+          tag: "SELECT",
+          start: "2022-11-14T16:26:45.06819Z",
+          end: "2022-11-14T16:26:45.073657Z",
+          rows_affected: 0,
+          columns: [
+            {
+              name: "timestamp",
+              type: "TIMESTAMP",
+              oid: 1114,
+            },
+            {
+              name: "eventType",
+              type: "STRING",
+              oid: 25,
+            },
+            {
+              name: "reportingID",
+              type: "INT8",
+              oid: 20,
+            },
+            {
+              name: "info",
+              type: "STRING",
+              oid: 25,
+            },
+            {
+              name: "uniqueID",
+              type: "BYTES",
+              oid: 17,
+            },
+          ],
+          rows: events,
+        },
+      ],
+    },
+  };
 }
 
-export function stubTableDetails(
-  database: string,
-  table: string,
-  response: cockroach.server.serverpb.ITableDetailsResponse,
+export function stubDatabases(databases: string[], times?: number) {
+  const response = buildSQLApiDatabasesResponse(databases);
+  fetchMock.mock({
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-Cockroach-API-Session": "cookie",
+    },
+    matcher: clusterUiApi.SQL_API_PATH,
+    method: "POST",
+    response: (_url: string, requestObj: RequestInit) => {
+      expect(JSON.parse(requestObj.body.toString())).toEqual(
+        clusterUiApi.databasesRequest,
+      );
+      return {
+        body: JSON.stringify(response),
+      };
+    },
+    times: times,
+  });
+}
+
+export function stubNodesUI(
+  response: cockroach.server.serverpb.INodesResponseExternal,
 ) {
-  stubGet(
-    `/databases/${database}/tables/${table}`,
-    TableDetailsResponse.encode(response),
-    API_PREFIX,
-  );
+  stubGet(`/nodes_ui`, NodesResponse.encode(response), STATUS_PREFIX);
 }
 
 export function stubTableStats(
@@ -100,7 +199,9 @@ export function stubTableStats(
   response: cockroach.server.serverpb.ITableStatsResponse,
 ) {
   stubGet(
-    `/databases/${database}/tables/${table}/stats`,
+    `/databases/${encodeURIComponent(database)}/tables/${encodeURIComponent(
+      table,
+    )}/stats`,
     TableStatsResponse.encode(response),
     API_PREFIX,
   );
@@ -120,4 +221,108 @@ export function stubIndexStats(
 
 function stubGet(path: string, writer: $protobuf.Writer, prefix: string) {
   fetchMock.get(`${prefix}${path}`, writer.finish());
+}
+
+export function createMockDatabaseRangesForTable(
+  numRangesCreate: number,
+  numNodes: number,
+): clusterUiApi.DatabaseDetailsRow[] {
+  const res = [];
+  const replicas = [];
+  for (let i = 1; i <= numNodes; i++) {
+    replicas.push(i);
+  }
+  for (let i = 0; i < numRangesCreate; i++) {
+    res.push({
+      replicas: replicas,
+      regions: ["gcp-europe-west1", "gcp-europe-west2"],
+      range_size: 10,
+    });
+  }
+  return res;
+}
+
+export function stubSqlApiCall<T>(
+  req: clusterUiApi.SqlExecutionRequest,
+  mockTxnResults: mockSqlTxnResult<T>[],
+  times: number = 1,
+) {
+  const response = buildSqlExecutionResponse(mockTxnResults);
+  fetchMock.mock({
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-Cockroach-API-Session": "cookie",
+    },
+    matcher: clusterUiApi.SQL_API_PATH,
+    method: "POST",
+    response: (_url: string, requestObj: RequestInit) => {
+      expect(JSON.parse(requestObj.body.toString())).toEqual({
+        ...req,
+        application_name:
+          req.application_name || clusterUiApi.INTERNAL_SQL_API_APP,
+        database: req.database || clusterUiApi.FALLBACK_DB,
+      });
+      return {
+        body: JSON.stringify(response),
+      };
+    },
+    times: times,
+  });
+}
+
+export function buildSqlExecutionResponse<T>(
+  mockTxnResults: mockSqlTxnResult<T>[],
+  error?: clusterUiApi.SqlExecutionErrorMessage,
+): clusterUiApi.SqlExecutionResponse<T> {
+  const sqlTxnResults: clusterUiApi.SqlTxnResult<T>[] = mockTxnResults.map(
+    (mock, idx) => {
+      mock.statement = idx + 1;
+      return buildSqlTxnResult(mock);
+    },
+  );
+  const resp: clusterUiApi.SqlExecutionResponse<T> = {
+    execution: {
+      retries: 0,
+      txn_results: sqlTxnResults,
+    },
+    error: error,
+  };
+  return resp;
+}
+
+// Same as SqlTxnResult, but all fields are optional.
+export type mockSqlTxnResult<RowType> = {
+  statement?: number; // Statement index from input array
+  tag?: string; // Short stmt tag
+  start?: string; // Start timestamp, encoded as RFC3339
+  end?: string; // End timestamp, encoded as RFC3339
+  rows_affected?: number;
+  columns?: clusterUiApi.SqlResultColumn[];
+  rows?: RowType[];
+  error?: Error;
+};
+
+// buildSqlTxnResult provides default values for mandatory fields
+// of a SqlTxnResult.
+function buildSqlTxnResult<RowType>(
+  mock: mockSqlTxnResult<RowType>,
+): clusterUiApi.SqlTxnResult<RowType> {
+  const statement = mock.statement ? mock.statement : 1;
+  const rowsAffected = mock.rows_affected ? mock.rows_affected : 0;
+  const startTimestamp = mock.start ? mock.start : new Date().toISOString();
+  const endTimestamp = mock.end
+    ? mock.end
+    : moment(startTimestamp).add(1, "s").toISOString();
+  const stmtTag = mock.tag ? mock.tag : "SELECT";
+  return {
+    statement: statement,
+    tag: stmtTag,
+    start: startTimestamp,
+    end: endTimestamp,
+    rows_affected: rowsAffected,
+    columns: mock.columns,
+    rows: mock.rows,
+    error: mock.error,
+  };
 }

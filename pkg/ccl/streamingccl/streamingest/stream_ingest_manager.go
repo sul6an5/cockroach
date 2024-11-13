@@ -9,58 +9,82 @@
 package streamingest
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/repstream"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
-type streamIngestManagerImpl struct{}
+type streamIngestManagerImpl struct {
+	evalCtx     *eval.Context
+	jobRegistry *jobs.Registry
+	txn         isql.Txn
+}
 
 // CompleteStreamIngestion implements streaming.StreamIngestManager interface.
 func (r *streamIngestManagerImpl) CompleteStreamIngestion(
-	evalCtx *eval.Context, txn *kv.Txn, ingestionJobID jobspb.JobID, cutoverTimestamp hlc.Timestamp,
+	ctx context.Context, ingestionJobID jobspb.JobID, cutoverTimestamp hlc.Timestamp,
 ) error {
-	return completeStreamIngestion(evalCtx, txn, ingestionJobID, cutoverTimestamp)
+	return applyCutoverTime(ctx, r.jobRegistry, r.txn, ingestionJobID, cutoverTimestamp)
 }
 
 // GetStreamIngestionStats implements streaming.StreamIngestManager interface.
 func (r *streamIngestManagerImpl) GetStreamIngestionStats(
-	evalCtx *eval.Context, txn *kv.Txn, ingestionJobID jobspb.JobID,
+	ctx context.Context,
+	streamIngestionDetails jobspb.StreamIngestionDetails,
+	jobProgress jobspb.Progress,
 ) (*streampb.StreamIngestionStats, error) {
-	return getStreamIngestionStats(evalCtx, txn, ingestionJobID)
+	return replicationutils.GetStreamIngestionStats(ctx, streamIngestionDetails, jobProgress)
+}
+
+func (r *streamIngestManagerImpl) GetReplicationStatsAndStatus(
+	ctx context.Context, ingestionJobID jobspb.JobID,
+) (*streampb.StreamIngestionStats, string, error) {
+	return getReplicationStatsAndStatus(ctx, r.jobRegistry, r.txn, ingestionJobID)
 }
 
 func newStreamIngestManagerWithPrivilegesCheck(
-	evalCtx *eval.Context,
-) (streaming.StreamIngestManager, error) {
-	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(evalCtx.Context)
-	if err != nil {
-		return nil, err
-	}
-
-	if !isAdmin {
-		return nil,
-			pgerror.New(pgcode.InsufficientPrivilege, "replication restricted to ADMIN role")
-	}
-
+	ctx context.Context, evalCtx *eval.Context, txn isql.Txn,
+) (eval.StreamIngestManager, error) {
 	execCfg := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
 	enterpriseCheckErr := utilccl.CheckEnterpriseEnabled(
-		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), execCfg.Organization(), "REPLICATION")
+		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), "REPLICATION")
 	if enterpriseCheckErr != nil {
 		return nil, pgerror.Wrap(enterpriseCheckErr,
 			pgcode.InsufficientPrivilege, "replication requires enterprise license")
 	}
 
-	return &streamIngestManagerImpl{}, nil
+	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !isAdmin {
+		if err := evalCtx.SessionAccessor.CheckPrivilege(ctx,
+			syntheticprivilege.GlobalPrivilegeObject,
+			privilege.MANAGETENANT); err != nil {
+			return nil, err
+		}
+	}
+
+	return &streamIngestManagerImpl{
+		evalCtx:     evalCtx,
+		txn:         txn,
+		jobRegistry: execCfg.JobRegistry,
+	}, nil
 }
 
 func init() {
-	streaming.GetStreamIngestManagerHook = newStreamIngestManagerWithPrivilegesCheck
+	repstream.GetStreamIngestManagerHook = newStreamIngestManagerWithPrivilegesCheck
 }

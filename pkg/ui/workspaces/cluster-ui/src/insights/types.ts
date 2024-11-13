@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { Moment } from "moment";
+import { Moment } from "moment-timezone";
 import { Filters } from "../queryFilter";
 
 // This enum corresponds to the string enum for `problems` in `cluster_execution_insights`
@@ -26,63 +26,94 @@ export enum InsightExecEnum {
   STATEMENT = "statement",
 }
 
-export type TransactionInsightEvent = {
-  transactionID: string;
-  fingerprintID: string;
-  queries: string[];
-  insights: Insight[];
-  startTime: Moment;
-  contentionDuration: moment.Duration;
-  contentionThreshold: number;
+export enum StatementStatus {
+  COMPLETED = "Completed",
+  FAILED = "Failed",
+}
+
+export enum TransactionStatus {
+  COMPLETED = "Completed",
+  FAILED = "Failed",
+  // Unimplemented, see https://github.com/cockroachdb/cockroach/issues/98219/.
+  CANCELLED = "Cancelled",
+}
+
+// Common fields for both txn and stmt insights.
+export type InsightEventBase = {
   application: string;
-  execType: InsightExecEnum;
+  contentionTime?: moment.Duration;
+  cpuSQLNanos: number;
+  elapsedTimeMillis: number;
+  endTime: Moment;
+  implicitTxn: boolean;
+  insights: Insight[];
+  lastRetryReason?: string;
+  priority: string;
+  query: string;
+  retries: number;
+  rowsRead: number;
+  rowsWritten: number;
+  sessionID: string;
+  startTime: Moment;
+  transactionExecutionID: string;
+  transactionFingerprintID: string;
+  username: string;
+  errorCode: string;
 };
 
-export type TransactionInsightEventDetails = {
-  executionID: string;
-  queries: string[];
-  insights: Insight[];
-  startTime: Moment;
-  elapsedTime: number;
-  contentionThreshold: number;
-  application: string;
-  fingerprintID: string;
+export type TxnInsightEvent = InsightEventBase & {
+  status: TransactionStatus;
+  stmtExecutionIDs: string[];
+};
+
+// Information about the blocking transaction and schema.
+export type ContentionDetails = {
+  collectionTimeStamp: Moment;
   blockingExecutionID: string;
-  blockingFingerprintID: string;
-  blockingQueries: string[];
+  blockingTxnFingerprintID: string;
+  blockingTxnQuery: string[];
+  waitingTxnID: string;
+  waitingTxnFingerprintID: string;
+  waitingStmtID: string;
+  waitingStmtFingerprintID: string;
   contendedKey: string;
   schemaName: string;
   databaseName: string;
   tableName: string;
   indexName: string;
-  execType: InsightExecEnum;
+  contentionTimeMs: number;
 };
 
-export type StatementInsightEvent = {
-  // Some of these can be moved to a common InsightEvent type if txn query is updated.
-  statementID: string;
-  transactionID: string;
-  statementFingerprintID: string;
-  transactionFingerprintID: string;
-  startTime: Moment;
-  elapsedTimeMillis: number;
-  sessionID: string;
-  timeSpentWaiting?: moment.Duration;
-  isFullScan: boolean;
-  endTime: Moment;
-  databaseName: string;
-  username: string;
-  rowsRead: number;
-  rowsWritten: number;
-  lastRetryReason?: string;
-  priority: string;
-  retries: number;
-  causes: string[];
-  problem: string;
-  query: string;
+export type TxnContentionInsightDetails = {
+  transactionExecutionID: string;
   application: string;
-  insights: Insight[];
+  transactionFingerprintID: string;
+  blockingContentionDetails: ContentionDetails[];
+  execType: InsightExecEnum;
+  insightName: string;
+};
+
+export type TxnInsightDetails = {
+  // Querying from virtual tables is expensive.
+  // This data is segmented into 3 parts so that we can
+  // selective fetch missing info on the details page.
+  txnDetails?: TxnInsightEvent;
+  blockingContentionDetails?: ContentionDetails[];
+  statements?: StmtInsightEvent[];
+  execType?: InsightExecEnum;
+};
+
+// Shown on the stmt insights overview page.
+export type StmtInsightEvent = InsightEventBase & {
+  statementExecutionID: string;
+  statementFingerprintID: string;
+  isFullScan: boolean;
+  contentionEvents?: ContentionDetails[];
   indexRecommendations: string[];
+  planGist: string;
+  databaseName: string;
+  execType?: InsightExecEnum;
+  status: StatementStatus;
 };
 
 export type Insight = {
@@ -92,109 +123,146 @@ export type Insight = {
   tooltipDescription: string;
 };
 
-export type EventExecution = {
+export type ContentionEvent = {
   executionID: string;
   fingerprintID: string;
+  waitingStmtID: string;
+  waitingStmtFingerprintID: string;
   queries: string[];
   startTime: Moment;
-  elapsedTime: number;
+  contentionTimeMs: number;
+  schemaName: string;
+  databaseName: string;
+  tableName: string;
+  indexName: string;
   execType: InsightExecEnum;
+  stmtInsightEvent: StmtInsightEvent;
 };
 
-const highContentionInsight = (
-  execType: InsightExecEnum = InsightExecEnum.TRANSACTION,
-  latencyThreshold: number,
+export const highContentionInsight = (
+  execType: InsightExecEnum,
+  latencyThresholdMs?: number,
+  contentionDuration?: number,
+): Insight => {
+  let waitDuration: string;
+  if (
+    latencyThresholdMs &&
+    contentionDuration &&
+    contentionDuration < latencyThresholdMs
+  ) {
+    waitDuration = `${contentionDuration}ms`;
+  } else if (!latencyThresholdMs) {
+    waitDuration =
+      "longer than the value of the 'sql.insights.latency_threshold' cluster setting";
+  } else {
+    waitDuration = `longer than ${latencyThresholdMs}ms`;
+  }
+  const description = `This ${execType} waited on other ${execType}s to execute for ${waitDuration}.`;
+  return {
+    name: InsightNameEnum.highContention,
+    label: InsightEnumToLabel.get(InsightNameEnum.highContention),
+    description: description,
+    tooltipDescription:
+      description + ` Click the ${execType} execution ID to see more details.`,
+  };
+};
+
+export const slowExecutionInsight = (
+  execType: InsightExecEnum,
+  latencyThreshold?: number,
 ): Insight => {
   let threshold = latencyThreshold + "ms";
   if (!latencyThreshold) {
     threshold =
-      "the value of the sql.insights.latency_threshold cluster setting";
+      "the value of the 'sql.insights.latency_threshold' cluster setting";
   }
-  const description = `This ${execType} has been waiting on other ${execType}s to execute for longer than ${threshold}.`;
-  return {
-    name: InsightNameEnum.highContention,
-    label: "High Contention",
-    description: description,
-    tooltipDescription:
-      description + ` Click the ${execType} execution ID to see more details.`,
-  };
-};
-
-const slowExecutionInsight = (execType: InsightExecEnum): Insight => {
-  const description = `Unable to identify a specific cause for this ${execType}.`;
+  const description = `This ${execType} took longer than ${threshold} to execute.`;
   return {
     name: InsightNameEnum.slowExecution,
-    label: "Slow Execution",
+    label: InsightEnumToLabel.get(InsightNameEnum.slowExecution),
     description: description,
     tooltipDescription:
       description + ` Click the ${execType} execution ID to see more details.`,
   };
 };
 
-const planRegressionInsight = (execType: InsightExecEnum): Insight => {
+export const planRegressionInsight = (execType: InsightExecEnum): Insight => {
   const description =
     `This ${execType} was slow because we picked the wrong plan, ` +
     `possibly due to outdated statistics, the statement using different literals or ` +
     `search conditions, or a change in the database schema.`;
   return {
     name: InsightNameEnum.planRegression,
-    label: "Plan Regression",
+    label: InsightEnumToLabel.get(InsightNameEnum.planRegression),
     description: description,
     tooltipDescription:
       description + ` Click the ${execType} execution ID to see more details.`,
   };
 };
 
-const suboptimalPlanInsight = (execType: InsightExecEnum): Insight => {
-  const description =
-    `This ${execType} was slow because a good plan was not available, whether ` +
-    `due to outdated statistics or missing indexes.`;
+export const suboptimalPlanInsight = (execType: InsightExecEnum): Insight => {
+  let description = "";
+  switch (execType) {
+    case InsightExecEnum.STATEMENT:
+      description =
+        `This statement was slow because a good plan was unavailable; ` +
+        `possible reasons include outdated statistics or missing indexes.`;
+      break;
+    case InsightExecEnum.TRANSACTION:
+      description =
+        "This transaction was slow because a good plan was unavailable for some " +
+        "statement(s) in this transaction; possible reasons include outdated " +
+        "statistics or missing indexes.";
+      break;
+  }
   return {
     name: InsightNameEnum.suboptimalPlan,
-    label: "Suboptimal Plan",
+    label: InsightEnumToLabel.get(InsightNameEnum.suboptimalPlan),
     description: description,
     tooltipDescription:
       description + ` Click the ${execType} execution ID to see more details.`,
   };
 };
 
-const highRetryCountInsight = (execType: InsightExecEnum): Insight => {
+export const highRetryCountInsight = (execType: InsightExecEnum): Insight => {
   const description =
-    `This ${execType} was slow because of being retried multiple times, again due ` +
-    `to contention. The "high" threshold may be configured by the ` +
+    `This ${execType} has being retried more times than the value of the ` +
     `'sql.insights.high_retry_count.threshold' cluster setting.`;
   return {
     name: InsightNameEnum.highRetryCount,
-    label: "High Retry Count",
+    label: InsightEnumToLabel.get(InsightNameEnum.highRetryCount),
     description: description,
     tooltipDescription:
       description + ` Click the ${execType} execution ID to see more details.`,
   };
 };
 
-const failedExecutionInsight = (execType: InsightExecEnum): Insight => {
+export const failedExecutionInsight = (execType: InsightExecEnum): Insight => {
   const description =
     `This ${execType} execution failed completely, due to contention, resource ` +
     `saturation, or syntax errors.`;
   return {
     name: InsightNameEnum.failedExecution,
-    label: "Failed Execution",
+    label: InsightEnumToLabel.get(InsightNameEnum.failedExecution),
     description: description,
     tooltipDescription:
       description + ` Click the ${execType} execution ID to see more details.`,
   };
 };
 
-export const InsightTypes = [highContentionInsight]; // only used by getTransactionInsights to iterate over txn insights
-
-export const getInsightFromProblem = (
+export const getInsightFromCause = (
   cause: string,
   execOption: InsightExecEnum,
   latencyThreshold?: number,
+  contentionDuration?: number,
 ): Insight => {
   switch (cause) {
     case InsightNameEnum.highContention:
-      return highContentionInsight(execOption, latencyThreshold);
+      return highContentionInsight(
+        execOption,
+        latencyThreshold,
+        contentionDuration,
+      );
     case InsightNameEnum.failedExecution:
       return failedExecutionInsight(execOption);
     case InsightNameEnum.planRegression:
@@ -204,16 +272,27 @@ export const getInsightFromProblem = (
     case InsightNameEnum.highRetryCount:
       return highRetryCountInsight(execOption);
     default:
-      return slowExecutionInsight(execOption);
+      return slowExecutionInsight(execOption, latencyThreshold);
   }
 };
 
 export const InsightExecOptions = new Map<string, string>([
-  [InsightExecEnum.TRANSACTION.toString(), "Transaction Executions"],
   [InsightExecEnum.STATEMENT.toString(), "Statement Executions"],
+  [InsightExecEnum.TRANSACTION.toString(), "Transaction Executions"],
 ]);
 
-export type WorkloadInsightEventFilters = Pick<Filters, "app">;
+export const InsightEnumToLabel = new Map<string, string>([
+  [InsightNameEnum.highContention.toString(), "High Contention"],
+  [InsightNameEnum.slowExecution.toString(), "Slow Execution"],
+  [InsightNameEnum.suboptimalPlan.toString(), "Suboptimal Plan"],
+  [InsightNameEnum.highRetryCount.toString(), "High Retry Count"],
+  [InsightNameEnum.failedExecution.toString(), "Failed Execution"],
+]);
+
+export type WorkloadInsightEventFilters = Pick<
+  Filters,
+  "app" | "workloadInsightType"
+>;
 
 export type SchemaInsightEventFilters = Pick<
   Filters,
@@ -237,24 +316,35 @@ export interface InsightRecommendation {
   database?: string;
   query?: string;
   indexDetails?: indexDetails;
-  execution?: executionDetails;
+  execution?: ExecutionDetails;
   details?: insightDetails;
 }
 
 export interface indexDetails {
   table: string;
+  schema: string;
   indexID: number;
   indexName: string;
   lastUsed?: string;
 }
 
-export interface executionDetails {
-  statement?: string;
-  summary?: string;
+// These are the fields used for workload insight recommendations.
+export interface ExecutionDetails {
+  application?: string;
+  databaseName?: string;
+  elapsedTimeMillis?: number;
+  contentionTimeMs?: number;
   fingerprintID?: string;
   implicit?: boolean;
-  retries?: number;
   indexRecommendations?: string[];
+  retries?: number;
+  statement?: string;
+  summary?: string;
+  statementExecutionID?: string;
+  transactionExecutionID?: string;
+  execType?: InsightExecEnum;
+  errorCode?: string;
+  status?: string;
 }
 
 export interface insightDetails {

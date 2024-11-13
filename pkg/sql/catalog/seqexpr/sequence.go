@@ -20,6 +20,7 @@ import (
 	"go/constant"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -56,8 +57,19 @@ func GetSequenceFromFunc(funcExpr *tree.FuncExpr) (*SeqIdentifier, error) {
 	// the function should have already been resolved.
 	// TODO(chengxiong): Since we have funcExpr here, it's possible to narrow down
 	// overloads by using input types.
+	if ref, ok := funcExpr.Func.FunctionReference.(*tree.FunctionOID); ok && funcdesc.IsOIDUserDefinedFunc(ref.OID) {
+		// If it's a user defined function OID, then we know that it's not a
+		// sequence reference.
+		return nil, nil
+	}
 	def, err := funcExpr.Func.Resolve(context.Background(), tree.EmptySearchPath, nil /* resolver */)
 	if err != nil {
+		// We have expression sanitization and type checking to make sure functions
+		// exists and type is valid, so here if function is not found, it must be a
+		// user defined function. We don't need to get sequences reference from it.
+		if errors.Is(err, tree.ErrFunctionUndefined) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -72,7 +84,7 @@ func GetSequenceFromFunc(funcExpr *tree.FuncExpr) (*SeqIdentifier, error) {
 			// Find the overload that matches funcExpr.
 			if len(funcExpr.Exprs) == def.Overloads[i].Types.Length() {
 				found = true
-				argTypes, ok := def.Overloads[i].Types.(tree.ArgTypes)
+				paramTypes, ok := def.Overloads[i].Types.(tree.ParamTypes)
 				if !ok {
 					panic(pgerror.Newf(
 						pgcode.InvalidFunctionDefinition,
@@ -80,9 +92,9 @@ func GetSequenceFromFunc(funcExpr *tree.FuncExpr) (*SeqIdentifier, error) {
 					))
 				}
 				for i := 0; i < def.Overloads[i].Types.Length(); i++ {
-					// Find the sequence name arg.
-					argName := argTypes[i].Name
-					if argName == builtinconstants.SequenceNameArg {
+					// Find the sequence name param.
+					paramName := paramTypes[i].Name
+					if paramName == builtinconstants.SequenceNameArg {
 						arg := funcExpr.Exprs[i]
 						if seqIdentifier := getSequenceIdentifier(arg); seqIdentifier != nil {
 							return seqIdentifier, nil

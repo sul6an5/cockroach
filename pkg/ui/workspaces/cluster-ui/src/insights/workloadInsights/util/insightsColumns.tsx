@@ -14,20 +14,31 @@ import { InsightExecEnum } from "src/insights";
 import { contentModifiers } from "../../../statsTableUtil/statsTableUtil";
 import { Anchor } from "../../../anchor";
 import { contentionTime, readFromDisk, writtenToDisk } from "../../../util";
+import { Timezone } from "src/timestamp";
 
 export const insightsColumnLabels = {
   executionID: "Execution ID",
+  latestExecutionID: "Latest Execution ID",
+  waitingID: "Waiting Execution ID",
+  waitingFingerprintID: "Waiting Fingerprint ID",
   query: "Execution",
+  status: "Status",
   insights: "Insights",
-  startTime: "Start Time (UTC)",
+  startTime: "Start Time",
   elapsedTime: "Elapsed Time",
   applicationName: "Application Name",
   username: "User Name",
   fingerprintID: "Fingerprint ID",
   numRetries: "Retries",
   isFullScan: "Full Scan",
-  contention: "Contention",
+  contention: "Contention Time",
+  contentionStartTime: "Contention Start Time",
   rowsProcessed: "Rows Processed",
+  schemaName: "Schema Name",
+  databaseName: "Database Name",
+  tableName: "Table Name",
+  indexName: "Index Name",
+  cpu: "CPU Time",
 };
 
 export type InsightsTableColumnKeys = keyof typeof insightsColumnLabels;
@@ -42,8 +53,14 @@ export function getLabel(
 ): string {
   switch (execType) {
     case InsightExecEnum.TRANSACTION:
+      if (key === "latestExecutionID") {
+        return "Latest Transaction Execution ID";
+      }
       return "Transaction " + insightsColumnLabels[key];
     case InsightExecEnum.STATEMENT:
+      if (key === "latestExecutionID") {
+        return "Latest Statement Execution ID";
+      }
       return "Statement " + insightsColumnLabels[key];
     default:
       return insightsColumnLabels[key];
@@ -54,10 +71,13 @@ function makeToolTip(
   content: JSX.Element,
   columnKey: InsightsTableColumnKeys,
   execType?: InsightExecEnum,
+  timezone?: JSX.Element,
 ): ReactElement {
   return (
     <Tooltip placement="bottom" style="tableTitle" content={content}>
-      {getLabel(columnKey, execType)}
+      <>
+        {getLabel(columnKey, execType)} {timezone}
+      </>
     </Tooltip>
   );
 }
@@ -72,11 +92,32 @@ export const insightsTableTitles: InsightsTableTitleType = {
   },
   executionID: (execType: InsightExecEnum) => {
     return makeToolTip(
+      <p>The ID of the execution with the {execType} fingerprint.</p>,
+      "executionID",
+      execType,
+    );
+  },
+  waitingFingerprintID: (execType: InsightExecEnum) => {
+    return makeToolTip(
+      <p>The {execType} fingerprint ID.</p>,
+      "waitingFingerprintID",
+      execType,
+    );
+  },
+  waitingID: (execType: InsightExecEnum) => {
+    return makeToolTip(
+      <p>The ID of the waiting {execType}.</p>,
+      "waitingID",
+      execType,
+    );
+  },
+  latestExecutionID: (execType: InsightExecEnum) => {
+    return makeToolTip(
       <p>
         The execution ID of the latest execution with the {execType}{" "}
         fingerprint.
       </p>,
-      "executionID",
+      "latestExecutionID",
       execType,
     );
   },
@@ -86,6 +127,10 @@ export const insightsTableTitles: InsightsTableTitleType = {
       tooltipText = "The queries attempted in the transaction.";
     }
     return makeToolTip(<p>{tooltipText}</p>, "query", execType);
+  },
+  status: (execType: InsightExecEnum) => {
+    const tooltipText = `The ${execType} status`;
+    return makeToolTip(<p>{tooltipText}</p>, "status");
   },
   insights: (execType: InsightExecEnum) => {
     return makeToolTip(
@@ -97,6 +142,16 @@ export const insightsTableTitles: InsightsTableTitleType = {
     return makeToolTip(
       <p>The timestamp at which the {execType} started.</p>,
       "startTime",
+      undefined,
+      <Timezone />,
+    );
+  },
+  contentionStartTime: (execType: InsightExecEnum) => {
+    return makeToolTip(
+      <p>The timestamp at which contention was detected for the {execType}.</p>,
+      "contentionStartTime",
+      undefined,
+      <Timezone />,
     );
   },
   elapsedTime: (execType: InsightExecEnum) => {
@@ -110,6 +165,21 @@ export const insightsTableTitles: InsightsTableTitleType = {
       <p>The user that started the {execType}.</p>,
       "username",
     );
+  },
+  schemaName: (execType: InsightExecEnum) => {
+    return makeToolTip(<p>The name of the contended schema.</p>, "schemaName");
+  },
+  databaseName: (execType: InsightExecEnum) => {
+    return makeToolTip(
+      <p>The name of the contended database.</p>,
+      "databaseName",
+    );
+  },
+  tableName: (execType: InsightExecEnum) => {
+    return makeToolTip(<p>The name of the contended table.</p>, "tableName");
+  },
+  indexName: (execType: InsightExecEnum) => {
+    return makeToolTip(<p>The name of the contended index.</p>, "indexName");
   },
   applicationName: (execType: InsightExecEnum) => {
     return makeToolTip(
@@ -164,6 +234,12 @@ export const insightsTableTitles: InsightsTableTitleType = {
         {` to disk per execution for ${execType} within the specified time interval.`}
       </p>,
       "rowsProcessed",
+    );
+  },
+  cpu: (_: InsightExecEnum) => {
+    return makeToolTip(
+      <p>{`CPU Time spent executing within the specified time interval.`}</p>,
+      "cpu",
     );
   },
 };

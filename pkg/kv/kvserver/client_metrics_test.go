@@ -16,24 +16,24 @@ import (
 	"strconv"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -137,7 +137,7 @@ func verifyStats(t *testing.T, tc *testcluster.TestCluster, storeIdxSlice ...int
 }
 
 func verifyStorageStats(t *testing.T, s *kvserver.Store) {
-	if err := s.ComputeMetrics(context.Background(), 0); err != nil {
+	if err := s.ComputeMetrics(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -176,6 +176,8 @@ func TestStoreResolveMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.WithIssue(t, 98404)
+
 	// First prevent rot that would result from adding fields without handling
 	// them everywhere.
 	{
@@ -203,7 +205,7 @@ func TestStoreResolveMetrics(t *testing.T) {
 	const resolveAbortCount = int64(800)
 	const resolvePoisonCount = int64(2400)
 
-	var ba roachpb.BatchRequest
+	ba := &kvpb.BatchRequest{}
 	{
 		repl := store.LookupReplica(keys.MustAddr(span.Key))
 		var err error
@@ -218,7 +220,7 @@ func TestStoreResolveMetrics(t *testing.T) {
 			key := span.Key
 			endKey := span.EndKey
 			if i > n/2 {
-				req := &roachpb.ResolveIntentRangeRequest{
+				req := &kvpb.ResolveIntentRangeRequest{
 					IntentTxn: txn.TxnMeta,
 					Status:    status,
 					Poison:    poison,
@@ -227,7 +229,7 @@ func TestStoreResolveMetrics(t *testing.T) {
 				ba.Add(req)
 				continue
 			}
-			req := &roachpb.ResolveIntentRequest{
+			req := &kvpb.ResolveIntentRequest{
 				IntentTxn: txn.TxnMeta,
 				Status:    status,
 				Poison:    poison,
@@ -284,6 +286,7 @@ func TestStoreMetrics(t *testing.T) {
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					DisableRaftLogQueue: true,
+					EngineKnobs:         []storage.ConfigOption{storage.DisableAutomaticCompactions},
 				},
 			},
 		}
@@ -299,7 +302,7 @@ func TestStoreMetrics(t *testing.T) {
 	// This is useful, because most of the stats we track don't apply to
 	// memtables.
 	for i := range tc.Servers {
-		if err := tc.GetFirstStoreFromServer(t, i).Engine().Flush(); err != nil {
+		if err := tc.GetFirstStoreFromServer(t, i).TODOEngine().Flush(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -356,7 +359,7 @@ func TestStoreMetrics(t *testing.T) {
 		_, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
 		if err == nil {
 			return fmt.Errorf("replica still exists on dest 0")
-		} else if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+		} else if errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 			return nil
 		}
 		return err
@@ -372,62 +375,4 @@ func TestStoreMetrics(t *testing.T) {
 
 	verifyStorageStats(t, tc.GetFirstStoreFromServer(t, 1))
 	verifyStorageStats(t, tc.GetFirstStoreFromServer(t, 2))
-}
-
-// TestStoreMaxBehindNanosOnlyTracksEpochBasedLeases ensures that the metric
-// ClosedTimestampMaxBehindNanos does not follow the start time of expiration
-// based leases. Expiration based leases don't publish closed timestamps.
-func TestStoreMaxBehindNanosOnlyTracksEpochBasedLeases(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			// Set a long timeout so that no lease or liveness ever times out.
-			RaftConfig: base.RaftConfig{RaftElectionTimeoutTicks: 100},
-		},
-	})
-	defer tc.Stopper().Stop(ctx)
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
-	// We want to choose setting values such that this test doesn't take too long
-	// with the caveat that under extreme stress, we need to make sure that the
-	// subsystem remains live.
-	const closedTimestampDuration = 15 * time.Millisecond
-	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = $1",
-		closedTimestampDuration.String())
-	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = $1",
-		closedTimestampDuration.String())
-
-	// Let's get to a point where we know that we have an expiration based lease
-	// with a start time more than some time ago and then we have a max closed
-	// value more recent.
-	_, meta2Repl1 := getFirstStoreReplica(t, tc.Server(0), keys.Meta2Prefix)
-
-	// Transfer the lease for the meta range to ensure that it has a non-zero
-	// start time.
-	require.NoError(t, tc.TransferRangeLease(*meta2Repl1.Desc(), tc.Target(1)))
-
-	testutils.SucceedsSoon(t, func() error {
-		_, metaRepl := getFirstStoreReplica(t, tc.Server(1), keys.Meta2Prefix)
-		l, _ := metaRepl.GetLease()
-		if l.Start.IsEmpty() {
-			return errors.Errorf("don't have a lease for meta1 yet: %v %v", l, meta2Repl1)
-		}
-		sinceExpBasedLeaseStart := timeutil.Since(timeutil.Unix(0, l.Start.WallTime))
-		for i := 0; i < tc.NumServers(); i++ {
-			s, _ := getFirstStoreReplica(t, tc.Server(i), keys.Meta1Prefix)
-			require.NoError(t, s.ComputeMetrics(ctx, 0))
-			maxBehind := time.Duration(s.Metrics().ClosedTimestampMaxBehindNanos.Value())
-			// We want to make sure that maxBehind ends up being much smaller than the
-			// start of an expiration based lease.
-			const behindMultiple = 5
-			if maxBehind*behindMultiple > sinceExpBasedLeaseStart {
-				return errors.Errorf("store %v has a ClosedTimestampMaxBehindNanos"+
-					" of %v which is not way less than the an expiration-based lease start, %v",
-					s.StoreID(), maxBehind, sinceExpBasedLeaseStart)
-			}
-		}
-		return nil
-	})
 }

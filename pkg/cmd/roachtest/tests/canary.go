@@ -18,7 +18,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -37,35 +36,20 @@ import (
 // blocklist is a lists of known test errors and failures.
 type blocklist map[string]string
 
-// blocklistForVersion contains both a blocklist of known test errors and
-// failures but also an optional ignorelist for flaky tests.
-// When the test suite is run, the results are compared to this list.
+// listWithName contains both a blocklist of known test errors and
+// failures and also an optional ignorelist for flaky tests.
+// When the test suite is run, the results are compared to this blocklist.
 // Any passed test that is not on this blocklist is reported as PASS - expected
 // Any passed test that is on this blocklist is reported as PASS - unexpected
 // Any failed test that is on this blocklist is reported as FAIL - expected
-// Any failed test that is not on blocklist list is reported as FAIL - unexpected
+// Any failed test that is not on blocklist blocklist is reported as FAIL - unexpected
 // Any test on this blocklist that is not run is reported as FAIL - not run
-// Ant test in the ignorelist is reported as SKIP if it is run
-type blocklistForVersion struct {
-	versionPrefix  string
-	blocklistname  string
+// Any test in the ignorelist is reported as SKIP if it is run
+type listWithName struct {
+	blocklistName  string
 	blocklist      blocklist
-	ignorelistname string
+	ignorelistName string
 	ignorelist     blocklist
-}
-
-type blocklistsForVersion []blocklistForVersion
-
-// getLists returns the appropriate blocklist and ignorelist based on the
-// cockroach version. This check only looks to ensure that the prefix that
-// matches.
-func (b blocklistsForVersion) getLists(version string) (string, blocklist, string, blocklist) {
-	for _, info := range b {
-		if strings.HasPrefix(version, info.versionPrefix) {
-			return info.blocklistname, info.blocklist, info.ignorelistname, info.ignorelist
-		}
-	}
-	return "", nil, "", nil
 }
 
 func fetchCockroachVersion(

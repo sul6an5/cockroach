@@ -19,7 +19,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -27,10 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -113,9 +114,16 @@ func TestMultiRegionDataDriven(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderRace(t, "flaky test")
-
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
+
+		if strings.Contains(path, "regional_by_table") {
+			skip.WithIssue(t, 98020, "flaky test")
+		}
+		if strings.Contains(path, "secondary_region") {
+			skip.WithIssue(t, 92235, "flaky test")
+		}
+
 		ds := datadrivenTestState{}
 		defer ds.cleanup(ctx)
 		var mu syncutil.Mutex
@@ -123,6 +131,11 @@ func TestMultiRegionDataDriven(t *testing.T) {
 		var recCh chan tracingpb.Recording
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
+			case "skip":
+				var issue int
+				d.ScanArgs(t, "issue-num", &issue)
+				skip.WithIssue(t, issue)
+				return ""
 			case "sleep-for-follower-read":
 				time.Sleep(time.Second)
 			case "new-cluster":
@@ -193,6 +206,12 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 
 			case "cleanup-cluster":
 				ds.cleanup(ctx)
+
+			case "stop-server":
+				mustHaveArgOrFatal(t, d, serverIdx)
+				var idx int
+				d.ScanArgs(t, serverIdx, &idx)
+				ds.tc.StopServer(idx)
 
 			case "exec-sql":
 				mustHaveArgOrFatal(t, d, serverIdx)
@@ -301,7 +320,7 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 				// There's a lot going on here and things can fail at various steps, for
 				// completely legitimate reasons, which is why this thing needs to be
 				// wrapped in a succeeds soon.
-				if err := testutils.SucceedsSoonError(func() error {
+				if err := testutils.SucceedsWithinError(func() error {
 					desc, err := ds.tc.LookupRange(lookupKey)
 					if err != nil {
 						return err
@@ -404,7 +423,7 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 					}
 
 					return nil
-				}); err != nil {
+				}, 2*time.Minute); err != nil {
 					return err.Error()
 				}
 
@@ -789,10 +808,8 @@ func lookupTable(ec *sql.ExecutorConfig, database, table string) (catalog.TableD
 	err = sql.DescsTxn(
 		context.Background(),
 		ec,
-		func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-			_, desc, err := col.GetImmutableTableByName(ctx, txn, tbName, tree.ObjectLookupFlags{
-				DesiredObjectKind: tree.TableObject,
-			})
+		func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			_, desc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).MaybeGet(), tbName)
 			if err != nil {
 				return err
 			}

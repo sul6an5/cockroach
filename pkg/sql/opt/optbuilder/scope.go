@@ -643,7 +643,7 @@ func (s *scope) findFuncArgCol(idx tree.PlaceholderIdx) *scopeColumn {
 	for ; s != nil; s = s.parent {
 		for i := range s.cols {
 			col := &s.cols[i]
-			if col.funcArgReferencedBy(idx) {
+			if col.funcParamReferencedBy(idx) {
 				return col
 			}
 		}
@@ -1025,7 +1025,12 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 	case *tree.ColumnItem:
 		colI, resolveErr := colinfo.ResolveColumnItem(s.builder.ctx, s, t)
 		if resolveErr != nil {
-			if sqlerrors.IsUndefinedColumnError(resolveErr) {
+			// It may be a reference to a table, e.g. SELECT tbl FROM tbl.
+			// Attempt to resolve as a TupleStar. We do not attempt to resolve
+			// as a TupleStar if we are inside a view or function definition
+			// because views and functions do not support * expressions.
+			if !s.builder.insideViewDef && !s.builder.insideFuncDef &&
+				sqlerrors.IsUndefinedColumnError(resolveErr) {
 				// Attempt to resolve as columnname.*, which allows items
 				// such as SELECT row_to_json(tbl_name) FROM tbl_name to work.
 				return func() (bool, tree.Expr) {
@@ -1534,6 +1539,9 @@ func (s *scope) replaceCount(
 	}
 	f.Exprs[0] = vn
 
+	// It is ok to use string equality here, even if there is a UDF named
+	// "count" because UDFs cannot be aggregate functions. This code path is
+	// only executed for aggregate functions.
 	if strings.EqualFold(def.Name, "count") && f.Type == 0 {
 		if _, ok := vn.(tree.UnqualifiedStar); ok {
 			if f.Filter != nil {
@@ -1548,9 +1556,6 @@ func (s *scope) replaceCount(
 				e := &cpy
 				e.Exprs = tree.Exprs{tree.DBoolTrue}
 
-				// TODO(mgartner): What happens if a user defines a UDF named
-				// "count"? We might need to resolve the function first, not
-				// just rely on string equality to "count" above.
 				newDef, err := e.Func.Resolve(s.builder.ctx, s.builder.semaCtx.SearchPath, nil /* resolver */)
 				if err != nil {
 					panic(err)
@@ -1577,9 +1582,6 @@ func (s *scope) replaceCount(
 			if _, err := e.TypeCheck(s.builder.ctx, &semaCtx, types.Any); err != nil {
 				panic(err)
 			}
-			// TODO(mgartner): What happens if a user defines a UDF named
-			// "count"? We might need to resolve the function first, not just
-			// rely on string equality to "count" above.
 			newDef, err := e.Func.Resolve(s.builder.ctx, s.builder.semaCtx.SearchPath, nil /* resolver */)
 			if err != nil {
 				panic(err)
@@ -1633,10 +1635,12 @@ func (*scope) VisitPost(expr tree.Expr) tree.Expr {
 // scope implements the IndexedVarContainer interface so it can be used as
 // semaCtx.IVarContainer. This allows tree.TypeCheck to determine the correct
 // type for any IndexedVars.
-var _ tree.IndexedVarContainer = &scope{}
+var _ eval.IndexedVarContainer = &scope{}
 
-// IndexedVarEval is part of the IndexedVarContainer interface.
-func (s *scope) IndexedVarEval(idx int, e tree.ExprEvaluator) (tree.Datum, error) {
+// IndexedVarEval is part of the eval.IndexedVarContainer interface.
+func (s *scope) IndexedVarEval(
+	ctx context.Context, idx int, e tree.ExprEvaluator,
+) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("unimplemented: scope.IndexedVarEval"))
 }
 

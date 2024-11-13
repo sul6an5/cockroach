@@ -31,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 5
+const configIdx = 4
 
 var sqliteLogicTestDir string
 
@@ -68,9 +68,15 @@ func runSqliteLogicTest(t *testing.T, file string) {
 		skip.IgnoreLint(t, "-bigtest flag must be specified to run this test")
 	}
 	// SQLLite logic tests can be very memory intensive, so we give them larger
-	// limit than other logic tests get.
+	// limit than other logic tests get. Also some of the 'delete' files become
+	// extremely slow when MVCC range tombstones are enabled for point deletes,
+	// so we disable that.
 	serverArgs := logictest.TestServerArgs{
 		MaxSQLMemoryLimit: 512 << 20, // 512 MiB
+		DisableUseMVCCRangeTombstonesForPointDeletes: true,
+		// Some sqlite tests with very low bytes limit value are too slow, so
+		// ensure 3 KiB lower bound.
+		BatchBytesLimitLowerBound: 3 << 10, // 3 KiB
 	}
 	logictest.RunLogicTest(t, serverArgs, configIdx, filepath.Join(sqliteLogicTestDir, file))
 }

@@ -16,8 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -30,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 9
+const configIdx = 8
 
 var logicTestDir string
 var cclLogicTestDir string
@@ -67,7 +66,7 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
@@ -88,6 +87,9 @@ func runExecBuildLogicTest(t *testing.T, file string) {
 	skip.UnderDeadlock(t, "times out and/or hangs")
 	serverArgs := logictest.TestServerArgs{
 		DisableWorkmemRandomization: true,
+		// Disable the direct scans in order to keep the output of EXPLAIN (VEC)
+		// deterministic.
+		DisableDirectColumnarScans: true,
 	}
 	logictest.RunLogicTest(t, serverArgs, configIdx, filepath.Join(execBuildLogicTestDir, file))
 }
@@ -302,6 +304,13 @@ func TestTenantLogic_as_of(
 	runLogicTest(t, "as_of")
 }
 
+func TestTenantLogic_asyncpg(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "asyncpg")
+}
+
 func TestTenantLogic_auto_span_config_reconciliation_job(
 	t *testing.T,
 ) {
@@ -428,6 +437,20 @@ func TestTenantLogic_column_families(
 	runLogicTest(t, "column_families")
 }
 
+func TestTenantLogic_comment_on(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "comment_on")
+}
+
+func TestTenantLogic_composite_types(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "composite_types")
+}
+
 func TestTenantLogic_computed(
 	t *testing.T,
 ) {
@@ -461,13 +484,6 @@ func TestTenantLogic_create_as(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "create_as")
-}
-
-func TestTenantLogic_create_as_non_metamorphic(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "create_as_non_metamorphic")
 }
 
 func TestTenantLogic_create_index(
@@ -687,6 +703,13 @@ func TestTenantLogic_drop_table(
 	runLogicTest(t, "drop_table")
 }
 
+func TestTenantLogic_drop_temp(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "drop_temp")
+}
+
 func TestTenantLogic_drop_type(
 	t *testing.T,
 ) {
@@ -755,6 +778,13 @@ func TestTenantLogic_explain_analyze(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "explain_analyze")
+}
+
+func TestTenantLogic_export(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "export")
 }
 
 func TestTenantLogic_expression_index(
@@ -888,6 +918,13 @@ func TestTenantLogic_grant_schema(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "grant_schema")
+}
+
+func TestTenantLogic_group_join(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "group_join")
 }
 
 func TestTenantLogic_hash_join(
@@ -1359,6 +1396,13 @@ func TestTenantLogic_record(
 	runLogicTest(t, "record")
 }
 
+func TestTenantLogic_redact_descriptor(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "redact_descriptor")
+}
+
 func TestTenantLogic_rename_atomic(
 	t *testing.T,
 ) {
@@ -1422,6 +1466,13 @@ func TestTenantLogic_reset(
 	runLogicTest(t, "reset")
 }
 
+func TestTenantLogic_retry(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "retry")
+}
+
 func TestTenantLogic_returning(
 	t *testing.T,
 ) {
@@ -1464,6 +1515,13 @@ func TestTenantLogic_save_table(
 	runLogicTest(t, "save_table")
 }
 
+func TestTenantLogic_savepoints(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "savepoints")
+}
+
 func TestTenantLogic_scale(
 	t *testing.T,
 ) {
@@ -1497,6 +1555,13 @@ func TestTenantLogic_schema_change_retry(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "schema_change_retry")
+}
+
+func TestTenantLogic_schema_locked(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "schema_locked")
 }
 
 func TestTenantLogic_schema_repair(
@@ -1632,6 +1697,13 @@ func TestTenantLogic_shift(
 	runLogicTest(t, "shift")
 }
 
+func TestTenantLogic_show_commit_timestamp(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_commit_timestamp")
+}
+
 func TestTenantLogic_show_completions(
 	t *testing.T,
 ) {
@@ -1674,6 +1746,13 @@ func TestTenantLogic_show_create_all_types(
 	runLogicTest(t, "show_create_all_types")
 }
 
+func TestTenantLogic_show_create_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_create_redact")
+}
+
 func TestTenantLogic_show_default_privileges(
 	t *testing.T,
 ) {
@@ -1709,11 +1788,25 @@ func TestTenantLogic_show_indexes(
 	runLogicTest(t, "show_indexes")
 }
 
+func TestTenantLogic_show_var(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_var")
+}
+
 func TestTenantLogic_span_builtins(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "span_builtins")
+}
+
+func TestTenantLogic_sql_keys(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "sql_keys")
 }
 
 func TestTenantLogic_sqllite(
@@ -1749,6 +1842,20 @@ func TestTenantLogic_statement_statistics(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "statement_statistics")
+}
+
+func TestTenantLogic_statement_statistics_errors(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "statement_statistics_errors")
+}
+
+func TestTenantLogic_stats(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "stats")
 }
 
 func TestTenantLogic_storing(
@@ -1842,11 +1949,25 @@ func TestTenantLogic_temp_table_txn(
 	runLogicTest(t, "temp_table_txn")
 }
 
+func TestTenantLogic_tenant_from_tenant(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "tenant_from_tenant")
+}
+
 func TestTenantLogic_tenant_slow_repro(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "tenant_slow_repro")
+}
+
+func TestTenantLogic_tenant_span_stats(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "tenant_span_stats")
 }
 
 func TestTenantLogic_time(
@@ -1889,6 +2010,20 @@ func TestTenantLogic_truncate(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "truncate")
+}
+
+func TestTenantLogic_truncate_with_concurrent_mutation(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "truncate_with_concurrent_mutation")
+}
+
+func TestTenantLogic_tsvector(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "tsvector")
 }
 
 func TestTenantLogic_tuple(
@@ -1947,6 +2082,55 @@ func TestTenantLogic_udf(
 	runLogicTest(t, "udf")
 }
 
+func TestTenantLogic_udf_in_column_defaults(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_in_column_defaults")
+}
+
+func TestTenantLogic_udf_in_constraints(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_in_constraints")
+}
+
+func TestTenantLogic_udf_oid_ref(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_oid_ref")
+}
+
+func TestTenantLogic_udf_record(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_record")
+}
+
+func TestTenantLogic_udf_setof(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_setof")
+}
+
+func TestTenantLogic_udf_star(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_star")
+}
+
+func TestTenantLogic_udf_volatility_check(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_volatility_check")
+}
+
 func TestTenantLogic_union(
 	t *testing.T,
 ) {
@@ -1980,6 +2164,13 @@ func TestTenantLogic_upsert(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "upsert")
+}
+
+func TestTenantLogic_upsert_non_metamorphic(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "upsert_non_metamorphic")
 }
 
 func TestTenantLogic_user(
@@ -2150,11 +2341,25 @@ func TestTenantLogicCCL_partitioning_enum(
 	runCCLLogicTest(t, "partitioning_enum")
 }
 
+func TestTenantLogicCCL_redact_descriptor(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "redact_descriptor")
+}
+
 func TestTenantLogicCCL_schema_change_in_txn(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "schema_change_in_txn")
+}
+
+func TestTenantLogicCCL_show_create(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "show_create")
 }
 
 func TestTenantLogicCCL_tenant(

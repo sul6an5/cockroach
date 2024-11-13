@@ -11,6 +11,7 @@
 package memo
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -88,7 +89,7 @@ func TestGetStatsFromConstraint(t *testing.T) {
 	}
 
 	var mem Memo
-	mem.Init(&evalCtx)
+	mem.Init(context.Background(), &evalCtx)
 	tn := tree.NewUnqualifiedTableName("sel")
 	tab := catalog.Table(tn)
 	tabID := mem.Metadata().AddTable(tab, tn)
@@ -104,7 +105,7 @@ func TestGetStatsFromConstraint(t *testing.T) {
 		}
 
 		sb := &statisticsBuilder{}
-		sb.init(&evalCtx, mem.Metadata())
+		sb.init(context.Background(), &evalCtx, mem.Metadata())
 
 		// Make the scan.
 		scan := mem.MemoizeScan(&ScanPrivate{Table: tabID, Cols: cols})
@@ -114,14 +115,14 @@ func TestGetStatsFromConstraint(t *testing.T) {
 
 		relProps := &props.Relational{Cardinality: props.AnyCardinality}
 		relProps.NotNullCols = cs.ExtractNotNullCols(&evalCtx)
-		s := &relProps.Stats
+		s := relProps.Statistics()
 		s.Init(relProps)
 
 		// Calculate distinct counts.
-		sb.applyConstraintSet(cs, true /* tight */, sel, relProps, &relProps.Stats)
+		sb.applyConstraintSet(cs, true /* tight */, sel, relProps, relProps.Statistics())
 
 		// Calculate row count and selectivity.
-		s.RowCount = scan.Relational().Stats.RowCount
+		s.RowCount = scan.Relational().Statistics().RowCount
 		selectivity, _ := sb.selectivityFromMultiColDistinctCounts(cols, sel, s)
 		s.ApplySelectivity(selectivity)
 

@@ -55,11 +55,12 @@ func NewRelativeRankOperator(
 			partitionColIdx: args.PartitionColIdx,
 			peersColIdx:     args.PeersColIdx,
 		},
-		memoryLimit:  args.MemoryLimit,
-		diskQueueCfg: args.QueueCfg,
-		fdSemaphore:  args.FdSemaphore,
-		inputTypes:   args.InputTypes,
-		diskAcc:      args.DiskAcc,
+		memoryLimit:     args.MemoryLimit,
+		diskQueueCfg:    args.QueueCfg,
+		fdSemaphore:     args.FdSemaphore,
+		inputTypes:      args.InputTypes,
+		diskAcc:         args.DiskAcc,
+		converterMemAcc: args.ConverterMemAcc,
 	}
 	switch windowFn {
 	case execinfrapb.WindowerSpec_PERCENT_RANK:
@@ -132,7 +133,8 @@ type relativeRankInitFields struct {
 	fdSemaphore  semaphore.Semaphore
 	inputTypes   []*types.T
 
-	diskAcc *mon.BoundAccount
+	diskAcc         *mon.BoundAccount
+	converterMemAcc *mon.BoundAccount
 }
 
 type relativeRankSizesState struct {
@@ -190,6 +192,7 @@ func (r *percentRankNoPartitionOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			ConverterMemAcc:    r.converterMemAcc,
 		},
 	)
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
@@ -262,7 +265,7 @@ func (r *percentRankNoPartitionOp) Next() coldata.Batch {
 				continue
 			}
 
-			r.allocator.ResetBatch(r.output)
+			r.output.ResetInternalBatch()
 			// First, we copy over the buffered up columns.
 			r.allocator.PerformOperation(r.output.ColVecs()[:len(r.inputTypes)], func() {
 				for colIdx, vec := range r.output.ColVecs()[:len(r.inputTypes)] {
@@ -372,6 +375,7 @@ func (r *percentRankWithPartitionOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			ConverterMemAcc:    r.converterMemAcc,
 		},
 	)
 	r.partitionsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
@@ -384,6 +388,7 @@ func (r *percentRankWithPartitionOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			ConverterMemAcc:    r.converterMemAcc,
 		},
 	)
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
@@ -473,9 +478,7 @@ func (r *percentRankWithPartitionOp) Next() coldata.Batch {
 								r.partitionsState.runningSizes.SetLength(coldata.BatchSize())
 								r.partitionsState.Enqueue(r.Ctx, r.partitionsState.runningSizes)
 								r.partitionsState.idx = 0
-								// This batch has only a single INT column, so no memory is ever
-								// released on the ResetInternalBatch() call.
-								_ = r.partitionsState.runningSizes.ResetInternalBatch()
+								r.partitionsState.runningSizes.ResetInternalBatch()
 							}
 						}
 					}
@@ -498,9 +501,7 @@ func (r *percentRankWithPartitionOp) Next() coldata.Batch {
 								r.partitionsState.runningSizes.SetLength(coldata.BatchSize())
 								r.partitionsState.Enqueue(r.Ctx, r.partitionsState.runningSizes)
 								r.partitionsState.idx = 0
-								// This batch has only a single INT column, so no memory is ever
-								// released on the ResetInternalBatch() call.
-								_ = r.partitionsState.runningSizes.ResetInternalBatch()
+								r.partitionsState.runningSizes.ResetInternalBatch()
 							}
 						}
 					}
@@ -528,7 +529,7 @@ func (r *percentRankWithPartitionOp) Next() coldata.Batch {
 				r.numTuplesInPartition = 0
 			}
 
-			r.allocator.ResetBatch(r.output)
+			r.output.ResetInternalBatch()
 			// First, we copy over the buffered up columns.
 			r.allocator.PerformOperation(r.output.ColVecs()[:len(r.inputTypes)], func() {
 				for colIdx, vec := range r.output.ColVecs()[:len(r.inputTypes)] {
@@ -657,6 +658,7 @@ func (r *cumeDistNoPartitionOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			ConverterMemAcc:    r.converterMemAcc,
 		},
 	)
 	r.peerGroupsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
@@ -669,6 +671,7 @@ func (r *cumeDistNoPartitionOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			ConverterMemAcc:    r.converterMemAcc,
 		},
 	)
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
@@ -755,9 +758,7 @@ func (r *cumeDistNoPartitionOp) Next() coldata.Batch {
 								r.peerGroupsState.runningSizes.SetLength(coldata.BatchSize())
 								r.peerGroupsState.Enqueue(r.Ctx, r.peerGroupsState.runningSizes)
 								r.peerGroupsState.idx = 0
-								// This batch has only a single INT column, so no memory is ever
-								// released on the ResetInternalBatch() call.
-								_ = r.peerGroupsState.runningSizes.ResetInternalBatch()
+								r.peerGroupsState.runningSizes.ResetInternalBatch()
 							}
 						}
 					}
@@ -780,9 +781,7 @@ func (r *cumeDistNoPartitionOp) Next() coldata.Batch {
 								r.peerGroupsState.runningSizes.SetLength(coldata.BatchSize())
 								r.peerGroupsState.Enqueue(r.Ctx, r.peerGroupsState.runningSizes)
 								r.peerGroupsState.idx = 0
-								// This batch has only a single INT column, so no memory is ever
-								// released on the ResetInternalBatch() call.
-								_ = r.peerGroupsState.runningSizes.ResetInternalBatch()
+								r.peerGroupsState.runningSizes.ResetInternalBatch()
 							}
 						}
 					}
@@ -809,7 +808,7 @@ func (r *cumeDistNoPartitionOp) Next() coldata.Batch {
 				r.numPeers = 0
 			}
 
-			r.allocator.ResetBatch(r.output)
+			r.output.ResetInternalBatch()
 			// First, we copy over the buffered up columns.
 			r.allocator.PerformOperation(r.output.ColVecs()[:len(r.inputTypes)], func() {
 				for colIdx, vec := range r.output.ColVecs()[:len(r.inputTypes)] {
@@ -927,6 +926,7 @@ func (r *cumeDistWithPartitionOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			ConverterMemAcc:    r.converterMemAcc,
 		},
 	)
 	r.partitionsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
@@ -939,6 +939,7 @@ func (r *cumeDistWithPartitionOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			ConverterMemAcc:    r.converterMemAcc,
 		},
 	)
 	r.peerGroupsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
@@ -951,6 +952,7 @@ func (r *cumeDistWithPartitionOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			ConverterMemAcc:    r.converterMemAcc,
 		},
 	)
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
@@ -1043,9 +1045,7 @@ func (r *cumeDistWithPartitionOp) Next() coldata.Batch {
 								r.partitionsState.runningSizes.SetLength(coldata.BatchSize())
 								r.partitionsState.Enqueue(r.Ctx, r.partitionsState.runningSizes)
 								r.partitionsState.idx = 0
-								// This batch has only a single INT column, so no memory is ever
-								// released on the ResetInternalBatch() call.
-								_ = r.partitionsState.runningSizes.ResetInternalBatch()
+								r.partitionsState.runningSizes.ResetInternalBatch()
 							}
 						}
 					}
@@ -1068,9 +1068,7 @@ func (r *cumeDistWithPartitionOp) Next() coldata.Batch {
 								r.partitionsState.runningSizes.SetLength(coldata.BatchSize())
 								r.partitionsState.Enqueue(r.Ctx, r.partitionsState.runningSizes)
 								r.partitionsState.idx = 0
-								// This batch has only a single INT column, so no memory is ever
-								// released on the ResetInternalBatch() call.
-								_ = r.partitionsState.runningSizes.ResetInternalBatch()
+								r.partitionsState.runningSizes.ResetInternalBatch()
 							}
 						}
 					}
@@ -1099,9 +1097,7 @@ func (r *cumeDistWithPartitionOp) Next() coldata.Batch {
 								r.peerGroupsState.runningSizes.SetLength(coldata.BatchSize())
 								r.peerGroupsState.Enqueue(r.Ctx, r.peerGroupsState.runningSizes)
 								r.peerGroupsState.idx = 0
-								// This batch has only a single INT column, so no memory is ever
-								// released on the ResetInternalBatch() call.
-								_ = r.peerGroupsState.runningSizes.ResetInternalBatch()
+								r.peerGroupsState.runningSizes.ResetInternalBatch()
 							}
 						}
 					}
@@ -1124,9 +1120,7 @@ func (r *cumeDistWithPartitionOp) Next() coldata.Batch {
 								r.peerGroupsState.runningSizes.SetLength(coldata.BatchSize())
 								r.peerGroupsState.Enqueue(r.Ctx, r.peerGroupsState.runningSizes)
 								r.peerGroupsState.idx = 0
-								// This batch has only a single INT column, so no memory is ever
-								// released on the ResetInternalBatch() call.
-								_ = r.peerGroupsState.runningSizes.ResetInternalBatch()
+								r.peerGroupsState.runningSizes.ResetInternalBatch()
 							}
 						}
 					}
@@ -1161,7 +1155,7 @@ func (r *cumeDistWithPartitionOp) Next() coldata.Batch {
 				r.numPeers = 0
 			}
 
-			r.allocator.ResetBatch(r.output)
+			r.output.ResetInternalBatch()
 			// First, we copy over the buffered up columns.
 			r.allocator.PerformOperation(r.output.ColVecs()[:len(r.inputTypes)], func() {
 				for colIdx, vec := range r.output.ColVecs()[:len(r.inputTypes)] {

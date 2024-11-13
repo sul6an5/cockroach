@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -28,6 +29,11 @@ import (
 // TestingRunInner exports the inner run method for testing purposes.
 func (s *KVSubscriber) TestingRunInner(ctx context.Context) error {
 	return s.rfc.Run(ctx)
+}
+
+// TestingUpdateMetrics exports the inner updateMetrics method for testing purposes.
+func (s *KVSubscriber) TestingUpdateMetrics(ctx context.Context) {
+	s.updateMetrics(ctx)
 }
 
 func TestGetProtectionTimestamps(t *testing.T) {
@@ -75,13 +81,18 @@ func TestGetProtectionTimestamps(t *testing.T) {
 	// Mark sp43 as excluded from backup.
 	sp43Cfg.cfg.ExcludeDataFromBackup = true
 
+	const timeDeltaFromTS1 = 10
+	mt := timeutil.NewManualTime(ts1.GoTime())
+	mt.AdvanceTo(ts1.Add(timeDeltaFromTS1, 0).GoTime())
+
 	subscriber := New(
-		nil, /* clock */
+		hlc.NewClockForTesting(mt),
 		nil, /* rangeFeedFactory */
 		keys.SpanConfigurationsTableID,
 		1<<20, /* 1 MB */
 		roachpb.SpanConfig{},
 		cluster.MakeTestingClusterSettings(),
+		spanconfigstore.NewEmptyBoundsReader(),
 		nil,
 		nil,
 	)
@@ -132,6 +143,15 @@ func TestGetProtectionTimestamps(t *testing.T) {
 			testCase.test(t, m, subscriber)
 		})
 	}
+
+	// Test internal metrics. We should expect a protected record count of 3,
+	// ignoring the one from ts3 since it has both
+	// {IgnoreIfExcludedFromBackup,ExcludeDataFromBackup} are true. We should
+	// also observe the right delta between the oldest protected timestamp and
+	// current wall clock time.
+	subscriber.TestingUpdateMetrics(ctx)
+	require.Equal(t, int64(3), subscriber.metrics.ProtectedRecordCount.Value())
+	require.Equal(t, int64(timeDeltaFromTS1), subscriber.metrics.OldestProtectedRecordNanos.Value())
 }
 
 var _ spanconfig.Store = &manualStore{}
@@ -153,12 +173,14 @@ func (m *manualStore) Apply(
 }
 
 // NeedsSplit implements the spanconfig.Store interface.
-func (m *manualStore) NeedsSplit(context.Context, roachpb.RKey, roachpb.RKey) bool {
+func (m *manualStore) NeedsSplit(context.Context, roachpb.RKey, roachpb.RKey) (bool, error) {
 	panic("unimplemented")
 }
 
 // ComputeSplitKey implements the spanconfig.Store interface.
-func (m *manualStore) ComputeSplitKey(context.Context, roachpb.RKey, roachpb.RKey) roachpb.RKey {
+func (m *manualStore) ComputeSplitKey(
+	context.Context, roachpb.RKey, roachpb.RKey,
+) (roachpb.RKey, error) {
 	panic("unimplemented")
 }
 

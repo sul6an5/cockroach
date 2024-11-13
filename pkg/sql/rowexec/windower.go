@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -98,19 +99,38 @@ var _ execopnode.OpNode = &windower{}
 const windowerProcName = "windower"
 
 func newWindower(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.WindowerSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*windower, error) {
 	w := &windower{
 		input: input,
 	}
 	evalCtx := flowCtx.NewEvalCtx()
 	w.inputTypes = input.OutputTypes()
-	ctx := evalCtx.Ctx()
+
+	// Limit the memory use by creating a child monitor with a hard limit.
+	// windower will overflow to disk if this limit is not enough.
+	limit := execinfra.GetWorkMemLimit(flowCtx)
+	if limit < memRequiredByWindower {
+		// The limit is set very low (likely by the tests in order to improve
+		// the test coverage), but the windower requires some amount of RAM, so
+		// we override the limit. This behavior is acceptable given that we
+		// don't expect anyone to lower the setting to less than 100KiB in
+		// production.
+		limit = memRequiredByWindower
+	}
+	limitedMon := mon.NewMonitorInheritWithLimit("windower-limited", limit, flowCtx.Mon)
+	limitedMon.StartNoReserved(ctx, flowCtx.Mon)
+	w.acc = limitedMon.MakeBoundAccount()
+	// If we have aggregate builtins that aggregate a single datum, we want
+	// them to reuse the same shared memory account with the windower. Notably,
+	// we need to update the eval context before constructing the window
+	// builtins.
+	evalCtx.SingleDatumAggMemAccount = &w.acc
 
 	w.partitionBy = spec.PartitionBy
 	windowFns := spec.WindowFns
@@ -145,28 +165,14 @@ func newWindower(
 	}
 	w.outputRow = make(rowenc.EncDatumRow, len(w.outputTypes))
 
-	// Limit the memory use by creating a child monitor with a hard limit.
-	// windower will overflow to disk if this limit is not enough.
-	limit := execinfra.GetWorkMemLimit(flowCtx)
-	if limit < memRequiredByWindower {
-		// The limit is set very low (likely by the tests in order to improve
-		// the test coverage), but the windower requires some amount of RAM, so
-		// we override the limit. This behavior is acceptable given that we
-		// don't expect anyone to lower the setting to less than 100KiB in
-		// production.
-		limit = memRequiredByWindower
-	}
-	limitedMon := mon.NewMonitorInheritWithLimit("windower-limited", limit, evalCtx.Mon)
-	limitedMon.StartNoReserved(ctx, evalCtx.Mon)
-
 	if err := w.InitWithEvalCtx(
+		ctx,
 		w,
 		post,
 		w.outputTypes,
 		flowCtx,
 		evalCtx,
 		processorID,
-		output,
 		limitedMon,
 		execinfra.ProcStateOpts{InputsToDrain: []execinfra.RowSource{w.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -191,11 +197,6 @@ func newWindower(
 		return nil, err
 	}
 
-	w.acc = w.MemMonitor.MakeBoundAccount()
-	// If we have aggregate builtins that aggregate a single datum, we want
-	// them to reuse the same shared memory account with the windower.
-	evalCtx.SingleDatumAggMemAccount = &w.acc
-
 	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		w.input = newInputStatCollector(w.input)
 		w.ExecStatsForTrace = w.execStatsForTrace
@@ -208,7 +209,7 @@ func newWindower(
 func (w *windower) Start(ctx context.Context) {
 	ctx = w.StartInternal(ctx, windowerProcName)
 	w.input.Start(ctx)
-	w.cancelChecker.Reset(ctx)
+	w.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 	w.runningState = windowerAccumulating
 }
 
@@ -223,7 +224,7 @@ func (w *windower) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 		case windowerEmittingRows:
 			w.runningState, row, meta = w.emitRow()
 		default:
-			log.Fatalf(w.Ctx, "unsupported state: %d", w.runningState)
+			log.Fatalf(w.Ctx(), "unsupported state: %d", w.runningState)
 		}
 
 		if row == nil && meta == nil {
@@ -245,16 +246,16 @@ func (w *windower) close() {
 		if w.allRowsIterator != nil {
 			w.allRowsIterator.Close()
 		}
-		w.allRowsPartitioned.Close(w.Ctx)
+		w.allRowsPartitioned.Close(w.Ctx())
 		if w.partition != nil {
-			w.partition.Close(w.Ctx)
+			w.partition.Close(w.Ctx())
 		}
 		for _, builtin := range w.builtins {
-			builtin.Close(w.Ctx, w.EvalCtx)
+			builtin.Close(w.Ctx(), w.EvalCtx)
 		}
-		w.acc.Close(w.Ctx)
-		w.MemMonitor.Stop(w.Ctx)
-		w.diskMonitor.Stop(w.Ctx)
+		w.acc.Close(w.Ctx())
+		w.MemMonitor.Stop(w.Ctx())
+		w.diskMonitor.Stop(w.Ctx())
 	}
 }
 
@@ -278,17 +279,17 @@ func (w *windower) accumulateRows() (
 			return windowerAccumulating, nil, meta
 		}
 		if row == nil {
-			log.VEvent(w.Ctx, 1, "accumulation complete")
+			log.VEvent(w.Ctx(), 1, "accumulation complete")
 			w.inputDone = true
 			// We need to sort all the rows based on partitionBy columns so that all
 			// rows belonging to the same hash bucket are contiguous.
-			w.allRowsPartitioned.Sort(w.Ctx)
+			w.allRowsPartitioned.Sort(w.Ctx())
 			break
 		}
 
 		// The underlying row container will decode all datums as necessary, so we
 		// don't need to worry about that.
-		if err := w.allRowsPartitioned.AddRow(w.Ctx, row); err != nil {
+		if err := w.allRowsPartitioned.AddRow(w.Ctx(), row); err != nil {
 			w.MoveToDraining(err)
 			return windowerStateUnknown, nil, w.DrainHelper()
 		}
@@ -311,7 +312,7 @@ func (w *windower) emitRow() (windowerState, rowenc.EncDatumRow, *execinfrapb.Pr
 				return windowerStateUnknown, nil, w.DrainHelper()
 			}
 
-			if err := w.computeWindowFunctions(w.Ctx, w.EvalCtx); err != nil {
+			if err := w.computeWindowFunctions(w.Ctx(), w.EvalCtx); err != nil {
 				w.MoveToDraining(err)
 				return windowerStateUnknown, nil, w.DrainHelper()
 			}
@@ -341,7 +342,7 @@ func (w *windower) emitRow() (windowerState, rowenc.EncDatumRow, *execinfrapb.Pr
 func (w *windower) spillAllRowsToDisk() error {
 	if w.allRowsPartitioned != nil {
 		if !w.allRowsPartitioned.UsingDisk() {
-			if err := w.allRowsPartitioned.SpillToDisk(w.Ctx); err != nil {
+			if err := w.allRowsPartitioned.SpillToDisk(w.Ctx()); err != nil {
 				return err
 			}
 		} else {
@@ -349,7 +350,7 @@ func (w *windower) spillAllRowsToDisk() error {
 			// w.partition if possible.
 			if w.partition != nil {
 				if !w.partition.UsingDisk() {
-					if err := w.partition.SpillToDisk(w.Ctx); err != nil {
+					if err := w.partition.SpillToDisk(w.Ctx()); err != nil {
 						return err
 					}
 				}
@@ -363,12 +364,12 @@ func (w *windower) spillAllRowsToDisk() error {
 // error, it forces all rows to spill and attempts to grow acc by usage
 // one more time.
 func (w *windower) growMemAccount(acc *mon.BoundAccount, usage int64) error {
-	if err := acc.Grow(w.Ctx, usage); err != nil {
+	if err := acc.Grow(w.Ctx(), usage); err != nil {
 		if sqlerrors.IsOutOfMemoryError(err) {
 			if err := w.spillAllRowsToDisk(); err != nil {
 				return err
 			}
-			if err := acc.Grow(w.Ctx, usage); err != nil {
+			if err := acc.Grow(w.Ctx(), usage); err != nil {
 				return err
 			}
 		} else {
@@ -642,7 +643,7 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *eval.Con
 		} else if !ok {
 			break
 		}
-		row, err := i.Row()
+		row, err := i.EncRow()
 		if err != nil {
 			return err
 		}
@@ -694,7 +695,7 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *eval.Con
 				}
 			}
 		}
-		if err := w.partition.AddRow(w.Ctx, row); err != nil {
+		if err := w.partition.AddRow(w.Ctx(), row); err != nil {
 			return err
 		}
 	}
@@ -708,7 +709,7 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *eval.Con
 func (w *windower) populateNextOutputRow() (bool, error) {
 	if w.partitionIdx < len(w.partitionSizes) {
 		if w.allRowsIterator == nil {
-			w.allRowsIterator = w.allRowsPartitioned.NewUnmarkedIterator(w.Ctx)
+			w.allRowsIterator = w.allRowsPartitioned.NewUnmarkedIterator(w.Ctx())
 			w.allRowsIterator.Rewind()
 		}
 		// rowIdx is the index of the next row to be emitted from the
@@ -719,7 +720,7 @@ func (w *windower) populateNextOutputRow() (bool, error) {
 		} else if !ok {
 			return false, nil
 		}
-		inputRow, err := w.allRowsIterator.Row()
+		inputRow, err := w.allRowsIterator.EncRow()
 		w.allRowsIterator.Next()
 		if err != nil {
 			return false, err
@@ -789,7 +790,10 @@ func (n *partitionPeerGrouper) InSameGroup(i, j int) (bool, error) {
 			n.err = err
 			return false, n.err
 		}
-		if c := da.Compare(n.evalCtx, db); c != 0 {
+		if c, err := da.CompareError(n.evalCtx, db); err != nil {
+			n.err = err
+			return false, n.err
+		} else if c != 0 {
 			if o.Direction != execinfrapb.Ordering_Column_ASC {
 				return false, nil
 			}

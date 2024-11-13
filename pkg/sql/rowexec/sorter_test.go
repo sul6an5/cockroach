@@ -277,6 +277,7 @@ func TestSorter(t *testing.T) {
 					defer diskMonitor.Stop(ctx)
 					flowCtx := execinfra.FlowCtx{
 						EvalCtx: &evalCtx,
+						Mon:     evalCtx.TestingMon,
 						Cfg: &execinfra.ServerConfig{
 							Settings:    cluster.MakeTestingClusterSettings(),
 							TempStorage: tempEngine,
@@ -291,11 +292,11 @@ func TestSorter(t *testing.T) {
 					in := distsqlutils.NewRowBuffer(c.types, c.input, distsqlutils.RowBufferArgs{})
 					out := &distsqlutils.RowBuffer{}
 
-					s, err := newSorter(context.Background(), &flowCtx, 0 /* processorID */, &c.spec, in, &c.post, out)
+					s, err := newSorter(context.Background(), &flowCtx, 0 /* processorID */, &c.spec, in, &c.post)
 					if err != nil {
 						t.Fatal(err)
 					}
-					s.Run(context.Background())
+					s.Run(context.Background(), out)
 					if !out.ProducerClosed() {
 						t.Fatalf("output RowReceiver not closed")
 					}
@@ -351,6 +352,7 @@ func TestSortInvalidLimit(t *testing.T) {
 		defer diskMonitor.Stop(ctx)
 		flowCtx := execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 			},
@@ -359,9 +361,8 @@ func TestSortInvalidLimit(t *testing.T) {
 
 		post := execinfrapb.PostProcessSpec{}
 		in := distsqlutils.NewRowBuffer([]*types.T{types.Int}, rowenc.EncDatumRows{}, distsqlutils.RowBufferArgs{})
-		out := &distsqlutils.RowBuffer{}
 		proc, err := newSorter(
-			context.Background(), &flowCtx, 0, &spec, in, &post, out,
+			context.Background(), &flowCtx, 0, &spec, in, &post,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -375,7 +376,7 @@ func TestSortInvalidLimit(t *testing.T) {
 		var k uint64
 		// All arguments apart from spec and post are not necessary.
 		if _, err := newSortTopKProcessor(
-			nil, 0, &spec, nil, nil, nil, k,
+			context.Background(), nil, 0, &spec, nil, nil, k,
 		); !testutils.IsError(err, errSortTopKZeroK.Error()) {
 			t.Fatalf("unexpected error %v, expected %v", err, errSortTopKZeroK)
 		}
@@ -400,6 +401,7 @@ func BenchmarkSortAll(b *testing.B) {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -417,12 +419,12 @@ func BenchmarkSortAll(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				s, err := newSorter(
-					context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post, &rowDisposer{},
+					context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post,
 				)
 				if err != nil {
 					b.Fatal(err)
 				}
-				s.Run(context.Background())
+				s.Run(context.Background(), &rowDisposer{})
 				input.Reset()
 			}
 		})
@@ -443,6 +445,7 @@ func BenchmarkSortLimit(b *testing.B) {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -463,12 +466,12 @@ func BenchmarkSortLimit(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					s, err := newSorter(
 						context.Background(), &flowCtx, 0, /* processorID */
-						&spec, input, &execinfrapb.PostProcessSpec{Limit: 0}, &rowDisposer{},
+						&spec, input, &execinfrapb.PostProcessSpec{Limit: 0},
 					)
 					if err != nil {
 						b.Fatal(err)
 					}
-					s.Run(context.Background())
+					s.Run(context.Background(), &rowDisposer{})
 					input.Reset()
 				}
 			})
@@ -491,6 +494,7 @@ func BenchmarkSortChunks(b *testing.B) {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -515,11 +519,11 @@ func BenchmarkSortChunks(b *testing.B) {
 				b.SetBytes(int64(numRows * numCols * 8))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					s, err := newSorter(context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post, &rowDisposer{})
+					s, err := newSorter(context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post)
 					if err != nil {
 						b.Fatal(err)
 					}
-					s.Run(context.Background())
+					s.Run(context.Background(), &rowDisposer{})
 					input.Reset()
 				}
 			})

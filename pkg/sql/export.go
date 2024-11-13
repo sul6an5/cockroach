@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -83,13 +84,13 @@ const (
 	parquetSuffix         = "parquet"
 )
 
-var exportOptionExpectValues = map[string]KVStringOptValidate{
-	exportOptionChunkRows:   KVStringOptRequireValue,
-	exportOptionDelimiter:   KVStringOptRequireValue,
-	exportOptionFileName:    KVStringOptRequireValue,
-	exportOptionNullAs:      KVStringOptRequireValue,
-	exportOptionCompression: KVStringOptRequireValue,
-	exportOptionChunkSize:   KVStringOptRequireValue,
+var exportOptionExpectValues = map[string]exprutil.KVStringOptValidate{
+	exportOptionChunkRows:   exprutil.KVStringOptRequireValue,
+	exportOptionDelimiter:   exprutil.KVStringOptRequireValue,
+	exportOptionFileName:    exprutil.KVStringOptRequireValue,
+	exportOptionNullAs:      exprutil.KVStringOptRequireValue,
+	exportOptionCompression: exprutil.KVStringOptRequireValue,
+	exportOptionChunkSize:   exprutil.KVStringOptRequireValue,
 }
 
 // featureExportEnabled is used to enable and disable the EXPORT feature.
@@ -118,7 +119,7 @@ func (ef *execFactory) ConstructExport(
 	}
 
 	if err := featureflag.CheckEnabled(
-		ef.planner.EvalContext().Context,
+		ef.ctx,
 		ef.planner.execCfg,
 		featureExportEnabled,
 		"EXPORT",
@@ -134,7 +135,7 @@ func (ef *execFactory) ConstructExport(
 		return nil, errors.Errorf("unsupported export format: %q", fileSuffix)
 	}
 
-	destinationDatum, err := eval.Expr(ef.planner.EvalContext(), fileName)
+	destinationDatum, err := eval.Expr(ef.ctx, ef.planner.EvalContext(), fileName)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +144,7 @@ func (ef *execFactory) ConstructExport(
 	if !ok {
 		return nil, errors.Errorf("expected string value for the file location")
 	}
-	admin, err := ef.planner.HasAdminRole(ef.planner.EvalContext().Context)
+	admin, err := ef.planner.HasAdminRole(ef.ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -151,8 +152,9 @@ func (ef *execFactory) ConstructExport(
 	// `cloudprivilege.CheckDestinationPrivileges privileges here, but because of
 	// a ciruclar dependancy with `pkg/sql` this is not possible. Consider moving
 	// this file into `pkg/sql/importer` to get around this.
-	hasExternalIOImplicitAccess := ef.planner.CheckPrivilege(ef.planner.EvalContext().Context,
-		syntheticprivilege.GlobalPrivilegeObject, privilege.EXTERNALIOIMPLICITACCESS) == nil
+	hasExternalIOImplicitAccess := ef.planner.CheckPrivilege(
+		ef.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.EXTERNALIOIMPLICITACCESS,
+	) == nil
 	if !admin &&
 		!ef.planner.ExecCfg().ExternalIODirConfig.EnableNonAdminImplicitAndArbitraryOutbound &&
 		!hasExternalIOImplicitAccess {
@@ -167,7 +169,12 @@ func (ef *execFactory) ConstructExport(
 					"are allowed to access the specified %s URI", conf.Provider.String()))
 		}
 	}
-	optVals, err := evalStringOptions(ef.planner.EvalContext(), options, exportOptionExpectValues)
+	exprEval := ef.planner.ExprEvaluator("EXPORT")
+	treeOptions := make(tree.KVOptions, len(options))
+	for i, o := range options {
+		treeOptions[i] = tree.KVOption{Key: tree.Name(o.Key), Value: o.Value}
+	}
+	optVals, err := exprEval.KVOptions(ef.ctx, treeOptions, exportOptionExpectValues)
 	if err != nil {
 		return nil, err
 	}

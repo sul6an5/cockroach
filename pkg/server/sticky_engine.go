@@ -14,6 +14,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -85,6 +87,11 @@ func (e *stickyInMemEngine) Closed() bool {
 	return e.closed
 }
 
+// SetStoreID implements the StoreIDSetter interface.
+func (e *stickyInMemEngine) SetStoreID(ctx context.Context, storeID int32) error {
+	return e.Engine.SetStoreID(ctx, storeID)
+}
+
 // stickyInMemEnginesRegistryImpl is the bookkeeper for all active
 // sticky engines, keyed by their id. It implements the
 // StickyInMemEnginesRegistry interface.
@@ -138,16 +145,22 @@ func (registry *stickyInMemEnginesRegistryImpl) GetOrCreateStickyInMemEngine(
 		storage.ForStickyEngineTesting,
 	}
 
+	if s := cfg.TestingKnobs.Store; s != nil {
+		stk := s.(*kvserver.StoreTestingKnobs)
+		if stk.SmallEngineBlocks {
+			options = append(options, storage.BlockSize(1))
+		}
+		if len(stk.EngineKnobs) > 0 {
+			options = append(options, stk.EngineKnobs...)
+		}
+	}
+
 	log.Infof(ctx, "creating new sticky in-mem engine %s", spec.StickyInMemoryEngineID)
-	engine := storage.InMemFromFS(ctx, fs, "", options...)
+	engine := storage.InMemFromFS(ctx, fs, "", cluster.MakeClusterSettings(), options...)
 
 	engineEntry := &stickyInMemEngine{
 		id:     spec.StickyInMemoryEngineID,
 		closed: false,
-		// This engine will stay alive after the node dies, so we don't want the
-		// caller to pass in a *cluster.Settings from the current node. Just
-		// create a random one since that is what we like to do in tests (for
-		// better test coverage).
 		Engine: engine,
 		fs:     fs,
 	}

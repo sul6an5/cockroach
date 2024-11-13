@@ -16,7 +16,7 @@
 # offline tables.
 
 
-new-server name=s1
+new-cluster name=s1
 ----
 
 exec-sql
@@ -35,7 +35,7 @@ USE d;
 # Run a backup to then restore from and test that future backups capture the
 # in-progress restore data.
 exec-sql
-BACKUP INTO 'nodelocal://0/cluster/' WITH revision_history;
+BACKUP INTO 'nodelocal://1/cluster/' WITH revision_history;
 ----
 
 
@@ -49,14 +49,14 @@ SET CLUSTER SETTING jobs.debug.pausepoints = restore.before_publishing_descripto
 
 # Pause a RESTORE DATABASE job, so a cluster backup can back up the restoring data.
 restore expect-pausepoint tag=a
-RESTORE DATABASE b FROM LATEST IN 'nodelocal://0/cluster/' with new_db_name=b2;
+RESTORE DATABASE b FROM LATEST IN 'nodelocal://1/cluster/' with new_db_name=b2;
 ----
 job paused at pausepoint
 
 
 # This incremental cluster backup should capture the offline restoring database
 exec-sql
-BACKUP INTO LATEST IN 'nodelocal://0/cluster/' WITH revision_history;
+BACKUP INTO LATEST IN 'nodelocal://1/cluster/' WITH revision_history;
 ----
 
 save-cluster-ts tag=t0
@@ -82,7 +82,7 @@ job tag=a wait-for-state=succeeded
 
 # This backup should capture the online restored database
 exec-sql
-BACKUP INTO LATEST IN 'nodelocal://0/cluster/' WITH revision_history;
+BACKUP INTO LATEST IN 'nodelocal://1/cluster/' WITH revision_history;
 ----
 
 
@@ -96,7 +96,7 @@ query-sql
 SELECT
   database_name, object_name, object_type, rows, backup_type
 FROM
-  [SHOW BACKUP FROM LATEST IN 'nodelocal://0/cluster/']
+  [SHOW BACKUP FROM LATEST IN 'nodelocal://1/cluster/']
 WHERE
   database_name = 'b2'
 ORDER BY
@@ -116,12 +116,12 @@ b2 baz table 3 incremental
 
 # Ensure the restored cluster contains nothing from the in-progress restoring database as of system
 # time t0
-new-server name=s2 share-io-dir=s1 allow-implicit-access
+new-cluster name=s2 share-io-dir=s1 allow-implicit-access
 ----
 
 
 restore aost=t0
-RESTORE FROM LATEST IN 'nodelocal://0/cluster/' AS OF SYSTEM TIME t0;
+RESTORE FROM LATEST IN 'nodelocal://1/cluster/' AS OF SYSTEM TIME t0;
 ----
 
 
@@ -131,12 +131,12 @@ SELECT database_name FROM [SHOW DATABASES] WHERE database_name = 'b2';
 
 
 # Ensure restored cluster contains the restored database as of latest time
-new-server name=s3 share-io-dir=s1 allow-implicit-access
+new-cluster name=s3 share-io-dir=s1 allow-implicit-access
 ----
 
 
 exec-sql
-RESTORE FROM LATEST IN 'nodelocal://0/cluster/';
+RESTORE FROM LATEST IN 'nodelocal://1/cluster/';
 ----
 
 
@@ -155,10 +155,10 @@ SELECT * FROM b2.me.baz;
 
 
 query-sql
-SELECT * FROM [SHOW INDEX FROM b2.me.baz] WHERE index_name = 'greeting_idx';
+SELECT table_name,index_name,non_unique,seq_in_index,column_name FROM [SHOW INDEX FROM b2.me.baz] WHERE index_name = 'greeting_idx';
 ----
-baz greeting_idx true 1 y ASC false false true
-baz greeting_idx true 2 rowid ASC false true true
+baz greeting_idx true 1 y
+baz greeting_idx true 2 rowid
 
 
 #################
@@ -178,7 +178,7 @@ SET CLUSTER SETTING jobs.debug.pausepoints = restore.before_publishing_descripto
 
 
 restore expect-pausepoint tag=b
-RESTORE TABLE b.me.baz FROM LATEST IN 'nodelocal://0/cluster/' WITH into_db='d';
+RESTORE TABLE b.me.baz FROM LATEST IN 'nodelocal://1/cluster/' WITH into_db='d';
 ----
 job paused at pausepoint
 
@@ -192,7 +192,7 @@ pq: schema "me" already exists
 
 # This backup should capture 3 rows from restoring table table baz
 exec-sql
-BACKUP DATABASE d INTO 'nodelocal://0/database/' WITH revision_history;
+BACKUP DATABASE d INTO 'nodelocal://1/database/' WITH revision_history;
 ----
 
 save-cluster-ts tag=m0
@@ -213,7 +213,7 @@ job tag=b wait-for-state=succeeded
 # This backup should capture 3 rows from restoring table table baz, since it just came online
 # (this will change once we more selectively reintroduce offline spans)
 exec-sql
-BACKUP DATABASE d INTO LATEST IN 'nodelocal://0/database/' WITH revision_history;
+BACKUP DATABASE d INTO LATEST IN 'nodelocal://1/database/' WITH revision_history;
 ----
 
 # Display the backed up objects from the restoring d database
@@ -225,7 +225,7 @@ query-sql
 SELECT
   database_name, object_name, object_type, rows, backup_type
 FROM
-  [SHOW BACKUP FROM LATEST IN 'nodelocal://0/database/']
+  [SHOW BACKUP FROM LATEST IN 'nodelocal://1/database/']
 WHERE
   database_name = 'd'
 ORDER BY
@@ -245,7 +245,7 @@ d baz table 3 incremental
 
 # Ensure that restoring the database, AOST the in-progress restore, elides the restoring descriptors
 restore aost=m0
-RESTORE DATABASE d FROM LATEST IN 'nodelocal://0/database/' AS OF SYSTEM TIME m0 with new_db_name = d_aost;
+RESTORE DATABASE d FROM LATEST IN 'nodelocal://1/database/' AS OF SYSTEM TIME m0 with new_db_name = d_aost;
 ----
 
 
@@ -260,7 +260,7 @@ SELECT schema_name FROM [SHOW SCHEMAS FROM d_aost] WHERE schema_name='me';
 
 # Restore AOST completed in-progress restore, implying baz is online.
 exec-sql
-RESTORE DATABASE d FROM LATEST IN 'nodelocal://0/database/' with new_db_name = d_latest
+RESTORE DATABASE d FROM LATEST IN 'nodelocal://1/database/' with new_db_name = d_latest
 ----
 
 
@@ -289,7 +289,7 @@ SET CLUSTER SETTING jobs.debug.pausepoints = restore.before_publishing_descripto
 
 
 restore expect-pausepoint tag=bb
-RESTORE TABLE b.me.baz FROM LATEST IN 'nodelocal://0/cluster/' WITH into_db='d_with_schema';
+RESTORE TABLE b.me.baz FROM LATEST IN 'nodelocal://1/cluster/' WITH into_db='d_with_schema';
 ----
 job paused at pausepoint
 
@@ -302,7 +302,7 @@ INSERT INTO d_with_schema.me.bar VALUES (1);
 
 # This backup should capture 3 rows from restoring table table baz
 exec-sql
-BACKUP DATABASE d_with_schema INTO 'nodelocal://0/database/' WITH revision_history;
+BACKUP DATABASE d_with_schema INTO 'nodelocal://1/database/' WITH revision_history;
 ----
 
 
@@ -321,13 +321,13 @@ job tag=bb wait-for-state=succeeded
 ----
 
 exec-sql
-BACKUP DATABASE d_with_schema INTO LATEST IN 'nodelocal://0/database/' WITH revision_history;
+BACKUP DATABASE d_with_schema INTO LATEST IN 'nodelocal://1/database/' WITH revision_history;
 ----
 
 
 # Ensure that restoring the tables, AOST the in-progress restore, elides the restoring descriptors.
 restore aost=n0
-RESTORE DATABASE d_with_schema FROM LATEST IN 'nodelocal://0/database/' AS OF SYSTEM TIME n0 with new_db_name = d_aost;
+RESTORE DATABASE d_with_schema FROM LATEST IN 'nodelocal://1/database/' AS OF SYSTEM TIME n0 with new_db_name = d_aost;
 ----
 
 
@@ -346,7 +346,7 @@ me
 
 
 exec-sql
-RESTORE DATABASE d_with_schema FROM LATEST IN 'nodelocal://0/database/' with new_db_name = d_latest
+RESTORE DATABASE d_with_schema FROM LATEST IN 'nodelocal://1/database/' with new_db_name = d_latest
 ----
 
 
@@ -377,13 +377,13 @@ SET CLUSTER SETTING jobs.debug.pausepoints = restore.before_publishing_descripto
 
 
 restore expect-pausepoint tag=bbb
-RESTORE TABLE b.me.baz FROM LATEST IN 'nodelocal://0/cluster/' WITH into_db='d';
+RESTORE TABLE b.me.baz FROM LATEST IN 'nodelocal://1/cluster/' WITH into_db='d';
 ----
 job paused at pausepoint
 
 
 exec-sql
-BACKUP TABLE d.* INTO 'nodelocal://0/table/' WITH revision_history;
+BACKUP TABLE d.* INTO 'nodelocal://1/table/' WITH revision_history;
 ----
 
 
@@ -404,13 +404,13 @@ job tag=bbb wait-for-state=succeeded
 
 
 exec-sql
-BACKUP TABLE d.* INTO LATEST IN 'nodelocal://0/table/' WITH revision_history;
+BACKUP TABLE d.* INTO LATEST IN 'nodelocal://1/table/' WITH revision_history;
 ----
 
 
 # Ensure that restoring the table, AOST the in-progress restore, elides the restoring descriptors.
 restore aost=o0
-RESTORE TABLE d.* FROM LATEST IN 'nodelocal://0/table/' AS OF SYSTEM TIME o0 with into_db = d_aost;
+RESTORE TABLE d.* FROM LATEST IN 'nodelocal://1/table/' AS OF SYSTEM TIME o0 with into_db = d_aost;
 ----
 
 
@@ -426,7 +426,7 @@ SELECT schema_name FROM [SHOW SCHEMAS FROM d_aost] WHERE schema_name='me';
 
 
 exec-sql
-RESTORE TABLE d.* FROM LATEST IN 'nodelocal://0/table/' with into_db = d_latest
+RESTORE TABLE d.* FROM LATEST IN 'nodelocal://1/table/' with into_db = d_latest
 ----
 
 

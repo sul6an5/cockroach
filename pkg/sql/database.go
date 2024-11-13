@@ -42,7 +42,7 @@ func (p *planner) renameDatabase(
 	}
 
 	// Check that the new name is available.
-	if dbID, err := p.Descriptors().Direct().LookupDatabaseID(ctx, p.txn, newName); err == nil && dbID != descpb.InvalidID {
+	if dbID, err := p.Descriptors().LookupDatabaseID(ctx, p.txn, newName); err == nil && dbID != descpb.InvalidID {
 		return pgerror.Newf(pgcode.DuplicateDatabase,
 			"the new database name %q already exists", newName)
 	} else if err != nil {
@@ -54,7 +54,9 @@ func (p *planner) renameDatabase(
 
 	// Populate the namespace update batch.
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, desc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, desc); err != nil {
+		return err
+	}
 
 	// Write the updated database descriptor.
 	if err := p.writeNonDropDatabaseChange(ctx, desc, stmt); err != nil {
@@ -71,9 +73,7 @@ func (p *planner) renameDatabase(
 func (p *planner) writeNonDropDatabaseChange(
 	ctx context.Context, desc *dbdesc.Mutable, jobDesc string,
 ) error {
-	if err := p.createNonDropDatabaseChangeJob(ctx, desc.ID, jobDesc); err != nil {
-		return err
-	}
+	p.createNonDropDatabaseChangeJob(ctx, desc.ID, jobDesc)
 	b := p.Txn().NewBatch()
 	if err := p.writeDatabaseChangeToBatch(ctx, desc, b); err != nil {
 		return err
@@ -118,7 +118,7 @@ func (p *planner) forEachMutableTableInDatabase(
 		}
 		droppedRemoved = append(droppedRemoved, tbID)
 	}
-	descs, err := p.Descriptors().GetMutableDescriptorsByID(ctx, p.Txn(), droppedRemoved...)
+	descs, err := p.Descriptors().MutableByID(p.Txn()).Descs(ctx, droppedRemoved)
 	if err != nil {
 		return err
 	}

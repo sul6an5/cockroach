@@ -5,6 +5,7 @@ go_library(
     name = "oidcccl",
     srcs = [
         "authentication_oidc.go",
+        "claim_match.go",
         "settings.go",
         "state.go",
     ],
@@ -18,7 +19,6 @@ go_library(
         "//pkg/server/telemetry",
         "//pkg/settings",
         "//pkg/settings/cluster",
-        "//pkg/sql",
         "//pkg/ui",
         "//pkg/util/log",
         "//pkg/util/protoutil",
@@ -35,13 +35,14 @@ go_test(
     size = "small",
     srcs = [
         "authentication_oidc_test.go",
+        "main_test.go",
         "settings_test.go",
     ],
     args = ["-test.timeout=55s"],
     embed = [":oidcccl"],
     deps = [
         "//pkg/base",
-        "//pkg/ccl/utilccl",
+        "//pkg/ccl",
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/security/securityassets",

@@ -21,14 +21,17 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -36,9 +39,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schematelemetry/schematelemetrycontroller"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention/txnidcache"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
@@ -59,6 +65,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
@@ -71,6 +79,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tochar"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"golang.org/x/net/trace"
@@ -284,7 +293,8 @@ type Server struct {
 
 	insights insights.Provider
 
-	reCache *tree.RegexpCache
+	reCache           *tree.RegexpCache
+	toCharFormatCache *tochar.FormatCache
 
 	// pool is the parent monitor for all session monitors.
 	pool *mon.BytesMonitor
@@ -314,7 +324,8 @@ type Server struct {
 
 	mu struct {
 		syncutil.Mutex
-		connectionCount int64
+		connectionCount     int64
+		rootConnectionCount int64
 	}
 }
 
@@ -365,23 +376,24 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		sqlstats.MaxMemReportedSQLStatsTxnFingerprints,
 		serverMetrics.StatsMetrics.ReportedSQLStatsMemoryCurBytesCount,
 		serverMetrics.StatsMetrics.ReportedSQLStatsMemoryMaxBytesHist,
-		insightsProvider.Writer(),
+		insightsProvider.Writer,
 		pool,
 		nil, /* reportedProvider */
 		cfg.SQLStatsTestingKnobs,
+		insightsProvider.LatencyInformation(),
 	)
-	reportedSQLStatsController :=
-		reportedSQLStats.GetController(cfg.SQLStatusServer, cfg.DB, cfg.InternalExecutor)
+	reportedSQLStatsController := reportedSQLStats.GetController(cfg.SQLStatusServer)
 	memSQLStats := sslocal.New(
 		cfg.Settings,
 		sqlstats.MaxMemSQLStatsStmtFingerprints,
 		sqlstats.MaxMemSQLStatsTxnFingerprints,
 		serverMetrics.StatsMetrics.SQLStatsMemoryCurBytesCount,
 		serverMetrics.StatsMetrics.SQLStatsMemoryMaxBytesHist,
-		insightsProvider.Writer(),
+		insightsProvider.Writer,
 		pool,
 		reportedSQLStats,
 		cfg.SQLStatsTestingKnobs,
+		insightsProvider.LatencyInformation(),
 	)
 	s := &Server{
 		cfg:                     cfg,
@@ -393,6 +405,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		reportedStatsController: reportedSQLStatsController,
 		insights:                insightsProvider,
 		reCache:                 tree.NewRegexpCache(512),
+		toCharFormatCache:       tochar.NewFormatCache(512),
 		indexUsageStats: idxusage.NewLocalIndexUsageStats(&idxusage.Config{
 			ChannelSize: idxusage.DefaultChannelSize,
 			Setting:     cfg.Settings,
@@ -410,27 +423,31 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 
 	sqlStatsInternalExecutorMonitor := MakeInternalExecutorMemMonitor(MemoryMetrics{}, s.GetExecutorConfig().Settings)
 	sqlStatsInternalExecutorMonitor.StartNoReserved(context.Background(), s.GetBytesMonitor())
-	sqlStatsInternalExecutor := MakeInternalExecutor(s, MemoryMetrics{}, sqlStatsInternalExecutorMonitor)
 	persistedSQLStats := persistedsqlstats.New(&persistedsqlstats.Config{
 		Settings:                s.cfg.Settings,
-		InternalExecutor:        &sqlStatsInternalExecutor,
 		InternalExecutorMonitor: sqlStatsInternalExecutorMonitor,
-		KvDB:                    cfg.DB,
-		SQLIDContainer:          cfg.NodeInfo.NodeID,
-		JobRegistry:             s.cfg.JobRegistry,
-		Knobs:                   cfg.SQLStatsTestingKnobs,
-		FlushCounter:            serverMetrics.StatsMetrics.SQLStatsFlushStarted,
-		FailureCounter:          serverMetrics.StatsMetrics.SQLStatsFlushFailure,
-		FlushDuration:           serverMetrics.StatsMetrics.SQLStatsFlushDuration,
+		DB: NewInternalDB(
+			s, MemoryMetrics{}, sqlStatsInternalExecutorMonitor,
+		),
+		SQLIDContainer: cfg.NodeInfo.NodeID,
+		JobRegistry:    s.cfg.JobRegistry,
+		Knobs:          cfg.SQLStatsTestingKnobs,
+		FlushCounter:   serverMetrics.StatsMetrics.SQLStatsFlushStarted,
+		FailureCounter: serverMetrics.StatsMetrics.SQLStatsFlushFailure,
+		FlushDuration:  serverMetrics.StatsMetrics.SQLStatsFlushDuration,
 	}, memSQLStats)
 
 	s.sqlStats = persistedSQLStats
 	s.sqlStatsController = persistedSQLStats.GetController(cfg.SQLStatusServer)
 	schemaTelemetryIEMonitor := MakeInternalExecutorMemMonitor(MemoryMetrics{}, s.GetExecutorConfig().Settings)
 	schemaTelemetryIEMonitor.StartNoReserved(context.Background(), s.GetBytesMonitor())
-	schemaTelemetryIE := MakeInternalExecutor(s, MemoryMetrics{}, schemaTelemetryIEMonitor)
 	s.schemaTelemetryController = schematelemetrycontroller.NewController(
-		s.cfg.DB, &schemaTelemetryIE, schemaTelemetryIEMonitor, s.cfg.Settings, s.cfg.JobRegistry,
+		NewInternalDB(
+			s, MemoryMetrics{}, schemaTelemetryIEMonitor,
+		),
+		schemaTelemetryIEMonitor,
+		s.cfg.Settings, s.cfg.JobRegistry,
+		s.cfg.NodeInfo.LogicalClusterID,
 	)
 	s.indexUsageStatsController = idxusage.NewController(cfg.SQLStatusServer)
 	return s
@@ -444,21 +461,36 @@ func makeMetrics(internal bool) Metrics {
 			SQLOptPlanCacheHits:   metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheHits, internal)),
 			SQLOptPlanCacheMisses: metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheMisses, internal)),
 			// TODO(mrtracy): See HistogramWindowInterval in server/config.go for the 6x factor.
-			DistSQLExecLatency: metric.NewHistogram(
-				getMetricMeta(MetaDistSQLExecLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLExecLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLExecLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			DistSQLServiceLatency: metric.NewHistogram(
-				getMetricMeta(MetaDistSQLServiceLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLServiceLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLServiceLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLTxnLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLTxnLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			DistSQLExecLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaDistSQLExecLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLExecLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLExecLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			DistSQLServiceLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaDistSQLServiceLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLServiceLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLServiceLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLTxnLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLTxnLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 			SQLTxnsOpen:         metric.NewGauge(getMetricMeta(MetaSQLTxnsOpen, internal)),
 			SQLActiveStatements: metric.NewGauge(getMetricMeta(MetaSQLActiveQueries, internal)),
 			SQLContendedTxns:    metric.NewCounter(getMetricMeta(MetaSQLTxnContended, internal)),
@@ -482,28 +514,38 @@ func makeMetrics(internal bool) Metrics {
 func makeServerMetrics(cfg *ExecutorConfig) ServerMetrics {
 	return ServerMetrics{
 		StatsMetrics: StatsMetrics{
-			SQLStatsMemoryMaxBytesHist: metric.NewHistogram(
-				MetaSQLStatsMemMaxBytes,
-				cfg.HistogramWindowInterval,
-				metric.MemoryUsage64MBBuckets,
-			),
+			SQLStatsMemoryMaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+				Metadata: MetaSQLStatsMemMaxBytes,
+				Duration: cfg.HistogramWindowInterval,
+				MaxVal:   log10int64times1000,
+				SigFigs:  3,
+				Buckets:  metric.MemoryUsage64MBBuckets,
+			}),
 			SQLStatsMemoryCurBytesCount: metric.NewGauge(MetaSQLStatsMemCurBytes),
-			ReportedSQLStatsMemoryMaxBytesHist: metric.NewHistogram(
-				MetaReportedSQLStatsMemMaxBytes,
-				cfg.HistogramWindowInterval,
-				metric.MemoryUsage64MBBuckets,
-			),
+			ReportedSQLStatsMemoryMaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+				Metadata: MetaReportedSQLStatsMemMaxBytes,
+				Duration: cfg.HistogramWindowInterval,
+				MaxVal:   log10int64times1000,
+				SigFigs:  3,
+				Buckets:  metric.MemoryUsage64MBBuckets,
+			}),
 			ReportedSQLStatsMemoryCurBytesCount: metric.NewGauge(MetaReportedSQLStatsMemCurBytes),
 			DiscardedStatsCount:                 metric.NewCounter(MetaDiscardedSQLStats),
 			SQLStatsFlushStarted:                metric.NewCounter(MetaSQLStatsFlushStarted),
 			SQLStatsFlushFailure:                metric.NewCounter(MetaSQLStatsFlushFailure),
-			SQLStatsFlushDuration: metric.NewHistogram(
-				MetaSQLStatsFlushDuration, 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			SQLStatsFlushDuration: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: MetaSQLStatsFlushDuration,
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 			SQLStatsRemovedRows: metric.NewCounter(MetaSQLStatsRemovedRows),
-			SQLTxnStatsCollectionOverhead: metric.NewHistogram(
-				MetaSQLTxnStatsCollectionOverhead, 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			SQLTxnStatsCollectionOverhead: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: MetaSQLTxnStatsCollectionOverhead,
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 		},
 		ContentionSubsystemMetrics: txnidcache.NewMetrics(),
 		InsightsMetrics:            insights.NewMetrics(),
@@ -512,7 +554,6 @@ func makeServerMetrics(cfg *ExecutorConfig) ServerMetrics {
 
 // Start starts the Server's background processing.
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
-	log.Info(ctx,"Start in pkg/sql/conn_executor.go")
 	// Exclude SQL background processing from cost accounting and limiting.
 	// NOTE: Only exclude background processing that is not under user control.
 	// If a user can opt in/out of some aspect of background processing, then it
@@ -578,7 +619,7 @@ func (s *Server) GetTxnIDCache() *txnidcache.Cache {
 // scrubbed will be omitted from the returned map.
 func (s *Server) GetScrubbedStmtStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	return s.getScrubbedStmtStats(ctx, s.sqlStats.GetLocalMemProvider())
 }
 
@@ -589,9 +630,9 @@ var _ = (*Server).GetScrubbedStmtStats
 // identifiers (e.g. table and column names) aren't scrubbed from the statements.
 func (s *Server) GetUnscrubbedStmtStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
-	var stmtStats []roachpb.CollectedStatementStatistics
-	stmtStatsVisitor := func(_ context.Context, stat *roachpb.CollectedStatementStatistics) error {
+) ([]appstatspb.CollectedStatementStatistics, error) {
+	var stmtStats []appstatspb.CollectedStatementStatistics
+	stmtStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedStatementStatistics) error {
 		stmtStats = append(stmtStats, *stat)
 		return nil
 	}
@@ -609,9 +650,9 @@ func (s *Server) GetUnscrubbedStmtStats(
 // Identifiers (e.g. table and column names) aren't scrubbed from the statements.
 func (s *Server) GetUnscrubbedTxnStats(
 	ctx context.Context,
-) ([]roachpb.CollectedTransactionStatistics, error) {
-	var txnStats []roachpb.CollectedTransactionStatistics
-	txnStatsVisitor := func(_ context.Context, stat *roachpb.CollectedTransactionStatistics) error {
+) ([]appstatspb.CollectedTransactionStatistics, error) {
+	var txnStats []appstatspb.CollectedTransactionStatistics
+	txnStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedTransactionStatistics) error {
 		txnStats = append(txnStats, *stat)
 		return nil
 	}
@@ -629,19 +670,19 @@ func (s *Server) GetUnscrubbedTxnStats(
 // returns statistics from the reported stats pool.
 func (s *Server) GetScrubbedReportingStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	return s.getScrubbedStmtStats(ctx, s.reportedStats)
 }
 
 func (s *Server) getScrubbedStmtStats(
 	ctx context.Context, statsProvider sqlstats.Provider,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	salt := ClusterSecret.Get(&s.cfg.Settings.SV)
 
-	var scrubbedStats []roachpb.CollectedStatementStatistics
-	stmtStatsVisitor := func(_ context.Context, stat *roachpb.CollectedStatementStatistics) error {
+	var scrubbedStats []appstatspb.CollectedStatementStatistics
+	stmtStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedStatementStatistics) error {
 		// Scrub the statement itself.
-		scrubbedQueryStr, ok := scrubStmtStatKey(s.cfg.VirtualSchemas, stat.Key.Query)
+		scrubbedQueryStr, ok := scrubStmtStatKey(s.cfg.VirtualSchemas, stat.Key.Query, nil)
 
 		// We don't want to report this stats if scrubbing has failed. We also don't
 		// wish to abort here because we want to try our best to report all the
@@ -712,7 +753,7 @@ func (s *Server) SetupConn(
 	memMetrics MemoryMetrics,
 	onDefaultIntSizeChange func(newSize int32),
 ) (ConnectionHandler, error) {
-	sd := s.newSessionData(args)
+	sd := newSessionData(args)
 	sds := sessiondata.NewStack(sd)
 	// Set the SessionData from args.SessionDefaults. This also validates the
 	// respective values.
@@ -737,7 +778,7 @@ func (s *Server) SetupConn(
 
 	ex := s.newConnExecutor(
 		ctx, sdMutIterator, stmtBuf, clientComm, memMetrics, &s.Metrics,
-		s.sqlStats.GetApplicationStats(sd.ApplicationName),
+		s.sqlStats.GetApplicationStats(sd.ApplicationName, false /* internal */),
 		nil, /* postSetupFn */
 	)
 	return ConnectionHandler{ex}, nil
@@ -750,6 +791,14 @@ func (s *Server) IncrementConnectionCount() {
 	s.mu.connectionCount++
 }
 
+// IncrementRootConnectionCount increases both connectionCount and rootConnectionCount by 1.
+func (s *Server) IncrementRootConnectionCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.connectionCount++
+	s.mu.rootConnectionCount++
+}
+
 // DecrementConnectionCount decreases connectionCount by 1.
 func (s *Server) DecrementConnectionCount() {
 	s.mu.Lock()
@@ -757,7 +806,15 @@ func (s *Server) DecrementConnectionCount() {
 	s.mu.connectionCount--
 }
 
-// IncrementConnectionCountIfLessThan increases connectionCount by and returns true if allowedConnectionCount < max,
+// DecrementRootConnectionCount decreases both connectionCount and rootConnectionCount by 1.
+func (s *Server) DecrementRootConnectionCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.connectionCount--
+	s.mu.rootConnectionCount--
+}
+
+// IncrementConnectionCountIfLessThan increases connectionCount by 1 and returns true if connectionCount < max,
 // otherwise it does nothing and returns false.
 func (s *Server) IncrementConnectionCountIfLessThan(max int64) bool {
 	s.mu.Lock()
@@ -774,6 +831,13 @@ func (s *Server) GetConnectionCount() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mu.connectionCount
+}
+
+// GetNonRootConnectionCount returns the current number of non root connections.
+func (s *Server) GetNonRootConnectionCount() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mu.connectionCount - s.mu.rootConnectionCount
 }
 
 // ConnectionHandler is the interface between the result of SetupConn
@@ -816,7 +880,6 @@ func (h ConnectionHandler) GetQueryCancelKey() pgwirecancel.BackendKeyData {
 func (s *Server) ServeConn(
 	ctx context.Context, h ConnectionHandler, reserved *mon.BoundAccount, cancel context.CancelFunc,
 ) error {
-	log.Info(ctx,"ServeConn serves a client connection by reading commands from the stmtBuf\n// embedded in the ConnHandler")
 	// Make sure to close the reserved account even if closeWrapper below
 	// panics: so we do it in a defer that is guaranteed to execute. We also
 	// cannot close it before closeWrapper since we need to close the internal
@@ -835,17 +898,19 @@ func (s *Server) GetLocalIndexStatistics() *idxusage.LocalIndexUsageStats {
 }
 
 // newSessionData a SessionData that can be passed to newConnExecutor.
-func (s *Server) newSessionData(args SessionArgs) *sessiondata.SessionData {
+func newSessionData(args SessionArgs) *sessiondata.SessionData {
 	sd := &sessiondata.SessionData{
 		SessionData: sessiondatapb.SessionData{
 			UserProto: args.User.EncodeProto(),
 		},
 		LocalUnmigratableSessionData: sessiondata.LocalUnmigratableSessionData{
 			RemoteAddr: args.RemoteAddr,
+			IsSSL:      args.IsSSL,
 		},
 		LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
-			ResultsBufferSize: args.ConnResultsBufferSize,
-			IsSuperuser:       args.IsSuperuser,
+			ResultsBufferSize:   args.ConnResultsBufferSize,
+			IsSuperuser:         args.IsSuperuser,
+			SystemIdentityProto: args.SystemIdentity.EncodeProto(),
 		},
 	}
 	if len(args.CustomOptionSessionDefaults) > 0 {
@@ -854,7 +919,7 @@ func (s *Server) newSessionData(args SessionArgs) *sessiondata.SessionData {
 			sd.CustomOptions[k] = v
 		}
 	}
-	s.populateMinimalSessionData(sd)
+	populateMinimalSessionData(sd)
 	return sd
 }
 
@@ -873,7 +938,7 @@ func (s *Server) makeSessionDataMutatorIterator(
 
 // populateMinimalSessionData populates sd with some minimal values needed for
 // not crashing. Fields of sd that are already set are not overwritten.
-func (s *Server) populateMinimalSessionData(sd *sessiondata.SessionData) {
+func populateMinimalSessionData(sd *sessiondata.SessionData) {
 	if sd.SequenceState == nil {
 		sd.SequenceState = sessiondata.NewSequenceState()
 	}
@@ -920,6 +985,13 @@ func (s *Server) newConnExecutor(
 		memMetrics.SessionMaxBytesHist,
 		-1 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
 	)
+	sessionPreparedMon := mon.NewMonitor(
+		"session prepared statements",
+		mon.MemoryResource,
+		memMetrics.SessionPreparedCurBytesCount,
+		memMetrics.SessionPreparedMaxBytesHist,
+		1024 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
+	)
 	// The txn monitor is started in txnState.resetForNewSQLTxn().
 	txnMon := mon.NewMonitor(
 		"txn",
@@ -937,6 +1009,7 @@ func (s *Server) newConnExecutor(
 		clientComm:          clientComm,
 		mon:                 sessionRootMon,
 		sessionMon:          sessionMon,
+		sessionPreparedMon:  sessionPreparedMon,
 		sessionDataStack:    sdMutIterator.sds,
 		dataMutatorIterator: sdMutIterator,
 		state: txnState{
@@ -992,26 +1065,31 @@ func (s *Server) newConnExecutor(
 	)
 	ex.dataMutatorIterator.onApplicationNameChange = func(newName string) {
 		ex.applicationName.Store(newName)
-		ex.applicationStats = ex.server.sqlStats.GetApplicationStats(newName)
+		ex.applicationStats = ex.server.sqlStats.GetApplicationStats(newName, false /* internal */)
 	}
 
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionInit, timeutil.Now())
 
 	ex.extraTxnState.prepStmtsNamespace = prepStmtNamespace{
-		prepStmts: make(map[string]*PreparedStatement),
-		portals:   make(map[string]PreparedPortal),
+		prepStmts:    make(map[string]*PreparedStatement),
+		prepStmtsLRU: make(map[string]struct{ prev, next string }),
+		portals:      make(map[string]PreparedPortal),
 	}
 	ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos = prepStmtNamespace{
-		prepStmts: make(map[string]*PreparedStatement),
-		portals:   make(map[string]PreparedPortal),
+		prepStmts:    make(map[string]*PreparedStatement),
+		prepStmtsLRU: make(map[string]struct{ prev, next string }),
+		portals:      make(map[string]PreparedPortal),
 	}
 	ex.extraTxnState.prepStmtsNamespaceMemAcc = ex.sessionMon.MakeBoundAccount()
-	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.NewCollection(ctx, descs.NewTemporarySchemaProvider(sdMutIterator.sds), ex.sessionMon)
-	ex.extraTxnState.jobs = new(jobsCollection)
+	dsdp := catsessiondata.NewDescriptorSessionDataStackProvider(sdMutIterator.sds)
+	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.NewCollection(
+		ctx, descs.WithDescriptorSessionDataProvider(dsdp), descs.WithMonitor(ex.sessionMon),
+	)
+	ex.extraTxnState.jobs = newTxnJobsCollection()
 	ex.extraTxnState.txnRewindPos = -1
-	ex.extraTxnState.schemaChangeJobRecords = make(map[descpb.ID]*jobs.Record)
 	ex.extraTxnState.schemaChangerState = &SchemaChangerState{
-		mode: ex.sessionData().NewSchemaChangerMode,
+		mode:   ex.sessionData().NewSchemaChangerMode,
+		memAcc: ex.sessionMon.MakeBoundAccount(),
 	}
 	ex.queryCancelKey = pgwirecancel.MakeBackendKeyData(ex.rng, ex.server.cfg.NodeInfo.NodeID.SQLInstanceID())
 	ex.mu.ActiveQueries = make(map[clusterunique.ID]*queryMeta)
@@ -1058,7 +1136,7 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 			// Embed the statement in the error object for the telemetry
 			// report below. The statement gets anonymized.
 			vt := ex.planner.extendedEvalCtx.VirtualSchemas
-			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST, vt)
+			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST, vt, nil)
 		}
 
 		// Report the panic to telemetry in any case.
@@ -1085,6 +1163,14 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	if _, noTxn := ex.machine.CurState().(stateNoTxn); !noTxn {
 		txnEvType = txnRollback
 	}
+
+	// Close all portals, otherwise there will be leftover bytes.
+	ex.extraTxnState.prepStmtsNamespace.closeAllPortals(
+		ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
+	ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.closeAllPortals(
+		ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
 
 	if closeType == normalClose {
 		// We'll cleanup the SQL txn by creating a non-retriable (commit:true) event.
@@ -1119,9 +1205,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	if ex.hasCreatedTemporarySchema && !ex.server.cfg.TestingKnobs.DisableTempObjectsCleanupOnSessionExit {
 		err := cleanupSessionTempObjects(
 			ctx,
-			ex.server.cfg.Settings,
-			ex.server.cfg.CollectionFactory,
-			ex.server.cfg.DB,
+			ex.server.cfg.InternalDB,
 			ex.server.cfg.Codec,
 			ex.sessionID,
 		)
@@ -1144,7 +1228,9 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 			ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 		)
 		ex.extraTxnState.prepStmtsNamespaceMemAcc.Close(ctx)
-		ex.extraTxnState.sqlCursors.closeAll()
+		if err := ex.extraTxnState.sqlCursors.closeAll(false /* errorOnWithHold */); err != nil {
+			log.Warningf(ctx, "error closing cursors: %v", err)
+		}
 	}
 
 	if ex.sessionTracing.Enabled() {
@@ -1165,10 +1251,12 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 
 	if closeType != panicClose {
 		ex.state.mon.Stop(ctx)
+		ex.sessionPreparedMon.Stop(ctx)
 		ex.sessionMon.Stop(ctx)
 		ex.mon.Stop(ctx)
 	} else {
 		ex.state.mon.EmergencyStop(ctx)
+		ex.sessionPreparedMon.EmergencyStop(ctx)
 		ex.sessionMon.EmergencyStop(ctx)
 		ex.mon.EmergencyStop(ctx)
 	}
@@ -1214,6 +1302,9 @@ type connExecutor struct {
 	// statistics for result sets (which escape transactions).
 	mon        *mon.BytesMonitor
 	sessionMon *mon.BytesMonitor
+
+	// sessionPreparedMon tracks memory usage by prepared statements.
+	sessionPreparedMon *mon.BytesMonitor
 	// memMetrics contains the metrics that statements executed on this connection
 	// will contribute to.
 	memMetrics MemoryMetrics
@@ -1264,18 +1355,7 @@ type connExecutor struct {
 		// descCollection collects descriptors used by the current transaction.
 		descCollection *descs.Collection
 
-		// jobs accumulates jobs staged for execution inside the transaction.
-		// Staging happens when executing statements that are implemented with a
-		// job. The jobs are staged via the function QueueJob in
-		// pkg/sql/planner.go. The staged jobs are executed once the transaction
-		// that staged them commits.
-		jobs *jobsCollection
-
-		// schemaChangeJobRecords is a map of descriptor IDs to job Records.
-		// Used in createOrUpdateSchemaChangeJob so we can check if a job has been
-		// queued up for the given ID. The cache remains valid only for the current
-		// transaction and it is cleared after the transaction is committed.
-		schemaChangeJobRecords map[descpb.ID]*jobs.Record
+		jobs *txnJobsCollection
 
 		// firstStmtExecuted indicates that the first statement inside this
 		// transaction has been executed.
@@ -1289,6 +1369,9 @@ type connExecutor struct {
 		// transaction. This is simply the summation of number of rows observed by
 		// comprising statements.
 		numRows int
+
+		// validateDbZoneConfig should the DB zone config on commit.
+		validateDbZoneConfig bool
 
 		// txnCounter keeps track of how many SQL txns have been open since
 		// the start of the session. This is used for logging, to
@@ -1352,7 +1435,7 @@ type connExecutor struct {
 		txnFinishClosure struct {
 			// txnStartTime is the time that the transaction started.
 			txnStartTime time.Time
-			// implicit is whether or not the transaction was implicit.
+			// implicit is whether the transaction was implicit.
 			implicit bool
 		}
 
@@ -1374,7 +1457,7 @@ type connExecutor struct {
 		// transactionStatementFingerprintIDs tracks all statement IDs that make up the current
 		// transaction. It's length is bound by the TxnStatsNumStmtFingerprintIDsToRecord
 		// cluster setting.
-		transactionStatementFingerprintIDs []roachpb.StmtFingerprintID
+		transactionStatementFingerprintIDs []appstatspb.StmtFingerprintID
 
 		// transactionStatementsHash is the hashed accumulation of all statementFingerprintIDs
 		// that comprise the transaction. It is used to construct the key when
@@ -1385,6 +1468,8 @@ type connExecutor struct {
 		// statements.
 		transactionStatementsHash util.FNV64
 
+		// schemaChangerState captures the state of the ongoing declarative schema
+		// in the transaction.
 		schemaChangerState *SchemaChangerState
 
 		// shouldCollectTxnExecutionStats specifies whether the statements in
@@ -1392,6 +1477,11 @@ type connExecutor struct {
 		shouldCollectTxnExecutionStats bool
 		// accumulatedStats are the accumulated stats of all statements.
 		accumulatedStats execstats.QueryLevelStats
+
+		// idleLatency is the cumulative amount of time spent waiting for the
+		// client to send statements while holding the transaction open.
+		idleLatency time.Duration
+
 		// rowsRead and bytesRead are separate from QueryLevelStats because they are
 		// accumulated independently since they are always collected, as opposed to
 		// QueryLevelStats which are sampled.
@@ -1407,6 +1497,13 @@ type connExecutor struct {
 		// respectively.
 		rowsWrittenLogged bool
 		rowsReadLogged    bool
+
+		// shouldAcceptReleaseCockroachRestartInCommitWait is set to true if the
+		// transaction had SAVEPOINT cockroach_restart installed at the time that
+		// SHOW COMMIT TIMESTAMP was executed to commit the transaction. If so, the
+		// connExecutor will permit one invocation of RELEASE SAVEPOINT
+		// cockroach_restart while in the CommitWait state.
+		shouldAcceptReleaseCockroachRestartInCommitWait bool
 
 		// hasAdminRole is used to cache if the user running the transaction
 		// has admin privilege. hasAdminRoleCache is set for the first statement
@@ -1433,6 +1530,10 @@ type connExecutor struct {
 	// statsCollector is used to collect statistics about SQL statements and
 	// transactions.
 	statsCollector sqlstats.StatsCollector
+
+	// cpuStatsCollector is used to estimate RU consumption due to CPU usage for
+	// tenants.
+	cpuStatsCollector multitenantcpu.CPUUsageHelper
 
 	// applicationName is the same as sessionData.ApplicationName. It's copied
 	// here as an atomic so that it can be read concurrently by serialize().
@@ -1532,6 +1633,11 @@ type connExecutor struct {
 	// totalActiveTimeStopWatch tracks the total active time of the session.
 	// This is defined as the time spent executing transactions and statements.
 	totalActiveTimeStopWatch *timeutil.StopWatch
+
+	// previousTransactionCommitTimestamp is the timestamp of the previous
+	// transaction which committed. It is zero-valued when there is a transaction
+	// open or the previous transaction did not successfully commit.
+	previousTransactionCommitTimestamp hlc.Timestamp
 }
 
 // ctxHolder contains a connection's context and, while session tracing is
@@ -1581,6 +1687,18 @@ type prepStmtNamespace struct {
 	// prepStmts contains the prepared statements currently available on the
 	// session.
 	prepStmts map[string]*PreparedStatement
+	// prepStmtsLRU is a circular doubly-linked list containing the prepared
+	// statement names ordered by most recent access (needed to determine
+	// evictions when prepared_statements_cache_size is set). There is a special
+	// entry for the empty string which is both the head and tail of the
+	// list. (Consequently, if it exists, the actual prepared statement for the
+	// empty string does not have an entry in this list and cannot be evicted.)
+	prepStmtsLRU map[string]struct{ prev, next string }
+	// prepStmtsLRUAlloc is the total amount of memory allocated for prepared
+	// statements in prepStmtsLRU. This will sometimes be less than
+	// ex.sessionPreparedMon.AllocBytes() because refcounting causes us to hold
+	// onto more PreparedStatements than are currently in the LRU list.
+	prepStmtsLRUAlloc int64
 	// portals contains the portals currently available on the session. Note
 	// that PreparedPortal.accountForCopy needs to be called if a copy of a
 	// PreparedPortal is retained.
@@ -1588,20 +1706,128 @@ type prepStmtNamespace struct {
 }
 
 // HasActivePortals returns true if there are portals in the session.
-func (ns prepStmtNamespace) HasActivePortals() bool {
+func (ns *prepStmtNamespace) HasActivePortals() bool {
 	return len(ns.portals) > 0
 }
 
 // HasPortal returns true if there exists a given named portal in the session.
-func (ns prepStmtNamespace) HasPortal(s string) bool {
+func (ns *prepStmtNamespace) HasPortal(s string) bool {
 	_, ok := ns.portals[s]
 	return ok
 }
 
+const prepStmtsLRUHead = ""
+const prepStmtsLRUTail = ""
+
+// addLRUEntry adds a new prepared statement name to the LRU list. It is an
+// error to re-add an existing name to the LRU list.
+func (ns *prepStmtNamespace) addLRUEntry(name string, alloc int64) {
+	if name == prepStmtsLRUHead {
+		return
+	}
+	if _, ok := ns.prepStmtsLRU[name]; ok {
+		// Assert that we're not re-adding an existing name to the LRU list.
+		panic(errors.AssertionFailedf(
+			"prepStmtsLRU unexpected existing entry (%s): %v", name, ns.prepStmtsLRU,
+		))
+	}
+	var this struct{ prev, next string }
+	this.prev = prepStmtsLRUHead
+	// Note: must do this serially in case head and next are the same entry.
+	head := ns.prepStmtsLRU[this.prev]
+	this.next = head.next
+	head.next = name
+	ns.prepStmtsLRU[prepStmtsLRUHead] = head
+	next, ok := ns.prepStmtsLRU[this.next]
+	if !ok || next.prev != prepStmtsLRUHead {
+		// Assert that the chain isn't broken before we modify it.
+		panic(errors.AssertionFailedf(
+			"prepStmtsLRU head entry not correct (%s): %v", this.next, ns.prepStmtsLRU,
+		))
+	}
+	next.prev = name
+	ns.prepStmtsLRU[this.next] = next
+	ns.prepStmtsLRU[name] = this
+	ns.prepStmtsLRUAlloc += alloc
+}
+
+// delLRUEntry removes a prepared statement name from the LRU list. (It is not an
+// error to remove a non-existent prepared statement.)
+func (ns *prepStmtNamespace) delLRUEntry(name string, alloc int64) {
+	if name == prepStmtsLRUHead {
+		return
+	}
+	this, ok := ns.prepStmtsLRU[name]
+	if !ok {
+		// Not an error to remove a non-existent prepared statement.
+		return
+	}
+	// Note: must do this serially in case prev and next are the same entry.
+	prev, ok := ns.prepStmtsLRU[this.prev]
+	if !ok || prev.next != name {
+		// Assert that the chain isn't broken before we modify it.
+		panic(errors.AssertionFailedf(
+			"prepStmtsLRU prev entry not correct (%s): %v", this.prev, ns.prepStmtsLRU,
+		))
+	}
+	prev.next = this.next
+	ns.prepStmtsLRU[this.prev] = prev
+	next, ok := ns.prepStmtsLRU[this.next]
+	if !ok || next.prev != name {
+		// Assert that the chain isn't broken before we modify it.
+		panic(errors.AssertionFailedf(
+			"prepStmtsLRU next entry not correct (%s): %v", this.next, ns.prepStmtsLRU,
+		))
+	}
+	next.prev = this.prev
+	ns.prepStmtsLRU[this.next] = next
+	delete(ns.prepStmtsLRU, name)
+	ns.prepStmtsLRUAlloc -= alloc
+}
+
+// touchLRUEntry moves an existing prepared statement to the front of the LRU
+// list.
+func (ns *prepStmtNamespace) touchLRUEntry(name string) {
+	if name == prepStmtsLRUHead {
+		return
+	}
+	if ns.prepStmtsLRU[prepStmtsLRUHead].next == name {
+		// Already at the front of the list.
+		return
+	}
+	ns.delLRUEntry(name, 0)
+	ns.addLRUEntry(name, 0)
+}
+
+func (ns *prepStmtNamespace) closeAllPortals(
+	ctx context.Context, prepStmtsNamespaceMemAcc *mon.BoundAccount,
+) {
+	for name, p := range ns.portals {
+		p.close(ctx, prepStmtsNamespaceMemAcc, name)
+		delete(ns.portals, name)
+	}
+}
+
+func (ns *prepStmtNamespace) closeAllPausablePortals(
+	ctx context.Context, prepStmtsNamespaceMemAcc *mon.BoundAccount,
+) {
+	for name, p := range ns.portals {
+		if p.pauseInfo != nil {
+			p.close(ctx, prepStmtsNamespaceMemAcc, name)
+			delete(ns.portals, name)
+		}
+	}
+}
+
 // MigratablePreparedStatements returns a mapping of all prepared statements.
-func (ns prepStmtNamespace) MigratablePreparedStatements() []sessiondatapb.MigratableSession_PreparedStatement {
+func (ns *prepStmtNamespace) MigratablePreparedStatements() []sessiondatapb.MigratableSession_PreparedStatement {
 	ret := make([]sessiondatapb.MigratableSession_PreparedStatement, 0, len(ns.prepStmts))
-	for name, stmt := range ns.prepStmts {
+
+	// Serialize prepared statements from least-recently used to most-recently
+	// used, so that we build the LRU list correctly when deserializing.
+	for e, ok := ns.prepStmtsLRU[prepStmtsLRUTail]; ok && e.prev != prepStmtsLRUHead; e, ok = ns.prepStmtsLRU[e.prev] {
+		name := e.prev
+		stmt := ns.prepStmts[name]
 		ret = append(
 			ret,
 			sessiondatapb.MigratableSession_PreparedStatement{
@@ -1611,15 +1837,32 @@ func (ns prepStmtNamespace) MigratablePreparedStatements() []sessiondatapb.Migra
 			},
 		)
 	}
+	// Finally, serialize the anonymous prepared statement (if it exists).
+	if stmt, ok := ns.prepStmts[""]; ok {
+		ret = append(
+			ret,
+			sessiondatapb.MigratableSession_PreparedStatement{
+				Name:                 "",
+				PlaceholderTypeHints: stmt.InferredTypes,
+				SQL:                  stmt.SQL,
+			},
+		)
+	}
+
 	return ret
 }
 
-func (ns prepStmtNamespace) String() string {
+func (ns *prepStmtNamespace) String() string {
 	var sb strings.Builder
 	sb.WriteString("Prep stmts: ")
-	for name := range ns.prepStmts {
-		sb.WriteString(name + " ")
+	// Put the anonymous prepared statement first (if it exists).
+	if _, ok := ns.prepStmts[""]; ok {
+		sb.WriteString("\"\" ")
 	}
+	for e, ok := ns.prepStmtsLRU[prepStmtsLRUHead]; ok && e.next != prepStmtsLRUTail; e, ok = ns.prepStmtsLRU[e.next] {
+		sb.WriteString(e.next + " ")
+	}
+	fmt.Fprintf(&sb, "LRU alloc: %d ", ns.prepStmtsLRUAlloc)
 	sb.WriteString("Portals: ")
 	for name := range ns.portals {
 		sb.WriteString(name + " ")
@@ -1632,7 +1875,7 @@ func (ns *prepStmtNamespace) resetToEmpty(
 	ctx context.Context, prepStmtsNamespaceMemAcc *mon.BoundAccount,
 ) {
 	// No errors could occur since we're releasing the resources.
-	_ = ns.resetTo(ctx, prepStmtNamespace{}, prepStmtsNamespaceMemAcc)
+	_ = ns.resetTo(ctx, &prepStmtNamespace{}, prepStmtsNamespaceMemAcc)
 }
 
 // resetTo resets a namespace to equate another one (`to`). All the receiver's
@@ -1643,21 +1886,25 @@ func (ns *prepStmtNamespace) resetToEmpty(
 // It can only return an error if we've reached the memory limit and had to make
 // a copy of portals.
 func (ns *prepStmtNamespace) resetTo(
-	ctx context.Context, to prepStmtNamespace, prepStmtsNamespaceMemAcc *mon.BoundAccount,
+	ctx context.Context, to *prepStmtNamespace, prepStmtsNamespaceMemAcc *mon.BoundAccount,
 ) error {
 	for name, p := range ns.prepStmts {
 		p.decRef(ctx)
 		delete(ns.prepStmts, name)
 	}
-	for name, p := range ns.portals {
-		p.close(ctx, prepStmtsNamespaceMemAcc, name)
-		delete(ns.portals, name)
+	for name := range ns.prepStmtsLRU {
+		delete(ns.prepStmtsLRU, name)
 	}
+	ns.closeAllPortals(ctx, prepStmtsNamespaceMemAcc)
 
 	for name, ps := range to.prepStmts {
 		ps.incRef(ctx)
 		ns.prepStmts[name] = ps
 	}
+	for name, entry := range to.prepStmtsLRU {
+		ns.prepStmtsLRU[name] = entry
+	}
+	ns.prepStmtsLRUAlloc = to.prepStmtsLRUAlloc
 	for name, p := range to.portals {
 		if err := p.accountForCopy(ctx, prepStmtsNamespaceMemAcc, name); err != nil {
 			return err
@@ -1672,6 +1919,7 @@ func (ns *prepStmtNamespace) resetTo(
 // transaction event, resetExtraTxnState invokes corresponding callbacks
 // (e.g. onTxnFinish() and onTxnRestart()).
 func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
+	ex.extraTxnState.numDDL = 0
 	ex.extraTxnState.firstStmtExecuted = false
 	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
 
@@ -1681,32 +1929,32 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
 		}
 	} else {
 		ex.extraTxnState.descCollection.ReleaseAll(ctx)
-		for k := range ex.extraTxnState.schemaChangeJobRecords {
-			delete(ex.extraTxnState.schemaChangeJobRecords, k)
-		}
 		ex.extraTxnState.jobs.reset()
+		ex.extraTxnState.validateDbZoneConfig = false
+		ex.extraTxnState.schemaChangerState.memAcc.Clear(ctx)
 		ex.extraTxnState.schemaChangerState = &SchemaChangerState{
-			mode: ex.sessionData().NewSchemaChangerMode,
+			mode:   ex.sessionData().NewSchemaChangerMode,
+			memAcc: ex.sessionMon.MakeBoundAccount(),
 		}
 	}
 
 	// Close all portals.
-	for name, p := range ex.extraTxnState.prepStmtsNamespace.portals {
-		p.close(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
-		delete(ex.extraTxnState.prepStmtsNamespace.portals, name)
-	}
+	ex.extraTxnState.prepStmtsNamespace.closeAllPortals(
+		ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
 
 	// Close all cursors.
-	ex.extraTxnState.sqlCursors.closeAll()
+	if err := ex.extraTxnState.sqlCursors.closeAll(false /* errorOnWithHold */); err != nil {
+		log.Warningf(ctx, "error closing cursors: %v", err)
+	}
 
 	ex.extraTxnState.createdSequences = make(map[descpb.ID]struct{})
 
 	switch ev.eventType {
 	case txnCommit, txnRollback:
-		for name, p := range ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.portals {
-			p.close(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
-			delete(ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.portals, name)
-		}
+		ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.closeAllPortals(
+			ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		)
 		ex.extraTxnState.savepoints.clear()
 		ex.onTxnFinish(ctx, ev)
 	case txnRestart:
@@ -1727,7 +1975,7 @@ func (ex *connExecutor) Ctx() context.Context {
 	if _, ok := ex.machine.CurState().(stateNoTxn); ok {
 		ctx = ex.ctxHolder.ctx()
 	}
-	// stateInternalError is used by the InternalExecutor.
+	// stateInternalError is used by the Executor.
 	if _, ok := ex.machine.CurState().(stateInternalError); ok {
 		ctx = ex.ctxHolder.ctx()
 	}
@@ -1762,6 +2010,7 @@ func (ex *connExecutor) activate(
 	// single threaded, and the point of buffering is just to avoid contention.
 	ex.mon.Start(ctx, parentMon, reserved)
 	ex.sessionMon.StartNoReserved(ctx, ex.mon)
+	ex.sessionPreparedMon.StartNoReserved(ctx, ex.sessionMon)
 
 	// Enable the trace if configured.
 	if traceSessionEventLogEnabled.Get(&ex.server.cfg.Settings.SV) {
@@ -1819,8 +2068,6 @@ func (ex *connExecutor) run(
 	reserved *mon.BoundAccount,
 	onCancel context.CancelFunc,
 ) (err error) {
-	log.Infof(ctx,"run implements the run loop for a connExecutor. Commands are read one by one\n" +
-		"// from the input buffer; they are executed and the resulting state transitions\n// are performed.")
 	if !ex.activated {
 		ex.activate(ctx, parentMon, reserved)
 	}
@@ -1847,6 +2094,7 @@ func (ex *connExecutor) run(
 
 		var err error
 		if err = ex.execCmd(); err != nil {
+			// Both of these errors are normal ways for the connExecutor to exit.
 			if errors.IsAny(err, io.EOF, errDrainingComplete) {
 				return nil
 			}
@@ -1869,10 +2117,8 @@ var errDrainingComplete = fmt.Errorf("draining done. this is a good time to fini
 // Returns drainingComplete if the session should finish because draining is
 // complete (i.e. we received a DrainRequest - possibly previously - and the
 // connection is found to be idle).
-func (ex *connExecutor) execCmd() error {
-
+func (ex *connExecutor) execCmd() (retErr error) {
 	ctx := ex.Ctx()
-	log.Info(ctx,"=========== Start execution execCmd() conn_executor.go ============")
 	cmd, pos, err := ex.stmtBuf.CurCmd()
 	if err != nil {
 		return err // err could be io.EOF
@@ -1886,14 +2132,12 @@ func (ex *connExecutor) execCmd() error {
 	var ev fsm.Event
 	var payload fsm.EventPayload
 	var res ResultBase
-
 	switch tcmd := cmd.(type) {
 	case ExecStmt:
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
-		log.Infof(ctx, "ExecStmt tcmd %v", tcmd)
-		log.Infof(ctx, "ExecStmt cmd %v", cmd)
+
 		// We use a closure for the body of the execution so as to
 		// guarantee that the full service time is captured below.
 		err := func() error {
@@ -1902,7 +2146,7 @@ func (ex *connExecutor) execCmd() error {
 				return nil
 			}
 			ex.curStmtAST = tcmd.AST
-			log.Infof(ctx,"ex.curStmtAST 1900 conn_executor.go %v", ex.curStmtAST)
+
 			stmtRes := ex.clientComm.CreateStatementResult(
 				tcmd.AST,
 				NeedRowDesc,
@@ -1913,6 +2157,7 @@ func (ex *connExecutor) execCmd() error {
 				0,  /* limit */
 				"", /* portalName */
 				ex.implicitTxn(),
+				PortalPausabilityDisabled, /* portalPausability */
 			)
 			res = stmtRes
 
@@ -1923,13 +2168,13 @@ func (ex *connExecutor) execCmd() error {
 			// The behavior is configurable, in case users want to preserve the
 			// behavior from v21.2 and earlier.
 			implicitTxnForBatch := ex.sessionData().EnableImplicitTransactionForBatchStatements
-			canAutoCommit := ex.implicitTxn() && (tcmd.LastInBatch || !implicitTxnForBatch)
-			log.Info(ctx,"ex.execStmt")
+			canAutoCommit := ex.implicitTxn() &&
+				(tcmd.LastInBatchBeforeShowCommitTimestamp ||
+					tcmd.LastInBatch || !implicitTxnForBatch)
 			ev, payload, err = ex.execStmt(
-				ctx, tcmd.Statement, nil /* prepared */, nil /* pinfo */, stmtRes, canAutoCommit,
+				ctx, tcmd.Statement, nil /* portal */, nil /* pinfo */, stmtRes, canAutoCommit,
 			)
-			//log.Infof(ctx, "ev.Event %v", ev.Event)
-			//log.Infof(ctx, "ev.payload %v", payload)
+
 			return err
 		}()
 		// Note: we write to ex.statsCollector.PhaseTimes, instead of ex.phaseTimes,
@@ -1938,15 +2183,12 @@ func (ex *connExecutor) execCmd() error {
 		// - ex.statsCollector merely contains a copy of the times, that
 		//   was created when the statement started executing (via the
 		//   Reset() method).
-
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
 		if err != nil {
 			return err
 		}
 
 	case ExecPortal:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"ExecPortal 1939 conn_executor.go")
 		// ExecPortal is handled like ExecStmt, except that the placeholder info
 		// is taken from the portal.
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
@@ -1978,6 +2220,22 @@ func (ex *connExecutor) execCmd() error {
 				log.VEventf(ctx, 2, "portal resolved to: %s", portal.Stmt.AST.String())
 			}
 			ex.curStmtAST = portal.Stmt.AST
+			if copyTo, ok := ex.curStmtAST.(*tree.CopyTo); ok {
+				// The execution uses the same logic as if it were a simple query. This
+				// is because we no-op preparing of a COPY statement, in order to match
+				// Postgres behavior. Since there is no plan, we use the connExecutor
+				// to execute a prepared COPY.
+				copyCmd := CopyOut{
+					ParsedStmt:   portal.Stmt.Statement,
+					Stmt:         copyTo,
+					TimeReceived: tcmd.TimeReceived,
+				}
+				copyRes := ex.clientComm.CreateCopyOutResult(copyCmd, pos)
+				res = copyRes
+				stmtCtx := withStatement(ctx, copyTo)
+				ev, payload = ex.execCopyOut(stmtCtx, copyCmd, copyRes)
+				return nil
+			}
 
 			pinfo := &tree.PlaceholderInfo{
 				PlaceholderTypesInfo: tree.PlaceholderTypesInfo{
@@ -1985,6 +2243,12 @@ func (ex *connExecutor) execCmd() error {
 					Types:     portal.Stmt.Types,
 				},
 				Values: portal.Qargs,
+			}
+
+			// If this is the first-time execution of a portal without a limit set,
+			// it means all rows will be exhausted, so no need to pause this portal.
+			if tcmd.Limit == 0 && portal.pauseInfo != nil && portal.pauseInfo.curRes == nil {
+				portal.pauseInfo = nil
 			}
 
 			stmtRes := ex.clientComm.CreateStatementResult(
@@ -1998,7 +2262,11 @@ func (ex *connExecutor) execCmd() error {
 				tcmd.Limit,
 				portalName,
 				ex.implicitTxn(),
+				portal.portalPausablity,
 			)
+			if portal.pauseInfo != nil {
+				portal.pauseInfo.curRes = stmtRes
+			}
 			res = stmtRes
 
 			// In the extended protocol, autocommit is not always allowed. The postgres
@@ -2017,6 +2285,8 @@ func (ex *connExecutor) execCmd() error {
 		// - ex.statsCollector merely contains a copy of the times, that
 		//   was created when the statement started executing (via the
 		//   reset() method).
+		// TODO(sql-sessions): fix the phase time for pausable portals.
+		// https://github.com/cockroachdb/cockroach/issues/99410
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
 		if err != nil {
 			return err
@@ -2029,37 +2299,25 @@ func (ex *connExecutor) execCmd() error {
 		}
 
 	case PrepareStmt:
-		log.Infof(ctx, "tcmd = %v", tcmd)
 		ex.curStmtAST = tcmd.AST
-		log.Infof(ctx,"PrepareStmt 2023 conn_executor.go %v", ex.curStmtAST)
 		res = ex.clientComm.CreatePrepareResult(pos)
 		stmtCtx := withStatement(ctx, ex.curStmtAST)
 		ev, payload = ex.execPrepare(stmtCtx, tcmd)
 	case DescribeStmt:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"DescribeStmt 2028 conn_executor.go")
 		descRes := ex.clientComm.CreateDescribeResult(pos)
 		res = descRes
 		ev, payload = ex.execDescribe(ctx, tcmd, descRes)
 	case BindStmt:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"BindStmt 2033 conn_executor.go")
 		res = ex.clientComm.CreateBindResult(pos)
 		ev, payload = ex.execBind(ctx, tcmd)
 	case DeletePreparedStmt:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"DeletePreparedStmt 2037 conn_executor.go")
 		res = ex.clientComm.CreateDeleteResult(pos)
 		ev, payload = ex.execDelPrepStmt(ctx, tcmd)
 	case SendError:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"SendError 2041 conn_executor.go")
 		res = ex.clientComm.CreateErrorResult(pos)
 		ev = eventNonRetriableErr{IsCommit: fsm.False}
 		payload = eventNonRetriableErrPayload{err: tcmd.Err}
 	case Sync:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"Sync 2046 conn_executor.go")
 		// The Postgres docs say: "At completion of each series of extended-query
 		// messages, the frontend should issue a Sync message. This parameterless
 		// message causes the backend to close the current transaction if it's not
@@ -2075,26 +2333,27 @@ func (ex *connExecutor) execCmd() error {
 		// Note that the Sync result will flush results to the network connection.
 		res = ex.clientComm.CreateSyncResult(pos)
 		if ex.draining {
-			// If we're draining, check whether this is a good time to finish the
+			// If we're draining, then after handing the Sync connExecutor state
+			// transition, check whether this is a good time to finish the
 			// connection. If we're not inside a transaction, we stop processing
 			// now. If we are inside a transaction, we'll check again the next time
 			// a Sync is processed.
-			if ex.idleConn() {
-				// If we're about to close the connection, close res in order to flush
-				// now, as we won't have an opportunity to do it later.
-				res.Close(ctx, stateToTxnStatusIndicator(ex.machine.CurState()))
-				return errDrainingComplete
-			}
+			defer func() {
+				if ex.idleConn() {
+					retErr = errDrainingComplete
+				}
+			}()
 		}
 	case CopyIn:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"CopyIn 2074 conn_executor.go")
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
-		res = ex.clientComm.CreateCopyInResult(pos)
-		var err error
-		ev, payload, err = ex.execCopyIn(ctx, tcmd)
+
+		copyRes := ex.clientComm.CreateCopyInResult(tcmd, pos)
+		res = copyRes
+		stmtCtx := withStatement(ctx, tcmd.Stmt)
+		ev, payload = ex.execCopyIn(stmtCtx, tcmd, copyRes)
+
 		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
 		// because:
 		// - stats use ex.statsCollector, not ex.phasetimes.
@@ -2102,12 +2361,23 @@ func (ex *connExecutor) execCmd() error {
 		//   was created when the statement started executing (via the
 		//   reset() method).
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
-		if err != nil {
-			return err
-		}
+	case CopyOut:
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
+		copyRes := ex.clientComm.CreateCopyOutResult(tcmd, pos)
+		res = copyRes
+		stmtCtx := withStatement(ctx, tcmd.Stmt)
+		ev, payload = ex.execCopyOut(stmtCtx, tcmd, copyRes)
+
+		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
+		// because:
+		// - stats use ex.statsCollector, not ex.phasetimes.
+		// - ex.statsCollector merely contains a copy of the times, that
+		//   was created when the statement started executing (via the
+		//   reset() method).
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
 	case DrainRequest:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"DrainRequest 2092 conn_executor.go")
 		// We received a drain request. We terminate immediately if we're not in a
 		// transaction. If we are in a transaction, we'll finish as soon as a Sync
 		// command (i.e. the end of a batch) is processed outside of a
@@ -2118,22 +2388,34 @@ func (ex *connExecutor) execCmd() error {
 			return errDrainingComplete
 		}
 	case Flush:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"Flush 2103 conn_executor.go")
 		// Closing the res will flush the connection's buffer.
 		res = ex.clientComm.CreateFlushResult(pos)
 	default:
-		log.Infof(ctx, "tcmd = %v", tcmd)
-		log.Info(ctx,"default 2107 conn_executor.go")
 		panic(errors.AssertionFailedf("unsupported command type: %T", cmd))
 	}
 
 	var advInfo advanceInfo
 
+	// We close all pausable portals when we encounter err payload, otherwise
+	// there will be leftover bytes.
+	shouldClosePausablePortals := func(payload fsm.EventPayload) bool {
+		switch payload.(type) {
+		case eventNonRetriableErrPayload, eventRetriableErrPayload:
+			return true
+		default:
+			return false
+		}
+	}
+
 	// If an event was generated, feed it to the state machine.
 	if ev != nil {
 		var err error
-		//log.Infof(ctx,"event was generated, feed it to the state machine %v", ev.Event)
+		if shouldClosePausablePortals(payload) {
+			// We need this as otherwise, there'll be leftover bytes when
+			// txnState.finishSQLTxn() is being called, as the underlying resources of
+			// pausable portals hasn't been cleared yet.
+			ex.extraTxnState.prepStmtsNamespace.closeAllPausablePortals(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc)
+		}
 		advInfo, err = ex.txnStateTransitionsApplyWrapper(ev, payload, res, pos)
 		if err != nil {
 			return err
@@ -2141,7 +2423,6 @@ func (ex *connExecutor) execCmd() error {
 
 		// Massage the advancing for Sync, which is special.
 		if _, ok := cmd.(Sync); ok {
-			//log.Infof(ctx, "advInfo.code %v", advInfo.code)
 			switch advInfo.code {
 			case skipBatch:
 				// An error on Sync doesn't cause us to skip commands (and errors are
@@ -2167,7 +2448,6 @@ func (ex *connExecutor) execCmd() error {
 		ctx = ex.Ctx()
 	} else {
 		// If no event was generated synthesize an advance code.
-		//log.Infof(ctx,"event was not generated, no feed for the state machine %v", ev.Event)
 		advInfo = advanceInfo{code: advanceOne}
 	}
 
@@ -2175,7 +2455,6 @@ func (ex *connExecutor) execCmd() error {
 	// we're staying in place or rewinding - the statement will be executed
 	// again.
 	if advInfo.code != stayInPlace && advInfo.code != rewind {
-		log.Info(ctx, " stayInPlace")
 		// Close the result. In case of an execution error, the result might have
 		// its error set already or it might not.
 		resErr := res.Err()
@@ -2187,9 +2466,18 @@ func (ex *connExecutor) execCmd() error {
 				res.SetError(pe.errorCause())
 			}
 		}
+		// For a pausable portal, we don't log the affected rows until we close the
+		// portal. However, we update the result for each execution. Thus, we need
+		// to accumulate the number of affected rows before closing the result.
+		if tcmd, ok := cmd.(*ExecPortal); ok {
+			if portal, ok := ex.extraTxnState.prepStmtsNamespace.portals[tcmd.Name]; ok {
+				if portal.pauseInfo != nil {
+					portal.pauseInfo.dispatchToExecutionEngine.rowsAffected += res.(RestrictedCommandResult).RowsAffected()
+				}
+			}
+		}
 		res.Close(ctx, stateToTxnStatusIndicator(ex.machine.CurState()))
 	} else {
-		log.Info(ctx, " close the result")
 		res.Discard()
 	}
 
@@ -2205,7 +2493,6 @@ func (ex *connExecutor) execCmd() error {
 		// command and only sends Syncs once it received some data. But we ignore
 		// flush commands (just like we ignore any other commands) when skipping
 		// to the next batch.
-		log.Info(ctx,"skipBatch")
 		if err := ex.clientComm.Flush(pos); err != nil {
 			return err
 		}
@@ -2223,7 +2510,6 @@ func (ex *connExecutor) execCmd() error {
 		advInfo.rewCap.rewindAndUnlock(ctx)
 	case stayInPlace:
 		// Nothing to do. The same statement will be executed again.
-		// log.Info(ctx,"stayinplace")
 	default:
 		panic(errors.AssertionFailedf("unexpected advance code: %s", advInfo.code))
 	}
@@ -2238,7 +2524,7 @@ func (ex *connExecutor) execCmd() error {
 	} else {
 		rewindCapability.close()
 	}
-	//log.Infof(ctx,"AfterExecCmd %v", cmd)
+
 	if ex.server.cfg.TestingKnobs.AfterExecCmd != nil {
 		ex.server.cfg.TestingKnobs.AfterExecCmd(ctx, cmd, ex.stmtBuf)
 	}
@@ -2267,20 +2553,17 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 	if _, ok := ex.machine.CurState().(stateOpen); !ok {
 		return nil
 	}
-	//log.Infof(ctx, "advInfo.txnEvent.eventType %v", advInfo.txnEvent.eventType)
 	if advInfo.txnEvent.eventType == txnStart ||
 		advInfo.txnEvent.eventType == txnRestart {
 		var nextPos CmdPos
 		switch advInfo.code {
 		case stayInPlace:
 			nextPos = pos
-			log.Info(ctx, "stayInPlace")
 		case advanceOne:
 			// Future rewinds will refer to the next position; the statement that
 			// started the transaction (i.e. BEGIN) will not be itself be executed
 			// again.
 			nextPos = pos + 1
-			log.Info(ctx, "advanceOne")
 		case rewind:
 			if advInfo.rewCap.rewindPos != ex.extraTxnState.txnRewindPos {
 				return errors.AssertionFailedf(
@@ -2288,11 +2571,9 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 					errors.Safe(advInfo.rewCap.rewindPos),
 					errors.Safe(ex.extraTxnState.txnRewindPos))
 			}
-			log.Info(ctx, "rewind")
 			// txnRewindPos stays unchanged.
 			return nil
 		default:
-			log.Info(ctx, "default")
 			return errors.AssertionFailedf(
 				"unexpected advance code when starting a txn: %s",
 				errors.Safe(advInfo.code))
@@ -2311,7 +2592,7 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 		// 2: BindStmt
 		// 3: ExecutePortal
 		// 4: Sync
-		log.Info(ctx, "Not txnStart and not txnRestart")
+
 		// Note that the current command cannot influence the rewind point if
 		// if the rewind point is not current set to the command's position
 		// (i.e. we don't do anything if txnRewindPos != pos).
@@ -2346,6 +2627,8 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 			case Sync:
 				canAdvance = true
 			case CopyIn:
+				// Can't advance.
+			case CopyOut:
 				// Can't advance.
 			case DrainRequest:
 				canAdvance = true
@@ -2388,7 +2671,6 @@ func (ex *connExecutor) stmtDoesntNeedRetry(ast tree.Statement) bool {
 }
 
 func stateToTxnStatusIndicator(s fsm.State) TransactionStatusIndicator {
-	//fmt.Println("stateToTxnStatusIndicator conn_executor.go")
 	switch s.(type) {
 	case stateOpen:
 		return InTxnBlock
@@ -2415,100 +2697,42 @@ func isCopyToExternalStorage(cmd CopyIn) bool {
 		stmt.Table.Table() == UserFileUploadTable) && stmt.Table.SchemaName == CrdbInternalName
 }
 
-// We handle the CopyFrom statement by creating a copyMachine and handing it
-// control over the connection until the copying is done. The contract is that,
-// when this is called, the pgwire.conn is not reading from the network
-// connection any more until this returns. The copyMachine will do the reading
-// and writing up to the CommandComplete message.
-func (ex *connExecutor) execCopyIn(
-	ctx context.Context, cmd CopyIn,
-) (_ fsm.Event, retPayload fsm.EventPayload, retErr error) {
+func (ex *connExecutor) execCopyOut(
+	ctx context.Context, cmd CopyOut, res CopyOutResult,
+) (retEv fsm.Event, retPayload fsm.EventPayload) {
+	// First handle connExecutor state transitions.
+	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
+		return ex.beginImplicitTxn(ctx, cmd.ParsedStmt.AST)
+	} else if _, isAbortedTxn := ex.machine.CurState().(stateAborted); isAbortedTxn {
+		return ex.makeErrEvent(sqlerrors.NewTransactionAbortedError("" /* customMsg */), cmd.ParsedStmt.AST)
+	}
+
 	ex.incrementStartedStmtCounter(cmd.Stmt)
+	var numOutputRows int
+	var cancelQuery context.CancelFunc
+	ctx, cancelQuery = contextutil.WithCancel(ctx)
+	queryID := ex.generateID()
+	ex.addActiveQuery(cmd.ParsedStmt, nil /* placeholders */, queryID, cancelQuery)
+	ex.metrics.EngineMetrics.SQLActiveStatements.Inc(1)
+
 	defer func() {
-		if retErr == nil && !payloadHasError(retPayload) {
+		ex.removeActiveQuery(queryID, cmd.Stmt)
+		cancelQuery()
+		ex.metrics.EngineMetrics.SQLActiveStatements.Dec(1)
+		if !payloadHasError(retPayload) {
 			ex.incrementExecutedStmtCounter(cmd.Stmt)
 		}
-		if retErr != nil {
-			log.SqlExec.Errorf(ctx, "error executing %s: %+v", cmd, retErr)
+		var copyErr error
+		if p, ok := retPayload.(payloadWithError); ok {
+			copyErr = p.errorCause()
+			log.SqlExec.Errorf(ctx, "error executing %s: %+v", cmd, copyErr)
 		}
-	}()
 
-	// When we're done, unblock the network connection.
-	defer cmd.CopyDone.Done()
-
-	state := ex.machine.CurState()
-	_, isNoTxn := state.(stateNoTxn)
-	_, isOpen := state.(stateOpen)
-	if !isNoTxn && !isOpen {
-		ev := eventNonRetriableErr{IsCommit: fsm.False}
-		payload := eventNonRetriableErrPayload{
-			err: sqlerrors.NewTransactionAbortedError("" /* customMsg */)}
-		return ev, payload, nil
-	}
-
-	// If we're in an explicit txn, then the copying will be done within that
-	// txn. Otherwise, we tell the copyMachine to manage its own transactions
-	// and give it a closure to reset the accumulated extraTxnState.
-	var txnOpt copyTxnOpt
-	if isOpen {
-		txnOpt = copyTxnOpt{
-			txn:           ex.state.mu.txn,
-			txnTimestamp:  ex.state.sqlTimestamp,
-			stmtTimestamp: ex.server.cfg.Clock.PhysicalTime(),
-		}
-	} else {
-		txnOpt = copyTxnOpt{
-			resetExtraTxnState: func(ctx context.Context) {
-				ex.resetExtraTxnState(ctx, txnEvent{eventType: noEvent})
-			},
-		}
-	}
-
-	var monToStop *mon.BytesMonitor
-	defer func() {
-		if monToStop != nil {
-			monToStop.Stop(ctx)
-		}
-	}()
-	if isNoTxn {
-		// HACK: We're reaching inside ex.state and starting the monitor. Normally
-		// that's driven by the state machine, but we're bypassing the state machine
-		// here.
-		ex.state.mon.StartNoReserved(ctx, ex.sessionMon)
-		monToStop = ex.state.mon
-	}
-	txnOpt.resetPlanner = func(ctx context.Context, p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time) {
-		// HACK: We're reaching inside ex.state and changing sqlTimestamp by hand.
-		// It is used by resetPlanner. Normally sqlTimestamp is updated by the
-		// state machine, but the copyMachine manages its own transactions without
-		// going through the state machine.
-		ex.state.sqlTimestamp = txnTS
-		ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
-		ex.initPlanner(ctx, p)
-		ex.resetPlanner(ctx, p, txn, stmtTS)
-	}
-
-	// These fields need to be set for logging purposes.
-	ex.planner.stmt = Statement{
-		Statement: cmd.ParsedStmt,
-	}
-	ann := tree.MakeAnnotations(0)
-	ex.planner.extendedEvalCtx.Context.Annotations = &ann
-	ex.planner.extendedEvalCtx.Context.Placeholders = &tree.PlaceholderInfo{}
-	ex.planner.curPlan.stmt = &ex.planner.stmt
-
-	var cm copyMachineInterface
-	var copyErr error
-	// Log the query for sampling.
-	defer func() {
-		var numInsertedRows int
-		if cm != nil {
-			numInsertedRows = cm.numInsertedRows()
-		}
+		// Log the query for sampling.
 		// These fields are not available in COPY, so use the empty value.
 		f := tree.NewFmtCtx(tree.FmtHideConstants)
 		f.FormatNode(cmd.Stmt)
-		stmtFingerprintID := roachpb.ConstructStatementFingerprintID(
+		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
 			f.CloseAndGetString(),
 			copyErr != nil,
 			ex.implicitTxn(),
@@ -2521,7 +2745,8 @@ func (ex *connExecutor) execCopyIn(
 			true, /* isCopy */
 			int(ex.state.mu.autoRetryCounter),
 			ex.extraTxnState.txnCounter,
-			numInsertedRows,
+			numOutputRows,
+			0, /* bulkJobId */
 			copyErr,
 			ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
 			&ex.extraTxnState.hasAdminRoleCache,
@@ -2531,15 +2756,250 @@ func (ex *connExecutor) execCopyIn(
 		)
 	}()
 
+	stmtTS := ex.server.cfg.Clock.PhysicalTime()
+	ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
+	ex.resetPlanner(ctx, &ex.planner, ex.state.mu.txn, stmtTS)
+	ex.setCopyLoggingFields(cmd.ParsedStmt)
+
+	var queryTimeoutTicker *time.Timer
+	var txnTimeoutTicker *time.Timer
+	queryTimedOut := false
+	txnTimedOut := false
+
+	// queryDoneAfterFunc and txnDoneAfterFunc will be allocated only when
+	// queryTimeoutTicker or txnTimeoutTicker is non-nil.
+	var queryDoneAfterFunc chan struct{}
+	var txnDoneAfterFunc chan struct{}
+
+	defer func(ctx context.Context) {
+		if queryTimeoutTicker != nil {
+			if !queryTimeoutTicker.Stop() {
+				// Wait for the timer callback to complete to avoid a data race on
+				// queryTimedOut.
+				<-queryDoneAfterFunc
+			}
+		}
+		if txnTimeoutTicker != nil {
+			if !txnTimeoutTicker.Stop() {
+				// Wait for the timer callback to complete to avoid a data race on
+				// txnTimedOut.
+				<-txnDoneAfterFunc
+			}
+		}
+
+		// Detect context cancelation and overwrite whatever error might have been
+		// set on the result before. The idea is that once the query's context is
+		// canceled, all sorts of actors can detect the cancelation and set all
+		// sorts of errors on the result. Rather than trying to impose discipline
+		// in that jungle, we just overwrite them all here with an error that's
+		// nicer to look at for the client.
+		if ctx.Err() != nil {
+			// Even in the cases where the error is a retryable error, we want to
+			// intercept the event and payload returned here to ensure that the query
+			// is not retried.
+			retEv = eventNonRetriableErr{
+				IsCommit: fsm.FromBool(false),
+			}
+			retPayload = eventNonRetriableErrPayload{err: cancelchecker.QueryCanceledError}
+		}
+
+		// If the query timed out, we intercept the error, payload, and event here
+		// for the same reasons we intercept them for canceled queries above.
+		// Overriding queries with a QueryTimedOut error needs to happen after
+		// we've checked for canceled queries as some queries may be canceled
+		// because of a timeout, in which case the appropriate error to return to
+		// the client is one that indicates the timeout, rather than the more general
+		// query canceled error. It's important to note that a timed out query may
+		// not have been canceled (eg. We never even start executing a query
+		// because the timeout has already expired), and therefore this check needs
+		// to happen outside the canceled query check above.
+		if queryTimedOut {
+			// A timed out query should never produce retryable errors/events/payloads
+			// so we intercept and overwrite them all here.
+			retEv = eventNonRetriableErr{
+				IsCommit: fsm.FromBool(false),
+			}
+			retPayload = eventNonRetriableErrPayload{err: sqlerrors.QueryTimeoutError}
+		} else if txnTimedOut {
+			retEv = eventNonRetriableErr{
+				IsCommit: fsm.FromBool(false),
+			}
+			retPayload = eventNonRetriableErrPayload{err: sqlerrors.TxnTimeoutError}
+		}
+	}(ctx)
+
+	if ex.sessionData().StmtTimeout > 0 {
+		timerDuration :=
+			ex.sessionData().StmtTimeout - timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived))
+		// There's no need to proceed with execution if the timer has already expired.
+		if timerDuration < 0 {
+			queryTimedOut = true
+			return ex.makeErrEvent(sqlerrors.QueryTimeoutError, cmd.Stmt)
+		}
+		queryDoneAfterFunc = make(chan struct{}, 1)
+		queryTimeoutTicker = time.AfterFunc(
+			timerDuration,
+			func() {
+				cancelQuery()
+				queryTimedOut = true
+				queryDoneAfterFunc <- struct{}{}
+			})
+	}
+	if ex.sessionData().TransactionTimeout > 0 && !ex.implicitTxn() {
+		timerDuration :=
+			ex.sessionData().TransactionTimeout - timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionTransactionStarted))
+
+		// If the timer already expired, but the transaction is not yet aborted,
+		// we should error immediately without executing. If the timer
+		// expired but the transaction already is aborted, then we should still
+		// proceed with executing the statement in order to get a
+		// TransactionAbortedError.
+		_, txnAborted := ex.machine.CurState().(stateAborted)
+
+		if timerDuration < 0 && !txnAborted {
+			txnTimedOut = true
+			return ex.makeErrEvent(sqlerrors.TxnTimeoutError, cmd.Stmt)
+		}
+
+		if timerDuration > 0 {
+			txnDoneAfterFunc = make(chan struct{}, 1)
+			txnTimeoutTicker = time.AfterFunc(
+				timerDuration,
+				func() {
+					cancelQuery()
+					txnTimedOut = true
+					txnDoneAfterFunc <- struct{}{}
+				})
+		}
+	}
+
+	if copyErr := ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
+		ex.mu.Lock()
+		queryMeta, ok := ex.mu.ActiveQueries[queryID]
+		if !ok {
+			return errors.AssertionFailedf("query %d not in registry", queryID)
+		}
+		queryMeta.phase = executing
+		ex.mu.Unlock()
+
+		// We'll always have a txn on the planner since we called resetPlanner
+		// above.
+		txn := ex.planner.Txn()
+		var err error
+		if numOutputRows, err = runCopyTo(ctx, &ex.planner, txn, cmd, res); err != nil {
+			return err
+		}
+
+		return nil
+	}); copyErr != nil {
+		ev := eventNonRetriableErr{IsCommit: fsm.False}
+		payload := eventNonRetriableErrPayload{err: copyErr}
+		return ev, payload
+	}
+	return nil, nil
+}
+
+func (ex *connExecutor) setCopyLoggingFields(stmt statements.Statement[tree.Statement]) {
+	// These fields need to be set for logging purposes.
+	ex.planner.stmt = Statement{
+		Statement: stmt,
+	}
+	ann := tree.MakeAnnotations(stmt.NumAnnotations)
+	ex.planner.extendedEvalCtx.Context.Annotations = &ann
+	ex.planner.extendedEvalCtx.Context.Placeholders = &tree.PlaceholderInfo{}
+	ex.planner.curPlan.init(&ex.planner.stmt, &ex.planner.instrumentation)
+}
+
+// We handle the CopyFrom statement by creating a copyMachine and handing it
+// control over the connection until the copying is done. The contract is that,
+// when this is called, the pgwire.conn is not reading from the network
+// connection any more until this returns. The copyMachine will do the reading
+// and writing up to the CommandComplete message.
+func (ex *connExecutor) execCopyIn(
+	ctx context.Context, cmd CopyIn, res CopyInResult,
+) (retEv fsm.Event, retPayload fsm.EventPayload) {
+	// First handle connExecutor state transitions.
+	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
+		return ex.beginImplicitTxn(ctx, cmd.ParsedStmt.AST)
+	} else if _, isAbortedTxn := ex.machine.CurState().(stateAborted); isAbortedTxn {
+		return ex.makeErrEvent(sqlerrors.NewTransactionAbortedError("" /* customMsg */), cmd.ParsedStmt.AST)
+	}
+
+	ex.incrementStartedStmtCounter(cmd.Stmt)
+	var cancelQuery context.CancelFunc
+	ctx, cancelQuery = contextutil.WithCancel(ctx)
+	queryID := ex.generateID()
+	ex.addActiveQuery(cmd.ParsedStmt, nil /* placeholders */, queryID, cancelQuery)
+	ex.metrics.EngineMetrics.SQLActiveStatements.Inc(1)
+
+	defer func() {
+		ex.removeActiveQuery(queryID, cmd.Stmt)
+		cancelQuery()
+		ex.metrics.EngineMetrics.SQLActiveStatements.Dec(1)
+		if !payloadHasError(retPayload) {
+			ex.incrementExecutedStmtCounter(cmd.Stmt)
+		}
+		if p, ok := retPayload.(payloadWithError); ok {
+			log.SqlExec.Errorf(ctx, "error executing %s: %+v", cmd, p.errorCause())
+		}
+	}()
+
+	// When we're done, unblock the network connection.
+	defer cmd.CopyDone.Done()
+
+	// The connExecutor state machine has already set us up with a txn at this
+	// point.
+	txnOpt := copyTxnOpt{
+		txn:           ex.state.mu.txn,
+		txnTimestamp:  ex.state.sqlTimestamp,
+		stmtTimestamp: ex.server.cfg.Clock.PhysicalTime(),
+		initPlanner: func(ctx context.Context, p *planner) {
+			ex.initPlanner(ctx, p)
+		},
+		resetPlanner: func(ctx context.Context, p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time) {
+			ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
+			ex.resetPlanner(ctx, p, txn, stmtTS)
+		},
+	}
+
+	ex.setCopyLoggingFields(cmd.ParsedStmt)
+
+	var cm copyMachineInterface
+	// Log the query for sampling.
+	defer func() {
+		var copyErr error
+		if p, ok := retPayload.(payloadWithError); ok {
+			copyErr = p.errorCause()
+		}
+		var numInsertedRows int
+		if cm != nil {
+			numInsertedRows = cm.numInsertedRows()
+			res.SetRowsAffected(ctx, numInsertedRows)
+		}
+		// These fields are not available in COPY, so use the empty value.
+		f := tree.NewFmtCtx(tree.FmtHideConstants)
+		f.FormatNode(cmd.Stmt)
+		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
+			f.CloseAndGetString(),
+			copyErr != nil,
+			ex.implicitTxn(),
+			ex.planner.CurrentDatabase(),
+		)
+		var stats topLevelQueryStats
+		ex.planner.maybeLogStatement(ctx, ex.executorType, true, int(ex.state.mu.autoRetryCounter), ex.extraTxnState.txnCounter, numInsertedRows, 0 /* bulkJobId */, copyErr, ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived), &ex.extraTxnState.hasAdminRoleCache, ex.server.TelemetryLoggingMetrics, stmtFingerprintID, &stats)
+	}()
+
+	var copyErr error
 	if isCopyToExternalStorage(cmd) {
-		cm, copyErr = newFileUploadMachine(ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg, ex.state.mon)
+		cm, copyErr = newFileUploadMachine(ctx, cmd.Conn, cmd.Stmt, txnOpt, &ex.planner, ex.state.mon)
 	} else {
 		// The planner will be prepared before use.
-		p := planner{execCfg: ex.server.cfg}
+		p := ex.planner
 		cm, copyErr = newCopyMachine(
-			ctx, cmd.Conn, cmd.Stmt, &p, txnOpt, ex.state.mon,
+			ctx, cmd.Conn, cmd.Stmt, &p, txnOpt, ex.state.mon, ex.implicitTxn(),
 			// execInsertPlan
 			func(ctx context.Context, p *planner, res RestrictedCommandResult) error {
+				defer p.curPlan.close(ctx)
 				_, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, DistributionTypeNone, nil /* progressAtomic */)
 				return err
 			},
@@ -2548,25 +3008,146 @@ func (ex *connExecutor) execCopyIn(
 	if copyErr != nil {
 		ev := eventNonRetriableErr{IsCommit: fsm.False}
 		payload := eventNonRetriableErrPayload{err: copyErr}
-		return ev, payload, nil
+		return ev, payload
 	}
-	defer cm.Close(ctx)
+
+	var queryTimeoutTicker *time.Timer
+	var txnTimeoutTicker *time.Timer
+	queryTimedOut := false
+	txnTimedOut := false
+
+	// queryDoneAfterFunc and txnDoneAfterFunc will be allocated only when
+	// queryTimeoutTicker or txnTimeoutTicker is non-nil.
+	var queryDoneAfterFunc chan struct{}
+	var txnDoneAfterFunc chan struct{}
+
+	defer func(ctx context.Context) {
+		if queryTimeoutTicker != nil {
+			if !queryTimeoutTicker.Stop() {
+				// Wait for the timer callback to complete to avoid a data race on
+				// queryTimedOut.
+				<-queryDoneAfterFunc
+			}
+		}
+		if txnTimeoutTicker != nil {
+			if !txnTimeoutTicker.Stop() {
+				// Wait for the timer callback to complete to avoid a data race on
+				// txnTimedOut.
+				<-txnDoneAfterFunc
+			}
+		}
+
+		// Detect context cancelation and overwrite whatever error might have been
+		// set on the result before. The idea is that once the query's context is
+		// canceled, all sorts of actors can detect the cancelation and set all
+		// sorts of errors on the result. Rather than trying to impose discipline
+		// in that jungle, we just overwrite them all here with an error that's
+		// nicer to look at for the client.
+		if ctx.Err() != nil {
+			// Even in the cases where the error is a retryable error, we want to
+			// intercept the event and payload returned here to ensure that the query
+			// is not retried.
+			retEv = eventNonRetriableErr{
+				IsCommit: fsm.FromBool(false),
+			}
+			retPayload = eventNonRetriableErrPayload{err: cancelchecker.QueryCanceledError}
+		}
+
+		cm.Close(ctx)
+
+		// If the query timed out, we intercept the error, payload, and event here
+		// for the same reasons we intercept them for canceled queries above.
+		// Overriding queries with a QueryTimedOut error needs to happen after
+		// we've checked for canceled queries as some queries may be canceled
+		// because of a timeout, in which case the appropriate error to return to
+		// the client is one that indicates the timeout, rather than the more general
+		// query canceled error. It's important to note that a timed out query may
+		// not have been canceled (eg. We never even start executing a query
+		// because the timeout has already expired), and therefore this check needs
+		// to happen outside the canceled query check above.
+		if queryTimedOut {
+			// A timed out query should never produce retryable errors/events/payloads
+			// so we intercept and overwrite them all here.
+			retEv = eventNonRetriableErr{
+				IsCommit: fsm.FromBool(false),
+			}
+			retPayload = eventNonRetriableErrPayload{err: sqlerrors.QueryTimeoutError}
+		} else if txnTimedOut {
+			retEv = eventNonRetriableErr{
+				IsCommit: fsm.FromBool(false),
+			}
+			retPayload = eventNonRetriableErrPayload{err: sqlerrors.TxnTimeoutError}
+		}
+	}(ctx)
+
+	if ex.sessionData().StmtTimeout > 0 {
+		timerDuration :=
+			ex.sessionData().StmtTimeout - timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived))
+		// There's no need to proceed with execution if the timer has already expired.
+		if timerDuration < 0 {
+			queryTimedOut = true
+			return ex.makeErrEvent(sqlerrors.QueryTimeoutError, cmd.Stmt)
+		}
+		queryDoneAfterFunc = make(chan struct{}, 1)
+		queryTimeoutTicker = time.AfterFunc(
+			timerDuration,
+			func() {
+				cancelQuery()
+				queryTimedOut = true
+				queryDoneAfterFunc <- struct{}{}
+			})
+	}
+	if ex.sessionData().TransactionTimeout > 0 && !ex.implicitTxn() {
+		timerDuration :=
+			ex.sessionData().TransactionTimeout - timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionTransactionStarted))
+
+		// If the timer already expired, but the transaction is not yet aborted,
+		// we should error immediately without executing. If the timer
+		// expired but the transaction already is aborted, then we should still
+		// proceed with executing the statement in order to get a
+		// TransactionAbortedError.
+		_, txnAborted := ex.machine.CurState().(stateAborted)
+
+		if timerDuration < 0 && !txnAborted {
+			txnTimedOut = true
+			return ex.makeErrEvent(sqlerrors.TxnTimeoutError, cmd.Stmt)
+		}
+
+		if timerDuration > 0 {
+			txnDoneAfterFunc = make(chan struct{}, 1)
+			txnTimeoutTicker = time.AfterFunc(
+				timerDuration,
+				func() {
+					cancelQuery()
+					txnTimedOut = true
+					txnDoneAfterFunc <- struct{}{}
+				})
+		}
+	}
 
 	if copyErr = ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
+		ex.mu.Lock()
+		queryMeta, ok := ex.mu.ActiveQueries[queryID]
+		if !ok {
+			return errors.AssertionFailedf("query %d not in registry", queryID)
+		}
+		queryMeta.phase = executing
+		ex.mu.Unlock()
 		return cm.run(ctx)
 	}); copyErr != nil {
-		// TODO(andrei): We don't have a retriable error story for the copy machine.
+		// TODO(andrei): We don't have a full retriable error story for the copy machine.
 		// When running outside of a txn, the copyMachine should probably do retries
-		// internally. When not, it's unclear what we should do. For now, we abort
+		// internally - this is partially done, see `copyMachine.insertRows`.
+		// When not, it's unclear what we should do. For now, we abort
 		// the txn (if any).
 		// We also don't have a story for distinguishing communication errors (which
 		// should terminate the connection) from query errors. For now, we treat all
 		// errors as query errors.
 		ev := eventNonRetriableErr{IsCommit: fsm.False}
 		payload := eventNonRetriableErrPayload{err: copyErr}
-		return ev, payload, nil
+		return ev, payload
 	}
-	return nil, nil, nil
+	return nil, nil
 }
 
 // stmtHasNoData returns true if describing a result of the input statement
@@ -2586,7 +3167,7 @@ func (ex *connExecutor) generateID() clusterunique.ID {
 // prepStmtsNamespaceAtTxnRewindPos that's not part of prepStmtsNamespace.
 func (ex *connExecutor) commitPrepStmtNamespace(ctx context.Context) error {
 	return ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.resetTo(
-		ctx, ex.extraTxnState.prepStmtsNamespace, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		ctx, &ex.extraTxnState.prepStmtsNamespace, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 	)
 }
 
@@ -2594,7 +3175,7 @@ func (ex *connExecutor) commitPrepStmtNamespace(ctx context.Context) error {
 // not part of prepStmtsNamespaceAtTxnRewindPos.
 func (ex *connExecutor) rewindPrepStmtNamespace(ctx context.Context) error {
 	return ex.extraTxnState.prepStmtsNamespace.resetTo(
-		ctx, ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		ctx, &ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 	)
 }
 
@@ -2629,10 +3210,15 @@ var retriableMinTimestampBoundUnsatisfiableError = errors.Newf(
 	"retriable MinTimestampBoundUnsatisfiableError",
 )
 
+// errIsRetriable is true if the error is a client-visible retry error
+// or the error is a special error that is handled internally and retried.
 func errIsRetriable(err error) bool {
-	return errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) ||
-		scerrors.ConcurrentSchemaChangeDescID(err) != descpb.InvalidID ||
+	return errors.HasInterface(err, (*pgerror.ClientVisibleRetryError)(nil)) ||
 		errors.Is(err, retriableMinTimestampBoundUnsatisfiableError) ||
+		// Note that this error is not handled internally and can make it to the
+		// client in implicit transactions. This is not great; it should
+		// be marked as a client visible retry error.
+		errors.Is(err, descidgen.ErrDescIDSequenceMigrationInProgress) ||
 		descs.IsTwoVersionInvariantViolationError(err)
 }
 
@@ -2644,7 +3230,7 @@ func (ex *connExecutor) makeErrEvent(err error, stmt tree.Statement) (fsm.Event,
 	// MaxTimestampBound set if our MinTimestampBound was bumped up from the
 	// original AS OF SYSTEM TIME timestamp set due to a schema bumping the
 	// timestamp to a higher value.
-	if minTSErr := (*roachpb.MinTimestampBoundUnsatisfiableError)(nil); errors.As(err, &minTSErr) {
+	if minTSErr := (*kvpb.MinTimestampBoundUnsatisfiableError)(nil); errors.As(err, &minTSErr) {
 		aost := ex.planner.EvalContext().AsOfSystemTime
 		if aost != nil && aost.BoundedStaleness {
 			if !aost.MaxTimestampBound.IsEmpty() && aost.MaxTimestampBound.LessEq(minTSErr.MinTimestampBound) {
@@ -2667,6 +3253,14 @@ func (ex *connExecutor) makeErrEvent(err error, stmt tree.Statement) (fsm.Event,
 	}
 
 	retriable := errIsRetriable(err)
+	if retriable && execinfra.IsDynamicQueryHasNoHomeRegionError(err) {
+		// Retry only # of remote regions times if the retry is due to the
+		// enforce_home_region setting.
+		retriable = int(ex.state.mu.autoRetryCounter) < len(ex.planner.EvalContext().RemoteRegions)
+		if !retriable {
+			err = execinfra.MaybeGetNonRetryableDynamicQueryHasNoHomeRegionError(err)
+		}
+	}
 	if retriable {
 		var rc rewindCapability
 		var canAutoRetry bool
@@ -2800,6 +3394,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 	*evalCtx = extendedEvalContext{
 		Context: eval.Context{
 			Planner:                        p,
+			StreamManagerFactory:           p,
 			PrivilegedAccessor:             p,
 			SessionAccessor:                p,
 			JobExecContext:                 p,
@@ -2812,6 +3407,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			PreparedStatementState:         &ex.extraTxnState.prepStmtsNamespace,
 			SessionDataStack:               ex.sessionDataStack,
 			ReCache:                        ex.server.reCache,
+			ToCharFormatCache:              ex.server.toCharFormatCache,
 			SQLStatsController:             ex.server.sqlStatsController,
 			SchemaTelemetryController:      ex.server.schemaTelemetryController,
 			IndexUsageStatsController:      ex.server.indexUsageStatsController,
@@ -2823,15 +3419,15 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			DescIDGenerator:                ex.getDescIDGenerator(),
 			RangeStatsFetcher:              p.execCfg.RangeStatsFetcher,
 		},
-		Tracing:                &ex.sessionTracing,
-		MemMetrics:             &ex.memMetrics,
-		Descs:                  ex.extraTxnState.descCollection,
-		TxnModesSetter:         ex,
-		Jobs:                   ex.extraTxnState.jobs,
-		SchemaChangeJobRecords: ex.extraTxnState.schemaChangeJobRecords,
-		statsProvider:          ex.server.sqlStats,
-		indexUsageStats:        ex.indexUsageStats,
-		statementPreparer:      ex,
+		Tracing:              &ex.sessionTracing,
+		MemMetrics:           &ex.memMetrics,
+		Descs:                ex.extraTxnState.descCollection,
+		TxnModesSetter:       ex,
+		jobs:                 ex.extraTxnState.jobs,
+		validateDbZoneConfig: &ex.extraTxnState.validateDbZoneConfig,
+		statsProvider:        ex.server.sqlStats,
+		indexUsageStats:      ex.indexUsageStats,
+		statementPreparer:    ex,
 	}
 	evalCtx.copyFromExecCfg(ex.server.cfg)
 }
@@ -2843,6 +3439,8 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 // return for statements executed with this evalCtx. Since generally each
 // statement is supposed to have a different timestamp, the evalCtx generally
 // shouldn't be reused across statements.
+//
+// Safe for concurrent use.
 func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, stmtTS time.Time) {
 	newTxn := txn == nil || evalCtx.Txn != txn
 	evalCtx.TxnState = ex.getTransactionState()
@@ -2859,30 +3457,19 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 	evalCtx.Placeholders = nil
 	evalCtx.Annotations = nil
 	evalCtx.IVarContainer = nil
-	evalCtx.Context.Context = ex.Ctx()
+	evalCtx.SetDeprecatedContext(ex.Ctx())
 	evalCtx.Txn = txn
-	evalCtx.Mon = ex.state.mon
 	evalCtx.PrepareOnly = false
 	evalCtx.SkipNormalize = false
 	evalCtx.SchemaChangerState = ex.extraTxnState.schemaChangerState
 	evalCtx.DescIDGenerator = ex.getDescIDGenerator()
 
-	// If we are retrying due to an unsatisfiable timestamp bound which is
-	// retriable, it means we were unable to serve the previous minimum timestamp
-	// as there was a schema update in between. When retrying, we want to keep the
-	// same minimum timestamp for the AOST read, but set the maximum timestamp
-	// to the point just before our failed read to ensure we don't try to read
-	// data which may be after the schema change when we retry.
-	var minTSErr *roachpb.MinTimestampBoundUnsatisfiableError
+	// See resetPlanner for more context on setting the maximum timestamp for
+	// AOST read retries.
+	var minTSErr *kvpb.MinTimestampBoundUnsatisfiableError
 	if err := ex.state.mu.autoRetryReason; err != nil && errors.As(err, &minTSErr) {
-		nextMax := minTSErr.MinTimestampBound
-		ex.extraTxnState.descCollection.SetMaxTimestampBound(nextMax)
-		evalCtx.AsOfSystemTime.MaxTimestampBound = nextMax
+		evalCtx.AsOfSystemTime.MaxTimestampBound = ex.extraTxnState.descCollection.GetMaxTimestampBound()
 	} else if newTxn {
-		// Otherwise, only change the historical timestamps if this is a new txn.
-		// This is because resetPlanner can be called multiple times for the same
-		// txn during the extended protocol.
-		ex.extraTxnState.descCollection.ResetMaxTimestampBound()
 		evalCtx.AsOfSystemTime = nil
 	}
 }
@@ -2927,7 +3514,37 @@ func (ex *connExecutor) initPlanner(ctx context.Context, p *planner) {
 func (ex *connExecutor) resetPlanner(
 	ctx context.Context, p *planner, txn *kv.Txn, stmtTS time.Time,
 ) {
-	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData())
+	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData(), ex.state.mon)
+	autoRetryReason := ex.state.mu.autoRetryReason
+	// If we are retrying due to an unsatisfiable timestamp bound which is
+	// retriable, it means we were unable to serve the previous minimum timestamp
+	// as there was a schema update in between. When retrying, we want to keep the
+	// same minimum timestamp for the AOST read, but set the maximum timestamp
+	// to the point just before our failed read to ensure we don't try to read
+	// data which may be after the schema change when we retry.
+	var minTSErr *kvpb.MinTimestampBoundUnsatisfiableError
+	// Make sure the default locality specifies the actual gateway region at the
+	// start of query compilation. It could have been overridden to a remote
+	// region when the enforce_home_region session setting is true.
+	p.EvalContext().Locality = p.EvalContext().OriginalLocality
+	if err := autoRetryReason; err != nil && errors.As(err, &minTSErr) {
+		nextMax := minTSErr.MinTimestampBound
+		ex.extraTxnState.descCollection.SetMaxTimestampBound(nextMax)
+	} else if execinfra.IsDynamicQueryHasNoHomeRegionError(autoRetryReason) {
+		if int(ex.state.mu.autoRetryCounter) <= len(p.EvalContext().RemoteRegions) {
+			// Set a fake gateway region for use by the optimizer to inform its
+			// decision on which region to access first in locality-optimized scan
+			// and join operations. This setting does not affect the distsql planner,
+			// and local plans will continue to be run from the actual gateway region.
+			p.EvalContext().Locality =
+				p.EvalContext().Locality.CopyReplaceKeyValue("region", string(p.EvalContext().RemoteRegions[ex.state.mu.autoRetryCounter-1]))
+		}
+	} else if newTxn := txn == nil || p.extendedEvalCtx.Txn != txn; newTxn {
+		// Otherwise, only change the historical timestamps if this is a new txn.
+		// This is because resetPlanner can be called multiple times for the same
+		// txn during the extended protocol.
+		ex.extraTxnState.descCollection.ResetMaxTimestampBound()
+	}
 	ex.resetEvalCtx(&p.extendedEvalCtx, txn, stmtTS)
 }
 
@@ -2971,7 +3588,15 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 				return advanceInfo{}, err
 			}
 		}
+		// Similarly, if the descriptor ID generator is not available because of
+		// an ongoing migration, wait for the migration to complete first.
+		if errors.Is(p.errorCause(), descidgen.ErrDescIDSequenceMigrationInProgress) {
+			if err := ex.handleWaitingForDescriptorIDGeneratorMigration(ex.Ctx()); err != nil {
+				return advanceInfo{}, err
+			}
+		}
 	}
+
 	// Handle transaction events which cause updates to txnState.
 	switch advInfo.txnEvent.eventType {
 	case noEvent, txnUpgradeToExplicit:
@@ -3004,18 +3629,8 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		// Session is considered active when executing a transaction.
 		ex.totalActiveTimeStopWatch.Start()
 
-		if !ex.server.cfg.Codec.ForSystemTenant() {
-			// Update the leased descriptor collection with the current sqlliveness.Session.
-			// This is required in the multi-tenant environment to update the transaction
-			// deadline to either the session expiry or the leased descriptor deadline,
-			// whichever is sooner. We need this to ensure that transactions initiated
-			// by ephemeral SQL pods in multi-tenant environments are committed before the
-			// session expires.
-			session, err := ex.server.cfg.SQLLiveness.Session(ex.Ctx())
-			if err != nil {
-				return advanceInfo{}, err
-			}
-			ex.extraTxnState.descCollection.SetSession(session)
+		if err := ex.maybeSetSQLLivenessSession(); err != nil {
+			return advanceInfo{}, err
 		}
 	case txnCommit:
 		if res.Err() != nil {
@@ -3069,24 +3684,66 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		}
 		ex.notifyStatsRefresherOfNewTables(ex.Ctx())
 
+		// If there is any descriptor has new version. We want to make sure there is
+		// only one version of the descriptor in all nodes. In schema changer jobs,
+		// `WaitForOneVersion` has been called for the descriptors included in jobs.
+		// So we just need to do this for descriptors not in jobs.
+		// We need to get descriptor IDs in jobs before jobs are run because we have
+		// operations in declarative schema changer removing descriptor IDs from job
+		// payload as it's done with the descriptors.
+		descIDsInJobs, err := ex.descIDsInSchemaChangeJobs()
+		if err != nil {
+			return advanceInfo{}, err
+		}
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionStartPostCommitJob, timeutil.Now())
 		if err := ex.server.cfg.JobRegistry.Run(
-			ex.ctxHolder.connCtx,
-			ex.server.cfg.InternalExecutor,
-			*ex.extraTxnState.jobs,
+			ex.ctxHolder.connCtx, ex.extraTxnState.jobs.created,
 		); err != nil {
 			handleErr(err)
 		}
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionEndPostCommitJob, timeutil.Now())
+		if err := ex.waitOneVersionForNewVersionDescriptorsWithoutJobs(descIDsInJobs); err != nil {
+			return advanceInfo{}, err
+		}
 
 		fallthrough
-	case txnRestart, txnRollback:
+	case txnRollback:
 		ex.resetExtraTxnState(ex.Ctx(), advInfo.txnEvent)
+		// Since we're doing a complete rollback, there's no need to keep the
+		// prepared stmts for a txn rewind.
+		ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.closeAllPortals(
+			ex.Ctx(), &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		)
+	case txnRestart:
+		// In addition to resetting the extraTxnState, the restart event may
+		// also need to reset the sqlliveness.Session.
+		ex.resetExtraTxnState(ex.Ctx(), advInfo.txnEvent)
+		if err := ex.maybeSetSQLLivenessSession(); err != nil {
+			return advanceInfo{}, err
+		}
 	default:
 		return advanceInfo{}, errors.AssertionFailedf(
 			"unexpected event: %v", errors.Safe(advInfo.txnEvent))
 	}
 	return advInfo, nil
+}
+
+func (ex *connExecutor) maybeSetSQLLivenessSession() error {
+	if !ex.server.cfg.Codec.ForSystemTenant() ||
+		ex.server.cfg.TestingKnobs.ForceSQLLivenessSession {
+		// Update the leased descriptor collection with the current sqlliveness.Session.
+		// This is required in the multi-tenant environment to update the transaction
+		// deadline to either the session expiry or the leased descriptor deadline,
+		// whichever is sooner. We need this to ensure that transactions initiated
+		// by ephemeral SQL pods in multi-tenant environments are committed before the
+		// session expires.
+		session, err := ex.server.cfg.SQLLiveness.Session(ex.Ctx())
+		if err != nil {
+			return err
+		}
+		ex.extraTxnState.descCollection.SetSession(session)
+	}
+	return nil
 }
 
 func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
@@ -3095,6 +3752,13 @@ func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
 	if err := ex.planner.waitForDescriptorSchemaChanges(
 		ctx, descID, *ex.extraTxnState.schemaChangerState,
 	); err != nil {
+		return err
+	}
+	return ex.resetTransactionOnSchemaChangeRetry(ctx)
+}
+
+func (ex *connExecutor) handleWaitingForDescriptorIDGeneratorMigration(ctx context.Context) error {
+	if err := ex.planner.waitForDescriptorIDGeneratorMigration(ctx); err != nil {
 		return err
 	}
 	return ex.resetTransactionOnSchemaChangeRetry(ctx)
@@ -3124,31 +3788,43 @@ func (ex *connExecutor) initStatementResult(
 	return nil
 }
 
-// cancelQuery is part of the registrySession interface.
-func (ex *connExecutor) cancelQuery(queryID clusterunique.ID) bool {
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
+// hasQuery is part of the RegistrySession interface.
+func (ex *connExecutor) hasQuery(queryID clusterunique.ID) bool {
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
+	_, exists := ex.mu.ActiveQueries[queryID]
+	return exists
+}
+
+// CancelQuery is part of the RegistrySession interface.
+func (ex *connExecutor) CancelQuery(queryID clusterunique.ID) bool {
+	// RLock can be used because map deletion happens in
+	// connExecutor.removeActiveQuery.
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
 	if queryMeta, exists := ex.mu.ActiveQueries[queryID]; exists {
-		queryMeta.cancel()
+		queryMeta.cancelQuery()
 		return true
 	}
 	return false
 }
 
-// cancelCurrentQueries is part of the registrySession interface.
-func (ex *connExecutor) cancelCurrentQueries() bool {
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
+// CancelActiveQueries is part of the RegistrySession interface.
+func (ex *connExecutor) CancelActiveQueries() bool {
+	// RLock can be used because map deletion happens in
+	// connExecutor.removeActiveQuery.
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
 	canceled := false
 	for _, queryMeta := range ex.mu.ActiveQueries {
-		queryMeta.cancel()
+		queryMeta.cancelQuery()
 		canceled = true
 	}
 	return canceled
 }
 
-// cancelSession is part of the registrySession interface.
-func (ex *connExecutor) cancelSession() {
+// CancelSession is part of the RegistrySession interface.
+func (ex *connExecutor) CancelSession() {
 	if ex.onCancelSession == nil {
 		return
 	}
@@ -3156,12 +3832,14 @@ func (ex *connExecutor) cancelSession() {
 	ex.onCancelSession()
 }
 
-// user is part of the registrySession interface.
-func (ex *connExecutor) user() username.SQLUsername {
-	return ex.sessionData().User()
+// SessionUser is part of the RegistrySession interface.
+func (ex *connExecutor) SessionUser() username.SQLUsername {
+	// SessionUser is the same for all elements in the stack so use Base()
+	// to avoid needing a lock and race conditions.
+	return ex.sessionDataStack.Base().SessionUser()
 }
 
-// serialize is part of the registrySession interface.
+// serialize is part of the RegistrySession interface.
 func (ex *connExecutor) serialize() serverpb.Session {
 	ex.mu.RLock()
 	defer ex.mu.RUnlock()
@@ -3177,11 +3855,14 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		autoRetryReasonStr = ex.state.mu.autoRetryReason.Error()
 	}
 
+	timeNow := timeutil.Now()
+
 	if txn != nil {
 		id := txn.ID()
 		activeTxnInfo = &serverpb.TxnInfo{
 			ID:                    id,
 			Start:                 ex.state.mu.txnStart,
+			ElapsedTime:           timeNow.Sub(ex.state.mu.txnStart),
 			NumStatementsExecuted: int32(ex.state.mu.stmtCount),
 			NumRetries:            int32(txn.Epoch()),
 			NumAutoRetries:        ex.state.mu.autoRetryCounter,
@@ -3217,24 +3898,48 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		if query.hidden {
 			continue
 		}
-		ast, err := query.getStatement()
+		// Note: while it may seem tempting to just use query.stmt.AST instead of
+		// re-parsing the original SQL, it's unfortunately NOT SAFE to do so because
+		// the AST is currently not immutable - doing so will produce data races.
+		// See issue https://github.com/cockroachdb/cockroach/issues/90965 for the
+		// last time this was hit.
+		// This can go away if we resolve https://github.com/cockroachdb/cockroach/issues/22847.
+		parsed, err := parser.ParseOne(query.stmt.SQL)
 		if err != nil {
+			// This shouldn't happen, but might as well not completely give up if we
+			// fail to parse a parseable sql for some reason. We unfortunately can't
+			// just log the SQL either as it could contain sensitive information.
+			log.Warningf(ex.Ctx(), "failed to re-parse sql during session "+
+				"serialization")
 			continue
 		}
-		sqlNoConstants := truncateSQL(formatStatementHideConstants(ast))
-		sql := truncateSQL(ast.String())
+		sqlNoConstants := truncateSQL(formatStatementHideConstants(parsed.AST))
+		nPlaceholders := 0
+		if query.placeholders != nil {
+			nPlaceholders = len(query.placeholders.Values)
+		}
+		placeholders := make([]string, nPlaceholders)
+		for i := range placeholders {
+			placeholders[i] = tree.AsStringWithFlags(query.placeholders.Values[i], tree.FmtSimple)
+		}
+		sql := truncateSQL(query.stmt.SQL)
 		progress := math.Float64frombits(atomic.LoadUint64(&query.progressAtomic))
+		queryStart := query.start.UTC()
 		activeQueries = append(activeQueries, serverpb.ActiveQuery{
 			TxnID:          query.txnID,
 			ID:             id.String(),
-			Start:          query.start.UTC(),
+			Start:          queryStart,
+			ElapsedTime:    timeNow.Sub(queryStart),
 			Sql:            sql,
 			SqlNoConstants: sqlNoConstants,
-			SqlSummary:     formatStatementSummary(ast),
+			SqlSummary:     formatStatementSummary(parsed.AST),
+			Placeholders:   placeholders,
 			IsDistributed:  query.isDistributed,
 			Phase:          (serverpb.ActiveQuery_Phase)(query.phase),
 			Progress:       float32(progress),
 			IsFullScan:     query.isFullScan,
+			PlanGist:       query.planGist,
+			Database:       query.database,
 		})
 	}
 	lastActiveQuery := ""
@@ -3334,10 +4039,11 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 		return nil
 	}
 	deps := newSchemaChangerTxnRunDependencies(
+		ctx,
 		ex.planner.SessionData(),
 		ex.planner.User(),
 		ex.server.cfg,
-		ex.planner.txn,
+		ex.planner.InternalSQLTxn(),
 		ex.extraTxnState.descCollection,
 		ex.planner.EvalContext(),
 		ex.planner.ExtendedEvalContext().Tracing.KVTracingEnabled(),
@@ -3354,7 +4060,7 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 	scs.state = after
 	scs.jobID = jobID
 	if jobID != jobspb.InvalidJobID {
-		ex.extraTxnState.jobs.add(jobID)
+		ex.extraTxnState.jobs.addCreatedJobID(jobID)
 		log.Infof(ctx, "queued new schema change job %d using the new schema changer", jobID)
 	}
 	return nil
@@ -3363,13 +4069,11 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 func (ex *connExecutor) getDescIDGenerator() eval.DescIDGenerator {
 	if ex.server.cfg.TestingKnobs.UseTransactionalDescIDGenerator &&
 		ex.state.mu.txn != nil {
-		return descidgen.NewTransactionalGenerator(ex.server.cfg.Codec, ex.state.mu.txn)
+		return descidgen.NewTransactionalGenerator(
+			ex.server.cfg.Settings, ex.server.cfg.Codec, ex.state.mu.txn,
+		)
 	}
 	return ex.server.cfg.DescIDGenerator
-}
-
-func (ex *connExecutor) getState() txnState{
-	return ex.state
 }
 
 // StatementCounters groups metrics for counting different types of
@@ -3402,6 +4106,13 @@ type StatementCounters struct {
 
 	// CopyCount counts all COPY statements.
 	CopyCount telemetry.CounterWithMetric
+
+	// CopyNonAtomicCount counts all non-atomic COPY statements (prior to 22.2
+	// non-atomic was the default, in 22.2 COPY became atomic by default
+	// but we want to know if there's customers using the
+	// 'CopyFromAtomicEnabled' session variable to go back to non-atomic
+	// COPYs.
+	CopyNonAtomicCount telemetry.CounterWithMetric
 
 	// DdlCount counts all statements whose StatementReturnType is DDL.
 	DdlCount telemetry.CounterWithMetric
@@ -3442,6 +4153,8 @@ func makeStartedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaDdlStarted, internal)),
 		CopyCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaCopyStarted, internal)),
+		CopyNonAtomicCount: telemetry.NewCounterWithMetric(
+			getMetricMeta(MetaCopyNonAtomicStarted, internal)),
 		MiscCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaMiscStarted, internal)),
 		QueryCount: telemetry.NewCounterWithMetric(
@@ -3481,6 +4194,8 @@ func makeExecutedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaDdlExecuted, internal)),
 		CopyCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaCopyExecuted, internal)),
+		CopyNonAtomicCount: telemetry.NewCounterWithMetric(
+			getMetricMeta(MetaCopyNonAtomicExecuted, internal)),
 		MiscCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaMiscExecuted, internal)),
 		QueryCount: telemetry.NewCounterWithMetric(
@@ -3531,6 +4246,9 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 		}
 	case *tree.CopyFrom:
 		sc.CopyCount.Inc()
+		if !ex.sessionData().CopyFromAtomicEnabled {
+			sc.CopyNonAtomicCount.Inc()
+		}
 	default:
 		if tree.CanModifySchema(stmt) {
 			sc.DdlCount.Inc()
@@ -3540,26 +4258,6 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 	}
 }
 
-func (sc *StatementCounters) getMetrics(ctx context.Context){
-	log.Info(ctx, "================")
-	log.Infof(ctx, "SavepointCount %v ", sc.SavepointCount.Count())
-	log.Infof(ctx, "ReleaseSavepointCount %v ", sc.ReleaseSavepointCount.Count())
-	log.Infof(ctx, "TxnCommitCount %v ", sc.TxnCommitCount.Count())
-	log.Infof(ctx, "TxnRollbackCount %v ", sc.TxnRollbackCount.Count())
-	log.Infof(ctx, "SelectCount %v ", sc.SelectCount.Count())
-	log.Infof(ctx, "TxnBeginCount %v ", sc.TxnBeginCount.Count())
-	log.Infof(ctx, "InsertCount %v ", sc.InsertCount.Count())
-	log.Infof(ctx, "QueryCount %v ", sc.QueryCount.Count())
-	log.Infof(ctx, "CopyCount %v ", sc.CopyCount.Count())
-	log.Infof(ctx, "DdlCount %v ", sc.DdlCount.Count())
-	log.Infof(ctx, "DeleteCount %v ", sc.DeleteCount.Count())
-	log.Infof(ctx, "MiscCount %v ", sc.MiscCount.Count())
-	log.Infof(ctx, "ReleaseRestartSavepointCount %v ", sc.ReleaseRestartSavepointCount.Count())
-	log.Infof(ctx, "RollbackToRestartSavepointCount %v ", sc.RollbackToRestartSavepointCount.Count())
-	log.Infof(ctx, "RollbackToSavepointCount %v ", sc.RollbackToSavepointCount.Count())
-	log.Infof(ctx, "UpdateCount %v ", sc.UpdateCount.Count())
-	log.Info(ctx, "================")
-}
 // connExPrepStmtsAccessor is an implementation of preparedStatementsAccessor
 // that gives access to a connExecutor's prepared statements.
 type connExPrepStmtsAccessor struct {
@@ -3580,14 +4278,17 @@ func (ps connExPrepStmtsAccessor) List() map[string]*PreparedStatement {
 }
 
 // Get is part of the preparedStatementsAccessor interface.
-func (ps connExPrepStmtsAccessor) Get(name string) (*PreparedStatement, bool) {
+func (ps connExPrepStmtsAccessor) Get(name string, touchLRU bool) (*PreparedStatement, bool) {
 	s, ok := ps.ex.extraTxnState.prepStmtsNamespace.prepStmts[name]
+	if ok && touchLRU {
+		ps.ex.extraTxnState.prepStmtsNamespace.touchLRUEntry(name)
+	}
 	return s, ok
 }
 
 // Delete is part of the preparedStatementsAccessor interface.
 func (ps connExPrepStmtsAccessor) Delete(ctx context.Context, name string) bool {
-	_, ok := ps.Get(name)
+	_, ok := ps.Get(name, false /* touchLRU */)
 	if !ok {
 		return false
 	}
@@ -3648,7 +4349,7 @@ func init() {
 			return ""
 		}
 		// Anonymize the statement for reporting.
-		return anonymizeStmtAndConstants(stmt, nil /* VirtualTabler */)
+		return anonymizeStmtAndConstants(stmt, nil /* VirtualTabler */, nil /* ClientNoticeSender */)
 	})
 	logcrash.RegisterTagFn("gist", func(ctx context.Context) string {
 		return planGistFromCtx(ctx)

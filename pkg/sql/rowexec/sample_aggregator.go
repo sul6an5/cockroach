@@ -17,11 +17,12 @@ import (
 
 	"github.com/axiomhq/hyperloglog"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -85,12 +87,12 @@ const sampleAggregatorProcName = "sample aggregator"
 var SampleAggregatorProgressInterval = 5 * time.Second
 
 func newSampleAggregator(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.SampleAggregatorSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*sampleAggregator, error) {
 	for _, s := range spec.Sketches {
 		if len(s.Columns) == 0 {
@@ -107,11 +109,10 @@ func newSampleAggregator(
 		}
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// The processor will disable histogram collection if this limit is not
 	// enough.
-	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "sample-aggregator-mem")
+	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "sample-aggregator-mem")
 	rankCol := len(input.OutputTypes()) - 8
 	s := &sampleAggregator{
 		spec:         spec,
@@ -134,7 +135,7 @@ func newSampleAggregator(
 		invSketch:    make(map[uint32]*sketchInfo, len(spec.InvertedSketches)),
 	}
 
-	var sampleCols util.FastIntSet
+	var sampleCols intsets.Fast
 	for i := range spec.Sketches {
 		s.sketches[i] = sketchInfo{
 			spec:     spec.Sketches[i],
@@ -156,7 +157,7 @@ func newSampleAggregator(
 		// The datums are converted to their inverted index bytes and sent as a
 		// single DBytes column. We do not use DEncodedKey here because it would
 		// introduce backward compatibility complications.
-		var srCols util.FastIntSet
+		var srCols intsets.Fast
 		srCols.Add(0)
 		sr.Init(int(spec.SampleSize), int(spec.MinSampleSize), bytesRowType, &s.memAcc, srCols)
 		col := spec.InvertedSketches[i].Columns[0]
@@ -170,7 +171,7 @@ func newSampleAggregator(
 	}
 
 	if err := s.Init(
-		nil, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor,
+		ctx, nil, post, input.OutputTypes(), flowCtx, processorID, memMonitor,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				s.close()
@@ -183,35 +184,37 @@ func newSampleAggregator(
 	return s, nil
 }
 
-func (s *sampleAggregator) pushTrailingMeta(ctx context.Context) {
-	execinfra.SendTraceData(ctx, s.Output)
+func (s *sampleAggregator) pushTrailingMeta(ctx context.Context, output execinfra.RowReceiver) {
+	execinfra.SendTraceData(ctx, output)
 }
 
 // Run is part of the Processor interface.
-func (s *sampleAggregator) Run(ctx context.Context) {
+func (s *sampleAggregator) Run(ctx context.Context, output execinfra.RowReceiver) {
 	ctx = s.StartInternal(ctx, sampleAggregatorProcName)
 	s.input.Start(ctx)
 
-	earlyExit, err := s.mainLoop(ctx)
+	earlyExit, err := s.mainLoop(ctx, output)
 	if err != nil {
-		execinfra.DrainAndClose(ctx, s.Output, err, s.pushTrailingMeta, s.input)
+		execinfra.DrainAndClose(ctx, output, err, s.pushTrailingMeta, s.input)
 	} else if !earlyExit {
-		s.pushTrailingMeta(ctx)
+		s.pushTrailingMeta(ctx, output)
 		s.input.ConsumerClosed()
-		s.Output.ProducerDone()
+		output.ProducerDone()
 	}
 	s.MoveToDraining(nil /* err */)
 }
 
 func (s *sampleAggregator) close() {
 	if s.InternalClose() {
-		s.memAcc.Close(s.Ctx)
-		s.tempMemAcc.Close(s.Ctx)
-		s.MemMonitor.Stop(s.Ctx)
+		s.memAcc.Close(s.Ctx())
+		s.tempMemAcc.Close(s.Ctx())
+		s.MemMonitor.Stop(s.Ctx())
 	}
 }
 
-func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err error) {
+func (s *sampleAggregator) mainLoop(
+	ctx context.Context, output execinfra.RowReceiver,
+) (earlyExit bool, err error) {
 	var job *jobs.Job
 	jobID := s.spec.JobID
 	// Some tests run this code without a job, so check if the jobID is 0.
@@ -231,10 +234,10 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 		// If it changed by less than 1%, just check for cancellation (which is more
 		// efficient).
 		if fractionCompleted < 1.0 && fractionCompleted < lastReportedFractionCompleted+0.01 {
-			return job.CheckStatus(ctx, nil /* txn */)
+			return job.NoTxn().CheckStatus(ctx)
 		}
 		lastReportedFractionCompleted = fractionCompleted
-		return job.FractionProgressed(ctx, nil /* txn */, jobs.FractionUpdater(fractionCompleted))
+		return job.NoTxn().FractionProgressed(ctx, jobs.FractionUpdater(fractionCompleted))
 	}
 
 	var rowsProcessed uint64
@@ -272,7 +275,7 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 						sr.Disable()
 					}
 				}
-			} else if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+			} else if !emitHelper(ctx, output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 				// No cleanup required; emitHelper() took care of it.
 				return true, nil
 			}
@@ -433,12 +436,28 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 	// internal executor instead of doing this weird thing where it uses the
 	// internal executor to execute one statement at a time inside a db.Txn()
 	// closure.
-	if err := s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	if err := s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		for _, si := range s.sketches {
 			var histogram *stats.HistogramData
 			if si.spec.GenerateHistogram {
 				colIdx := int(si.spec.Columns[0])
 				typ := s.inTypes[colIdx]
+
+				var lowerBound tree.Datum
+				if si.spec.PrevLowerBound != "" {
+					lbExpr, err := parser.ParseExpr(si.spec.PrevLowerBound)
+					if err != nil {
+						return err
+					}
+					lbTypedExpr, err := lbExpr.TypeCheck(ctx, &s.SemaCtx, typ)
+					if err != nil {
+						return err
+					}
+					lowerBound, err = eval.Expr(ctx, s.EvalCtx, lbTypedExpr)
+					if err != nil {
+						return err
+					}
+				}
 
 				h, err := s.generateHistogram(
 					ctx,
@@ -449,6 +468,7 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 					si.numRows-si.numNulls,
 					s.getDistinctCount(&si, false /* includeNulls */),
 					int(si.spec.HistogramMaxBuckets),
+					lowerBound,
 				)
 				if err != nil {
 					return err
@@ -479,6 +499,7 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 					invSketch.numRows-invSketch.numNulls,
 					invDistinctCount,
 					int(invSketch.spec.HistogramMaxBuckets),
+					nil,
 				)
 				if err != nil {
 					return err
@@ -491,22 +512,23 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 				columnIDs[i] = s.sampledCols[c]
 			}
 
-			// Delete old stats that have been superseded.
-			if err := stats.DeleteOldStatsForColumns(
-				ctx,
-				s.FlowCtx.Cfg.Executor,
-				txn,
-				s.tableID,
-				columnIDs,
-			); err != nil {
-				return err
+			// Delete old stats that have been superseded,
+			// if the new statistic is not partial
+			if si.spec.PartialPredicate == "" {
+				if err := stats.DeleteOldStatsForColumns(
+					ctx,
+					txn,
+					s.tableID,
+					columnIDs,
+				); err != nil {
+					return err
+				}
 			}
 
 			// Insert the new stat.
 			if err := stats.InsertNewStat(
 				ctx,
 				s.FlowCtx.Cfg.Settings,
-				s.FlowCtx.Cfg.Executor,
 				txn,
 				s.tableID,
 				si.spec.StatName,
@@ -515,7 +537,10 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 				s.getDistinctCount(&si, true /* includeNulls */),
 				si.numNulls,
 				s.getAvgSize(&si),
-				histogram); err != nil {
+				histogram,
+				si.spec.PartialPredicate,
+				si.spec.FullStatisticID,
+			); err != nil {
 				return err
 			}
 
@@ -538,13 +563,12 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 			columnsUsed[i] = columnIDs
 		}
 		keepTime := stats.TableStatisticsRetentionPeriod.Get(&s.FlowCtx.Cfg.Settings.SV)
-		if err := s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		if err := s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			// Delete old stats from columns that were not collected. This is
 			// important to prevent single-column stats from deleted columns or
 			// multi-column stats from deleted indexes from persisting indefinitely.
 			return stats.DeleteOldStatsForOtherColumns(
 				ctx,
-				s.FlowCtx.Cfg.Executor,
 				txn,
 				s.tableID,
 				columnsUsed,
@@ -604,18 +628,27 @@ func (s *sampleAggregator) generateHistogram(
 	numRows int64,
 	distinctCount int64,
 	maxBuckets int,
+	lowerBound tree.Datum,
 ) (stats.HistogramData, error) {
 	prevCapacity := sr.Cap()
 	values, err := sr.GetNonNullDatums(ctx, &s.tempMemAcc, colIdx)
 	if err != nil {
 		return stats.HistogramData{}, err
 	}
+
 	if sr.Cap() != prevCapacity {
 		log.Infof(
 			ctx, "histogram samples reduced from %d to %d due to excessive memory utilization",
 			prevCapacity, sr.Cap(),
 		)
 	}
+
+	if lowerBound != nil {
+		h, buckets, err := stats.ConstructExtremesHistogram(evalCtx, colType, values, numRows, distinctCount, maxBuckets, lowerBound)
+		_ = buckets
+		return h, err
+	}
+
 	// TODO(michae2): Instead of using the flowCtx's evalCtx, investigate
 	// whether this can use a nil *eval.Context.
 	h, _, err := stats.EquiDepthHistogram(evalCtx, colType, values, numRows, distinctCount, maxBuckets)

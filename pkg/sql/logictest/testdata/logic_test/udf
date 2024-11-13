@@ -1,13 +1,28 @@
 statement ok
 CREATE TABLE ab (
-a INT PRIMARY KEY,
-b INT
+  a INT PRIMARY KEY,
+  b INT
 )
 
-statement error pq: unimplemented: user-defined functions with SETOF return types are not supported
-CREATE FUNCTION f(a int) RETURNS SETOF INT LANGUAGE SQL AS 'SELECT 1'
+statement error pq: plpgsql not supported in user-defined functions
+CREATE FUNCTION populate() RETURNS integer AS $$
+DECLARE
+    -- declarations
+BEGIN
+    PERFORM my_function();
+END;
+$$ LANGUAGE plpgsql
 
-statement error pq: cannot set leakproof on function with non-immutable volatility: STABLE
+statement error pgcode 42704 language \"made_up_language\" does not exist
+CREATE FUNCTION populate() RETURNS integer AS $$
+DECLARE
+    -- declarations
+BEGIN
+    PERFORM my_function();
+END;
+$$ LANGUAGE made_up_language
+
+statement error pgcode 42P13 leak proof function must be immutable, but got volatility: STABLE
 CREATE FUNCTION f(a int) RETURNS INT LEAKPROOF STABLE LANGUAGE SQL AS 'SELECT 1'
 
 statement error pq: return type mismatch in function declared to return int\nDETAIL: Actual return type is string
@@ -49,8 +64,8 @@ CREATE FUNCTION c(i INT, j INT) RETURNS INT LANGUAGE SQL AS 'SELECT i - j'
 statement error column \"j\" does not exist
 CREATE FUNCTION err(i INT) RETURNS INT LANGUAGE SQL AS 'SELECT j'
 
-statement error column \"j\" does not exist
-CREATE FUNCTION err(i INT) RETURNS INT LANGUAGE SQL AS 'SELECT * FROM ab WHERE a = j'
+statement error pgcode 42703 column \"j\" does not exist
+CREATE FUNCTION err(i INT) RETURNS INT LANGUAGE SQL AS 'SELECT a FROM ab WHERE a = j'
 
 statement ok
 CREATE FUNCTION d(i INT2) RETURNS INT4 LANGUAGE SQL AS 'SELECT i'
@@ -63,6 +78,10 @@ CREATE FUNCTION err(b BOOL) RETURNS INT LANGUAGE SQL AS 'SELECT b'
 
 statement error return type mismatch in function declared to return bool\nDETAIL: Actual return type is int
 CREATE FUNCTION err(i INT, j INT) RETURNS BOOL LANGUAGE SQL AS 'SELECT i - j'
+
+# TODO(100962): Add support for default parameters.
+statement error pgcode 0A000 unimplemented: default value
+CREATE FUNCTION err(i INT, j INT DEFAULT 2) RETURNS INT LANGUAGE SQL AS 'SELECT i - j'
 
 # Make sure using table name as tuple type name works properly.
 # It should pass the return type validation and stored as a tuple type.
@@ -77,7 +96,7 @@ statement ok
 CREATE FUNCTION f_no_ref(a int) RETURNS INT IMMUTABLE AS 'SELECT 1' LANGUAGE SQL
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_no_ref];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_no_ref];
 ----
 CREATE FUNCTION public.f_no_ref(IN a INT8)
   RETURNS INT8
@@ -107,7 +126,7 @@ statement ok
 CREATE TYPE notmyworkday AS ENUM ('Monday', 'Tuesday');
 
 statement ok
-CREATE FUNCTION f(a notmyworkday) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$
+CREATE FUNCTION f(a notmyworkday) RETURNS INT VOLATILE LANGUAGE SQL AS $$
 SELECT a FROM t;
 SELECT b FROM t@t_idx_b;
 SELECT c FROM t@t_idx_c;
@@ -115,19 +134,19 @@ SELECT nextval('sq1');
 $$
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f];
 ----
 CREATE FUNCTION public.f(IN a test.public.notmyworkday)
-    RETURNS INT8
-    IMMUTABLE
-    NOT LEAKPROOF
-    CALLED ON NULL INPUT
-    LANGUAGE SQL
-    AS $$
-    SELECT a FROM test.public.t;
-    SELECT b FROM test.public.t@t_idx_b;
-    SELECT c FROM test.public.t@t_idx_c;
-    SELECT nextval('public.sq1'::REGCLASS);
+  RETURNS INT8
+  VOLATILE
+  NOT LEAKPROOF
+  CALLED ON NULL INPUT
+  LANGUAGE SQL
+  AS $$
+  SELECT a FROM test.public.t;
+  SELECT b FROM test.public.t@t_idx_b;
+  SELECT c FROM test.public.t@t_idx_c;
+  SELECT nextval('public.sq1'::REGCLASS);
 $$
 
 statement error pq: unimplemented: alter function depends on extension not supported.*
@@ -148,13 +167,31 @@ CREATE SCHEMA sc;
 statement
 CREATE FUNCTION sc.proc_f_2(STRING) RETURNS STRING LANGUAGE SQL AS $$ SELECT 'hello' $$;
 
+query TTTTTBBBTITTTTTT
+SELECT oid, proname, pronamespace, proowner, prolang, proleakproof, proisstrict, proretset, provolatile, pronargs, prorettype, proargtypes, proargmodes, proargnames, prokind, prosrc
+FROM pg_catalog.pg_proc WHERE proname IN ('proc_f', 'proc_f_2');
+----
+100118  proc_f    105  1546506610  14  false  false  false  v  1  20  20     {i}    NULL    f  SELECT 1;
+100119  proc_f    105  1546506610  14  true   true   false  i  2  25  25 20  {i,i}  {"",b}  f  SELECT 'hello';
+100121  proc_f_2  120  1546506610  14  false  false  false  v  1  25  25     {i}    NULL    f  SELECT 'hello';
+
+# Ensure that the pg_proc virtual index works properly.
+
+query TT
+SELECT oid, proname FROM pg_proc WHERE oid = 'sc.proc_f_2'::regproc
+----
+100121  proc_f_2
+
+statement ok
+USE defaultdb;
+
 query TTTTTBBBTITTTTT
 SELECT oid, proname, pronamespace, proowner, prolang, proleakproof, proisstrict, proretset, provolatile, pronargs, prorettype, proargtypes, proargmodes, proargnames, prosrc
 FROM pg_catalog.pg_proc WHERE proname IN ('proc_f', 'proc_f_2');
 ----
-100118  proc_f    4101115737  1546506610  14  false  false  false  v  1  20  20     {i}    NULL    SELECT 1;
-100119  proc_f    4101115737  1546506610  14  true   true   false  i  2  25  25 20  {i,i}  {"",b}  SELECT 'hello';
-100121  proc_f_2  131273696   1546506610  14  false  false  false  v  1  25  25     {i}    NULL    SELECT 'hello';
+
+statement ok
+USE test;
 
 subtest create_function_statements
 
@@ -244,7 +281,7 @@ $$  122  test_cross_db  123  public  124  f_cross_db
 subtest show_create_function
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION proc_f];
+SELECT create_statement FROM [SHOW CREATE FUNCTION proc_f];
 ----
 CREATE FUNCTION public.proc_f(IN INT8)
   RETURNS INT8
@@ -269,7 +306,7 @@ statement error pq: unknown function: proc_f_2()
 SHOW CREATE FUNCTION proc_f_2;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION sc.proc_f_2];
+SELECT create_statement FROM [SHOW CREATE FUNCTION sc.proc_f_2];
 ----
 CREATE FUNCTION sc.proc_f_2(IN STRING)
   RETURNS STRING
@@ -285,7 +322,7 @@ statement ok
 SET search_path = sc;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION proc_f_2];
+SELECT create_statement FROM [SHOW CREATE FUNCTION proc_f_2];
 ----
 CREATE FUNCTION sc.proc_f_2(IN STRING)
   RETURNS STRING
@@ -356,7 +393,7 @@ statement ok
 SET search_path = public,sc1
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_drop];
+SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
 ----
 CREATE FUNCTION public.f_test_drop()
   RETURNS INT8
@@ -378,7 +415,7 @@ CREATE FUNCTION public.f_test_drop(IN INT8)
 $$
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
+SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
 ----
 CREATE FUNCTION sc1.f_test_drop(IN INT8)
   RETURNS INT8
@@ -413,7 +450,7 @@ statement ok
 DROP FUNCTION f_test_drop();
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_drop];
+SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
 ----
 CREATE FUNCTION public.f_test_drop(IN INT8)
   RETURNS INT8
@@ -426,7 +463,7 @@ CREATE FUNCTION public.f_test_drop(IN INT8)
 $$
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
+SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
 ----
 CREATE FUNCTION sc1.f_test_drop(IN INT8)
   RETURNS INT8
@@ -443,11 +480,11 @@ $$
 statement ok
 DROP FUNCTION f_test_drop(INT), f_test_drop(INT);
 
-statement error pq: function public.f_test_drop does not exist
-SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_drop];
+statement error pq: unknown function: public.f_test_drop\(\): function undefined
+SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
+SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
 ----
 CREATE FUNCTION sc1.f_test_drop(IN INT8)
   RETURNS INT8
@@ -462,8 +499,8 @@ $$
 statement ok
 DROP FUNCTION f_test_drop(INT);
 
-statement error pq: function sc1.f_test_drop does not exist
-SELECT @2 FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
+statement error pq: unknown function: sc1.f_test_drop\(\): function undefined
+SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
 
 # If there are identical function signatures in different schemas, multiple drop
 # statements should drop them all. This matches postgres behavior.
@@ -472,7 +509,7 @@ CREATE FUNCTION public.f_test_drop() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 CREATE FUNCTION sc1.f_test_drop() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_drop];
+SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
 ----
 CREATE FUNCTION public.f_test_drop()
   RETURNS INT8
@@ -485,7 +522,7 @@ CREATE FUNCTION public.f_test_drop()
 $$
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
+SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
 ----
 CREATE FUNCTION sc1.f_test_drop()
   RETURNS INT8
@@ -503,11 +540,11 @@ DROP FUNCTION f_test_drop();
 DROP FUNCTION f_test_drop();
 COMMIT;
 
-statement error pq: function public.f_test_drop does not exist
-SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_drop];
+statement error pq: unknown function: public.f_test_drop\(\): function undefined
+SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
 
-statement error pq: function sc1.f_test_drop does not exist
-SELECT @2 FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
+statement error pq: unknown function: sc1.f_test_drop\(\): function undefined
+SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
 
 statement ok
 SET search_path = public
@@ -521,16 +558,10 @@ statement ok
 CREATE FUNCTION test_tbl_f() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
-CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT DEFAULT (test_tbl_f() + 1));
-
-statement error pq: unimplemented: usage of user-defined function from relations not supported
 CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT ON UPDATE (test_tbl_f() + 1));
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
 CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT AS (test_tbl_f() + 1) STORED);
-
-statement error pq: unimplemented: usage of user-defined function from relations not supported
-CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT CHECK (test_tbl_f() > 0));
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
 CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT, INDEX idx_b(test_tbl_f()));
@@ -545,12 +576,6 @@ statement error pq: unimplemented: usage of user-defined function from relations
 CREATE INDEX t_idx ON test_tbl_t(b) WHERE test_tbl_f() > 0;
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
-ALTER TABLE test_tbl_t ADD CONSTRAINT bgt CHECK (test_tbl_f() > 1);
-
-statement error pq: unimplemented: usage of user-defined function from relations not supported
-ALTER TABLE test_tbl_t ADD COLUMN c int CHECK (test_tbl_f() > 0);
-
-statement error pq: unimplemented: usage of user-defined function from relations not supported
 ALTER TABLE test_tbl_t ADD COLUMN c int AS (test_tbl_f()) stored;
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
@@ -559,25 +584,28 @@ ALTER TABLE test_tbl_t ADD COLUMN c int DEFAULT (test_tbl_f());
 statement error pq: unimplemented: usage of user-defined function from relations not supported
 ALTER TABLE test_tbl_t ADD COLUMN c int ON UPDATE (test_tbl_f());
 
+statement error pq: unimplemented: usage of user-defined function from relations not supported
+ALTER TABLE test_tbl_t ALTER COLUMN b SET ON UPDATE (test_tbl_f());
+
 subtest disallow_udf_in_views_and_udf
 
 statement ok
 CREATE FUNCTION test_vf_f() RETURNS STRING LANGUAGE SQL AS $$ SELECT lower('hello') $$;
 
-statement error pq: unknown function: test_vf_f\(\): function undefined
+statement error pq: unknown function: test_vf_f\(\): function undefined\nHINT:.*intention was to use a user-defined function in the function body, which is currently not supported.
 CREATE FUNCTION test_vf_g() RETURNS STRING LANGUAGE SQL AS $$ SELECT test_vf_f() $$;
 
 statement ok
 CREATE FUNCTION test_vf_g() RETURNS STRING LANGUAGE SQL AS $$ SELECT lower('hello') $$;
 
-statement error pq: unknown function: test_vf_f\(\): function undefined
+statement error pq: unknown function: test_vf_f\(\): function undefined\nHINT:.*intention was to use a user-defined function in the view query, which is currently not supported.
 CREATE VIEW v AS SELECT test_vf_f();
 
 statement ok
 CREATE VIEW v AS SELECT lower('hello');
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION test_vf_f];
+SELECT create_statement FROM [SHOW CREATE FUNCTION test_vf_f];
 ----
 CREATE FUNCTION public.test_vf_f()
   RETURNS STRING
@@ -594,6 +622,7 @@ subtest grant_revoke
 
 statement ok
 CREATE SCHEMA test_priv_sc1;
+SET search_path = public,test_priv_sc1;
 CREATE FUNCTION test_priv_f1() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 CREATE FUNCTION test_priv_f2(int) RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 CREATE FUNCTION test_priv_sc1.test_priv_f3() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
@@ -608,6 +637,86 @@ grantor  grantee  specific_catalog  specific_schema  specific_name        routin
 NULL     root     test              public           test_priv_f1_100137  test             public          test_priv_f1  EXECUTE         YES
 NULL     root     test              public           test_priv_f2_100138  test             public          test_priv_f2  EXECUTE         YES
 NULL     root     test              test_priv_sc1    test_priv_f3_100139  test             test_priv_sc1   test_priv_f3  EXECUTE         YES
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee  privilege_type  is_grantable
+test           public         100137       test_priv_f1()      root     EXECUTE         true
+test           public         100138       test_priv_f2(int8)  root     EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      root     EXECUTE         true
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1(), test_priv_f2(INT), test_priv_f3()
+----
+database_name  schema_name    function_id  function_signature  grantee  privilege_type  is_grantable
+test           public         100137       test_priv_f1()      root     EXECUTE         true
+test           public         100138       test_priv_f2(int8)  root     EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      root     EXECUTE         true
+
+query TTTTTT colnames
+SHOW FUNCTIONS
+----
+schema_name    function_name  result_data_type  argument_data_types  function_type  volatility
+public         a              int8              int8                 func           volatile
+public         b              int8              int8                 func           volatile
+public         c              int8              int8, int8           func           volatile
+public         d              int4              int2                 func           volatile
+public         f              int8              notmyworkday         func           volatile
+public         f_no_ref       int8              int8                 func           immutable
+public         proc_f         int8              int8                 func           volatile
+public         proc_f         text              text, int8           func           immutable
+public         test_priv_f1   int8              ·                    func           volatile
+public         test_priv_f2   int8              int8                 func           volatile
+public         test_tbl_f     int8              ·                    func           immutable
+public         test_vf_f      text              ·                    func           volatile
+public         test_vf_g      text              ·                    func           volatile
+sc             proc_f_2       text              text                 func           volatile
+test_priv_sc1  test_priv_f3   int8              ·                    func           volatile
+
+query TTTTTT colnames
+SHOW FUNCTIONS FROM public
+----
+schema_name  function_name  result_data_type  argument_data_types  function_type  volatility
+public       a              int8              int8                 func           volatile
+public       b              int8              int8                 func           volatile
+public       c              int8              int8, int8           func           volatile
+public       d              int4              int2                 func           volatile
+public       f              int8              notmyworkday         func           volatile
+public       f_no_ref       int8              int8                 func           immutable
+public       proc_f         int8              int8                 func           volatile
+public       proc_f         text              text, int8           func           immutable
+public       test_priv_f1   int8              ·                    func           volatile
+public       test_priv_f2   int8              int8                 func           volatile
+public       test_tbl_f     int8              ·                    func           immutable
+public       test_vf_f      text              ·                    func           volatile
+public       test_vf_g      text              ·                    func           volatile
+
+query TTTTTT colnames
+SHOW FUNCTIONS FROM test_priv_sc1
+----
+schema_name    function_name  result_data_type  argument_data_types  function_type  volatility
+test_priv_sc1  test_priv_f3   int8              ·                    func           volatile
+
+query TTTTTT colnames
+SHOW FUNCTIONS FROM test
+----
+schema_name    function_name  result_data_type  argument_data_types  function_type  volatility
+public         a              int8              int8                 func           volatile
+public         b              int8              int8                 func           volatile
+public         c              int8              int8, int8           func           volatile
+public         d              int4              int2                 func           volatile
+public         f              int8              notmyworkday         func           volatile
+public         f_no_ref       int8              int8                 func           immutable
+public         proc_f         int8              int8                 func           volatile
+public         proc_f         text              text, int8           func           immutable
+public         test_priv_f1   int8              ·                    func           volatile
+public         test_priv_f2   int8              int8                 func           volatile
+public         test_tbl_f     int8              ·                    func           immutable
+public         test_vf_f      text              ·                    func           volatile
+public         test_vf_g      text              ·                    func           volatile
+sc             proc_f_2       text              text                 func           volatile
+test_priv_sc1  test_priv_f3   int8              ·                    func           volatile
 
 statement ok
 GRANT EXECUTE ON FUNCTION test_priv_f1(), test_priv_f2(int), test_priv_sc1.test_priv_f3 TO udf_test_user WITH GRANT OPTION;
@@ -624,6 +733,17 @@ NULL     root           test              test_priv_sc1    test_priv_f3_100139  
 NULL     udf_test_user  test              public           test_priv_f1_100137  test             public          test_priv_f1  EXECUTE         YES
 NULL     udf_test_user  test              public           test_priv_f2_100138  test             public          test_priv_f2  EXECUTE         YES
 NULL     udf_test_user  test              test_priv_sc1    test_priv_f3_100139  test             test_priv_sc1   test_priv_f3  EXECUTE         YES
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee        privilege_type  is_grantable
+test           public         100137       test_priv_f1()      root           EXECUTE         true
+test           public         100137       test_priv_f1()      udf_test_user  EXECUTE         true
+test           public         100138       test_priv_f2(int8)  root           EXECUTE         true
+test           public         100138       test_priv_f2(int8)  udf_test_user  EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      root           EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      udf_test_user  EXECUTE         true
 
 statement error pq: cannot drop role/user udf_test_user: grants still exist on.*
 DROP USER udf_test_user;
@@ -644,6 +764,17 @@ NULL     udf_test_user  test              public           test_priv_f1_100137  
 NULL     udf_test_user  test              public           test_priv_f2_100138  test             public          test_priv_f2  EXECUTE         NO
 NULL     udf_test_user  test              test_priv_sc1    test_priv_f3_100139  test             test_priv_sc1   test_priv_f3  EXECUTE         NO
 
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee        privilege_type  is_grantable
+test           public         100137       test_priv_f1()      root           EXECUTE         true
+test           public         100137       test_priv_f1()      udf_test_user  EXECUTE         false
+test           public         100138       test_priv_f2(int8)  root           EXECUTE         true
+test           public         100138       test_priv_f2(int8)  udf_test_user  EXECUTE         false
+test           test_priv_sc1  100139       test_priv_f3()      root           EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      udf_test_user  EXECUTE         false
+
 statement ok
 REVOKE EXECUTE ON FUNCTION test_priv_f1(), test_priv_f2(int), test_priv_sc1.test_priv_f3 FROM udf_test_user;
 
@@ -656,6 +787,14 @@ grantor  grantee  specific_catalog  specific_schema  specific_name        routin
 NULL     root     test              public           test_priv_f1_100137  test             public          test_priv_f1  EXECUTE         YES
 NULL     root     test              public           test_priv_f2_100138  test             public          test_priv_f2  EXECUTE         YES
 NULL     root     test              test_priv_sc1    test_priv_f3_100139  test             test_priv_sc1   test_priv_f3  EXECUTE         YES
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee  privilege_type  is_grantable
+test           public         100137       test_priv_f1()      root     EXECUTE         true
+test           public         100138       test_priv_f2(int8)  root     EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      root     EXECUTE         true
 
 statement ok
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, test_priv_sc1 TO udf_test_user WITH GRANT OPTION;
@@ -673,6 +812,17 @@ NULL     udf_test_user  test              public           test_priv_f1_100137  
 NULL     udf_test_user  test              public           test_priv_f2_100138  test             public          test_priv_f2  EXECUTE         YES
 NULL     udf_test_user  test              test_priv_sc1    test_priv_f3_100139  test             test_priv_sc1   test_priv_f3  EXECUTE         YES
 
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee        privilege_type  is_grantable
+test           public         100137       test_priv_f1()      root           EXECUTE         true
+test           public         100137       test_priv_f1()      udf_test_user  EXECUTE         true
+test           public         100138       test_priv_f2(int8)  root           EXECUTE         true
+test           public         100138       test_priv_f2(int8)  udf_test_user  EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      root           EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      udf_test_user  EXECUTE         true
+
 statement ok
 REVOKE GRANT OPTION FOR EXECUTE ON ALL FUNCTIONS in schema public, test_priv_sc1 FROM udf_test_user;
 
@@ -689,6 +839,17 @@ NULL     udf_test_user  test              public           test_priv_f1_100137  
 NULL     udf_test_user  test              public           test_priv_f2_100138  test             public          test_priv_f2  EXECUTE         NO
 NULL     udf_test_user  test              test_priv_sc1    test_priv_f3_100139  test             test_priv_sc1   test_priv_f3  EXECUTE         NO
 
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee        privilege_type  is_grantable
+test           public         100137       test_priv_f1()      root           EXECUTE         true
+test           public         100137       test_priv_f1()      udf_test_user  EXECUTE         false
+test           public         100138       test_priv_f2(int8)  root           EXECUTE         true
+test           public         100138       test_priv_f2(int8)  udf_test_user  EXECUTE         false
+test           test_priv_sc1  100139       test_priv_f3()      root           EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      udf_test_user  EXECUTE         false
+
 statement ok
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public, test_priv_sc1 FROM udf_test_user;
 
@@ -701,6 +862,14 @@ grantor  grantee  specific_catalog  specific_schema  specific_name        routin
 NULL     root     test              public           test_priv_f1_100137  test             public          test_priv_f1  EXECUTE         YES
 NULL     root     test              public           test_priv_f2_100138  test             public          test_priv_f2  EXECUTE         YES
 NULL     root     test              test_priv_sc1    test_priv_f3_100139  test             test_priv_sc1   test_priv_f3  EXECUTE         YES
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee  privilege_type  is_grantable
+test           public         100137       test_priv_f1()      root     EXECUTE         true
+test           public         100138       test_priv_f2(int8)  root     EXECUTE         true
+test           test_priv_sc1  100139       test_priv_f3()      root     EXECUTE         true
 
 statement ok
 DROP FUNCTION test_priv_f1;
@@ -722,6 +891,12 @@ ORDER BY grantee, routine_name;
 grantor  grantee  specific_catalog  specific_schema  specific_name        routine_catalog  routine_schema  routine_name  privilege_type  is_grantable
 NULL     root     test              public           test_priv_f1_100140  test             public          test_priv_f1  EXECUTE         YES
 
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1
+----
+database_name  schema_name  function_id  function_signature  grantee  privilege_type  is_grantable
+test           public       100140       test_priv_f1()      root     EXECUTE         true
+
 # Add default privilege and make sure new function
 statement ok
 ALTER DEFAULT PRIVILEGES IN SCHEMA public, test_priv_sc1 GRANT EXECUTE ON FUNCTIONS TO udf_test_user WITH GRANT OPTION;
@@ -742,6 +917,16 @@ NULL     root           test              test_priv_sc1    test_priv_f3_100142  
 NULL     udf_test_user  test              public           test_priv_f2_100141  test             public          test_priv_f2  EXECUTE         YES
 NULL     udf_test_user  test              test_priv_sc1    test_priv_f3_100142  test             test_priv_sc1   test_priv_f3  EXECUTE         YES
 
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee        privilege_type  is_grantable
+test           public         100140       test_priv_f1()      root           EXECUTE         true
+test           public         100141       test_priv_f2(int8)  root           EXECUTE         true
+test           public         100141       test_priv_f2(int8)  udf_test_user  EXECUTE         true
+test           test_priv_sc1  100142       test_priv_f3()      root           EXECUTE         true
+test           test_priv_sc1  100142       test_priv_f3()      udf_test_user  EXECUTE         true
+
 statement ok
 DROP FUNCTION test_priv_f2;
 DROP FUNCTION test_priv_sc1.test_priv_f3;
@@ -753,6 +938,12 @@ ORDER BY grantee, routine_name;
 ----
 grantor  grantee  specific_catalog  specific_schema  specific_name        routine_catalog  routine_schema  routine_name  privilege_type  is_grantable
 NULL     root     test              public           test_priv_f1_100140  test             public          test_priv_f1  EXECUTE         YES
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1
+----
+database_name  schema_name  function_id  function_signature  grantee  privilege_type  is_grantable
+test           public       100140       test_priv_f1()      root     EXECUTE         true
 
 statement ok
 ALTER DEFAULT PRIVILEGES IN SCHEMA public, test_priv_sc1 REVOKE EXECUTE ON FUNCTIONS FROM udf_test_user;
@@ -771,13 +962,103 @@ NULL     root     test              public           test_priv_f1_100140  test  
 NULL     root     test              public           test_priv_f2_100143  test             public          test_priv_f2  EXECUTE         YES
 NULL     root     test              test_priv_sc1    test_priv_f3_100144  test             test_priv_sc1   test_priv_f3  EXECUTE         YES
 
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+----
+database_name  schema_name    function_id  function_signature  grantee  privilege_type  is_grantable
+test           public         100140       test_priv_f1()      root     EXECUTE         true
+test           public         100143       test_priv_f2(int8)  root     EXECUTE         true
+test           test_priv_sc1  100144       test_priv_f3()      root     EXECUTE         true
+
+# Make sure has_function_privilege works.
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE WITH GRANT OPTION')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
+true
+
+user testuser
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE')
+----
+false
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE WITH GRANT OPTION')
+----
+false
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
+false
+
+user root
+
+statement ok
+GRANT EXECUTE ON FUNCTION test_priv_f1(), test_priv_f2(int), test_priv_sc1.test_priv_f3 TO testuser WITH GRANT OPTION;
+
+user testuser
+
+query B retry
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE WITH GRANT OPTION')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
+true
+
+user root
+
+statement ok
+REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION test_priv_f1(), test_priv_f2(int), test_priv_sc1.test_priv_f3 FROM testuser;
+
+user testuser
+
+query B retry
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE WITH GRANT OPTION')
+----
+false
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
+true
+
+user root
+
+statement ok
+SET search_path = public;
+
 subtest alter_function_options
 
 statement ok
 CREATE FUNCTION f_test_alter_opt(INT) RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_opt];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_alter_opt];
 ----
 CREATE FUNCTION public.f_test_alter_opt(IN INT8)
   RETURNS INT8
@@ -792,14 +1073,14 @@ $$
 statement error pq: IMMUTABLE: conflicting or redundant options
 ALTER FUNCTION f_test_alter_opt IMMUTABLE IMMUTABLE
 
-statement error pq: cannot set leakproof on function with non-immutable volatility: STABLE
+statement error pgcode 42P13 leak proof function must be immutable, but got volatility: STABLE
 ALTER FUNCTION f_test_alter_opt STABLE LEAKPROOF
 
 statement ok
 ALTER FUNCTION f_test_alter_opt IMMUTABLE LEAKPROOF STRICT;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_opt];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_alter_opt];
 ----
 CREATE FUNCTION public.f_test_alter_opt(IN INT8)
   RETURNS INT8
@@ -823,7 +1104,7 @@ statement ok
 CREATE FUNCTION f_test_alter_name_diff_in() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_name];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_alter_name];
 ----
 CREATE FUNCTION public.f_test_alter_name(IN INT8)
   RETURNS INT8
@@ -844,11 +1125,11 @@ ALTER FUNCTION f_test_alter_name RENAME TO f_test_alter_name_same_in
 statement ok
 ALTER FUNCTION f_test_alter_name RENAME TO f_test_alter_name_new
 
-statement error pq: function f_test_alter_name does not exist
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_name];
+statement error pq: unknown function: f_test_alter_name\(\): function undefined
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_alter_name];
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_name_new];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_alter_name_new];
 ----
 CREATE FUNCTION public.f_test_alter_name_new(IN INT8)
   RETURNS INT8
@@ -863,11 +1144,11 @@ $$
 statement ok
 ALTER FUNCTION f_test_alter_name_new RENAME to f_test_alter_name_diff_in
 
-statement error pq: function f_test_alter_name_new does not exist
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_name_new];
+statement error pq: unknown function: f_test_alter_name_new\(\): function undefined
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_alter_name_new];
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_name_diff_in];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_alter_name_diff_in];
 ----
 CREATE FUNCTION public.f_test_alter_name_diff_in()
   RETURNS INT8
@@ -1037,7 +1318,7 @@ SELECT fn->>'id' AS id, fn->'parentSchemaId'
 153  152
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_sc];
+SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_sc];
 ----
 CREATE FUNCTION public.f_test_sc()
   RETURNS INT8
@@ -1087,7 +1368,7 @@ SELECT fn->>'id' AS id, fn->'parentSchemaId'
 153  152
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_sc];
+SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_sc];
 ----
 CREATE FUNCTION public.f_test_sc()
   RETURNS INT8
@@ -1100,7 +1381,7 @@ CREATE FUNCTION public.f_test_sc()
 $$
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION test_alter_sc.f_test_sc];
+SELECT create_statement FROM [SHOW CREATE FUNCTION test_alter_sc.f_test_sc];
 ----
 CREATE FUNCTION test_alter_sc.f_test_sc()
   RETURNS INT8
@@ -1142,14 +1423,11 @@ CREATE OR REPLACE FUNCTION f_test_cor(a INT, c INT) RETURNS INT IMMUTABLE LANGUA
 statement error pq: cannot change return type of existing function
 CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ SELECT 'hello' $$;
 
-statement error pq: unimplemented: user-defined functions with SETOF return types are not supported
-CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS SETOF INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
-
-statement error pq: cannot set leakproof on function with non-immutable volatility: VOLATILE
+statement error pgcode 42P13 leak proof function must be immutable, but got volatility: VOLATILE
 CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS INT LEAKPROOF LANGUAGE SQL AS $$ SELECT 1 $$;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_cor];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_cor];
 ----
 CREATE FUNCTION public.f_test_cor(IN a INT8, IN b INT8)
   RETURNS INT8
@@ -1167,7 +1445,7 @@ statement ok
 CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS INT LANGUAGE SQL AS $$ SELECT 2 $$;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_cor];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_cor];
 ----
 CREATE FUNCTION public.f_test_cor(IN a INT8, IN b INT8)
   RETURNS INT8
@@ -1183,7 +1461,7 @@ statement ok
 CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS INT IMMUTABLE LEAKPROOF STRICT LANGUAGE SQL AS $$ SELECT 3 $$;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_test_cor];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_cor];
 ----
 CREATE FUNCTION public.f_test_cor(IN a INT8, IN b INT8)
   RETURNS INT8
@@ -1226,16 +1504,16 @@ statement ok
 CREATE FUNCTION f_udt_rewrite() RETURNS notmyworkday LANGUAGE SQL AS $$ SELECT 'Monday':: notmyworkday $$;
 
 query T
-SELECT @2 FROM [SHOW CREATE FUNCTION f_udt_rewrite];
+SELECT create_statement FROM [SHOW CREATE FUNCTION f_udt_rewrite];
 ----
 CREATE FUNCTION public.f_udt_rewrite()
-    RETURNS test.public.notmyworkday
-    VOLATILE
-    NOT LEAKPROOF
-    CALLED ON NULL INPUT
-    LANGUAGE SQL
-    AS $$
-    SELECT 'Monday':::test.public.notmyworkday;
+  RETURNS test.public.notmyworkday
+  VOLATILE
+  NOT LEAKPROOF
+  CALLED ON NULL INPUT
+  LANGUAGE SQL
+  AS $$
+  SELECT 'Monday':::test.public.notmyworkday;
 $$
 
 query T
@@ -1335,6 +1613,7 @@ DROP FUNCTION sc2.f_tbl()
 
 statement ok
 ALTER DATABASE rename_db1 RENAME TO rename_db2;
+USE rename_db2;
 
 # Make sure that db renaming does not affect types and sequences in UDF.
 query T
@@ -1387,7 +1666,7 @@ Mon
 query I
 SELECT sc1.f_seq()
 ----
-5
+1
 
 query T
 SELECT sc2.f_type()
@@ -1397,7 +1676,7 @@ Mon
 query I
 SELECT sc2.f_seq()
 ----
-6
+2
 
 statement error pq: cannot rename schema because relation "rename_sc1.sc1.f_tbl" depends on relation "rename_sc1.sc1.tbl"
 ALTER SCHEMA sc1 RENAME TO sc1_new
@@ -1414,16 +1693,23 @@ DROP FUNCTION sc2.f_tbl()
 statement ok
 ALTER SCHEMA sc1 RENAME TO sc1_new
 
-# Make sure that db renaming does not affect types and sequences in UDF.
-query T
+# Cannot refer to the old schema name.
+statement error pq: schema "sc1" does not exist
 SELECT sc1.f_type()
+
+statement error pq: schema "sc1" does not exist
+SELECT sc1.f_seq()
+
+# Make sure that schema renaming does not affect types and sequences in UDF.
+query T
+SELECT sc1_new.f_type()
 ----
 Mon
 
 query I
-SELECT sc1.f_seq()
+SELECT sc1_new.f_seq()
 ----
-7
+3
 
 query T
 SELECT sc2.f_type()
@@ -1433,7 +1719,7 @@ Mon
 query I
 SELECT sc2.f_seq()
 ----
-8
+4
 
 statement ok
 SET DATABASE = test
@@ -1488,6 +1774,197 @@ SELECT f()
 
 statement ok
 SET DATABASE = test;
+
+subtest event_logging
+
+statement ok
+CREATE USER u_test_event;
+CREATE SCHEMA sc_test_event;
+DELETE FROM system.eventlog;
+
+statement ok
+CREATE FUNCTION f_test_log() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+# TODO(chengxiong): remove this test condition when event logging is moved build
+# time in declarative schema changer.
+onlyif config local-legacy-schema-changer
+query TTTT retry
+WITH tmp AS (
+  SELECT "eventType" AS etype, info::JSONB AS info_json
+  FROM system.eventlog
+  WHERE "eventType" = 'create_function'
+)
+SELECT etype, info_json->'DescriptorID', info_json->'FunctionName', info_json->'Statement' FROM tmp;
+----
+create_function  203  "test.public.f_test_log"  "CREATE FUNCTION test.public.f_test_log()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT 1;$$"
+
+statement ok
+CREATE OR REPLACE FUNCTION f_test_log() RETURNS INT LANGUAGE SQL AS $$ SELECT 2 $$;
+
+onlyif config local-legacy-schema-changer
+query TTTT retry
+WITH tmp AS (
+  SELECT "eventType" AS etype, info::JSONB AS info_json
+  FROM system.eventlog
+  WHERE "eventType" = 'create_function'
+)
+SELECT etype, info_json->'DescriptorID', info_json->'FunctionName', info_json->'Statement' FROM tmp;
+----
+create_function  203  "test.public.f_test_log"  "CREATE FUNCTION test.public.f_test_log()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT 1;$$"
+create_function  203  "test.public.f_test_log"  "CREATE OR REPLACE FUNCTION test.public.f_test_log()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT 2;$$"
+
+statement ok
+ALTER FUNCTION f_test_log RENAME TO f_test_log_new;
+
+onlyif config local-legacy-schema-changer
+query TTTTT retry
+WITH tmp AS (
+  SELECT "eventType" AS etype, info::JSONB AS info_json
+  FROM system.eventlog
+  WHERE "eventType" = 'rename_function'
+)
+SELECT etype, info_json->'DescriptorID', info_json->'FunctionName', info_json->'NewFunctionName', info_json->'Statement' FROM tmp;
+----
+rename_function  203  "test.public.f_test_log"  "test.public.f_test_log_new"  "ALTER FUNCTION \"\".\"\".f_test_log RENAME TO f_test_log_new"
+
+statement ok
+ALTER FUNCTION f_test_log_new RENAME TO f_test_log;
+
+statement ok
+ALTER FUNCTION f_test_log OWNER TO u_test_event;
+
+onlyif config local-legacy-schema-changer
+query TTTTT retry
+WITH tmp AS (
+  SELECT "eventType" AS etype, info::JSONB AS info_json
+  FROM system.eventlog
+  WHERE "eventType" = 'alter_function_owner'
+)
+SELECT etype, info_json->'DescriptorID', info_json->'FunctionName', info_json->'Owner', info_json->'Statement' FROM tmp;
+----
+alter_function_owner  203  "test.public.f_test_log"  "u_test_event"  "ALTER FUNCTION \"\".\"\".f_test_log OWNER TO u_test_event"
+
+statement ok
+ALTER FUNCTION f_test_log SET SCHEMA sc_test_event;
+
+onlyif config local-legacy-schema-changer
+query TTTTT retry
+WITH tmp AS (
+  SELECT "eventType" AS etype, info::JSONB AS info_json
+  FROM system.eventlog
+  WHERE "eventType" = 'set_schema'
+)
+SELECT etype, info_json->'DescriptorID', info_json->'DescriptorName', info_json->'NewDescriptorName', info_json->'Statement' FROM tmp;
+----
+set_schema  203  "test.public.f_test_log"  "test.sc_test_event.f_test_log"  "ALTER FUNCTION \"\".\"\".f_test_log SET SCHEMA sc_test_event"
+
+statement ok
+ALTER FUNCTION sc_test_event.f_test_log SET SCHEMA public;
+ALTER FUNCTION f_test_log IMMUTABLE;
+DROP FUNCTION f_test_log;
+
+onlyif config local-legacy-schema-changer
+query TTTT retry
+WITH tmp AS (
+  SELECT "eventType" AS etype, info::JSONB AS info_json
+  FROM system.eventlog
+  WHERE "eventType" = 'alter_function_options'
+)
+SELECT etype, info_json->'DescriptorID', info_json->'FunctionName', info_json->'Statement' FROM tmp;
+----
+alter_function_options  203  "test.public.f_test_log"  "ALTER FUNCTION \"\".\"\".f_test_log IMMUTABLE"
+
+onlyif config local-legacy-schema-changer
+query TTTT retry
+WITH tmp AS (
+  SELECT "eventType" AS etype, info::JSONB AS info_json
+  FROM system.eventlog
+  WHERE "eventType" = 'drop_function'
+)
+SELECT etype, info_json->'DescriptorID', info_json->'FunctionName', info_json->'Statement' FROM tmp;
+----
+drop_function  203  "test.public.f_test_log"  "DROP FUNCTION \"\".\"\".f_test_log"
+
+subtest show_grants
+
+statement ok
+CREATE SCHEMA sc_test_show_grants;
+SET search_path = sc_test_show_grants;
+CREATE FUNCTION f_test_show_grants(INT) RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION f_test_show_grants(INT, string, OID) RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE USER u_test_show_grants;
+GRANT EXECUTE ON FUNCTION f_test_show_grants(INT), f_test_show_grants(INT, string, OID) TO u_test_show_grants;
+
+statement error pq: function name "f_test_show_grants" is not unique
+SHOW GRANTS ON FUNCTION f_test_show_grants;
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION f_test_show_grants(INT), f_test_show_grants(INT, string, OID);
+----
+database_name  schema_name          function_id  function_signature                   grantee             privilege_type  is_grantable
+test           sc_test_show_grants  100205       f_test_show_grants(int8)             root                EXECUTE         true
+test           sc_test_show_grants  100205       f_test_show_grants(int8)             u_test_show_grants  EXECUTE         false
+test           sc_test_show_grants  100206       f_test_show_grants(int8, text, oid)  root                EXECUTE         true
+test           sc_test_show_grants  100206       f_test_show_grants(int8, text, oid)  u_test_show_grants  EXECUTE         false
+
+statement error pq: function f_test_show_grants\(string\) does not exist: function undefined
+SHOW GRANTS ON FUNCTION f_test_show_grants(string);
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION f_test_show_grants(INT)
+----
+database_name  schema_name          function_id  function_signature        grantee             privilege_type  is_grantable
+test           sc_test_show_grants  100205       f_test_show_grants(int8)  root                EXECUTE         true
+test           sc_test_show_grants  100205       f_test_show_grants(int8)  u_test_show_grants  EXECUTE         false
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION f_test_show_grants(INT, string, OID);
+----
+database_name  schema_name          function_id  function_signature                   grantee             privilege_type  is_grantable
+test           sc_test_show_grants  100206       f_test_show_grants(int8, text, oid)  root                EXECUTE         true
+test           sc_test_show_grants  100206       f_test_show_grants(int8, text, oid)  u_test_show_grants  EXECUTE         false
+
+statement error pq: unknown function: f_not_existing\(\): function undefined
+SHOW GRANTS ON FUNCTION f_not_existing;
+
+query TTTTTTB colnames
+SHOW GRANTS ON FUNCTION f_test_show_grants(INT), f_test_show_grants(INT, string, OID) FOR u_test_show_grants;
+----
+database_name  schema_name          function_id  function_signature                   grantee             privilege_type  is_grantable
+test           sc_test_show_grants  100205       f_test_show_grants(int8)             u_test_show_grants  EXECUTE         false
+test           sc_test_show_grants  100206       f_test_show_grants(int8, text, oid)  u_test_show_grants  EXECUTE         false
+
+query TTTTTB colnames
+SHOW GRANTS FOR u_test_show_grants;
+----
+database_name  schema_name          relation_name                        grantee             privilege_type  is_grantable
+test           sc_test_show_grants  f_test_show_grants(int8)             u_test_show_grants  EXECUTE         false
+test           sc_test_show_grants  f_test_show_grants(int8, text, oid)  u_test_show_grants  EXECUTE         false
+
+statement ok
+SET search_path = public;
+
+subtest udf_create_privilege
+
+statement ok
+CREATE SCHEMA sc_test_priv;
+
+user testuser
+
+statement error pq: user testuser does not have CREATE privilege on schema sc_test_priv
+CREATE FUNCTION sc_test_priv.f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+user root
+
+statement ok
+GRANT CREATE ON SCHEMA sc_test_priv TO testuser
+
+user testuser
+
+statement ok
+CREATE FUNCTION sc_test_priv.f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+user root
 
 subtest execution
 
@@ -1665,6 +2142,37 @@ SELECT one_nth(0)
 statement error pgcode 22012 division by zero
 SELECT int_identity((1/0)::INT)
 
+# Test that tracing spans are created for each UDF invocation and for each
+# statement in the UDF body.
+statement ok
+CREATE TABLE trace_tab (
+  a INT PRIMARY KEY
+);
+INSERT INTO trace_tab VALUES (1), (2), (3);
+CREATE FUNCTION trace_fn(i INT) RETURNS INT LANGUAGE SQL AS $$
+  SELECT 'no-op';
+  SELECT i;
+$$
+
+statement ok
+SET tracing = on
+
+statement ok
+SELECT trace_fn(a) FROM trace_tab
+
+statement ok
+SET tracing = off
+
+query T rowsort
+SELECT message FROM [SHOW TRACE FOR SESSION] WHERE message ~ 'udf'
+----
+=== SPAN START: udf-stmt-trace_fn-1 ===
+=== SPAN START: udf-stmt-trace_fn-2 ===
+=== SPAN START: udf-stmt-trace_fn-1 ===
+=== SPAN START: udf-stmt-trace_fn-2 ===
+=== SPAN START: udf-stmt-trace_fn-1 ===
+=== SPAN START: udf-stmt-trace_fn-2 ===
+
 
 subtest args
 
@@ -1793,10 +2301,10 @@ subtest volatility
 statement ok
 CREATE TABLE kv (k INT PRIMARY KEY, v INT);
 INSERT INTO kv VALUES (1, 1), (2, 2), (3, 3);
-CREATE FUNCTION get_l(i INT) RETURNS INT IMMUTABLE LEAKPROOF LANGUAGE SQL AS $$
+CREATE FUNCTION get_l(i INT) RETURNS INT STABLE LANGUAGE SQL AS $$
 SELECT v FROM kv WHERE k = i;
 $$;
-CREATE FUNCTION get_i(i INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$
+CREATE FUNCTION get_i(i INT) RETURNS INT STABLE LANGUAGE SQL AS $$
 SELECT v FROM kv WHERE k = i;
 $$;
 CREATE FUNCTION get_s(i INT) RETURNS INT STABLE LANGUAGE SQL AS $$
@@ -1814,8 +2322,8 @@ SELECT pg_get_functiondef('get_l'::regproc::oid)
 ----
 CREATE FUNCTION public.get_l(IN i INT8)
     RETURNS INT8
-    IMMUTABLE
-    LEAKPROOF
+    STABLE
+    NOT LEAKPROOF
     CALLED ON NULL INPUT
     LANGUAGE SQL
     AS $$
@@ -1841,7 +2349,7 @@ soundex
 
 # Only the volatile functions should see the changes made by the UPDATE in the
 # CTE.
-query IIIIIIII colnames
+query IIIIIIII colnames,rowsort
 WITH u AS (
   UPDATE kv SET v = v + 10 RETURNING k
 )
@@ -1857,6 +2365,24 @@ l1  l2  i1  i2  s1  s2  v1  v2
 2   2   2   2   2   2   12  12
 3   3   3   3   3   3   13  13
 
+statement ok
+CREATE SEQUENCE sq2;
+
+statement error volatile statement not allowed in immutable function: SELECT nextval\('sq2'\)
+CREATE FUNCTION rand_i() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$SELECT nextval('sq2')$$;
+
+statement error volatile statement not allowed in stable function: SELECT nextval\('sq2'\)
+CREATE FUNCTION rand_s() RETURNS INT STABLE    LANGUAGE SQL AS $$SELECT nextval('sq2')$$;
+
+statement ok
+CREATE FUNCTION rand_v() RETURNS INT VOLATILE  LANGUAGE SQL AS $$SELECT nextval('sq2')$$;
+
+query II rowsort
+SELECT rand_v(), rand_v() FROM generate_series(1, 3)
+----
+1  2
+3  4
+5  6
 
 subtest implicit_record_types
 
@@ -1926,15 +2452,16 @@ SELECT imp(), (1,2,'a')::imp = imp(), pg_typeof(imp())
 ----
 (1,2,a)  true  imp
 
-statement ok
-CREATE FUNCTION imp_star() RETURNS imp LANGUAGE SQL AS $$
-  SELECT * FROM imp
-$$
-
-query TBT
-SELECT imp_star(), (1,2,'a')::imp = imp_star(), pg_typeof(imp_star())
-----
-(1,2,a)  true  imp
+# TODO(#90080): Allow star expressions in UDFs.
+# statement ok
+# CREATE FUNCTION imp_star() RETURNS imp LANGUAGE SQL AS $$
+#   SELECT * FROM imp
+# $$
+#
+# query TBT
+# SELECT imp_star(), (1,2,'a')::imp = imp_star(), pg_typeof(imp_star())
+# ----
+# (1,2,a)  true  imp
 
 statement ok
 INSERT INTO imp VALUES (100, 200, 'z')
@@ -2014,6 +2541,58 @@ CREATE FUNCTION err(i imp) RETURNS INT LANGUAGE SQL AS $$
 $$
 
 
+subtest strict
+
+statement ok
+CREATE FUNCTION strict_fn(i INT, t TEXT, b BOOL) RETURNS INT STRICT LANGUAGE SQL AS $$
+  SELECT 1
+$$
+
+query I
+SELECT strict_fn(1, 'foo', true)
+----
+1
+
+# Same as above, but with non-constant arguments.
+query I
+WITH tmp(a, b, c) AS MATERIALIZED (VALUES (1, 'foo', true))
+SELECT strict_fn(a, b, c) FROM tmp
+----
+1
+
+query III
+SELECT strict_fn(NULL, 'foo', true), strict_fn(1, NULL, true), strict_fn(1, 'foo', NULL)
+----
+NULL  NULL  NULL
+
+query III
+SELECT strict_fn(NULL, NULL, true), strict_fn(1, NULL, NULL), strict_fn(NULL, 'foo', NULL)
+----
+NULL  NULL  NULL
+
+query I
+SELECT strict_fn(NULL, NULL, NULL)
+----
+NULL
+
+statement ok
+CREATE FUNCTION strict_fn_imp(t TEXT, i imp) RETURNS INT RETURNS NULL ON NULL INPUT LANGUAGE SQL AS $$
+  SELECT 1
+$$
+
+# A tuple with all NULL elements is not considered "NULL INPUT" for a UDF, even
+# though IS NULL returns true for it.
+query IB
+SELECT strict_fn_imp('foo', (NULL,NULL,NULL)), (NULL,NULL,NULL)::imp IS NULL
+----
+1  true
+
+query I
+SELECT strict_fn_imp('foo', NULL)
+----
+NULL
+
+
 subtest return_type_assignment_casts
 
 # Do not allow functions with return type mismatches that cannot be cast in an
@@ -2039,3 +2618,822 @@ a  text
 
 statement error pgcode 22001 value too long for type CHAR
 SELECT stoc('abc')
+
+
+subtest tagged_dollar_quotes
+
+statement ok
+CREATE FUNCTION single_quote(s STRING) RETURNS STRING LANGUAGE SQL AS $func$
+  SELECT $prefix$'$prefix$ || s || $suffix$'$suffix$
+$func$
+
+query T
+SELECT create_statement FROM [SHOW CREATE FUNCTION single_quote]
+----
+CREATE FUNCTION public.single_quote(IN s STRING)
+  RETURNS STRING
+  VOLATILE
+  NOT LEAKPROOF
+  CALLED ON NULL INPUT
+  LANGUAGE SQL
+  AS $$
+  SELECT (e'\'' || s) || e'\'';
+$$
+
+query T
+SELECT single_quote('hello')
+----
+'hello'
+
+statement error unterminated string
+CREATE FUNCTION err() RETURNS STRING LANGUAGE SQL AS $outer$
+  SELECT $inner$hello$outer$
+$inner$
+
+
+subtest ddl
+
+# DDL is not currently supported in UDF bodies.
+statement error pgcode 0A000 unimplemented: CREATE TABLE usage inside a function definition
+CREATE FUNCTION err() RETURNS VOID LANGUAGE SQL AS 'CREATE TABLE t (a INT)'
+
+statement error pgcode 0A000 unimplemented: ALTER TABLE usage inside a function definition
+CREATE FUNCTION err() RETURNS VOID LANGUAGE SQL AS 'ALTER TABLE t ADD COLUMN b BOOL'
+
+statement error pgcode 0A000 unimplemented: DROP TABLE usage inside a function definition
+CREATE FUNCTION err() RETURNS VOID LANGUAGE SQL AS 'DROP TABLE t'
+
+
+subtest mutation
+
+# Mutations are not currently supported in UDF bodies.
+statement error pgcode 0A000 unimplemented: INSERT usage inside a function definition
+CREATE FUNCTION err() RETURNS VOID LANGUAGE SQL AS 'INSERT INTO t VALUES (1)'
+
+statement error pgcode 0A000 unimplemented: INSERT usage inside a function definition
+CREATE FUNCTION err() RETURNS VOID LANGUAGE SQL AS 'UPSERT INTO t VALUES (1)'
+
+statement error pgcode 0A000 unimplemented: UPDATE usage inside a function definition
+CREATE FUNCTION err() RETURNS VOID LANGUAGE SQL AS 'UPDATE t SET a = 1'
+
+statement error pgcode 0A000 unimplemented: DELETE usage inside a function definition
+CREATE FUNCTION err() RETURNS VOID LANGUAGE SQL AS 'DELETE FROM t WHERE a = 1'
+
+
+subtest prepared_statement
+
+# Prepared statements are not currently supported in UDF bodies.
+statement error pgcode 0A000 unimplemented: PREPARE usage inside a function definition
+CREATE FUNCTION err() RETURNS VOID LANGUAGE SQL AS 'PREPARE p AS SELECT * FROM t'
+
+
+subtest cte
+
+# CTEs are not currently supported in UDF bodies.
+statement error pgcode 0A000 unimplemented: CTE usage inside a function definition
+CREATE FUNCTION err() RETURNS INT LANGUAGE SQL AS 'WITH s AS (SELECT a FROM t) SELECT a FROM s'
+
+statement error pgcode 0A000 unimplemented: statement source \(square bracket syntax\) within user-defined function
+CREATE FUNCTION err() RETURNS INT LANGUAGE SQL AS 'SELECT a FROM [SELECT 1] a(a)'
+
+
+subtest recursion
+
+# Recursive UDFs are not currently supported.
+statement error pgcode 42883 unknown function: rec()
+CREATE FUNCTION rec(i INT) RETURNS INT LANGUAGE SQL AS 'SELECT CASE i WHEN 0 THEN 0 ELSE i + rec(i-1) END'
+
+# References to other UDFs in UDF bodies are not currently supported.
+statement ok
+CREATE FUNCTION other_udf() RETURNS INT LANGUAGE SQL AS 'SELECT 1'
+
+statement error pgcode 42883 unknown function: other_udf()
+CREATE FUNCTION err() RETURNS INT LANGUAGE SQL AS 'SELECT other_udf()'
+
+
+subtest subquery
+
+statement ok
+CREATE TABLE sub_all (a INT);
+INSERT INTO sub_all VALUES (1), (2), (3), (4), (5), (6)
+
+statement ok
+CREATE TABLE sub_odd (a INT);
+INSERT INTO sub_odd VALUES (1), (3), (5)
+
+# UDF with an uncorrelated subquery.
+statement ok
+CREATE FUNCTION sub_max_odd() RETURNS INT LANGUAGE SQL AS $$
+  SELECT a FROM sub_all WHERE a = (SELECT max(a) FROM sub_odd)
+$$
+
+query II
+SELECT a, sub_max_odd() FROM sub_all WHERE a = sub_max_odd()
+----
+5  5
+
+# Subqueries inside and outside a UDF are supported.
+query I rowsort
+SELECT a FROM sub_all WHERE sub_max_odd() = (SELECT max(a) FROM sub_odd)
+----
+1
+2
+3
+4
+5
+6
+
+# UDF with subquery where ordering must be preserved.
+statement ok
+CREATE FUNCTION sub_max_odd_with_order_by() RETURNS INT LANGUAGE SQL AS $$
+  SELECT a FROM sub_all WHERE a = (SELECT a FROM sub_odd ORDER BY a DESC LIMIT 1)
+$$
+
+query I
+SELECT sub_max_odd_with_order_by()
+----
+5
+
+# UDF with a subquery correlated with an input parameter.
+statement ok
+CREATE FUNCTION sub_prev_odd(i INT) RETURNS INT LANGUAGE SQL AS $$
+  SELECT a FROM sub_all WHERE a = (SELECT max(a) FROM sub_odd WHERE a < i)
+$$
+
+query II rowsort
+SELECT a, sub_prev_odd(a) FROM sub_all
+----
+1  NULL
+2  1
+3  1
+4  3
+5  3
+6  5
+
+# UDF with a correlated subquery.
+statement ok
+CREATE FUNCTION sub_is_odd(i INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT true FROM sub_all
+  WHERE EXISTS (SELECT 1 FROM sub_odd where sub_odd.a = sub_all.a)
+    AND a = i
+$$
+
+query IB rowsort
+SELECT a, sub_is_odd(a) FROM sub_all WHERE sub_is_odd(a) OR sub_is_odd(a) IS NULL
+----
+1  true
+2  NULL
+3  true
+4  NULL
+5  true
+6  NULL
+
+# UDF with an uncorrelated EXISTS.
+statement ok
+CREATE FUNCTION sub_first() RETURNS INT LANGUAGE SQL AS $$
+  SELECT a FROM sub_all WHERE EXISTS (SELECT a FROM sub_odd) ORDER BY a LIMIT 1
+$$
+
+query II rowsort
+SELECT sub_first(), a FROM sub_all
+----
+1  1
+1  2
+1  3
+1  4
+1  5
+1  6
+
+# UDF with a correlated EXISTS.
+statement ok
+CREATE FUNCTION sub_two() RETURNS INT LANGUAGE SQL AS $$
+  SELECT a FROM sub_all WHERE CASE
+    WHEN a > 1 THEN EXISTS (SELECT 0 FROM sub_odd WHERE sub_odd.a = sub_all.a+1)
+    ELSE false
+  END
+  ORDER BY a LIMIT 1
+$$
+
+query II rowsort
+SELECT a, sub_two() FROM sub_all
+----
+1  2
+2  2
+3  2
+4  2
+5  2
+6  2
+
+subtest any_subquery
+
+statement ok
+CREATE TABLE any_tab (
+  a INT,
+  b INT
+)
+
+statement ok
+CREATE FUNCTION any_fn(i INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT i = ANY(SELECT a FROM any_tab)
+$$
+
+statement ok
+CREATE FUNCTION any_fn_lt(i INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT i < ANY(SELECT a FROM any_tab)
+$$
+
+statement ok
+CREATE FUNCTION any_fn_tuple(i INT, j INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT (i, j) = ANY(SELECT a, b FROM any_tab)
+$$
+
+# If the subquery returns no rows, the result should always be false.
+query BBB
+SELECT any_fn(1), any_fn(4), any_fn(NULL::INT)
+----
+false  false  false
+
+query BBB
+SELECT any_fn_lt(1), any_fn_lt(4), any_fn_lt(NULL::INT)
+----
+false  false  false
+
+query BBB
+SELECT any_fn_tuple(1, 10), any_fn_tuple(1, 20), any_fn_tuple(NULL::INT, NULL::INT)
+----
+false  false  false
+
+statement ok
+INSERT INTO any_tab VALUES (1, 10), (3, 30)
+
+query BBB
+SELECT any_fn(1), any_fn(4), any_fn(NULL::INT)
+----
+true  false  NULL
+
+query BBB
+SELECT any_fn_lt(1), any_fn_lt(4), any_fn_lt(NULL::INT)
+----
+true  false  NULL
+
+query BBB
+SELECT any_fn_tuple(1, 10), any_fn_tuple(1, 20), any_fn_tuple(NULL::INT, NULL::INT)
+----
+true  false  NULL
+
+statement ok
+INSERT INTO any_tab VALUES (NULL, NULL)
+
+query BBB
+SELECT any_fn(1), any_fn(4), any_fn(NULL::INT)
+----
+true  NULL  NULL
+
+query BBB
+SELECT any_fn_lt(1), any_fn_lt(4), any_fn_lt(NULL::INT)
+----
+true  NULL  NULL
+
+query BBB
+SELECT any_fn_tuple(1, 10), any_fn_tuple(1, 20), any_fn_tuple(NULL::INT, NULL::INT)
+----
+true  NULL  NULL
+
+statement ok
+CREATE FUNCTION any_fn2(i INT) RETURNS SETOF INT LANGUAGE SQL AS $$
+  SELECT b FROM (VALUES (1), (2), (3), (NULL)) v(b)
+  WHERE b = ANY (SELECT a FROM any_tab WHERE a <= i)
+$$
+
+query I
+SELECT any_fn2(2)
+----
+1
+
+query I rowsort
+SELECT any_fn2(3)
+----
+1
+3
+
+subtest all_subquery
+
+statement ok
+CREATE TABLE all_tab (a INT)
+
+statement ok
+CREATE FUNCTION all_fn(i INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT i = ALL(SELECT a FROM all_tab)
+$$
+
+# If the subquery returns no rows, the result should always be true.
+query BBB
+SELECT all_fn(1), all_fn(2), all_fn(NULL::INT)
+----
+true  true  true
+
+statement ok
+INSERT INTO all_tab VALUES (1), (1);
+
+query BBB
+SELECT all_fn(1), all_fn(2), all_fn(NULL::INT)
+----
+true  false  NULL
+
+statement ok
+INSERT INTO all_tab VALUES (NULL);
+
+query BBB
+SELECT all_fn(1), all_fn(2), all_fn(NULL::INT)
+----
+NULL  false  NULL
+
+
+subtest array_flatten
+
+statement ok
+CREATE FUNCTION arr(x INT) RETURNS INT[] LANGUAGE SQL AS $$
+  SELECT ARRAY(VALUES (1), (2), (x));
+$$
+
+query T
+SELECT arr(10)
+----
+{1,2,10}
+
+query T
+SELECT arr(i) FROM generate_series(1, 3) g(i)
+----
+{1,2,1}
+{1,2,2}
+{1,2,3}
+
+
+subtest variadic
+
+# Variadic UDFS are not currently supported.
+statement error pgcode 0A000 unimplemented: this syntax\nHINT.*\n.*88947
+CREATE FUNCTION rec(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS '1'
+
+subtest execute_dropped_function
+
+statement ok
+CREATE FUNCTION f_test_exec_dropped(a int) RETURNS INT LANGUAGE SQL AS $$ SELECT a $$;
+
+query I
+SELECT f_test_exec_dropped(123);
+----
+123
+
+statement ok
+DROP FUNCTION f_test_exec_dropped;
+
+statement error pq: unknown function: f_test_exec_dropped\(\): function undefined
+SELECT f_test_exec_dropped(321);
+
+
+subtest regression_tests
+
+# Regression test for #93083. UDFs with empty bodies should execute successfully
+# and return NULL.
+statement ok
+CREATE FUNCTION f93083() RETURNS INT LANGUAGE SQL AS '';
+
+query I
+SELECT f93083()
+----
+NULL
+
+# Regression test for #93314
+subtest regression_93314
+
+statement ok
+CREATE TYPE e_93314 AS ENUM ('a', 'b');
+CREATE TABLE t_93314 (i INT, e e_93314);
+INSERT INTO t_93314 VALUES (1, 'a');
+
+statement ok
+CREATE OR REPLACE FUNCTION f_93314 () RETURNS t_93314 AS
+$$
+  SELECT i, e
+  FROM t_93314
+  ORDER BY i
+  LIMIT 1;
+$$ LANGUAGE SQL;
+
+query T
+SELECT f_93314();
+----
+(1,a)
+
+statement ok
+CREATE TABLE t_93314_alias (i INT, e _e_93314);
+INSERT INTO t_93314_alias VALUES (1, ARRAY['a', 'b']::_e_93314);
+
+statement ok
+CREATE OR REPLACE FUNCTION f_93314_alias () RETURNS t_93314_alias AS
+$$
+  SELECT i, e
+  FROM t_93314_alias
+  ORDER BY i
+  LIMIT 1;
+$$ LANGUAGE SQL;
+
+query T
+SELECT f_93314_alias();
+----
+(1,"{a,b}")
+
+statement ok
+CREATE TYPE comp_93314 AS (a INT, b INT);
+CREATE TABLE t_93314_comp (a INT, c comp_93314, FAMILY (a, c));
+
+statement ok
+INSERT INTO t_93314_comp VALUES (1, (2,3));
+
+statement ok
+CREATE FUNCTION f_93314_comp() RETURNS comp_93314 AS
+$$
+  SELECT (1, 2);
+$$ LANGUAGE SQL;
+
+query T
+SELECT f_93314_comp()
+----
+(1,2)
+
+statement ok
+CREATE FUNCTION f_93314_comp_t() RETURNS t_93314_comp AS
+$$
+  SELECT a, c FROM t_93314_comp LIMIT 1;
+$$ LANGUAGE SQL;
+
+query T
+SELECT f_93314_comp_t()
+----
+(1,"(2,3)")
+
+query TTTTTBBBTITTTTT
+SELECT oid, proname, pronamespace, proowner, prolang, proleakproof, proisstrict, proretset, provolatile, pronargs, prorettype, proargtypes, proargmodes, proargnames, prosrc
+FROM pg_catalog.pg_proc WHERE proname IN ('f_93314', 'f_93314_alias', 'f_93314_comp', 'f_93314_comp_t')
+ORDER BY oid;
+----
+100272  f_93314         105  1546506610  14  false  false  false  v  0  100271  ·  {}  NULL  SELECT i, e FROM test.public.t_93314 ORDER BY i LIMIT 1;
+100274  f_93314_alias   105  1546506610  14  false  false  false  v  0  100273  ·  {}  NULL  SELECT i, e FROM test.public.t_93314_alias ORDER BY i LIMIT 1;
+100278  f_93314_comp    105  1546506610  14  false  false  false  v  0  100275  ·  {}  NULL  SELECT (1, 2);
+100279  f_93314_comp_t  105  1546506610  14  false  false  false  v  0  100277  ·  {}  NULL  SELECT a, c FROM test.public.t_93314_comp LIMIT 1;
+
+# Regression test for #95240. Strict UDFs that are inlined should result in NULL
+# when presented with NULL arguments.
+statement ok
+CREATE FUNCTION f95240(i INT) RETURNS INT STRICT LANGUAGE SQL AS 'SELECT 33';
+CREATE TABLE t95240 (a INT);
+INSERT INTO t95240 VALUES (1), (NULL)
+
+query I
+SELECT f95240(a) FROM t95240
+----
+33
+NULL
+
+onlyif config local
+query T
+EXPLAIN CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS 'SELECT 1'
+----
+distribution: local
+vectorized: true
+·
+• create function
+
+# Regression test for #96326. Strict UDFs with no arguments should not error
+# while being called.
+statement ok
+CREATE FUNCTION f96326() RETURNS INT LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT 1';
+
+query I
+SELECT f96326();
+----
+1
+
+subtest regression_95364
+
+statement ok
+CREATE FUNCTION f_95364() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+let $dropped_fn_id
+SELECT function_id FROM crdb_internal.create_function_statements WHERE function_name = 'f_95364';
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+1
+
+statement ok
+DROP FUNCTION f_95364;
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+0
+
+statement ok
+CREATE DATABASE db_95364;
+
+statement ok
+USE db_95364;
+
+statement ok
+CREATE FUNCTION f_95364_2() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+let $dropped_fn_id
+SELECT function_id FROM crdb_internal.create_function_statements WHERE function_name = 'f_95364_2';
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+1
+
+statement ok
+USE test;
+
+statement ok
+DROP DATABASE db_95364 CASCADE;
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+0
+
+statement ok
+USE test;
+
+statement ok
+CREATE SCHEMA sc_95364;
+
+statement ok
+CREATE FUNCTION sc_95364.f_95364_3() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+let $dropped_fn_id
+SELECT function_id FROM crdb_internal.create_function_statements WHERE function_name = 'f_95364_3';
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+1
+
+statement ok
+DROP SCHEMA sc_95364 CASCADE;
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+0
+
+subtest udt_alter
+
+statement ok
+CREATE TABLE t_alter (
+  a INT PRIMARY KEY,
+  b INT
+)
+
+statement ok
+CREATE FUNCTION f_rtbl() RETURNS t_alter LANGUAGE SQL AS 'SELECT 1, 2;'
+
+query T
+SELECT f_rtbl();
+----
+(1,2)
+
+statement ok
+ALTER TABLE t_alter DROP COLUMN b;
+
+statement error pq: return type mismatch in function declared to return t_alter
+SELECT f_rtbl();
+
+statement ok
+ALTER TABLE t_alter ADD COLUMN b INT;
+
+query T
+SELECT f_rtbl();
+----
+(1,2)
+
+statement ok
+SET enable_experimental_alter_column_type_general=true
+
+statement ok
+ALTER TABLE t_alter ALTER b TYPE FLOAT;
+
+statement error pq: return type mismatch in function declared to return t_alter
+SELECT f_rtbl();
+
+statement ok
+ALTER TABLE t_alter ALTER b TYPE INT;
+
+query T
+SELECT f_rtbl();
+----
+(1,2)
+
+statement ok
+ALTER TABLE t_alter ADD COLUMN c INT;
+
+statement error pq: return type mismatch in function declared to return record
+CREATE OR REPLACE FUNCTION f_rtbl() RETURNS t_alter LANGUAGE SQL AS 'SELECT 1, 2;'
+
+statement ok
+CREATE OR REPLACE FUNCTION f_rtbl() RETURNS t_alter LANGUAGE SQL AS 'SELECT 1, 2, 3;'
+
+query T
+SELECT f_rtbl();
+----
+(1,2,3)
+
+subtest regression_94146
+
+# Regression test for #94146.
+statement ok
+CREATE FUNCTION f_94146(i INT2) RETURNS INT STRICT LANGUAGE SQL AS 'SELECT 2';
+CREATE FUNCTION f_94146(i INT4) RETURNS INT STRICT LANGUAGE SQL AS 'SELECT 4';
+CREATE FUNCTION f_94146(i INT8) RETURNS INT STRICT LANGUAGE SQL AS 'SELECT 8';
+
+query I
+SELECT f_94146(1::INT8)
+----
+8
+
+query I
+SELECT f_94146(1::INT4)
+----
+4
+
+query I
+SELECT f_94146(1::INT2)
+----
+2
+
+subtest regression_97130
+
+statement ok
+CREATE FUNCTION f_97130() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+let $pre_search_path
+SHOW search_path
+
+statement ok
+SET search_path = public,public
+
+statement ok
+SELECT f_97130();
+
+statement ok
+SET search_path = $pre_search_path
+
+subtest regression_97400
+
+# Make sure that creating a UDF with builtin function name is ok.
+statement ok
+CREATE FUNCTION abs(val INT) RETURNS INT
+CALLED ON NULL INPUT
+LANGUAGE SQL
+AS $$ SELECT val+100 $$;
+
+query I
+SELECT abs(-1)
+----
+1
+
+query I
+SELECT public.abs(-1)
+----
+99
+
+subtest regression_97854
+
+# Regression test for #97854.
+statement ok
+CREATE FUNCTION f_97854 (i INT) RETURNS CHAR LANGUAGE SQL AS $$ SELECT 'i' $$;
+CREATE FUNCTION f_97854 (f FLOAT) RETURNS CHAR LANGUAGE SQL AS $$ SELECT 'f' $$;
+
+# TODO(#88318): In Postgres, the float overload is chosen.
+statement error pgcode 42725 ambiguous call: f_97854\(decimal\).*
+SELECT f_97854(1.0)
+
+# Regression test for #93861 - non-strict UDFs should be evaluated with NULL
+# arguments.
+subtest regression_93861
+
+statement ok
+CREATE TABLE t93861(x INT);
+INSERT INTO t93861 VALUES (1), (2), (NULL);
+CREATE FUNCTION f93861_scalar (i INT) RETURNS INT CALLED ON NULL INPUT
+  LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION f93861_strict_scalar (i INT) RETURNS INT STRICT
+  LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION f93861_setof (i INT) RETURNS SETOF INT CALLED ON NULL INPUT
+  LANGUAGE SQL AS $$ SELECT * FROM generate_series(1, 3) $$;
+CREATE FUNCTION f93861_strict_setof (i INT) RETURNS SETOF INT STRICT
+  LANGUAGE SQL AS $$ SELECT * FROM generate_series(1, 3) $$;
+
+query III rowsort
+SELECT x, f93861_scalar(x), f93861_strict_scalar(x) FROM t93861;
+----
+1     1  1
+2     1  1
+NULL  1  NULL
+
+query II rowsort
+SELECT x, f93861_setof(x) FROM t93861;
+----
+1     1
+1     2
+1     3
+2     1
+2     2
+2     3
+NULL  1
+NULL  2
+NULL  3
+
+query II rowsort
+SELECT x, f93861_strict_setof(x) FROM t93861;
+----
+1  1
+1  2
+1  3
+2  1
+2  2
+2  3
+
+# Regression test for #93082 - invalidate a cached query with a UDF if the UDF
+# has been dropped.
+subtest regression_93082
+
+statement ok
+CREATE FUNCTION fn(a INT) RETURNS INT LANGUAGE SQL AS 'SELECT a';
+
+query I
+SELECT fn(1);
+----
+1
+
+statement ok
+DROP FUNCTION fn;
+
+statement error pq: unknown function: fn\(\): function undefined
+SELECT fn(1);
+
+# Regression test for #93321 - invalidate a cached query with an unqualified UDF
+# reference after the database is switched.
+subtest regression_93321
+
+statement ok
+CREATE FUNCTION fn(a INT) RETURNS INT LANGUAGE SQL AS 'SELECT a';
+
+query I
+SELECT fn(1);
+----
+1
+
+statement ok
+CREATE DATABASE d;
+USE d;
+
+statement error pq: unknown function: fn\(\): function undefined
+SELECT fn(1);
+
+statement ok
+USE test;
+DROP DATABASE d CASCADE;
+DROP FUNCTION fn;
+
+# Regression test for #100923. Do not attempt to inline an empty UDF and error.
+statement ok
+CREATE FUNCTION f100923() RETURNS BOOL STABLE LANGUAGE SQL AS ''
+
+query B rowsort
+SELECT f100923() FROM (VALUES (10), (20)) v(i)
+----
+NULL
+NULL
+
+# Regression test for #100915. Do not error when attempting to inline a UDF when
+# it has a subquery argument that corresponds to a parameter that is referenced
+# multiple times in the UDF body.
+statement ok
+CREATE FUNCTION f100915(i INT) RETURNS BOOL STABLE LANGUAGE SQL AS $$
+  SELECT i = 0 OR i = 10
+$$
+
+query B rowsort
+SELECT f100915((SELECT y FROM (VALUES (10), (20)) y(y) WHERE x=y)) FROM (VALUES (10), (20)) x(x)
+----
+true
+false
+
+query B rowsort
+SELECT f100915(20-(SELECT y FROM (VALUES (10), (20)) y(y) WHERE x=y)) FROM (VALUES (10), (20)) x(x)
+----
+true
+true

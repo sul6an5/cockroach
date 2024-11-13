@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -195,21 +196,38 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		if !descriptorIsVisible(schemaDesc, true /* allowAdding */) {
 			continue
 		}
-		// TODO(arul): Ideally this should be the fully qualified name of the schema,
-		// but at the time of writing there doesn't seem to be a clean way of doing
-		// this.
 		if _, ok := userNames[schemaDesc.GetPrivileges().Owner()]; ok {
+			sn, err := getSchemaNameFromSchemaDescriptor(lCtx, schemaDesc)
+			if err != nil {
+				return err
+			}
 			userNames[schemaDesc.GetPrivileges().Owner()] = append(
 				userNames[schemaDesc.GetPrivileges().Owner()],
 				objectAndType{
 					ObjectType: privilege.Schema,
-					ObjectName: schemaDesc.GetName(),
+					ObjectName: sn.String(),
 				})
 		}
 
 		dbDesc, err := lCtx.getDatabaseByID(schemaDesc.GetParentID())
 		if err != nil {
 			return err
+		}
+
+		for _, u := range schemaDesc.GetPrivileges().Users {
+			if _, ok := userNames[u.User()]; ok {
+				if privilegeObjectFormatter.Len() > 0 {
+					privilegeObjectFormatter.WriteString(", ")
+				}
+				sn := tree.ObjectNamePrefix{
+					ExplicitCatalog: true,
+					CatalogName:     tree.Name(dbDesc.GetName()),
+					ExplicitSchema:  true,
+					SchemaName:      tree.Name(schemaDesc.GetName()),
+				}
+				privilegeObjectFormatter.FormatNode(&sn)
+				break
+			}
 		}
 
 		if err := accumulateDependentDefaultPrivileges(schemaDesc.GetDefaultPrivilegeDescriptor(), userNames, dbDesc.GetName(), schemaDesc.GetName()); err != nil {
@@ -301,7 +319,12 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			if dependentObjects[i].ObjectName != dependentObjects[j].ObjectName {
 				return dependentObjects[i].ObjectName < dependentObjects[j].ObjectName
 			}
-
+			if dependentObjects[j].ErrorMessage == nil {
+				return false
+			}
+			if dependentObjects[i].ErrorMessage == nil {
+				return true
+			}
 			return dependentObjects[i].ErrorMessage.Error() < dependentObjects[j].ErrorMessage.Error()
 		})
 		var hints []string
@@ -346,10 +369,11 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		}
 
 		// Check if user owns any scheduled jobs.
-		numSchedulesRow, err := params.ExecCfg().InternalExecutor.QueryRow(
+		numSchedulesRow, err := params.p.InternalSQLTxn().QueryRowEx(
 			params.ctx,
 			"check-user-schedules",
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			"SELECT count(*) FROM system.scheduled_jobs WHERE owner=$1",
 			normalizedUsername,
 		)
@@ -366,10 +390,11 @@ func (n *DropRoleNode) startExec(params runParams) error {
 				normalizedUsername, numSchedules)
 		}
 
-		numUsersDeleted, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		numUsersDeleted, err := params.p.InternalSQLTxn().ExecEx(
 			params.ctx,
 			opName,
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			`DELETE FROM system.users WHERE username=$1`,
 			normalizedUsername,
 		)
@@ -378,14 +403,15 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		}
 
 		if numUsersDeleted == 0 && !n.ifExists {
-			return errors.Errorf("role/user %s does not exist", normalizedUsername)
+			return sqlerrors.NewUndefinedUserError(normalizedUsername)
 		}
 
 		// Drop all role memberships involving the user/role.
-		rowsDeleted, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		rowsDeleted, err := params.p.InternalSQLTxn().ExecEx(
 			params.ctx,
 			"drop-role-membership",
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			`DELETE FROM system.role_members WHERE "role" = $1 OR "member" = $1`,
 			normalizedUsername,
 		)
@@ -394,10 +420,11 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		}
 		numRoleMembershipsDeleted += rowsDeleted
 
-		_, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		_, err = params.p.InternalSQLTxn().ExecEx(
 			params.ctx,
 			opName,
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf(
 				`DELETE FROM %s WHERE username=$1`,
 				sessioninit.RoleOptionsTableName,
@@ -408,10 +435,11 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			return err
 		}
 
-		rowsDeleted, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		rowsDeleted, err = params.p.InternalSQLTxn().ExecEx(
 			params.ctx,
 			opName,
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf(
 				`DELETE FROM %s WHERE role_name = $1`,
 				sessioninit.DatabaseRoleSettingsTableName,

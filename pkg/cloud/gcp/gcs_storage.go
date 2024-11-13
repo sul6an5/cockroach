@@ -13,16 +13,17 @@ package gcp
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
 	gcs "cloud.google.com/go/storage"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -30,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/gogo/protobuf/types"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/net/http2"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/impersonate"
@@ -72,7 +73,7 @@ var gcsChunkRetryTimeout = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"cloudstorage.gs.chunking.retry_timeout",
 	"per-chunk retry deadline when chunking of file upload to Google Cloud Storage",
-	60,
+	60*time.Second,
 )
 
 func parseGSURL(_ cloud.ExternalStorageURIContext, uri *url.URL) (cloudpb.ExternalStorage, error) {
@@ -180,6 +181,10 @@ func makeGCSStorage(
 	if conf.AssumeRole == "" {
 		opts = append(opts, credentialsOpt...)
 	} else {
+		if !args.Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2SupportAssumeRoleAuth) {
+			return nil, errors.New("cannot authenticate to cloud storage via assume role until cluster has fully upgraded to 22.2")
+		}
+
 		assumeOpt, err := createImpersonateCredentials(ctx, conf.AssumeRole, conf.AssumeRoleDelegates, []string{scope}, credentialsOpt...)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to assume role")
@@ -193,6 +198,7 @@ func makeGCSStorage(
 		return nil, errors.Wrap(err, "failed to create google cloud client")
 	}
 	g.SetRetry(gcs.WithErrorFunc(shouldRetry))
+	g.SetRetry(gcs.WithPolicy(gcs.RetryAlways))
 	bucket := g.Bucket(conf.Bucket)
 	if conf.BillingProject != `` {
 		bucket = bucket.UserProject(conf.BillingProject)
@@ -254,8 +260,7 @@ func createImpersonateCredentials(
 func (g *gcsStorage) Writer(ctx context.Context, basename string) (io.WriteCloser, error) {
 	_, sp := tracing.ChildSpan(ctx, "gcs.Writer")
 	defer sp.Finish()
-	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.Writer: %s",
-		path.Join(g.prefix, basename))})
+	sp.SetTag("path", attribute.StringValue(path.Join(g.prefix, basename)))
 
 	w := g.bucket.Object(path.Join(g.prefix, basename)).NewWriter(ctx)
 	w.ChunkSize = int(cloud.WriteChunkSize.Get(&g.settings.SV))
@@ -279,8 +284,7 @@ func (g *gcsStorage) ReadFileAt(
 
 	ctx, sp := tracing.ChildSpan(ctx, "gcs.ReadFileAt")
 	defer sp.Finish()
-	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.ReadFileAt: %s",
-		path.Join(g.prefix, basename))})
+	sp.SetTag("path", attribute.StringValue(path.Join(g.prefix, basename)))
 
 	r := cloud.NewResumingReader(ctx,
 		func(ctx context.Context, pos int64) (io.ReadCloser, error) {
@@ -288,7 +292,8 @@ func (g *gcsStorage) ReadFileAt(
 		}, // opener
 		nil, //  reader
 		offset,
-		cloud.IsResumableHTTPError,
+		object,
+		cloud.ResumingReaderRetryOnErrFnForSettings(ctx, g.settings),
 		nil, // errFn
 	)
 
@@ -314,7 +319,7 @@ func (g *gcsStorage) List(ctx context.Context, prefix, delim string, fn cloud.Li
 	dest := cloud.JoinPathPreservingTrailingSlash(g.prefix, prefix)
 	ctx, sp := tracing.ChildSpan(ctx, "gcs.List")
 	defer sp.Finish()
-	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.List: %s", dest)})
+	sp.SetTag("path", attribute.StringValue(dest))
 
 	it := g.bucket.Objects(ctx, &gcs.Query{Prefix: dest, Delimiter: delim})
 	for {

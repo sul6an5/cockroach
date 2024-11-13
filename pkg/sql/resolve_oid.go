@@ -15,11 +15,12 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -29,7 +30,7 @@ import (
 func (p *planner) ResolveOIDFromString(
 	ctx context.Context, resultType *types.T, toResolve *tree.DString,
 ) (_ *tree.DOid, errSafeToIgnore bool, _ error) {
-	ie := p.ExecCfg().InternalExecutorFactory.NewInternalExecutor(p.SessionData())
+	ie := p.ExecCfg().InternalDB.NewInternalExecutor(p.SessionData())
 	return resolveOID(
 		ctx, p.Txn(),
 		ie,
@@ -41,7 +42,7 @@ func (p *planner) ResolveOIDFromString(
 func (p *planner) ResolveOIDFromOID(
 	ctx context.Context, resultType *types.T, toResolve *tree.DOid,
 ) (_ *tree.DOid, errSafeToIgnore bool, _ error) {
-	ie := p.ExecCfg().InternalExecutorFactory.NewInternalExecutor(p.SessionData())
+	ie := p.ExecCfg().InternalDB.NewInternalExecutor(p.SessionData())
 	return resolveOID(
 		ctx, p.Txn(),
 		ie,
@@ -50,11 +51,7 @@ func (p *planner) ResolveOIDFromOID(
 }
 
 func resolveOID(
-	ctx context.Context,
-	txn *kv.Txn,
-	ie sqlutil.InternalExecutor,
-	resultType *types.T,
-	toResolve tree.Datum,
+	ctx context.Context, txn *kv.Txn, ie isql.Executor, resultType *types.T, toResolve tree.Datum,
 ) (_ *tree.DOid, errSafeToIgnore bool, _ error) {
 	info, ok := regTypeInfos[resultType.Oid()]
 	if !ok {
@@ -77,7 +74,12 @@ func resolveOID(
 	results, err := ie.QueryRowEx(ctx, "queryOid", txn,
 		sessiondata.NoSessionDataOverride, q, toResolve)
 	if err != nil {
-		if errors.HasType(err, (*tree.MultipleResultsError)(nil)) {
+		if catalog.HasInactiveDescriptorError(err) {
+			// Descriptor is either dropped or offline, so
+			// the OID does not exist.
+			return nil, true, pgerror.Newf(info.errType,
+				"%s %s does not exist", info.objName, toResolve)
+		} else if errors.HasType(err, (*tree.MultipleResultsError)(nil)) {
 			return nil, false, pgerror.Newf(pgcode.AmbiguousAlias,
 				"more than one %s named %s", info.objName, toResolve)
 		}

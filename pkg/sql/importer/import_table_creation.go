@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/faketreeeval"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -156,7 +155,6 @@ func MakeSimpleTableDescriptor(
 	create.Defs = filteredDefs
 
 	evalCtx := eval.Context{
-		Context:            ctx,
 		Sequence:           &importSequenceOperators{},
 		Regions:            makeImportRegionOperator(""),
 		SessionDataStack:   sessiondata.NewStack(&sessiondata.SessionData{}),
@@ -164,6 +162,7 @@ func MakeSimpleTableDescriptor(
 		TxnTimestamp:       timeutil.Unix(0, walltime),
 		Settings:           st,
 	}
+	evalCtx.SetDeprecatedContext(ctx)
 	affected := make(map[descpb.ID]*tabledesc.Mutable)
 
 	tableDesc, err := sql.NewTableDesc(
@@ -285,16 +284,6 @@ func (so *importSequenceOperators) GetSerialSequenceNameFromColumn(
 	return nil, errors.WithStack(errSequenceOperators)
 }
 
-// ParseQualifiedTableName implements the eval.DatabaseCatalog interface.
-func (so *importSequenceOperators) ParseQualifiedTableName(sql string) (*tree.TableName, error) {
-	name, err := parser.ParseTableName(sql)
-	if err != nil {
-		return nil, err
-	}
-	tn := name.ToTableName()
-	return &tn, nil
-}
-
 // ResolveTableName implements the eval.DatabaseCatalog interface.
 func (so *importSequenceOperators) ResolveTableName(
 	ctx context.Context, tn *tree.TableName,
@@ -309,22 +298,8 @@ func (so *importSequenceOperators) SchemaExists(
 	return false, errSequenceOperators
 }
 
-// IsTableVisible is part of the eval.DatabaseCatalog interface.
-func (so *importSequenceOperators) IsTableVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID oid.Oid,
-) (bool, bool, error) {
-	return false, false, errors.WithStack(errSequenceOperators)
-}
-
-// IsTypeVisible is part of the eval.DatabaseCatalog interface.
-func (so *importSequenceOperators) IsTypeVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
-) (bool, bool, error) {
-	return false, false, errors.WithStack(errSequenceOperators)
-}
-
-// HasAnyPrivilege is part of the eval.DatabaseCatalog interface.
-func (so *importSequenceOperators) HasAnyPrivilege(
+// HasAnyPrivilegeForSpecifier is part of the eval.DatabaseCatalog interface.
+func (so *importSequenceOperators) HasAnyPrivilegeForSpecifier(
 	ctx context.Context,
 	specifier eval.HasPrivilegeSpecifier,
 	user username.SQLUsername,
@@ -361,9 +336,18 @@ type fkResolver struct {
 
 var _ resolver.SchemaResolver = &fkResolver{}
 
-// Accessor implements the resolver.SchemaResolver interface.
-func (r *fkResolver) Accessor() catalog.Accessor {
-	return nil
+// GetObjectNamesAndIDs implements the resolver.SchemaResolver interface.
+func (r *fkResolver) GetObjectNamesAndIDs(
+	ctx context.Context, db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor,
+) (tree.TableNames, descpb.IDs, error) {
+	return nil, nil, errors.AssertionFailedf("GetObjectNamesAndIDs is not implemented by fkResolver")
+}
+
+// MustGetCurrentSessionDatabase implements the resolver.SchemaResolver interface.
+func (r *fkResolver) MustGetCurrentSessionDatabase(
+	ctx context.Context,
+) (catalog.DatabaseDescriptor, error) {
+	return nil, errors.AssertionFailedf("MustGetCurrentSessionDatabase is not implemented by fkResolver")
 }
 
 // CurrentDatabase implements the resolver.SchemaResolver interface.
@@ -374,11 +358,6 @@ func (r *fkResolver) CurrentDatabase() string {
 // CurrentSearchPath implements the resolver.SchemaResolver interface.
 func (r *fkResolver) CurrentSearchPath() sessiondata.SearchPath {
 	return sessiondata.SearchPath{}
-}
-
-// CommonLookupFlags implements the resolver.SchemaResolver interface.
-func (r *fkResolver) CommonLookupFlags(required bool) tree.CommonLookupFlags {
-	return tree.CommonLookupFlags{}
 }
 
 // LookupObject implements the tree.ObjectNameExistingResolver interface.
@@ -437,6 +416,13 @@ func (r fkResolver) GetQualifiedTableNameByID(
 	return nil, errSchemaResolver
 }
 
+// GetQualifiedFunctionNameByID implements the resolver.SchemaResolver interface.
+func (r fkResolver) GetQualifiedFunctionNameByID(
+	ctx context.Context, id int64,
+) (*tree.FunctionName, error) {
+	return nil, errSchemaResolver
+}
+
 // ResolveFunction implements the resolver.SchemaResolver interface.
 func (r fkResolver) ResolveFunction(
 	ctx context.Context, name *tree.UnresolvedName, path tree.SearchPath,
@@ -447,6 +433,6 @@ func (r fkResolver) ResolveFunction(
 // ResolveFunctionByOID implements the resolver.SchemaResolver interface.
 func (r fkResolver) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (string, *tree.Overload, error) {
-	return "", nil, errSchemaResolver
+) (*tree.FunctionName, *tree.Overload, error) {
+	return nil, nil, errSchemaResolver
 }

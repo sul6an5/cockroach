@@ -529,7 +529,7 @@ FROM
 
 query error pq: st_mpointfromwkb\(\): error parsing EWKB: wkb: unknown byte order: 11000000
 WITH
-  with_111870 (col_664924) AS (SELECT * FROM (VALUES (NULL)) AS tab_397795 (col_664924))
+  with_111870 (col_664924) AS (SELECT * FROM (VALUES (true)) AS tab_397795 (col_664924))
 SELECT
   cte_ref_33032.col_664924 AS col_664951
 FROM
@@ -578,3 +578,90 @@ WHERE
         )
           AS tab_397813 (col_664948, col_664949) ON (tab_397806.col_664940) = (tab_397813.col_664948)
   );
+
+subtest regression_87733
+
+statement ok
+CREATE TABLE t87733a (a INT);
+CREATE TABLE t87733b (b INT);
+INSERT INTO t87733a VALUES (1)
+
+# Regression test for #87733. Do not panic when planning the RHS of an
+# apply-join that refers to a With expression transitively through another With
+# expression.
+query T
+WITH
+  t1 AS (SELECT a FROM t87733a),
+  t2 AS MATERIALIZED (SELECT a, b FROM t1 JOIN t87733b ON true)
+SELECT NULL
+FROM t1
+LEFT JOIN LATERAL (
+  WITH t3 AS (SELECT * FROM t2 WHERE t2.a = t1.a)
+  SELECT array_agg(CASE WHEN v = '' THEN b END)
+  FROM (
+    SELECT '' AS v, b FROM t3 ORDER BY b DESC
+  )
+) ON true;
+----
+NULL
+
+subtest regression_89601
+
+statement ok
+CREATE TABLE t89601 (i INT4);
+INSERT INTO t89601 VALUES (0)
+
+# Regression test for #89601. All with bindings should be added to the new
+# metadata when planning the RHS of an apply-join.
+statement ok
+SELECT NULL
+FROM t89601 t1, t89601 t2
+WHERE EXISTS(
+  SELECT NULL
+  FROM t89601 t3, t89601 t4
+  WHERE t3.i IN (
+     WITH w AS (SELECT NULL)
+     SELECT t4.i::INT8 FROM w
+  )
+)
+
+# Regression test for incorrectly using the RootTxn in apply join iterations
+# when the main query is using the LeafTxn (#97989).
+statement ok
+CREATE TABLE t1 (said, smid) AS VALUES (1, 1);
+CREATE TABLE t2 (aid, said, mid, pid) AS VALUES (1, 1, 1, 1);
+CREATE TABLE t3 (mid, smid) AS VALUES (1, 1);
+CREATE TABLE t4 (pid PRIMARY KEY) AS VALUES (1);
+CREATE TABLE t5 (said, smid) AS VALUES (1, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW v1 AS
+    WITH
+        cte1
+            AS (
+                SELECT
+                    aid, t4.pid
+                FROM
+                    t1
+                    INNER JOIN t2 ON t2.said = t1.said AND t2.mid = (SELECT mid FROM t3 WHERE smid = t1.smid)
+                    INNER JOIN t4 ON t4.pid = t2.pid
+                    INNER JOIN t3 ON t3.smid = t1.smid
+            ),
+        cte2
+            AS (
+                SELECT
+                    aid, t4.pid
+                FROM
+                    t5
+                    INNER JOIN t2 ON t2.said = t5.said AND t2.mid = (SELECT mid FROM t3 WHERE smid = t5.smid)
+                    INNER JOIN t4 ON t4.pid = t2.pid
+                    INNER JOIN t3 ON t3.smid = t5.smid
+            )
+    SELECT
+        aid, pid
+    FROM
+        (
+            SELECT aid, pid FROM cte1
+            UNION
+            SELECT aid, pid FROM cte2
+        );

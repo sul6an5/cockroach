@@ -233,6 +233,14 @@ SELECT ((_,) AS a) -- literals removed
 SELECT ((1,) AS _) -- identifiers removed
 
 parse
+SELECT (ROW(1) AS a, b)
+----
+SELECT ((1,) AS a, b) -- normalized!
+SELECT ((((1),) AS a, b)) -- fully parenthesized
+SELECT ((_,) AS a, b) -- literals removed
+SELECT ((1,) AS _, _) -- identifiers removed
+
+parse
 SELECT (SELECT 1)
 ----
 SELECT (SELECT 1)
@@ -311,6 +319,38 @@ SELECT ((1, 2, 3) AS a, b, c)
 SELECT ((((1), (2), (3)) AS a, b, c)) -- fully parenthesized
 SELECT ((_, _, __more1_10__) AS a, b) -- literals removed
 SELECT ((1, 2, 3) AS _, _, _) -- identifiers removed
+
+parse
+SELECT ((1, 2, 3) AS a)
+----
+SELECT ((1, 2, 3) AS a)
+SELECT ((((1), (2), (3)) AS a)) -- fully parenthesized
+SELECT ((_, _, __more1_10__) AS a) -- literals removed
+SELECT ((1, 2, 3) AS _) -- identifiers removed
+
+parse
+SELECT ((1, 2, 3) AS a, b)
+----
+SELECT ((1, 2, 3) AS a, b)
+SELECT ((((1), (2), (3)) AS a, b)) -- fully parenthesized
+SELECT ((_, _, __more1_10__) AS a, b) -- literals removed
+SELECT ((1, 2, 3) AS _, _) -- identifiers removed
+
+parse
+SELECT ((1, 2) AS a, b, c)
+----
+SELECT ((1, 2) AS a, b, c)
+SELECT ((((1), (2)) AS a, b, c)) -- fully parenthesized
+SELECT ((_, _) AS a, b, c) -- literals removed
+SELECT ((1, 2) AS _, _, _) -- identifiers removed
+
+parse
+SELECT ((1, 2, 3) AS a, b, c, d)
+----
+SELECT ((1, 2, 3) AS a, b, c, d)
+SELECT ((((1), (2), (3)) AS a, b, c, d)) -- fully parenthesized
+SELECT ((_, _, __more1_10__) AS a, b) -- literals removed
+SELECT ((1, 2, 3) AS _, _, _, _) -- identifiers removed
 
 parse
 SELECT ((1, 2, 3))
@@ -441,6 +481,26 @@ SELECT e'\n\\' -- normalized!
 SELECT (e'\n\\') -- fully parenthesized
 SELECT '_' -- literals removed
 SELECT e'\n\\' -- identifiers removed
+
+parse
+SELECT 'a'
+'b'
+----
+SELECT 'ab' -- normalized!
+SELECT ('ab') -- fully parenthesized
+SELECT '_' -- literals removed
+SELECT 'ab' -- identifiers removed
+
+parse
+SELECT 'a'
+
+
+'b'
+----
+SELECT 'ab' -- normalized!
+SELECT ('ab') -- fully parenthesized
+SELECT '_' -- literals removed
+SELECT 'ab' -- identifiers removed
 
 parse
 SELECT x'61'
@@ -603,20 +663,20 @@ SELECT BOOL '_', '_'::BOOL -- literals removed
 SELECT BOOL 'foo', 'foo'::BOOL -- identifiers removed
 
 parse
-SELECT BIT '10', '10'::BIT
+SELECT BIT '10', '10'::BIT, BIT(2) '10'
 ----
-SELECT BIT '10', '10'::BIT
-SELECT (BIT ('10')), (('10')::BIT) -- fully parenthesized
-SELECT BIT '_', '_'::BIT -- literals removed
-SELECT BIT '10', '10'::BIT -- identifiers removed
+SELECT BIT '10', '10'::BIT, BIT(2) '10'
+SELECT (BIT ('10')), (('10')::BIT), (BIT(2) ('10')) -- fully parenthesized
+SELECT BIT '_', '_'::BIT, BIT(2) '_' -- literals removed
+SELECT BIT '10', '10'::BIT, BIT(2) '10' -- identifiers removed
 
 parse
-SELECT VARBIT '1', '1'::VARBIT
+SELECT VARBIT '1', '1'::VARBIT, VARBIT(2) '01'
 ----
-SELECT VARBIT '1', '1'::VARBIT
-SELECT (VARBIT ('1')), (('1')::VARBIT) -- fully parenthesized
-SELECT VARBIT '_', '_'::VARBIT -- literals removed
-SELECT VARBIT '1', '1'::VARBIT -- identifiers removed
+SELECT VARBIT '1', '1'::VARBIT, VARBIT(2) '01'
+SELECT (VARBIT ('1')), (('1')::VARBIT), (VARBIT(2) ('01')) -- fully parenthesized
+SELECT VARBIT '_', '_'::VARBIT, VARBIT(2) '_' -- literals removed
+SELECT VARBIT '1', '1'::VARBIT, VARBIT(2) '01' -- identifiers removed
 
 parse
 SELECT INT2 'foo', 'foo'::INT2
@@ -685,28 +745,28 @@ SELECT DECIMAL 'foo' -- identifiers removed
 
 
 parse
-SELECT CHAR 'foo', 'foo'::CHAR
+SELECT CHAR 'foo', 'foo'::CHAR, CHAR(2) 'foo'
 ----
-SELECT CHAR 'foo', 'foo'::CHAR
-SELECT (CHAR ('foo')), (('foo')::CHAR) -- fully parenthesized
-SELECT CHAR '_', '_'::CHAR -- literals removed
-SELECT CHAR 'foo', 'foo'::CHAR -- identifiers removed
+SELECT CHAR 'foo', 'foo'::CHAR, CHAR(2) 'foo'
+SELECT (CHAR ('foo')), (('foo')::CHAR), (CHAR(2) ('foo')) -- fully parenthesized
+SELECT CHAR '_', '_'::CHAR, CHAR(2) '_' -- literals removed
+SELECT CHAR 'foo', 'foo'::CHAR, CHAR(2) 'foo' -- identifiers removed
 
 parse
-SELECT VARCHAR 'foo', 'foo'::VARCHAR
+SELECT VARCHAR 'foo', 'foo'::VARCHAR, VARCHAR(5) 'foo'
 ----
-SELECT VARCHAR 'foo', 'foo'::VARCHAR
-SELECT (VARCHAR ('foo')), (('foo')::VARCHAR) -- fully parenthesized
-SELECT VARCHAR '_', '_'::VARCHAR -- literals removed
-SELECT VARCHAR 'foo', 'foo'::VARCHAR -- identifiers removed
+SELECT VARCHAR 'foo', 'foo'::VARCHAR, VARCHAR(5) 'foo'
+SELECT (VARCHAR ('foo')), (('foo')::VARCHAR), (VARCHAR(5) ('foo')) -- fully parenthesized
+SELECT VARCHAR '_', '_'::VARCHAR, VARCHAR(5) '_' -- literals removed
+SELECT VARCHAR 'foo', 'foo'::VARCHAR, VARCHAR(5) 'foo' -- identifiers removed
 
 parse
-SELECT STRING 'foo', 'foo'::STRING
+SELECT STRING 'foo', 'foo'::STRING, STRING(9) 'foo'
 ----
-SELECT STRING 'foo', 'foo'::STRING
-SELECT (STRING ('foo')), (('foo')::STRING) -- fully parenthesized
-SELECT STRING '_', '_'::STRING -- literals removed
-SELECT STRING 'foo', 'foo'::STRING -- identifiers removed
+SELECT STRING 'foo', 'foo'::STRING, STRING(9) 'foo'
+SELECT (STRING ('foo')), (('foo')::STRING), (STRING(9) ('foo')) -- fully parenthesized
+SELECT STRING '_', '_'::STRING, STRING(9) '_' -- literals removed
+SELECT STRING 'foo', 'foo'::STRING, STRING(9) 'foo' -- identifiers removed
 
 parse
 SELECT BYTES 'foo', 'foo'::BYTES
@@ -1247,6 +1307,41 @@ SELECT 'a' AS "12345"
 SELECT ('a') AS "12345" -- fully parenthesized
 SELECT '_' AS "12345" -- literals removed
 SELECT 'a' AS _ -- identifiers removed
+
+parse
+SELECT 'a' AS "a""b"
+----
+SELECT 'a' AS "a""b"
+SELECT ('a') AS "a""b" -- fully parenthesized
+SELECT '_' AS "a""b" -- literals removed
+SELECT 'a' AS _ -- identifiers removed
+
+error
+SELECT 'a' AS "a"
+"b"
+----
+at or near "b": syntax error
+DETAIL: source SQL:
+SELECT 'a' AS "a"
+"b"
+^
+
+error
+SELECT 'a' AS "a"
+
+
+"b"
+----
+----
+at or near "b": syntax error
+DETAIL: source SQL:
+SELECT 'a' AS "a"
+
+
+"b"
+^
+----
+----
 
 parse
 SELECT 'a' AS clnm
@@ -1927,3 +2022,19 @@ OVERLAPS
 (DATE '2000-01-03')
                   ^
 HINT: try \h SELECT
+
+parse
+SELECT NOT ('a' ~ ANY (ARRAY['x']:::STRING[]))
+----
+SELECT NOT ('a' = ANY (ARRAY['x']:::STRING[])) -- normalized!
+SELECT (NOT (((('a') = ANY ((((ARRAY[('x')]):::STRING[]))))))) -- fully parenthesized
+SELECT NOT ('_' = ANY (ARRAY['_']:::STRING[])) -- literals removed
+SELECT NOT ('a' = ANY (ARRAY['x']:::STRING[])) -- identifiers removed
+
+parse
+SELECT ('a' !~ ANY (ARRAY['x']:::STRING[]))
+----
+SELECT ('a' !~ ANY (ARRAY['x']:::STRING[]))
+SELECT (((('a') !~ ANY ((((ARRAY[('x')]):::STRING[])))))) -- fully parenthesized
+SELECT ('_' !~ ANY (ARRAY['_']:::STRING[])) -- literals removed
+SELECT ('a' !~ ANY (ARRAY['x']:::STRING[])) -- identifiers removed

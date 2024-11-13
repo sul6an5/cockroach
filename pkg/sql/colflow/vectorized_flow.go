@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -196,16 +197,6 @@ type vectorizedFlow struct {
 		path string
 	}
 
-	testingInfo struct {
-		// numClosers is the number of components in the flow that implement
-		// Close. This is used for testing assertions.
-		numClosers int32
-		// numClosed is a pointer to an int32 that is updated atomically when a
-		// component's Close method is called. This is used for testing
-		// assertions.
-		numClosed *int32
-	}
-
 	testingKnobs struct {
 		// onSetupFlow is a testing knob that is called before calling
 		// creator.setupFlow with the given creator.
@@ -243,7 +234,6 @@ func (f *vectorizedFlow) Setup(
 	if execstats.ShouldCollectStats(ctx, f.FlowCtx.CollectStats) {
 		recordingStats = true
 	}
-	helper := newVectorizedFlowCreatorHelper(f.FlowBase)
 
 	diskQueueCfg := colcontainer.DiskQueueCfg{
 		FS:                  f.Cfg.TempFS,
@@ -259,8 +249,9 @@ func (f *vectorizedFlow) Setup(
 		f.Cfg.VecFDSemaphore, f.Cfg.Metrics.VecOpenFDs, &flowCtx.EvalCtx.Settings.SV,
 	)
 	f.creator = newVectorizedFlowCreator(
-		helper,
-		vectorizedRemoteComponentCreator{},
+		f.FlowBase,
+		nil, /* helper */
+		nil, /* componentCreator */
 		recordingStats,
 		f.Gateway,
 		f.GetWaitGroup(),
@@ -276,7 +267,7 @@ func (f *vectorizedFlow) Setup(
 	if f.testingKnobs.onSetupFlow != nil {
 		f.testingKnobs.onSetupFlow(f.creator)
 	}
-	opChains, batchFlowCoordinator, err := f.creator.setupFlow(ctx, flowCtx, spec.Processors, f.GetLocalProcessors(), opt)
+	opChains, batchFlowCoordinator, err := f.creator.setupFlow(ctx, flowCtx, spec.Processors, f.GetLocalProcessors(), f.GetLocalVectorSources(), opt)
 	if err != nil {
 		// It is (theoretically) possible that some of the memory monitoring
 		// infrastructure was created even in case of an error, and we need to
@@ -287,8 +278,6 @@ func (f *vectorizedFlow) Setup(
 		return ctx, nil, err
 	}
 	f.batchFlowCoordinator = batchFlowCoordinator
-	f.testingInfo.numClosers = f.creator.numClosers
-	f.testingInfo.numClosed = &f.creator.numClosed
 	f.SetStartedGoroutines(f.creator.operatorConcurrency)
 	log.VEventf(ctx, 2, "vectorized flow setup succeeded")
 	if !f.IsLocal() {
@@ -299,18 +288,35 @@ func (f *vectorizedFlow) Setup(
 	return ctx, opChains, nil
 }
 
+// Resume is part of the Flow interface.
+func (f *vectorizedFlow) Resume(recv execinfra.RowReceiver) {
+	if f.batchFlowCoordinator != nil {
+		recv.Push(
+			nil, /* row */
+			&execinfrapb.ProducerMetadata{
+				Err: errors.AssertionFailedf(
+					"batchFlowCoordinator should be nil for vectorizedFlow",
+				)})
+		recv.ProducerDone()
+		return
+	}
+	f.FlowBase.Resume(recv)
+}
+
 // Run is part of the Flow interface.
-func (f *vectorizedFlow) Run(ctx context.Context, doneFn func()) {
+func (f *vectorizedFlow) Run(ctx context.Context, noWait bool) {
 	if f.batchFlowCoordinator == nil {
 		// If we didn't create a BatchFlowCoordinator, then we have a processor
 		// as the root, so we run this flow with the default implementation.
-		f.FlowBase.Run(ctx, doneFn)
+		f.FlowBase.Run(ctx, noWait)
 		return
 	}
 
-	defer f.Wait()
+	if !noWait {
+		defer f.Wait()
+	}
 
-	if err := f.StartInternal(ctx, nil /* processors */, doneFn); err != nil {
+	if err := f.StartInternal(ctx, nil /* processors */, nil /* outputs */); err != nil {
 		f.GetRowSyncFlowConsumer().Push(nil /* row */, &execinfrapb.ProducerMetadata{Err: err})
 		f.GetRowSyncFlowConsumer().ProducerDone()
 		return
@@ -348,11 +354,6 @@ func (f *vectorizedFlow) GetPath(ctx context.Context) string {
 	return f.tempStorage.path
 }
 
-// IsVectorized is part of the flowinfra.Flow interface.
-func (f *vectorizedFlow) IsVectorized() bool {
-	return true
-}
-
 // ConcurrentTxnUse is part of the flowinfra.Flow interface. It is conservative
 // in that it returns that there is concurrent txn use as soon as any operator
 // concurrency is detected. This should be inconsequential for local flows that
@@ -371,20 +372,27 @@ func (f *vectorizedFlow) Release() {
 	vectorizedFlowPool.Put(f)
 }
 
+const (
+	vectorizedFlowOverhead        = int64(unsafe.Sizeof(vectorizedFlow{}))
+	vectorizedFlowCreatorOverhead = int64(unsafe.Sizeof(vectorizedFlowCreator{}))
+	fdCountingSemaphoreOverhead   = int64(unsafe.Sizeof(fdCountingSemaphore{}))
+)
+
+// MemUsage is part of the flowinfra.Flow interface.
+func (f *vectorizedFlow) MemUsage() int64 {
+	return f.FlowBase.MemUsage() + vectorizedFlowOverhead +
+		vectorizedFlowCreatorOverhead + fdCountingSemaphoreOverhead
+}
+
 // Cleanup is part of the flowinfra.Flow interface.
 func (f *vectorizedFlow) Cleanup(ctx context.Context) {
-	// This cleans up all the memory and disk monitoring of the vectorized flow.
-	f.creator.cleanup(ctx)
+	startCleanup, endCleanup := f.FlowBase.GetOnCleanupFns()
+	startCleanup()
+	defer endCleanup()
 
-	if buildutil.CrdbTestBuild && f.FlowBase.Started() {
-		// Check that all closers have been closed. Note that we don't check
-		// this in case the flow was never started in the first place (it is ok
-		// to not check this since closers haven't allocated any resources in
-		// such a case).
-		if numClosed := atomic.LoadInt32(f.testingInfo.numClosed); numClosed != f.testingInfo.numClosers {
-			colexecerror.InternalError(errors.AssertionFailedf("expected %d components to be closed, but found that only %d were", f.testingInfo.numClosers, numClosed))
-		}
-	}
+	// This cleans up all the memory and disk monitoring of the vectorized flow
+	// as well as closes all the closers.
+	f.creator.cleanup(ctx)
 
 	f.tempStorage.Lock()
 	created := f.tempStorage.path != ""
@@ -422,7 +430,7 @@ func (s *vectorizedFlowCreator) wrapWithVectorizedStatsCollectorBase(
 	component execinfrapb.ComponentID,
 	monitors []*mon.BytesMonitor,
 ) error {
-	inputWatch := timeutil.NewStopWatch()
+	inputWatch := timeutil.NewStopWatchWithCPU()
 	var memMonitors, diskMonitors []*mon.BytesMonitor
 	for _, m := range monitors {
 		if m.Resource() == mon.DiskResource {
@@ -471,11 +479,11 @@ func (s *vectorizedFlowCreator) makeGetStatsFnForOutbox(
 	flowCtx *execinfra.FlowCtx,
 	statsCollectors []colexecop.VectorizedStatsCollector,
 	originSQLInstanceID base.SQLInstanceID,
-) func() []*execinfrapb.ComponentStats {
+) func(context.Context) []*execinfrapb.ComponentStats {
 	if !s.recordingStats {
 		return nil
 	}
-	return func() []*execinfrapb.ComponentStats {
+	return func(ctx context.Context) []*execinfrapb.ComponentStats {
 		lastOutboxOnRemoteNode := atomic.AddInt32(&s.numOutboxesDrained, 1) == atomic.LoadInt32(&s.numOutboxes) && !s.isGatewayNode
 		numResults := len(statsCollectors)
 		if lastOutboxOnRemoteNode {
@@ -492,8 +500,9 @@ func (s *vectorizedFlowCreator) makeGetStatsFnForOutbox(
 			result = append(result, &execinfrapb.ComponentStats{
 				Component: execinfrapb.FlowComponentID(originSQLInstanceID, flowCtx.ID),
 				FlowStats: execinfrapb.FlowStats{
-					MaxMemUsage:  optional.MakeUint(uint64(flowCtx.EvalCtx.Mon.MaximumBytes())),
+					MaxMemUsage:  optional.MakeUint(uint64(flowCtx.Mon.MaximumBytes())),
 					MaxDiskUsage: optional.MakeUint(uint64(flowCtx.DiskMonitor.MaximumBytes())),
+					ConsumedRU:   optional.MakeUint(uint64(flowCtx.TenantCPUMonitor.EndCollection(ctx))),
 				},
 			})
 		}
@@ -507,7 +516,6 @@ type runFn func(_ context.Context, flowCtxCancel context.CancelFunc)
 // infrastructure to be run asynchronously as well as to perform some sanity
 // checks.
 type flowCreatorHelper interface {
-	execreleasable.Releasable
 	// addStreamEndpoint stores information about an inbound stream.
 	addStreamEndpoint(execinfrapb.StreamID, *colrpc.Inbox, *sync.WaitGroup)
 	// checkInboundStreamID checks that the provided stream ID has not been seen
@@ -518,7 +526,7 @@ type flowCreatorHelper interface {
 	accumulateAsyncComponent(runFn)
 	// addFlowCoordinator adds the FlowCoordinator to the flow. This is only
 	// done on the gateway node.
-	addFlowCoordinator(coordinator *FlowCoordinator)
+	addFlowCoordinator(coordinator *FlowCoordinator, output execinfra.RowReceiver)
 	// getCtxDone returns done channel of the context of this flow.
 	getFlowCtxDone() <-chan struct{}
 	// getCancelFlowFn returns a flow cancellation function.
@@ -535,9 +543,10 @@ type admissionOptions struct {
 type remoteComponentCreator interface {
 	newOutbox(
 		allocator *colmem.Allocator,
+		converterMemAcc *mon.BoundAccount,
 		input colexecargs.OpWithMetaInfo,
 		typs []*types.T,
-		getStats func() []*execinfrapb.ComponentStats,
+		getStats func(context.Context) []*execinfrapb.ComponentStats,
 	) (*colrpc.Outbox, error)
 	newInbox(
 		allocator *colmem.Allocator,
@@ -552,11 +561,12 @@ type vectorizedRemoteComponentCreator struct{}
 
 func (vectorizedRemoteComponentCreator) newOutbox(
 	allocator *colmem.Allocator,
+	converterMemAcc *mon.BoundAccount,
 	input colexecargs.OpWithMetaInfo,
 	typs []*types.T,
-	getStats func() []*execinfrapb.ComponentStats,
+	getStats func(context.Context) []*execinfrapb.ComponentStats,
 ) (*colrpc.Outbox, error) {
-	return colrpc.NewOutbox(allocator, input, typs, getStats)
+	return colrpc.NewOutbox(allocator, converterMemAcc, input, typs, getStats)
 }
 
 func (vectorizedRemoteComponentCreator) newInbox(
@@ -579,6 +589,12 @@ func (vectorizedRemoteComponentCreator) newInbox(
 type vectorizedFlowCreator struct {
 	flowCreatorHelper
 	remoteComponentCreator
+
+	// These two fields should not be accessed directly - instead, the embedded
+	// interfaces above should be used. These two structs are embedded in order
+	// to avoid allocations on the main code path.
+	fcHelper  vectorizedFlowCreatorHelper
+	rcCreator vectorizedRemoteComponentCreator
 
 	// rowReceiver is always set.
 	rowReceiver execinfra.RowReceiver
@@ -616,6 +632,11 @@ type vectorizedFlowCreator struct {
 	opChains execopnode.OpChains
 	// operatorConcurrency is set if any operators are executed in parallel.
 	operatorConcurrency bool
+	// closers will be closed during the flow cleanup. It is safe to do so in
+	// the main flow goroutine since all other goroutines that might have used
+	// these objects must have exited by the time Cleanup() is called -
+	// Flow.Wait() ensures that.
+	closers colexecop.Closers
 	// releasables contains all components that should be released back to their
 	// pools during the flow cleanup.
 	releasables []execreleasable.Releasable
@@ -623,11 +644,6 @@ type vectorizedFlowCreator struct {
 	monitorRegistry colexecargs.MonitorRegistry
 	diskQueueCfg    colcontainer.DiskQueueCfg
 	fdSemaphore     semaphore.Semaphore
-
-	// numClosers and numClosed are used to assert during testing that the
-	// expected number of components are closed.
-	numClosers int32
-	numClosed  int32
 }
 
 var _ execreleasable.Releasable = &vectorizedFlowCreator{}
@@ -642,7 +658,15 @@ var vectorizedFlowCreatorPool = sync.Pool{
 	},
 }
 
+// newVectorizedFlowCreator returns a new vectorizedFlowCreator.
+//
+// Only one of flowBase and helper should be set, if the former, then the
+// embedded vectorizedFlowCreatorHelper is updated with the flowBase is used.
+//
+// componentCreator can be nil in which case the embedded
+// vectorizedRemoteComponentCreator is used.
 func newVectorizedFlowCreator(
+	flowBase *flowinfra.FlowBase,
 	helper flowCreatorHelper,
 	componentCreator remoteComponentCreator,
 	recordingStats bool,
@@ -659,31 +683,52 @@ func newVectorizedFlowCreator(
 ) *vectorizedFlowCreator {
 	creator := vectorizedFlowCreatorPool.Get().(*vectorizedFlowCreator)
 	*creator = vectorizedFlowCreator{
-		flowCreatorHelper:      helper,
-		remoteComponentCreator: componentCreator,
-		streamIDToInputOp:      creator.streamIDToInputOp,
-		streamIDToSpecIdx:      creator.streamIDToSpecIdx,
-		recordingStats:         recordingStats,
-		isGatewayNode:          isGatewayNode,
-		waitGroup:              waitGroup,
-		rowReceiver:            rowSyncFlowConsumer,
-		batchReceiver:          batchSyncFlowConsumer,
-		podNodeDialer:          podNodeDialer,
-		flowID:                 flowID,
-		exprHelper:             creator.exprHelper,
-		typeResolver:           typeResolver,
-		admissionInfo:          admissionInfo,
-		procIdxQueue:           creator.procIdxQueue,
-		opChains:               creator.opChains,
-		releasables:            creator.releasables,
-		monitorRegistry:        creator.monitorRegistry,
-		diskQueueCfg:           diskQueueCfg,
-		fdSemaphore:            fdSemaphore,
+		streamIDToInputOp: creator.streamIDToInputOp,
+		streamIDToSpecIdx: creator.streamIDToSpecIdx,
+		recordingStats:    recordingStats,
+		isGatewayNode:     isGatewayNode,
+		waitGroup:         waitGroup,
+		rowReceiver:       rowSyncFlowConsumer,
+		batchReceiver:     batchSyncFlowConsumer,
+		podNodeDialer:     podNodeDialer,
+		flowID:            flowID,
+		exprHelper:        creator.exprHelper,
+		typeResolver:      typeResolver,
+		admissionInfo:     admissionInfo,
+		procIdxQueue:      creator.procIdxQueue,
+		opChains:          creator.opChains,
+		releasables:       creator.releasables,
+		monitorRegistry:   creator.monitorRegistry,
+		diskQueueCfg:      diskQueueCfg,
+		fdSemaphore:       fdSemaphore,
+	}
+	if flowBase != nil {
+		// On the main code path, update the embedded helper with the provided
+		// FlowBase and use it.
+		creator.fcHelper.f = flowBase
+		creator.flowCreatorHelper = &creator.fcHelper
+	} else {
+		creator.flowCreatorHelper = helper
+	}
+	if componentCreator == nil {
+		// On the main code path, use the embedded component creator.
+		creator.remoteComponentCreator = creator.rcCreator
+	} else {
+		creator.remoteComponentCreator = componentCreator
 	}
 	return creator
 }
 
 func (s *vectorizedFlowCreator) cleanup(ctx context.Context) {
+	if err := colexecerror.CatchVectorizedRuntimeError(func() {
+		for _, closer := range s.closers {
+			if err := closer.Close(ctx); err != nil && log.V(1) {
+				log.Infof(ctx, "error closing Closer: %v", err)
+			}
+		}
+	}); err != nil && log.V(1) {
+		log.Infof(ctx, "runtime error closing the closers: %v", err)
+	}
 	s.monitorRegistry.Close(ctx)
 }
 
@@ -695,7 +740,6 @@ func (s *vectorizedFlowCreator) Release() {
 	for k := range s.streamIDToSpecIdx {
 		delete(s.streamIDToSpecIdx, k)
 	}
-	s.flowCreatorHelper.Release()
 	for _, r := range s.releasables {
 		r.Release()
 	}
@@ -704,6 +748,9 @@ func (s *vectorizedFlowCreator) Release() {
 	// garbage-collected.
 	for i := range s.opChains {
 		s.opChains[i] = nil
+	}
+	for i := range s.closers {
+		s.closers[i] = nil
 	}
 	for i := range s.releasables {
 		s.releasables[i] = nil
@@ -720,16 +767,17 @@ func (s *vectorizedFlowCreator) Release() {
 		// prime it for reuse.
 		procIdxQueue:    s.procIdxQueue[:0],
 		opChains:        s.opChains[:0],
+		closers:         s.closers[:0],
 		releasables:     s.releasables[:0],
 		monitorRegistry: s.monitorRegistry,
 	}
 	vectorizedFlowCreatorPool.Put(s)
 }
 
-// setupRemoteOutputStream sets up an Outbox that will operate according to
-// the given StreamEndpointSpec. It will also drain all MetadataSources in the
-// metadataSources.
-// NOTE: The caller must not reuse the metadataSources and toClose.
+// setupRemoteOutputStream sets up a colrpc.Outbox that will operate according
+// to the given execinfrapb.StreamEndpointSpec. It will also drain all
+// MetadataSources in op.
+// NOTE: The caller must not reuse the metadata sources.
 func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
@@ -737,10 +785,11 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	outputTyps []*types.T,
 	stream *execinfrapb.StreamEndpointSpec,
 	factory coldata.ColumnFactory,
-	getStats func() []*execinfrapb.ComponentStats,
+	getStats func(context.Context) []*execinfrapb.ComponentStats,
 ) (execopnode.OpNode, error) {
 	outbox, err := s.remoteComponentCreator.newOutbox(
 		colmem.NewAllocator(ctx, s.monitorRegistry.NewStreamingMemAccount(flowCtx), factory),
+		s.monitorRegistry.NewStreamingMemAccount(flowCtx),
 		op, outputTyps, getStats,
 	)
 	if err != nil {
@@ -764,14 +813,11 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 }
 
 // setupRouter sets up a vectorized hash router according to the output router
-// spec. If the outputs are local, these are added to s.streamIDToInputOp to be
-// used as inputs in further planning. metadataSources is passed along to any
-// outboxes created to be drained, or stored in streamIDToInputOp for any local
-// outputs to pass that responsibility along. In any case, metadataSources will
-// always be fully consumed.
+// spec. The router takes the responsibility of draining the metadata sources
+// from input.MetadataSources.
 // NOTE: This method supports only BY_HASH routers. Callers should handle
 // PASS_THROUGH routers separately.
-// NOTE: The caller must not reuse the metadataSources and toClose.
+// NOTE: The caller must not reuse the metadata sources.
 func (s *vectorizedFlowCreator) setupRouter(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
@@ -794,15 +840,21 @@ func (s *vectorizedFlowCreator) setupRouter(
 	}
 	mmName := "hash-router-[" + streamIDs + "]"
 
-	hashRouterMemMonitor, accounts := s.monitorRegistry.CreateUnlimitedMemAccountsWithName(ctx, flowCtx, mmName, len(output.Streams))
-	allocators := make([]*colmem.Allocator, len(output.Streams))
+	numOutputs := len(output.Streams)
+	// We need to create two memory accounts for each output (one for the
+	// allocator and another one for the converter).
+	hashRouterMemMonitor, accounts := s.monitorRegistry.CreateUnlimitedMemAccountsWithName(
+		ctx, flowCtx, mmName, 2*numOutputs,
+	)
+	allocatorAccounts, converterAccounts := accounts[:numOutputs], accounts[numOutputs:]
+	allocators := make([]*colmem.Allocator, numOutputs)
 	for i := range allocators {
-		allocators[i] = colmem.NewAllocator(ctx, accounts[i], factory)
+		allocators[i] = colmem.NewAllocator(ctx, allocatorAccounts[i], factory)
 	}
-	diskMon, diskAccounts := s.monitorRegistry.CreateDiskAccounts(ctx, flowCtx, mmName, len(output.Streams))
+	diskMon, diskAccounts := s.monitorRegistry.CreateDiskAccounts(ctx, flowCtx, mmName, numOutputs)
 	router, outputs := NewHashRouter(
 		allocators, input, outputTyps, output.HashColumns, execinfra.GetWorkMemLimit(flowCtx),
-		s.diskQueueCfg, s.fdSemaphore, diskAccounts,
+		s.diskQueueCfg, s.fdSemaphore, diskAccounts, converterAccounts,
 	)
 	runRouter := func(ctx context.Context, _ context.CancelFunc) {
 		router.Run(logtags.AddTag(ctx, "hashRouterID", streamIDs))
@@ -811,6 +863,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 
 	foundLocalOutput := false
 	for i, op := range outputs {
+		s.closers = append(s.closers, op)
 		if buildutil.CrdbTestBuild {
 			op = colexec.NewInvariantsChecker(op)
 		}
@@ -819,13 +872,10 @@ func (s *vectorizedFlowCreator) setupRouter(
 		case execinfrapb.StreamEndpointSpec_SYNC_RESPONSE:
 			return errors.Errorf("unexpected sync response output when setting up router")
 		case execinfrapb.StreamEndpointSpec_REMOTE:
-			// Note that here we pass in nil 'toClose' slice because hash
-			// router is responsible for closing all of the idempotent closers.
 			if _, err := s.setupRemoteOutputStream(
 				ctx, flowCtx, colexecargs.OpWithMetaInfo{
 					Root:            op,
 					MetadataSources: colexecop.MetadataSources{op},
-					ToClose:         colexecop.Closers{op},
 				}, outputTyps, stream, factory, nil, /* getStats */
 			); err != nil {
 				return err
@@ -835,8 +885,6 @@ func (s *vectorizedFlowCreator) setupRouter(
 			opWithMetaInfo := colexecargs.OpWithMetaInfo{
 				Root:            op,
 				MetadataSources: colexecop.MetadataSources{op},
-				// input.ToClose will be closed by the hash router.
-				ToClose: colexecop.Closers{op},
 			}
 			if s.recordingStats {
 				mons := []*mon.BytesMonitor{hashRouterMemMonitor, diskMon}
@@ -950,20 +998,27 @@ func (s *vectorizedFlowCreator) setupInput(
 			os := colexec.NewOrderedSynchronizer(
 				colmem.NewAllocator(ctx, s.monitorRegistry.NewStreamingMemAccount(flowCtx), factory),
 				execinfra.GetWorkMemLimit(flowCtx), inputStreamOps,
-				input.ColumnTypes, execinfrapb.ConvertToColumnOrdering(input.Ordering),
+				input.ColumnTypes, execinfrapb.ConvertToColumnOrdering(input.Ordering), 0, /* tuplesToMerge */
 			)
 			opWithMetaInfo = colexecargs.OpWithMetaInfo{
 				Root:            os,
 				MetadataSources: colexecop.MetadataSources{os},
-				ToClose:         colexecop.Closers{os},
 			}
+			s.closers = append(s.closers, os)
 		} else if input.Type == execinfrapb.InputSyncSpec_SERIAL_UNORDERED || opt == flowinfra.FuseAggressively {
-			sync := colexec.NewSerialUnorderedSynchronizer(inputStreamOps)
+			var err error
+			if input.EnforceHomeRegionError != nil {
+				err = input.EnforceHomeRegionError.ErrorDetail(ctx)
+				if flowCtx.EvalCtx.SessionData().EnforceHomeRegionFollowerReadsEnabled {
+					err = execinfra.NewDynamicQueryHasNoHomeRegionError(err)
+				}
+			}
+			sync := colexec.NewSerialUnorderedSynchronizer(inputStreamOps, input.EnforceHomeRegionStreamExclusiveUpperBound, err)
 			opWithMetaInfo = colexecargs.OpWithMetaInfo{
 				Root:            sync,
 				MetadataSources: colexecop.MetadataSources{sync},
-				ToClose:         colexecop.Closers{sync},
 			}
+			s.closers = append(s.closers, sync)
 		} else {
 			// Note that if we have opt == flowinfra.FuseAggressively, then we
 			// must use the serial unordered sync above in order to remove any
@@ -974,8 +1029,8 @@ func (s *vectorizedFlowCreator) setupInput(
 			opWithMetaInfo = colexecargs.OpWithMetaInfo{
 				Root:            sync,
 				MetadataSources: colexecop.MetadataSources{sync},
-				ToClose:         colexecop.Closers{sync},
 			}
+			s.closers = append(s.closers, sync)
 			s.operatorConcurrency = true
 			// Don't use the unordered synchronizer's inputs for stats collection
 			// given that they run concurrently. The stall time will be collected
@@ -1005,10 +1060,10 @@ func (s *vectorizedFlowCreator) setupInput(
 }
 
 // setupOutput sets up any necessary infrastructure according to the output spec
-// of pspec. The metadataSources and toClose slices are fully consumed by either
-// passing them to an outbox or HashRouter to be drained/closed, or storing them
-// in streamIDToInputOp with the given op to be processed later.
-// NOTE: The caller must not reuse the metadataSources and toClose.
+// of pspec. The metadata sources are fully consumed by either passing them to
+// an outbox or HashRouter to be drained, or storing them in streamIDToInputOp
+// with the given op to be processed later.
+// NOTE: The caller must not reuse the metadata sources.
 func (s *vectorizedFlowCreator) setupOutput(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
@@ -1067,15 +1122,9 @@ func (s *vectorizedFlowCreator) setupOutput(
 			s.releasables = append(s.releasables, s.batchFlowCoordinator)
 		} else {
 			// We need to use the row receiving output.
-			if input != nil {
-				// We successfully removed the columnarizer.
-				if buildutil.CrdbTestBuild {
-					// That columnarizer was added as a closer, so we need to
-					// decrement the number of expected closers.
-					s.numClosers--
-				}
-			} else {
-				input = colexec.NewMaterializerNoEvalCtxCopy(
+			if input == nil {
+				// We couldn't remove the columnarizer.
+				input = colexec.NewMaterializer(
 					colmem.NewAllocator(ctx, s.monitorRegistry.NewStreamingMemAccount(flowCtx), factory),
 					flowCtx,
 					pspec.ProcessorID,
@@ -1089,7 +1138,6 @@ func (s *vectorizedFlowCreator) setupOutput(
 				flowCtx,
 				pspec.ProcessorID,
 				input,
-				s.rowReceiver,
 				s.getCancelFlowFn(),
 			)
 			// The flow coordinator is a root of its operator chain.
@@ -1097,7 +1145,7 @@ func (s *vectorizedFlowCreator) setupOutput(
 			// NOTE: we don't append f to s.releasables because addFlowCoordinator
 			// adds the FlowCoordinator to FlowBase.processors, which ensures that
 			// it is later released in FlowBase.Cleanup.
-			s.addFlowCoordinator(f)
+			s.addFlowCoordinator(f, s.rowReceiver)
 		}
 
 	default:
@@ -1106,24 +1154,12 @@ func (s *vectorizedFlowCreator) setupOutput(
 	return nil
 }
 
-// callbackCloser is a utility struct that implements the Closer interface by
-// calling the provided callback.
-type callbackCloser struct {
-	closeCb func(context.Context) error
-}
-
-var _ colexecop.Closer = &callbackCloser{}
-
-// Close implements the Closer interface.
-func (c *callbackCloser) Close(ctx context.Context) error {
-	return c.closeCb(ctx)
-}
-
 func (s *vectorizedFlowCreator) setupFlow(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorSpecs []execinfrapb.ProcessorSpec,
 	localProcessors []execinfra.LocalProcessor,
+	localVectorSources map[int32]any,
 	opt flowinfra.FuseOpt,
 ) (opChains execopnode.OpChains, batchFlowCoordinator *BatchFlowCoordinator, err error) {
 	if vecErr := colexecerror.CatchVectorizedRuntimeError(func() {
@@ -1176,6 +1212,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 				StreamingMemAccount:  s.monitorRegistry.NewStreamingMemAccount(flowCtx),
 				ProcessorConstructor: rowexec.NewProcessor,
 				LocalProcessors:      localProcessors,
+				LocalVectorSources:   localVectorSources,
 				DiskQueueCfg:         s.diskQueueCfg,
 				FDSemaphore:          s.fdSemaphore,
 				ExprHelper:           s.exprHelper,
@@ -1198,24 +1235,9 @@ func (s *vectorizedFlowCreator) setupFlow(
 				err = errors.Wrapf(err, "unable to vectorize execution plan")
 				return
 			}
+			s.closers = append(s.closers, result.ToClose...)
 			if flowCtx.EvalCtx.SessionData().TestingVectorizeInjectPanics {
 				result.Root = newPanicInjector(result.Root)
-			}
-			if buildutil.CrdbTestBuild {
-				toCloseCopy := append(colexecop.Closers{}, result.ToClose...)
-				for i := range toCloseCopy {
-					func(idx int) {
-						closed := false
-						result.ToClose[idx] = &callbackCloser{closeCb: func(ctx context.Context) error {
-							if !closed {
-								closed = true
-								atomic.AddInt32(&s.numClosed, 1)
-							}
-							return toCloseCopy[idx].Close(ctx)
-						}}
-					}(i)
-				}
-				s.numClosers += int32(len(result.ToClose))
 			}
 
 			if s.recordingStats {
@@ -1301,24 +1323,11 @@ func (s vectorizedInboundStreamHandler) Timeout(err error) {
 // vectorized infrastructure to be actually run.
 type vectorizedFlowCreatorHelper struct {
 	f          *flowinfra.FlowBase
-	processors []execinfra.Processor
+	processors [1]execinfra.Processor
+	outputs    [1]execinfra.RowReceiver
 }
 
 var _ flowCreatorHelper = &vectorizedFlowCreatorHelper{}
-
-var vectorizedFlowCreatorHelperPool = sync.Pool{
-	New: func() interface{} {
-		return &vectorizedFlowCreatorHelper{
-			processors: make([]execinfra.Processor, 0, 1),
-		}
-	},
-}
-
-func newVectorizedFlowCreatorHelper(f *flowinfra.FlowBase) *vectorizedFlowCreatorHelper {
-	helper := vectorizedFlowCreatorHelperPool.Get().(*vectorizedFlowCreatorHelper)
-	helper.f = f
-	return helper
-}
 
 func (r *vectorizedFlowCreatorHelper) addStreamEndpoint(
 	streamID execinfrapb.StreamID, inbox *colrpc.Inbox, wg *sync.WaitGroup,
@@ -1336,21 +1345,20 @@ func (r *vectorizedFlowCreatorHelper) checkInboundStreamID(sid execinfrapb.Strea
 func (r *vectorizedFlowCreatorHelper) accumulateAsyncComponent(run runFn) {
 	r.f.AddStartable(
 		flowinfra.StartableFn(func(ctx context.Context, wg *sync.WaitGroup, flowCtxCancel context.CancelFunc) {
-			if wg != nil {
-				wg.Add(1)
-			}
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
 				run(ctx, flowCtxCancel)
-				if wg != nil {
-					wg.Done()
-				}
 			}()
 		}))
 }
 
-func (r *vectorizedFlowCreatorHelper) addFlowCoordinator(f *FlowCoordinator) {
-	r.processors = append(r.processors, f)
-	r.f.SetProcessors(r.processors)
+func (r *vectorizedFlowCreatorHelper) addFlowCoordinator(
+	f *FlowCoordinator, output execinfra.RowReceiver,
+) {
+	r.processors[0] = f
+	r.outputs[0] = output
+	_ = r.f.SetProcessorsAndOutputs(r.processors[:1], r.outputs[:1])
 }
 
 func (r *vectorizedFlowCreatorHelper) getFlowCtxDone() <-chan struct{} {
@@ -1361,20 +1369,6 @@ func (r *vectorizedFlowCreatorHelper) getCancelFlowFn() context.CancelFunc {
 	return r.f.GetCancelFlowFn()
 }
 
-func (r *vectorizedFlowCreatorHelper) Release() {
-	// Note that processors here can only be of 0 or 1 length, but always of
-	// 1 capacity (only the flow coordinator can be appended to this slice).
-	// Unset the slot so that we don't keep the reference to the old flow
-	// coordinator.
-	if len(r.processors) == 1 {
-		r.processors[0] = nil
-	}
-	*r = vectorizedFlowCreatorHelper{
-		processors: r.processors[:0],
-	}
-	vectorizedFlowCreatorHelperPool.Put(r)
-}
-
 // noopFlowCreatorHelper is a flowCreatorHelper that only performs sanity
 // checks.
 type noopFlowCreatorHelper struct {
@@ -1383,16 +1377,10 @@ type noopFlowCreatorHelper struct {
 
 var _ flowCreatorHelper = &noopFlowCreatorHelper{}
 
-var noopFlowCreatorHelperPool = sync.Pool{
-	New: func() interface{} {
-		return &noopFlowCreatorHelper{
-			inboundStreams: make(map[execinfrapb.StreamID]struct{}),
-		}
-	},
-}
-
 func newNoopFlowCreatorHelper() *noopFlowCreatorHelper {
-	return noopFlowCreatorHelperPool.Get().(*noopFlowCreatorHelper)
+	return &noopFlowCreatorHelper{
+		inboundStreams: make(map[execinfrapb.StreamID]struct{}),
+	}
 }
 
 func (r *noopFlowCreatorHelper) addStreamEndpoint(
@@ -1410,7 +1398,7 @@ func (r *noopFlowCreatorHelper) checkInboundStreamID(sid execinfrapb.StreamID) e
 
 func (r *noopFlowCreatorHelper) accumulateAsyncComponent(runFn) {}
 
-func (r *noopFlowCreatorHelper) addFlowCoordinator(coordinator *FlowCoordinator) {}
+func (r *noopFlowCreatorHelper) addFlowCoordinator(*FlowCoordinator, execinfra.RowReceiver) {}
 
 func (r *noopFlowCreatorHelper) getFlowCtxDone() <-chan struct{} {
 	return nil
@@ -1418,13 +1406,6 @@ func (r *noopFlowCreatorHelper) getFlowCtxDone() <-chan struct{} {
 
 func (r *noopFlowCreatorHelper) getCancelFlowFn() context.CancelFunc {
 	return nil
-}
-
-func (r *noopFlowCreatorHelper) Release() {
-	for k := range r.inboundStreams {
-		delete(r.inboundStreams, k)
-	}
-	noopFlowCreatorHelperPool.Put(r)
 }
 
 // IsSupported returns whether a flow specified by spec can be vectorized.

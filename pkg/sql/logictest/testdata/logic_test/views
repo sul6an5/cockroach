@@ -4,7 +4,8 @@ statement ok
 SET CLUSTER SETTING sql.cross_db_views.enabled = TRUE
 
 statement ok
-CREATE TABLE t (a INT PRIMARY KEY, b INT)
+CREATE TABLE t (a INT PRIMARY KEY, b INT);
+CREATE TABLE u (a INT PRIMARY KEY, b INT);
 
 let $t_id
 SELECT id FROM system.namespace WHERE name='t'
@@ -21,12 +22,12 @@ CREATE VIEW v1 AS SELECT a, b FROM t
 statement error pgcode 42P07 relation \"test.public.t\" already exists
 CREATE VIEW t AS SELECT a, b FROM t
 
-# view statement ignored if other way around.
-statement ok
-CREATE VIEW IF NOT EXISTS v1 AS SELECT b, a FROM v1
-
 statement ok
 CREATE VIEW IF NOT EXISTS v2 (x, y) AS SELECT a, b FROM t
+
+# view statement ignored if other way around.
+statement ok
+CREATE VIEW IF NOT EXISTS v2 AS SELECT b, a FROM v1
 
 statement error pgcode 42601 CREATE VIEW specifies 1 column name, but data source has 2 columns
 CREATE VIEW v3 (x) AS SELECT a, b FROM t
@@ -42,6 +43,12 @@ CREATE VIEW v6 (x, y) AS SELECT a, b FROM v1
 
 statement ok
 CREATE VIEW v7 (x, y) AS SELECT a, b FROM v1 ORDER BY a DESC LIMIT 2
+
+statement error pgcode 42703 column \"j\" does not exist
+CREATE VIEW err AS SELECT j FROM t
+
+statement error pgcode 42703 column \"j\" does not exist
+CREATE VIEW err AS SELECT a FROM t WHERE a = j
 
 query II colnames,rowsort
 SELECT * FROM v1
@@ -134,6 +141,43 @@ CREATE DATABASE test2
 statement ok
 SET DATABASE = test2
 
+statement ok
+CREATE VIEW t1 AS SELECT ARRAY[]:::STRING[];
+CREATE VIEW t2 AS SELECT ARRAY[1,2,3]:::INT[];
+
+
+query TT colnames
+SHOW CREATE VIEW t1
+----
+table_name  create_statement
+t1          CREATE VIEW public.t1 (
+              "array"
+            ) AS SELECT ARRAY[]:::STRING[]
+
+query TT colnames
+SHOW CREATE VIEW t1 WITH REDACT
+----
+table_name  create_statement
+t1          CREATE VIEW public.t1 (
+              "array"
+            ) AS SELECT ARRAY[]:::STRING[]
+
+query TT colnames
+SHOW CREATE VIEW t2
+----
+table_name  create_statement
+t2          CREATE VIEW public.t2 (
+              "array"
+            ) AS SELECT ARRAY[1:::INT8, 2:::INT8, 3:::INT8]:::INT8[]
+
+query TT colnames
+SHOW CREATE VIEW t2 WITH REDACT
+----
+table_name  create_statement
+t2          CREATE VIEW public.t2 (
+              "array"
+            ) AS SELECT ARRAY[‹×›:::INT8, ‹×›:::INT8, ‹×›:::INT8]:::INT8[]
+
 query II colnames,rowsort
 SELECT * FROM test.v1
 ----
@@ -188,42 +232,50 @@ x y
 query TT
 SHOW CREATE VIEW v1
 ----
-v1                                   CREATE VIEW public.v1 (
-                                     a,
-                                     b
-) AS SELECT a, b FROM test.public.t
+v1  CREATE VIEW public.v1 (
+      a,
+      b
+    ) AS SELECT a, b FROM test.public.t
 
 query TT
 SHOW CREATE VIEW v2
 ----
-v2                                   CREATE VIEW public.v2 (
-                                     x,
-                                     y
-) AS SELECT a, b FROM test.public.t
+v2  CREATE VIEW public.v2 (
+      x,
+      y
+    ) AS SELECT a, b FROM test.public.t
 
 query TT
 SHOW CREATE VIEW v6
 ----
-v6                                    CREATE VIEW public.v6 (
-                                      x,
-                                      y
-) AS SELECT a, b FROM test.public.v1
+v6  CREATE VIEW public.v6 (
+      x,
+      y
+    ) AS SELECT a, b FROM test.public.v1
 
 query TT
 SHOW CREATE VIEW v7
 ----
-v7                                                            CREATE VIEW public.v7 (
-                                                              x,
-                                                              y
-) AS SELECT a, b FROM test.public.v1 ORDER BY a DESC LIMIT 2
+v7  CREATE VIEW public.v7 (
+      x,
+      y
+    ) AS SELECT a, b FROM test.public.v1 ORDER BY a DESC LIMIT 2
+
+query TT
+SHOW CREATE VIEW v7 WITH REDACT
+----
+v7  CREATE VIEW public.v7 (
+      x,
+      y
+    ) AS SELECT a, b FROM test.public.v1 ORDER BY a DESC LIMIT ‹×›
 
 query TT
 SHOW CREATE VIEW test2.v1
 ----
-test2.public.v1                       CREATE VIEW public.v1 (
-                                      x,
-                                      y
-) AS SELECT x, y FROM test.public.v2
+test2.public.v1  CREATE VIEW public.v1 (
+                   x,
+                   y
+                 ) AS SELECT x, y FROM test.public.v2
 
 statement ok
 GRANT SELECT ON t TO testuser
@@ -272,10 +324,10 @@ SELECT * FROM v6
 query TT
 SHOW CREATE VIEW v1
 ----
-v1                                   CREATE VIEW public.v1 (
-                                     a,
-                                     b
-) AS SELECT a, b FROM test.public.t
+v1  CREATE VIEW public.v1 (
+      a,
+      b
+    ) AS SELECT a, b FROM test.public.t
 
 user root
 
@@ -374,68 +426,244 @@ CREATE VIEW virt2 AS SELECT range_id, lease_holder FROM crdb_internal.ranges
 statement ok
 DROP VIEW virt2
 
-# Verify correct rejection of star expressions
-# TODO(a-robinson): Support star expressions as soon as we can (#10028)
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT * FROM t
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT t.* FROM t
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT a FROM t ORDER BY t.*
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT count(1) FROM t GROUP BY t.*
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT alias.* FROM t AS alias
-
-statement error views do not currently support \* expressions
-create view s1 AS TABLE t
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT a FROM (SELECT * FROM t)
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT a FROM t WHERE NOT a IN (SELECT a FROM (SELECT * FROM t))
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT a FROM t GROUP BY a HAVING a IN (SELECT a FROM (SELECT * FROM t))
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT t1.*, t2.a FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT t1.a, t2.* FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT t1.*, t2.* FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT * FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT t1.a, t2.a FROM (SELECT * FROM t) AS t1 JOIN t AS t2 ON t1.a = t2.a
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT t1.a, t2.a FROM t AS t1 JOIN (SELECT * FROM t) AS t2 ON t1.a = t2.a
-
-statement error views do not currently support \* expressions
-create view s1 AS SELECT t1.a, t2.a FROM t AS t1 JOIN t AS t2 ON t1.a IN (SELECT a FROM (SELECT * FROM t))
+statement ok
+CREATE VIEW star1 AS SELECT * FROM t
 
 statement ok
-create view s1 AS SELECT count(*) FROM t
+CREATE VIEW star2 AS SELECT t.* FROM t
+
+# Note: this is affected by
+# https://github.com/cockroachdb/cockroach/issues/97520
+statement ok
+CREATE VIEW star3 AS SELECT a FROM t ORDER BY t.*
+
+# Note: this is affected by
+# https://github.com/cockroachdb/cockroach/issues/97520
+statement ok
+CREATE VIEW star4 AS SELECT count(1) FROM t GROUP BY t.*
 
 statement ok
-create view s2 AS SELECT a FROM t WHERE a IN (SELECT count(*) FROM t)
+CREATE VIEW star5 AS SELECT alias.* FROM t AS alias
 
 statement ok
-create view s3 AS SELECT a, count(*) FROM t GROUP BY a
+CREATE VIEW star6 AS TABLE t
 
 statement ok
-create view s4 AS SELECT a, count(*) FROM t GROUP BY a HAVING a > (SELECT count(*) FROM t)
+CREATE VIEW star7 AS SELECT a FROM (SELECT * FROM t)
+
+statement ok
+CREATE VIEW star8 AS SELECT a FROM t WHERE NOT a IN (SELECT a FROM (SELECT * FROM t))
+
+statement ok
+CREATE VIEW star9 AS SELECT a FROM t GROUP BY a HAVING a IN (SELECT a FROM (SELECT * FROM t))
+
+# This error is the same as in postgres.
+statement error duplicate column name: "a"
+CREATE VIEW star10 AS SELECT t1.*, t2.a FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
+
+statement ok
+CREATE VIEW star10 AS SELECT t1.*, t2.a AS a2 FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
+
+# This error is the same as in postgres.
+statement error duplicate column name: "a"
+CREATE VIEW star11 AS SELECT t1.a, t2.* FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
+
+statement ok
+CREATE VIEW star11 AS SELECT t1.a AS a1, t2.* FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
+
+# This error is the same as in postgres.
+statement error duplicate column name: "a"
+CREATE VIEW star12 AS SELECT t1.*, t2.* FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
+
+# This error is the same as in postgres.
+statement error duplicate column name: "a"
+CREATE VIEW star13 AS SELECT * FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a
+
+statement ok
+CREATE VIEW star14 AS SELECT t1.a, t2.a AS a2 FROM (SELECT * FROM t) AS t1 JOIN t AS t2 ON t1.a = t2.a
+
+statement ok
+CREATE VIEW star15 AS SELECT t1.a, t2.a AS a2 FROM t AS t1 JOIN (SELECT * FROM t) AS t2 ON t1.a = t2.a
+
+statement ok
+CREATE VIEW star16 AS SELECT t1.a, t2.a AS a2 FROM t AS t1 JOIN t AS t2 ON t1.a IN (SELECT a FROM (SELECT * FROM t))
+
+# This error is the same as in postgres.
+statement error duplicate column name: "a"
+CREATE VIEW star17 AS SELECT * FROM (SELECT a FROM t) t1 JOIN (SELECT a FROM u) t2 ON true;
+
+# Ditto for crdb's special feature where subquery aliases can be omitted.
+statement error duplicate column name: "a"
+CREATE VIEW star17 AS SELECT * FROM (SELECT a FROM t) JOIN (SELECT a FROM u) ON true;
+
+statement ok
+CREATE VIEW star17 AS SELECT * FROM (SELECT a FROM t) JOIN (SELECT b FROM u) ON true;
+
+statement ok
+CREATE VIEW star18 AS SELECT * FROM (SELECT * FROM (SELECT a FROM t));
+
+statement ok
+CREATE VIEW star19 AS SELECT a FROM (SELECT * FROM (SELECT a FROM t));
+
+statement ok
+CREATE VIEW star20 AS SELECT ARRAY[z.*]::STRING FROM (SELECT * FROM (SELECT a FROM t), (SELECT a FROM t)) AS z
+
+statement ok
+ALTER TABLE t ADD COLUMN c INT
+
+statement error cannot drop column "b" because view "star1" depends on it
+ALTER TABLE t DROP COLUMN b
+
+# See: https://github.com/cockroachdb/cockroach/issues/10083
+statement error cannot rename column "b" because view "star1" depends on it
+ALTER TABLE t RENAME COLUMN b TO d
+
+query TT
+SELECT descriptor_name, create_statement FROM crdb_internal.create_statements WHERE descriptor_name LIKE 'star%' ORDER BY 1
+----
+star1   CREATE VIEW public.star1 (
+          a,
+          b
+        ) AS SELECT t.a, t.b FROM test.public.t
+star10  CREATE VIEW public.star10 (
+          a,
+          b,
+          a2
+        ) AS SELECT t1.a, t1.b, t2.a AS a2 FROM test.public.t AS t1 JOIN test.public.t AS t2 ON t1.a = t2.a
+star11  CREATE VIEW public.star11 (
+          a1,
+          a,
+          b
+        ) AS SELECT t1.a AS a1, t2.a, t2.b FROM test.public.t AS t1 JOIN test.public.t AS t2 ON t1.a = t2.a
+star14  CREATE VIEW public.star14 (
+          a,
+          a2
+        ) AS SELECT
+            t1.a, t2.a AS a2
+          FROM
+            (SELECT t.a, t.b FROM test.public.t) AS t1 JOIN test.public.t AS t2 ON t1.a = t2.a
+star15  CREATE VIEW public.star15 (
+          a,
+          a2
+        ) AS SELECT
+            t1.a, t2.a AS a2
+          FROM
+            test.public.t AS t1 JOIN (SELECT t.a, t.b FROM test.public.t) AS t2 ON t1.a = t2.a
+star16  CREATE VIEW public.star16 (
+          a,
+          a2
+        ) AS SELECT
+            t1.a, t2.a AS a2
+          FROM
+            test.public.t AS t1
+            JOIN test.public.t AS t2 ON
+                t1.a IN (SELECT a FROM (SELECT t.a, t.b FROM test.public.t) AS "?subquery1?")
+star17  CREATE VIEW public.star17 (
+          a,
+          b
+        ) AS SELECT
+            "?subquery1?".a, "?subquery2?".b
+          FROM
+            (SELECT a FROM test.public.t) AS "?subquery1?"
+            JOIN (SELECT b FROM test.public.u) AS "?subquery2?" ON true
+star18  CREATE VIEW public.star18 (
+          a
+        ) AS SELECT
+            "?subquery1?".a
+          FROM
+            (SELECT "?subquery2?".a FROM (SELECT a FROM test.public.t) AS "?subquery2?")
+              AS "?subquery1?"
+star19  CREATE VIEW public.star19 (
+          a
+        ) AS SELECT
+            a
+          FROM
+            (SELECT "?subquery2?".a FROM (SELECT a FROM test.public.t) AS "?subquery2?")
+              AS "?subquery1?"
+star2   CREATE VIEW public.star2 (
+          a,
+          b
+        ) AS SELECT t.a, t.b FROM test.public.t
+star20  CREATE VIEW public.star20 (
+          "array"
+        ) AS SELECT
+            ARRAY[z.*]::STRING
+          FROM
+            (
+              SELECT
+                "?subquery1?".a, "?subquery2?".a
+              FROM
+                (SELECT a FROM test.public.t) AS "?subquery1?",
+                (SELECT a FROM test.public.t) AS "?subquery2?"
+            )
+              AS z
+star3   CREATE VIEW public.star3 (
+          a
+        ) AS SELECT a FROM test.public.t ORDER BY t.*
+star4   CREATE VIEW public.star4 (
+          count
+        ) AS SELECT count(1:::INT8) FROM test.public.t GROUP BY t.*
+star5   CREATE VIEW public.star5 (
+          a,
+          b
+        ) AS SELECT alias.a, alias.b FROM test.public.t AS alias
+star6   CREATE VIEW public.star6 (
+          a,
+          b
+        ) AS TABLE test.public.t
+star7   CREATE VIEW public.star7 (
+          a
+        ) AS SELECT a FROM (SELECT t.a, t.b FROM test.public.t) AS "?subquery1?"
+star8   CREATE VIEW public.star8 (
+          a
+        ) AS SELECT
+            a
+          FROM
+            test.public.t
+          WHERE
+            NOT (a IN (SELECT a FROM (SELECT t.a, t.b FROM test.public.t) AS "?subquery1?"))
+star9   CREATE VIEW public.star9 (
+          a
+        ) AS SELECT
+            a
+          FROM
+            test.public.t
+          GROUP BY
+            a
+          HAVING
+            a IN (SELECT a FROM (SELECT t.a, t.b FROM test.public.t) AS "?subquery1?")
+
+statement ok
+DROP VIEW star1;
+DROP VIEW star2;
+DROP VIEW star3;
+DROP VIEW star4;
+DROP VIEW star5;
+DROP VIEW star6;
+DROP VIEW star7;
+DROP VIEW star8;
+DROP VIEW star9;
+DROP VIEW star10;
+DROP VIEW star11;
+DROP VIEW star14;
+DROP VIEW star15;
+DROP VIEW star16;
+DROP VIEW star17;
+DROP VIEW star18;
+DROP VIEW star19;
+DROP VIEW star20;
+
+statement ok
+CREATE VIEW s1 AS SELECT count(*) FROM t
+
+statement ok
+CREATE VIEW s2 AS SELECT a FROM t WHERE a IN (SELECT count(*) FROM t)
+
+statement ok
+CREATE VIEW s3 AS SELECT a, count(*) FROM t GROUP BY a
+
+statement ok
+CREATE VIEW s4 AS SELECT a, count(*) FROM t GROUP BY a HAVING a > (SELECT count(*) FROM t)
 
 statement ok
 DROP VIEW s4
@@ -450,7 +678,7 @@ statement ok
 DROP VIEW s1
 
 statement ok
-DROP TABLE t
+DROP TABLE t; DROP TABLE u
 
 # Check for memory leak (#10466)
 statement ok
@@ -466,11 +694,48 @@ CREATE TABLE t (d DATE, t TIMESTAMP)
 statement ok
 CREATE VIEW dt AS SELECT d, t FROM t WHERE d > DATE '1988-11-12' AND t < TIMESTAMP '2017-01-01'
 
+query TT
+SHOW CREATE VIEW dt
+----
+dt  CREATE VIEW public.dt (
+      d,
+      t
+    ) AS SELECT d, t FROM test.public.t WHERE d > DATE '1988-11-12' AND t < TIMESTAMP '2017-01-01'
+
+query TT
+SHOW CREATE VIEW dt WITH REDACT
+----
+dt  CREATE VIEW public.dt (
+      d,
+      t
+    ) AS SELECT
+        d, t
+      FROM
+        test.public.t
+      WHERE
+        d > DATE ‹×› AND t < TIMESTAMP ‹×›
+
 statement ok
 SELECT * FROM dt
 
 statement ok
 CREATE VIEW dt2 AS SELECT d, t FROM t WHERE d > d + INTERVAL '10h'
+
+query TT
+SHOW CREATE VIEW dt2
+----
+dt2  CREATE VIEW public.dt2 (
+       d,
+       t
+     ) AS SELECT d, t FROM test.public.t WHERE d > (d + '10h'::INTERVAL)
+
+query TT
+SHOW CREATE VIEW dt2 WITH REDACT
+----
+dt2  CREATE VIEW public.dt2 (
+       d,
+       t
+     ) AS SELECT d, t FROM test.public.t WHERE d > (d + ‹×›::INTERVAL)
 
 statement ok
 SELECT * FROM dt2
@@ -555,8 +820,15 @@ query T
 SELECT create_statement FROM [SHOW CREATE w]
 ----
 CREATE VIEW public.w (
-                                                x
+  x
 ) AS WITH a AS (SELECT 1 AS x) SELECT x FROM a
+
+query T
+SELECT create_statement FROM [SHOW CREATE w WITH REDACT]
+----
+CREATE VIEW public.w (
+  x
+) AS WITH a AS (SELECT ‹×› AS x) SELECT x FROM a
 
 statement ok
 CREATE VIEW w2 AS WITH t AS (SELECT x FROM w) SELECT x FROM t
@@ -565,7 +837,7 @@ query T
 SELECT create_statement FROM [SHOW CREATE w2]
 ----
 CREATE VIEW public.w2 (
-                                                              x
+  x
 ) AS WITH t AS (SELECT x FROM test.public.w) SELECT x FROM t
 
 statement ok
@@ -575,7 +847,7 @@ query T
 SELECT create_statement FROM [SHOW CREATE w3]
 ----
 CREATE VIEW public.w3 (
-                                                                x
+  x
 ) AS (WITH t AS (SELECT x FROM test.public.w) SELECT x FROM t)
 
 statement ok
@@ -1094,7 +1366,7 @@ CREATE VIEW v7_dep AS (SELECT i FROM t6@idx WHERE k < 'a'::typ6)
 statement error cannot drop type "typ6" because other objects \(\[db2.public.t6 db2.public.v7_dep\]\) still depend on it
 DROP TYPE typ6
 
-# Test we can create views from various data sources.
+# Test we can CREATE VIEWs from various data sources.
 statement ok
 CREATE SEQUENCE s
 
@@ -1120,9 +1392,16 @@ ALTER TYPE view_typ RENAME TO view_typ_new
 query TT
 SHOW CREATE VIEW v10
 ----
-v10                                        CREATE VIEW public.v10 (
-                                           view_typ
-) AS SELECT 'a':::db2.public.view_typ_new
+v10  CREATE VIEW public.v10 (
+       view_typ
+     ) AS SELECT 'a':::db2.public.view_typ_new
+
+query TT
+SHOW CREATE VIEW v10 WITH REDACT
+----
+v10  CREATE VIEW public.v10 (
+       view_typ
+     ) AS SELECT ‹×›:::db2.public.view_typ_new
 
 query T
 SELECT * FROM v10
@@ -1138,9 +1417,16 @@ ALTER TYPE view_typ_new RENAME TO view_typ
 query TT
 SHOW CREATE VIEW v11
 ----
-v11                                                                       CREATE VIEW public.v11 (
-                                                                          k
-) AS (SELECT 'a':::db2.public.view_typ < 'a':::db2.public.view_typ AS k)
+v11  CREATE VIEW public.v11 (
+       k
+     ) AS (SELECT 'a':::db2.public.view_typ < 'a':::db2.public.view_typ AS k)
+
+query TT
+SHOW CREATE VIEW v11 WITH REDACT
+----
+v11  CREATE VIEW public.v11 (
+       k
+     ) AS (SELECT ‹×›:::db2.public.view_typ < ‹×›:::db2.public.view_typ AS k)
 
 query B
 SELECT * FROM v11
@@ -1156,9 +1442,16 @@ ALTER TYPE view_typ RENAME TO view_type_new
 query TT
 SHOW CREATE VIEW v12
 ----
-v12                                                                CREATE VIEW public.v12 (
-                                                                   k
-) AS (SELECT k FROM (SELECT 'a':::db2.public.view_type_new AS k))
+v12  CREATE VIEW public.v12 (
+       k
+     ) AS (SELECT k FROM (SELECT 'a':::db2.public.view_type_new AS k) AS "?subquery1?")
+
+query TT
+SHOW CREATE VIEW v12 WITH REDACT
+----
+v12  CREATE VIEW public.v12 (
+       k
+     ) AS (SELECT k FROM (SELECT ‹×›:::db2.public.view_type_new AS k) AS "?subquery1?")
 
 query T
 SELECT * FROM v12
@@ -1174,9 +1467,16 @@ ALTER TYPE view_type_new RENAME TO view_type
 query TT
 SHOW CREATE VIEW v13
 ----
-v13                                                                                    CREATE VIEW public.v13 (
-                                                                                       k
-) AS (SELECT 'a':::db2.public.view_type AS k UNION SELECT 'b':::db2.public.view_type)
+v13  CREATE VIEW public.v13 (
+       k
+     ) AS (SELECT 'a':::db2.public.view_type AS k UNION SELECT 'b':::db2.public.view_type)
+
+query TT
+SHOW CREATE VIEW v13 WITH REDACT
+----
+v13  CREATE VIEW public.v13 (
+       k
+     ) AS (SELECT ‹×›:::db2.public.view_type AS k UNION SELECT ‹×›:::db2.public.view_type)
 
 query T
 SELECT * FROM v13 ORDER BY k
@@ -1194,11 +1494,21 @@ query TT
 SHOW CREATE VIEW v14
 ----
 v14  CREATE VIEW public.v14 (
-     "array"
-) AS (
-     SELECT
-       ARRAY['a':::db2.public.view_type_new, 'b':::db2.public.view_type_new]:::db2.public.view_type_new[]
-  )
+       "array"
+     ) AS (
+         SELECT
+           ARRAY['a':::db2.public.view_type_new, 'b':::db2.public.view_type_new]:::db2.public.view_type_new[]
+       )
+
+query TT
+SHOW CREATE VIEW v14 WITH REDACT
+----
+v14  CREATE VIEW public.v14 (
+       "array"
+     ) AS (
+         SELECT
+           ARRAY[‹×›:::db2.public.view_type_new, ‹×›:::db2.public.view_type_new]:::db2.public.view_type_new[]
+       )
 
 query T
 SELECT * FROM v14
@@ -1215,11 +1525,22 @@ query TT
 SHOW CREATE VIEW v15
 ----
 v15  CREATE VIEW public.v15 (
-     view_type_new
-) AS (
-     SELECT
-       ARRAY['a':::db2.public.view_type, 'b':::db2.public.view_type][2:::INT8] AS view_type_new
-  )
+       view_type_new
+     ) AS (
+         SELECT
+           ARRAY['a':::db2.public.view_type, 'b':::db2.public.view_type][2:::INT8] AS view_type_new
+       )
+
+query TT
+SHOW CREATE VIEW v15 WITH REDACT
+----
+v15  CREATE VIEW public.v15 (
+       view_type_new
+     ) AS (
+         SELECT
+           ARRAY[‹×›:::db2.public.view_type, ‹×›:::db2.public.view_type][‹×›:::INT8]
+             AS view_type_new
+       )
 
 query T
 SELECT * FROM v15
@@ -1273,10 +1594,10 @@ CREATE MATERIALIZED VIEW li AS (SELECT 1 AS test_t1);
 query TT
 SHOW CREATE VIEW li
 ----
-li                          CREATE MATERIALIZED VIEW public.li (
-                                                    test_t1,
-                                                    rowid
-                        ) AS (SELECT 1 AS test_t1)
+li  CREATE MATERIALIZED VIEW public.li (
+      test_t1,
+      rowid
+    ) AS (SELECT 1 AS test_t1)
 
 statement ok
 CREATE TABLE test_view (a INT PRIMARY KEY, b INT)
@@ -1493,3 +1814,36 @@ SELECT * FROM v;
 statement ok
 SET DATABASE = test;
 
+subtest circular_dependency
+
+statement ok
+CREATE TABLE t (a INT PRIMARY KEY, b INT);
+
+statement ok
+CREATE VIEW cd_v1 AS SELECT a, b FROM t;
+
+statement ok
+CREATE VIEW cd_v2 AS SELECT a, b FROM cd_v1;
+
+# Note: Creating a circular dependency in views does not result in an error in
+# postgres. In postgres, we only encounter errors during queries on the views.
+statement error pgcode 42P17 pq: cyclic view dependency for relation test.public.cd_v1
+CREATE OR REPLACE VIEW cd_v1 AS SELECT a, b FROM cd_v2;
+
+statement ok
+CREATE VIEW cd_v3 AS SELECT a, b FROM cd_v2;
+
+statement ok
+SELECT * FROM cd_v3;
+
+statement error pgcode 42P17 pq: cyclic view dependency for relation test.public.cd_v1
+CREATE OR REPLACE VIEW cd_v1 AS SELECT a, b FROM cd_v3;
+
+statement ok
+SELECT * FROM cd_v3;
+
+statement error pq: cannot drop relation "cd_v1" because view "cd_v2" depends on it
+DROP VIEW cd_v1;
+
+statement ok
+DROP VIEW cd_v1 CASCADE;

@@ -111,12 +111,15 @@ back to this document and perform these steps:
 * [ ] Adjust version in the TeamCity agent image ([setup script](./packer/teamcity-agent.sh))
 * [ ] Rebuild and push the Docker image (following [Basic Process](#basic-process))
 * [ ] Update `build/teamcity/internal/release/build-and-publish-patched-go/impl.sh` with the new version and adjust SHA256 sums as necessary.
-* [ ] Run the `Internal / Release / Build and Publish Patched Go` build configuration in TeamCity with your latest version of the script above. This will print out the new URL's and SHA256 sums for the patched Go that you built above.
+* [ ] Adjust `GO_VERSION` and `GO_FIPS_COMMIT` for the FIPS Go toolchain ([source](./teamcity/internal/release/build-and-publish-patched-go/impl-fips.sh)).
+* [ ] Run the `Internal / Cockroach / Build / Toolchains / Publish Patched Go for Mac` build configuration in TeamCity with your latest version of the script above. Note the job depends on another job `Build and Publish Patched Go`. That job prints out the SHA256 of all tarballs, which you will need to copy-paste into `WORKSPACE` (see below). `Publish Patched Go for Mac` is an extra step that publishes the *signed* `go` binaries for macOS. That job also prints out the SHA256 of the Mac tarballs in particular.
+* [ ] Adjust `--@io_bazel_rules_go//go/toolchain:sdk_version` in [.bazelrc](../.bazelrc).
 * [ ] Bump the version in `WORKSPACE` under `go_download_sdk`. You may need to bump [rules_go](https://github.com/bazelbuild/rules_go/releases). Also edit the filenames listed in `sdks` and update all the hashes to match what you built in the step above.
+* [ ] Bump the version in `WORKSPACE` under `go_download_sdk` for the FIPS version of Go (`go_sdk_fips`).
 * [ ] Run `./dev generate bazel` to refresh `distdir_files.bzl`, then `bazel fetch @distdir//:archives` to ensure you've updated all hashes to the correct value.
 * [ ] Bump the version in `builder.sh` accordingly ([source](./builder.sh#L6)).
 * [ ] Bump the version in `go-version-check.sh` ([source](./go-version-check.sh)), unless bumping to a new patch release.
-* [ ] Bump the go version in `go.mod`. You may also need to rerun `make vendor_rebuild` if vendoring has changed.
+* [ ] Bump the go version in `go.mod`.
 * [ ] Bump the default installed version of Go in `bootstrap-debian.sh` ([source](./bootstrap/bootstrap-debian.sh)).
 * [ ] Replace other mentions of the older version of go (grep for `golang:<old_version>` and `go<old_version>`).
 * [ ] Update the `builder.dockerImage` parameter in the TeamCity [`Cockroach`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Cockroach&tab=projectParams) and [`Internal`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Internal&tab=projectParams) projects.
@@ -146,146 +149,99 @@ The `bazelbuilder` image is used exclusively for performing builds using Bazel. 
     docker manifest create cockroachdb/bazel:$TAG --amend cockroachdb/bazel:amd64-$TAG --amend cockroachdb/bazel:arm64-$TAG
     docker manifest push cockroachdb/bazel:$TAG
 ```
-- Then, update `build/teamcity-bazel-support.sh` with the new tag and commit all your changes.
+- Then, update `build/.bazelbuilderversion` with the new tag and commit all your changes.
 - Ensure the "Bazel CI" job passes on your PR before merging.
 
 #  Dependencies
 
-Dependencies are managed using `go mod`. We use `go mod vendor` so that we can import and use
-non-Go files (e.g. protobuf files) using the [modvendor](https://github.com/goware/modvendor)
-script. Adding or updating a dependecy is a two step process: 1) import the dependency in a go
-file on your local branch, 2) push a commit containing this import to the `vendored` git submodule.
+Dependencies are managed using `go mod`.
 
 ## Working Locally with Dependencies
 
-### Installing a Dependency
-1. In `cockroachdb/cockroach`, switch to the local branch you plan to import the external package
+### Installing a new Dependency
+
+1. Familiarize yourself with [our wiki page on adding or updating
+   dependencies](https://wiki.crdb.io/wiki/spaces/CRDB/pages/181862804/Adding%2C+Updating+and+Deleting+external+dependencies).
+   In particular, you will need to go first through a non-technical step
+   related to checking the license of the dependency. This is
+   important and non-optional.
+2. In `cockroachdb/cockroach`, switch to the local branch you plan to import the external package
    into
-2. Run `go get -u <dependency>`. To get a specific version, run `go get -u
+3. Run `go get <dependency>@latest`. To get a specific version, run `go get
    <dependency>@<version|branch|sha>`. You should see changes in `go.mod` when running `git diff`.
-3. Import the dependency to a go file in `cockorachdb/cockroach`. You may use an anonymous
+
+   Beware of not using `-u` (e.g. `go get -u`) as the `-u` flag also
+   attempts to upgrade any indirect dependency from yours. We do not
+   want (generally) to bundle indirect dep upgrades, which might
+   include critical infrastructure packages like grpc, in the same PR
+   as specific dep updates/installations. See the wiki page linked
+   above for details.
+
+   If the `go get` command still results in updates to important
+   infrastructure dependencies besides the one you want to install,
+   proceed as per the section "Upgrading important infrastructure
+   dependencies" below.
+
+4. Import the dependency to a go file in `cockroachdb/cockroach`. You may use an anonymous
    import, e.g. `import _ "golang.org/api/compute/v1"`, if you haven't written any code that
-   references the dependency. This ensures cockroach's make file will properly add the package(s) to the vendor directory. Note that IDEs may bicker that
-   these import's paths don't exist. That's ok!
-4. Run `go mod tidy` to ensure stale dependencies are removed.
-5. Run `make vendor_rebuild` to add the package to the vendor directory. Note this command will only
-   add packages you have imported in the codebase (and any of the package's dependencies), so you
-   may want to add import statements for each package you plan to use (i.e. repeat step 3 a couple times).
-6. Run `cd vendor && git diff && cd ..`  to ensure the vendor directory contains the package(s)
-   you imported
-7. Run `make buildshort` to ensure your code compiles.
-8. Run `./dev generate bazel --mirror` to regenerate DEPS.bzl with the updated Go dependency information.
+   references the dependency. This ensures `go mod tidy` will not delete your dependency.
+   Note that IDEs may bicker that these import's paths don't exist. That's ok!
+5. Run `go mod tidy` to ensure stale dependencies are removed.
+6. Run `./dev generate bazel --mirror` to regenerate DEPS.bzl with the updated Go dependency information.
    Note that you need engineer permissions to mirror dependencies; if you want to get the Bazel build
    working locally without mirroring, `./dev generate bazel` will work, but you won't be able to check
    your changes in. (Assuming that you do have engineer permissions, you can run
    `gcloud auth application-default login` to authenticate if you get a credentials error.)
-9. Follow instructions for [pushing the dependency to the `vendored` submodule](#pushing-the-dependency-to-the-vendored-submodule)
+7. Run `./dev build short` to ensure your code compiles.
 
 ### Updating a Dependency
-Follow the instructions for [Installing a Dependency](#installing-a-dependency). Note:
-- If you're only importing a new package from an existing module in `go.mod`, you don't need to
-   re-download the module, step 2 above.
-- If you're only updating the package version, you probably don't need to update the import
-   statements, step 3 above.
 
-When [pushing the dependency to the `vendored` submodule](#pushing-the-dependency-to-the-vendored-submodule), you may either checkout a new branch, or create a new commit in the original branch you used to publicize the vendor
-  dependency.
+Follow the instructions for [Installing a Dependency](#installing-a-dependency).
+
+Beware of not using `-u` (e.g. `go get -u`) as the `-u` flag also
+attempts to upgrade any indirect dependency from yours. We do not
+want (generally) to bundle indirect dep upgrades, which might
+include critical infrastructure packages like grpc, in the same PR
+as specific dep upgrades. See the wiki page linked above for details.
+
+Note:
+
+- You will still need to pay extra attention to the licensing step as
+  described in [the wiki
+  page](https://wiki.crdb.io/wiki/spaces/CRDB/pages/181862804/Adding%2C+Updating+and+Deleting+external+dependencies).
+- If you're only importing a new package from an existing module in `go.mod`, you don't need to
+  re-download the module, step 2 above.
+- If you're only updating the package version, you probably don't need to update the import
+  statements, step 3 above.
+- If the `go get` command results in updates to important
+  infrastructure dependencies besides the one you want to install,
+  proceed as per "Upgrading important infrastructure dependencies"
+  below.
+
+### Updating important infrastructure dependencies
+
+Sometimes a key, infrastructure-like dependency is upgraded as a
+side-effect of (attempting to) installing or upgrading a more
+lightweight dependency. See the [wiki
+page](https://wiki.crdb.io/wiki/spaces/CRDB/pages/181862804/Adding+Updating+and+Deleting+external+dependencies#Reviewing-for-architectural-impact-of-key-dependencies)
+for a list of what we consider key dependencies.
+
+When this happens, we want to solicit more review scrutiny on this change.
+
+To achieve this, proceed as follows:
+
+1. If coming from the sections "Installing a new dep" or "updating a
+   dep" above, check out a branch/commit prior to the original dep
+   install/update you wanted to perform.
+2. Perform the `go get ...@<version>` command only for those
+   key dependencies you want/need to upgrade.
+3. Proceed as per the rest of "Installing a new dependency" from step
+   5 onwards.
+4. Commit the result with a descriptive title, e.g. "deps: upgrade XXX
+   to version YYY".
+5. Push this change in a PR (also with a descriptive title), then
+   solicit a review.
 
 ### Removing a dependency
-When a dependency has been removed, run `go mod tidy` and then `make vendor_rebuild`.
-Then follow the [Pushing the Dependency to the `vendored` submodule](#pushing-the-dependency-to-the-vendored-submodule) steps.
 
-## Working With Submodules
-To keep the bloat of all the changes in all our dependencies out of our main
-repository, we embed `vendor` as a git submodule, storing its content and
-history in [`vendored`](https://github.com/cockroachdb/vendored) instead.
-
-This split across two repositories however means that changes involving
-changed dependencies require a two step process. After altering dependencies and making related code
-changes, follow the steps below.
-
-### Pushing the Dependency to the `vendored` submodule
-- Notice that `git status` in `cockroachdb/cockroach` checkout will report that the
-`vendor` submodule has `modified/untracked content`.
-
-- `cd` into `vendor`, and ...
-    + Checkout a **new** named branch
-    + Run `git add .`
-    + Commit all changes, with a nice short message. There's no explicit policy related to commit
-      messages in the vendored submodule.
-
-- At this point the `git status` in your `cockroachdb/cockroach` checkout will report `new commits`
-for `vendor` instead of `modified content`.
-- Back in your `cockroachdb/cockroach` branch, commit your code changes and the new `vendor`
-  submodule ref.
-
-- Before the `cockroachdb/cockroach` commit can be submitted in a pull request, the submodule commit
-  it references must be available on `github.com/cockroachdb/vendored`. So, when you're ready to
-  publicize your vendor changes, push the `vendored` commit to remote:
-
-  + Organization members can push their named branches there directly, via:
-    + `git push [remote vendor name, probably 'origin'] [your vendor branch] `
-  + Non-members should fork the `vendored` repo and submit a pull request to
-`cockroachdb/vendored`, and need wait for it to merge before they will be able
-to use it in a `cockroachdb/cockroach` PR.
-
-### `master` Branch Pointer in Vendored Repo
-
-Since the `cockroachdb/cockroach` submodule references individual commit
-hashes in `vendored`, there is little significance to the `master` branch in
-`vendored` -- as outlined above, new commits are always authored with the
-previously referenced commit as their parent, regardless of what `master`
-happens to be.
-
-It is critical that any ref in vendored that is referenced from `cockroachdb/cockroach` remain
-available in vendored in perpetuity. One way to ensure this is to leave the vendored branch that
-you pushed your changes to in place.
-
-If you would like to delete your feature branch in the vendored repository, you must first ensure
-that another branch in vendored contains the commit referenced by `cockroachdb/cockroach`. You can
-update the master branch in vendored to point at the git SHA currently referenced in
-`cockroachdb/cockroach`.
-
-### Conflicting Submodule Changes
-
-If you pull/rebase from `cockroach/cockroachdb` and encounter a conflict in the vendor directory,
-it is often easiest to take the master branch's vendored directory and then recreate your vendor
-changes on top of it. For example:
-
-1. Remove your local changes to `vendored` by resetting your local
-   vendor directory to the commit currently used by `origin/master` on
-   `cockroachdb/cockroach`.
-      + Get reference: `git ls-tree origin/master vendor | awk '{print $3}'`
-      + Reset to it: `cd vendor && git reset --hard REF`
-2. In `cockroach/cockroachdb`, amend the commit that contained the dirty vendor pointer.
-3. Try pulling/rebasing again, and if that works, rebuild your local vendor repo with
-`go mod tidy` and `make vendor_rebuild`
-4. Push the clean vendor changes to the remote vendor submodule, following the [Pushing the Dependency to the `vendored` submodule](#pushing-the-dependency-to-the-vendored-submodule)
-
-Note: you may also observe conflicts in `go.mod` and `go.sum`. Resolve the conflict like
-any vanilla conflict on `cockroach/cockroachdb`, preferring master's
-version. Then, `make vendor_rebuild` to re-add your local changes to `go.
-mod` and `go.sum`.
-### Recovering from a broken vendor directory
-
-If you happen to run into a broken `vendor` directory which is irrecoverable,
-you can run the following commands which will restore the directory in
-working order:
-
-```
-rm -rf vendor
-git checkout HEAD vendor # you can replace HEAD with any branch/sha
-git submodule update --init --recursive
-```
-
-### Repository Name
-
-We only want the vendor directory used by builds when it is explicitly checked
-out *and managed* as a submodule at `./vendor`.
-
-If a go build fails to find a dependency in `./vendor`, it will continue
-searching anything named "vendor" in parent directories. Thus the vendor
-repository is _not_ named "vendor", to minimize the risk of it ending up
-somewhere in `GOPATH` with the name `vendor` (e.g. if it is manually cloned),
-where it could end up being unintentionally used by builds and causing
-confusion.
+When a dependency has been removed, run `go mod tidy` and `dev generate bazel`.

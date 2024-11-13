@@ -74,7 +74,7 @@ admin     ·        {}
 root      ·        {admin}
 testuser  ·        {}
 
-statement error pq: role/user myrole does not exist
+statement error pq: role/user "myrole" does not exist
 DROP ROLE myrole
 
 statement ok
@@ -92,7 +92,7 @@ CREATE ROLE rolec
 statement ok
 CREATE ROLE roled
 
-statement error pq: role/user rolee does not exist
+statement error pq: role/user "rolee" does not exist
 DROP ROLE rolea, roleb, rolec, roled, rolee
 
 statement ok
@@ -140,10 +140,10 @@ role_name
 admin
 root
 
-statement error pq: role/user unknownuser does not exist
+statement error pq: role/user "unknownuser" does not exist
 GRANT testrole TO unknownuser
 
-statement error pq: role/user unknownrole does not exist
+statement error pq: role/user "unknownrole" does not exist
 GRANT unknownrole TO testuser
 
 # Test role "grant" and WITH ADMIN option.
@@ -157,12 +157,12 @@ user root
 statement ok
 GRANT testrole TO testuser
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member    isAdmin
-admin     root      true
-testrole  testuser  false
+role      member    isAdmin  role_id  member_id
+admin     root      true     2        1
+testrole  testuser  false    108      100
 
 query TTB colnames
 SHOW GRANTS ON ROLE
@@ -186,14 +186,14 @@ CREATE ROLE child_role;
 GRANT testrole to child_role;
 GRANT testuser TO child_role;
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member      isAdmin
-admin     root        true
-testrole  child_role  false
-testrole  testuser    true
-testuser  child_role  false
+role      member      isAdmin  role_id  member_id
+admin     root        true     2        1
+testrole  child_role  false    108      109
+testrole  testuser    true     108      100
+testuser  child_role  false    100      109
 
 statement ok
 SET ROLE child_role
@@ -247,14 +247,14 @@ SELECT crdb_internal.is_admin()
 true
 
 # Dropping users/roles deletes all their memberships.
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member     isAdmin
-admin     root       true
-admin     testuser   false
-testrole  testuser   true
-testrole  testuser2  true
+role      member     isAdmin  role_id  member_id
+admin     root       true     2        1
+admin     testuser   false    2        100
+testrole  testuser   true     108      100
+testrole  testuser2  true     108      107
 
 query TTB colnames
 SHOW GRANTS ON ROLE
@@ -313,21 +313,21 @@ DROP USER testuser
 statement ok
 CREATE USER testuser
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member     isAdmin
-admin     root       true
-testrole  testuser2  true
+role      member     isAdmin  role_id  member_id
+admin     root       true     2        1
+testrole  testuser2  true     108      107
 
 statement ok
 DROP ROLE testrole
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member     isAdmin
-admin     root       true
+role   member  isAdmin  role_id  member_id
+admin  root    true     2        1
 
 # Test cycle detection.
 statement error pq: admin cannot be a member of itself
@@ -451,17 +451,17 @@ testuser
 
 user root
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role   member    isAdmin
-admin  root      true
-rolea  roleb     true
-rolea  rolee     false
-roleb  rolec     false
-rolec  roled     false
-rolec  testuser  false
-roled  testuser  false
+role   member    isAdmin  role_id  member_id
+admin  root      true     2        1
+rolea  roleb     true     111      112
+rolea  rolee     false    111      115
+roleb  rolec     false    112      113
+rolec  roled     false    113      114
+rolec  testuser  false    113      110
+roled  testuser  false    114      110
 
 statement ok
 DROP ROLE rolea
@@ -469,12 +469,12 @@ DROP ROLE rolea
 statement ok
 DROP ROLE rolec
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role   member    isAdmin
-admin  root      true
-roled  testuser false
+role   member    isAdmin  role_id  member_id
+admin  root      true     2        1
+roled  testuser  false    114      110
 
 query TTT
 SHOW ROLES
@@ -502,10 +502,10 @@ REVOKE admin FROM root
 statement error pq: role/user root cannot be removed from role admin or lose the ADMIN OPTION
 REVOKE ADMIN OPTION FOR admin FROM root
 
-statement error pq: role/user unknownuser does not exist
+statement error pq: role/user "unknownuser" does not exist
 REVOKE ADMIN OPTION FOR admin FROM unknownuser
 
-statement error pq: role/user unknownrole does not exist
+statement error pq: role/user "unknownrole" does not exist
 REVOKE ADMIN OPTION FOR unknownrole FROM root
 
 statement error pgcode 42939 CURRENT_USER cannot be used as a role name here
@@ -523,13 +523,13 @@ CREATE ROLE roleb
 statement ok
 GRANT rolea,roleb TO testuser WITH ADMIN OPTION
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role   member    isAdmin
-admin  root      true
-rolea  testuser  true
-roleb  testuser  true
+role   member    isAdmin  role_id  member_id
+admin  root      true     2        1
+rolea  testuser  true     116      110
+roleb  testuser  true     117      110
 
 user testuser
 
@@ -538,15 +538,15 @@ GRANT rolea,roleb TO root WITH ADMIN OPTION
 
 user root
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role   member    isAdmin
-admin  root      true
-rolea  root      true
-rolea  testuser  true
-roleb  root      true
-roleb  testuser  true
+role   member    isAdmin  role_id  member_id
+admin  root      true     2        1
+rolea  root      true     116      1
+rolea  testuser  true     116      110
+roleb  root      true     117      1
+roleb  testuser  true     117      110
 
 query TTT colnames,rowsort
 SELECT * FROM information_schema.administrable_role_authorizations
@@ -608,45 +608,45 @@ REVOKE roleb FROM root
 
 user root
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role   member    isAdmin
-admin  root      true
-rolea  root      true
-rolea  testuser  false
-roleb  testuser  true
+role   member    isAdmin  role_id  member_id
+admin  root      true     2        1
+rolea  root      true     116      1
+rolea  testuser  false    116      110
+roleb  testuser  true     117      110
 
 statement ok
 REVOKE rolea, roleb FROM testuser, root
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role   member    isAdmin
-admin  root      true
+role   member  isAdmin  role_id  member_id
+admin  root    true     2        1
 
 # Verify that GRANT/REVOKE are not sensitive to the case of role names.
 
 statement ok
 GRANT roLea,rOleB TO tEstUSER WITH ADMIN OPTION
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role   member    isAdmin
-admin  root      true
-rolea  testuser  true
-roleb  testuser  true
+role   member    isAdmin  role_id  member_id
+admin  root      true     2        1
+rolea  testuser  true     116      110
+roleb  testuser  true     117      110
 
 statement ok
 REVOKE roleA, roleB FROM TestUser
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role   member    isAdmin
-admin  root      true
+role   member  isAdmin  role_id  member_id
+admin  root    true     2        1
 
 # Test privilege checks.
 
@@ -677,13 +677,13 @@ GRANT admin TO newgroup
 
 user testuser
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member    isAdmin
-admin     newgroup  false
-admin     root      true
-newgroup  testuser  false
+role      member    isAdmin  role_id  member_id
+admin     newgroup  false    2        118
+admin     root      true     2        1
+newgroup  testuser  false    118      110
 
 
 user root
@@ -717,12 +717,12 @@ CREATE TABLE db2.s1.foo (k int);
 
 user root
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member    isAdmin
-admin     root      true
-newgroup  testuser  false
+role      member    isAdmin  role_id  member_id
+admin     root      true     2        1
+newgroup  testuser  false    118      110
 
 statement ok
 GRANT ALL ON DATABASE db2 TO newgroup
@@ -802,11 +802,11 @@ DROP TABLE db2.foo
 statement ok
 DROP USER testuser
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member    isAdmin
-admin     root      true
+role   member  isAdmin  role_id  member_id
+admin  root    true     2        1
 
 statement error cannot drop role/user newgroup: grants still exist on db2
 DROP ROLE newgroup
@@ -843,16 +843,16 @@ DROP USER public
 statement error role name "public" is reserved
 DROP ROLE public
 
-statement error role/user public does not exist
+statement error role/user "public" does not exist
 GRANT public TO testuser
 
-statement error role/user public does not exist
+statement error role/user "public" does not exist
 GRANT admin TO public
 
-statement error role/user public does not exist
+statement error role/user "public" does not exist
 REVOKE public FROM testuser
 
-statement error role/user public does not exist
+statement error role/user "public" does not exist
 REVOKE admin FROM public
 
 # Test "WITH CREATEROLE" option
@@ -860,11 +860,11 @@ REVOKE admin FROM public
 statement ok
 CREATE USER testuser
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role        member     isAdmin
-admin       root       true
+role   member  isAdmin  role_id  member_id
+admin  root    true     2        1
 
 
 user testuser
@@ -936,11 +936,11 @@ CREATE ROLE IF NOT EXISTS anotherrolewithcreate2 CREATEROLE
 statement ok
 CREATE ROLE IF NOT EXISTS rolewithoutcreate2 WITH NOCREATEROLE
 
-query TTB colnames
+query TTBOO colnames
 SELECT * FROM system.role_members
 ----
-role      member    isAdmin
-admin     root      true
+role   member  isAdmin  role_id  member_id
+admin  root    true     2        1
 
 user testuser
 
@@ -1018,7 +1018,7 @@ ALTER USER testuser3 WITH PASSWORD 'ilov3beefjerky'
 
 user root
 
-statement error pq: role/user rolek does not exist
+statement error pq: role/user "rolek" does not exist
 ALTER ROLE rolek CREATEROLE
 
 statement ok
@@ -1053,43 +1053,43 @@ DELETE FROM system.role_options WHERE NOT username in ('root', 'admin')
 statement ok
 CREATE ROLE rolewithlogin LOGIN
 
-query TTTO
-SELECT * FROM system.role_options
+query TTT
+SELECT username, option, value FROM system.role_options
 ----
 
 statement ok
 CREATE ROLE rolewithnologin NOLOGIN
 
-query TTTO
-SELECT * FROM system.role_options
+query TTT
+SELECT username, option, value FROM system.role_options
 ----
-rolewithnologin  NOLOGIN  NULL  133
+rolewithnologin  NOLOGIN  NULL
 
 statement ok
 ALTER ROLE rolewithlogin VALID UNTIL '2020-01-01'
 
-query TTTO
-SELECT * FROM system.role_options
+query TTT
+SELECT username, option, value FROM system.role_options
 ----
-rolewithlogin    VALID UNTIL  2020-01-01 00:00:00+00:00  132
-rolewithnologin  NOLOGIN      NULL                       133
+rolewithlogin    VALID UNTIL  2020-01-01 00:00:00+00
+rolewithnologin  NOLOGIN      NULL
 
 statement ok
 ALTER ROLE rolewithlogin VALID UNTIL NULL
 
-query TTTO
-SELECT * FROM system.role_options
+query TTT
+SELECT username, option, value FROM system.role_options
 ----
-rolewithlogin    VALID UNTIL  NULL  132
-rolewithnologin  NOLOGIN      NULL  133
+rolewithlogin    VALID UNTIL  NULL
+rolewithnologin  NOLOGIN      NULL
 
 statement ok
 DROP ROLE rolewithlogin
 
-query TTTO
-SELECT * FROM system.role_options
+query TTT
+SELECT username, option, value FROM system.role_options
 ----
-rolewithnologin  NOLOGIN  NULL  133
+rolewithnologin  NOLOGIN  NULL
 
 statement error pq: conflicting role options
 CREATE ROLE thisshouldntwork LOGIN NOLOGIN
@@ -1332,6 +1332,9 @@ ALTER ROLE testuser CREATELOGIN
 user testuser
 
 statement ok
+ALTER USER testuser PASSWORD NULL
+
+statement ok
 CREATE USER testuser3 WITH PASSWORD 'abc'
 
 statement ok
@@ -1381,6 +1384,12 @@ user root
 statement ok
 ALTER USER testuser NOCREATELOGIN
 
+# Verify default setting for sql.auth.change_own_password.enabled.
+query B
+SHOW CLUSTER SETTING sql.auth.change_own_password.enabled
+----
+false
+
 user testuser
 
 statement error user testuser does not have CREATELOGIN privilege
@@ -1391,6 +1400,13 @@ CREATE ROLE testuser6
 
 statement error user testuser does not have CREATELOGIN privilege
 CREATE USER testuser5 WITH PASSWORD 'abc'
+
+# Verify that testuser cannot change its own password.
+statement error user testuser does not have CREATELOGIN privilege
+ALTER USER testuser PASSWORD 'xyz'
+
+statement error user testuser does not have CREATELOGIN privilege
+ALTER USER CURRENT_USER PASSWORD '123'
 
 statement error user testuser does not have CREATELOGIN privilege
 ALTER USER testuser2 WITH PASSWORD 'abc'
@@ -1426,6 +1442,51 @@ statement error user testuser does not have CREATELOGIN privilege
 CREATE ROLE otherrole4 LOGIN
 
 user root
+
+subtest change_own_password
+
+statement ok
+SET CLUSTER SETTING sql.auth.change_own_password.enabled = true
+
+user testuser
+
+# Verify that testuser can change its own password now.
+statement ok
+ALTER USER testuser PASSWORD 'xyz'
+
+statement ok
+ALTER USER CURRENT_USER PASSWORD '123'
+
+# Verify that testuser cannot *remove* its own password.
+statement error user testuser does not have CREATELOGIN privilege
+ALTER USER testuser PASSWORD NULL
+
+# testuser still cannot change another user's password.
+statement error user testuser does not have CREATELOGIN privilege
+ALTER USER testuser2 WITH PASSWORD 'abc'
+
+# Verify that testuser cannot modify other role options of itself.
+statement error user testuser does not have CREATELOGIN privilege
+ALTER USER testuser PASSWORD 'abc' VALID UNTIL '4044-10-31'
+
+user root
+
+statement ok
+SET ROLE testuser
+
+# Changing users with SET ROLE should allow self-password change.
+statement ok
+ALTER USER testuser PASSWORD 'cat'
+
+# Changing users with SET ROLE should still mean that changing other users
+# is disallowed.
+statement error user testuser does not have CREATELOGIN privilege
+ALTER USER testuser2 WITH PASSWORD 'abc'
+
+statement ok
+RESET ROLE
+
+subtest end
 
 # Verify that root is allowed to edit some other role that has ADMIN.
 statement ok
@@ -1469,7 +1530,7 @@ statement ok
 SET CLUSTER SETTING server.user_login.store_client_pre_hashed_passwords.enabled = false
 
 # Password hash not recognized: hash considered as password input.
-statement ok
+statement error pgcode 28P01 bcrypt: password length exceeds 72 bytes
 CREATE USER hash4 WITH PASSWORD '$bcrypt_pw'
 
 # Password hash not recognized: hash considered as password input.
@@ -1477,7 +1538,7 @@ statement ok
 CREATE USER hash5 WITH PASSWORD 'md5aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 
 # Password hash not recognized: hash considered as password input.
-statement ok
+statement error pgcode 28P01 bcrypt: password length exceeds 72 bytes
 CREATE USER hash6 WITH PASSWORD '$scram_pw'
 
 query TTB
@@ -1485,9 +1546,7 @@ SELECT username, substr("hashedPassword", 1, 7), 'CRDB-BCRYPT'||"hashedPassword"
 ----
 hash1  $2a$10$  true
 hash3  SCRAM-S  false
-hash4  $2a$10$  false
 hash5  $2a$10$  false
-hash6  $2a$10$  false
 
 # Reset cluster setting after test completion.
 statement ok
@@ -1521,7 +1580,7 @@ CREATE USER hash8 WITH PASSWORD 'hello world'
 query TT
 SELECT username, substr("hashedPassword", 1, 20) FROM system.users WHERE username = 'hash8'
 ----
-hash8  SCRAM-SHA-256$119680
+hash8  SCRAM-SHA-256$10610:
 
 statement ok
 ALTER USER hash8 WITH PASSWORD 'hello universe'
@@ -1529,7 +1588,7 @@ ALTER USER hash8 WITH PASSWORD 'hello universe'
 query TT
 SELECT username, substr("hashedPassword", 1, 20) FROM system.users WHERE username = 'hash8'
 ----
-hash8  SCRAM-SHA-256$119680
+hash8  SCRAM-SHA-256$10610:
 
 subtest scram_cost
 

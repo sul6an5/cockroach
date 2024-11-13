@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/errors"
 )
@@ -158,39 +159,28 @@ func registerActiveRecord(r registry.Registry) {
 			"installing gems",
 			fmt.Sprintf(
 				`cd /mnt/data1/activerecord-cockroachdb-adapter/ && `+
-					`RAILS_VERSION=%s sudo bundle install`, supportedRailsVersion),
+					`sudo RAILS_VERSION=%s bundle install`, supportedRailsVersion),
 		); err != nil {
 			t.Fatal(err)
 		}
 
-		blocklistName, expectedFailures, ignorelistName, ignorelist := activeRecordBlocklists.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No activerecord blocklist defined for cockroach version %s", version)
-		}
-		status := fmt.Sprintf("Running cockroach version %s, using blocklist %s", version, blocklistName)
-		if ignorelist != nil {
-			status = fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
-				version, blocklistName, ignorelistName)
-		}
+		blocklistName, ignorelistName := "activeRecordBlocklist", "activeRecordIgnoreList"
+		status := fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
+			version, blocklistName, ignorelistName)
 		t.L().Printf("%s", status)
 
 		t.Status("running activerecord test suite")
 
 		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), node,
-			`cd /mnt/data1/activerecord-cockroachdb-adapter/ && `+
-				`sudo RUBYOPT="-W0" TESTOPTS="-v" bundle exec rake test`,
+			fmt.Sprintf(
+				`cd /mnt/data1/activerecord-cockroachdb-adapter/ && `+
+					`sudo RAILS_VERSION=%s RUBYOPT="-W0" TESTOPTS="-v" bundle exec rake test`, supportedRailsVersion),
 		)
 
-		// Expected to fail but we should still scan the error to check if
-		// there's an SSH/roachprod error.
-		if err != nil {
-			// install.NonZeroExitCode includes unrelated to SSH errors ("255")
-			// or roachprod errors, so we call t.Fatal if the error is not an
-			// install.NonZeroExitCode error
-			commandError := (*install.NonZeroExitCode)(nil)
-			if !errors.As(err, &commandError) {
-				t.Fatal(err)
-			}
+		// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+		// Proceed for any other (command) errors
+		if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+			t.Fatal(err)
 		}
 
 		// Result error contains stdout, stderr, and any error content returned by exec package.
@@ -211,8 +201,8 @@ func registerActiveRecord(r registry.Registry) {
 			skipped := result == "S"
 			results.allTests = append(results.allTests, test)
 
-			ignoredIssue, expectedIgnored := ignorelist[test]
-			issue, expectedFailure := expectedFailures[test]
+			ignoredIssue, expectedIgnored := activeRecordIgnoreList[test]
+			issue, expectedFailure := activeRecordBlocklist[test]
 			switch {
 			case expectedIgnored:
 				results.results[test] = fmt.Sprintf("--- SKIP: %s due to %s (expected)", test, ignoredIssue)
@@ -246,13 +236,13 @@ func registerActiveRecord(r registry.Registry) {
 		}
 
 		results.summarizeAll(
-			t, "activerecord" /* ormName */, blocklistName, expectedFailures, version, supportedRailsVersion,
+			t, "activerecord" /* ormName */, blocklistName, activeRecordBlocklist, version, supportedRailsVersion,
 		)
 	}
 
 	r.Add(registry.TestSpec{
 		Name:       "activerecord",
-		Owner:      registry.OwnerSQLExperience,
+		Owner:      registry.OwnerSQLFoundations,
 		Cluster:    r.MakeClusterSpec(1),
 		NativeLibs: registry.LibGEOS,
 		Tags:       []string{`default`, `orm`},

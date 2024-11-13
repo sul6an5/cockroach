@@ -20,10 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,14 +35,14 @@ func TestWaitForDelRangeInGCJob(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var (
-		v0 = clusterversion.ByKey(clusterversion.UseDelRangeInGCJob - 1)
-		v1 = clusterversion.ByKey(clusterversion.WaitedForDelRangeInGCJob)
+		v0 = clusterversion.TestingBinaryMinSupportedVersion
+		v1 = clusterversion.ByKey(clusterversion.V23_1WaitedForDelRangeInGCJob)
 	)
 
 	ctx := context.Background()
 	settings := cluster.MakeTestingClusterSettingsWithVersions(v1, v0, false /* initializeVersion */)
 	require.NoError(t, clusterversion.Initialize(ctx, v0, &settings.SV))
-
+	storage.MVCCRangeTombstonesEnabledInMixedClusters.Override(ctx, &settings.SV, false)
 	testServer, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		Settings: settings,
 		Knobs: base.TestingKnobs{
@@ -94,7 +97,7 @@ SELECT count(*)
  WHERE job_type = 'SCHEMA CHANGE GC'
    AND status = 'paused'`,
 		[][]string{{"2"}})
-	tdb.ExpectErr(t, `verifying precondition for version \d*22.1-\d+: `+
+	tdb.ExpectErr(t, `verifying precondition for version \d*22.2-\d+: `+
 		`paused GC jobs prevent upgrading GC job behavior: \[\d+ \d+]`,
 		"SET CLUSTER SETTING version = crdb_internal.node_executable_version()")
 
@@ -109,18 +112,31 @@ SELECT count(*)
 	tdb.Exec(t, "SET CLUSTER SETTING version = crdb_internal.node_executable_version()")
 
 	codec := testServer.ExecutorConfig().(sql.ExecutorConfig).Codec
-	{
-		dbFooStart := codec.TablePrefix(dbFooID)
-		res, err := kvDB.Scan(ctx, dbFooStart, dbFooStart.PrefixEnd(), 1)
-		require.NoError(t, err)
-		require.Len(t, res, 0)
-	}
-	{
-		idxStart := codec.IndexPrefix(fooID, idxID)
-		res, err := kvDB.Scan(ctx, idxStart, idxStart.PrefixEnd(), 1)
-		require.NoError(t, err)
-		require.Len(t, res, 0)
-	}
+	testutils.SucceedsSoon(t,
+		func() error {
+			{
+				dbFooStart := codec.TablePrefix(dbFooID)
+				res, err := kvDB.Scan(ctx, dbFooStart, dbFooStart.PrefixEnd(), 1)
+				if err != nil {
+					return err
+				}
+				if len(res) != 0 {
+					return errors.AssertionFailedf("unexpected number of table keys (got %d)", len(res))
+				}
+			}
+			{
+				idxStart := codec.IndexPrefix(fooID, idxID)
+				res, err := kvDB.Scan(ctx, idxStart, idxStart.PrefixEnd(), 1)
+				require.NoError(t, err)
+				if err != nil {
+					return err
+				}
+				if len(res) != 0 {
+					return errors.AssertionFailedf("unexpected number of index keys (got %d)", len(res))
+				}
+			}
+			return nil
+		})
 
 	// Make sure that there is still MVCC history.
 	tdb.CheckQueryResults(t, "SELECT count(*) FROM foo@idx AS OF SYSTEM TIME "+beforeDrop,

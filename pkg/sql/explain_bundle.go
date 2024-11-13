@@ -21,19 +21,26 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/colfetcher"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/memzipper"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
+
+const noPlan = "no plan"
 
 // setExplainBundleResult sets the result of an EXPLAIN ANALYZE (DEBUG)
 // statement. warnings will be printed out as is in the CLI.
@@ -121,25 +128,30 @@ type diagnosticsBundle struct {
 // system.statement_diagnostics.
 func buildStatementBundle(
 	ctx context.Context,
+	explainFlags explain.Flags,
 	db *kv.DB,
 	ie *InternalExecutor,
+	stmtRawSQL string,
 	plan *planTop,
 	planString string,
 	trace tracingpb.Recording,
 	placeholders *tree.PlaceholderInfo,
+	queryErr, payloadErr, commErr error,
+	sv *settings.Values,
 ) diagnosticsBundle {
 	if plan == nil {
 		return diagnosticsBundle{collectionErr: errors.AssertionFailedf("execution terminated early")}
 	}
-	b := makeStmtBundleBuilder(db, ie, plan, trace, placeholders)
+	b := makeStmtBundleBuilder(explainFlags, db, ie, stmtRawSQL, plan, trace, placeholders, sv)
 
 	b.addStatement()
-	b.addOptPlans()
+	b.addOptPlans(ctx)
 	b.addExecPlan(planString)
 	b.addDistSQLDiagrams()
 	b.addExplainVec()
 	b.addTrace()
 	b.addEnv(ctx)
+	b.addErrors(queryErr, payloadErr, commErr)
 
 	buf, err := b.finalize()
 	if err != nil {
@@ -159,11 +171,13 @@ func (bundle *diagnosticsBundle) insert(
 	ast tree.Statement,
 	stmtDiagRecorder *stmtdiagnostics.Registry,
 	diagRequestID stmtdiagnostics.RequestID,
+	req stmtdiagnostics.Request,
 ) {
 	var err error
 	bundle.diagID, err = stmtDiagRecorder.InsertStatementDiagnostics(
 		ctx,
 		diagRequestID,
+		req,
 		fingerprint,
 		tree.AsString(ast),
 		bundle.zip,
@@ -179,54 +193,86 @@ func (bundle *diagnosticsBundle) insert(
 
 // stmtBundleBuilder is a helper for building a statement bundle.
 type stmtBundleBuilder struct {
+	flags explain.Flags
+
 	db *kv.DB
 	ie *InternalExecutor
 
+	stmt         string
 	plan         *planTop
 	trace        tracingpb.Recording
 	placeholders *tree.PlaceholderInfo
+	sv           *settings.Values
 
 	z memzipper.Zipper
 }
 
 func makeStmtBundleBuilder(
+	flags explain.Flags,
 	db *kv.DB,
 	ie *InternalExecutor,
+	stmtRawSQL string,
 	plan *planTop,
 	trace tracingpb.Recording,
 	placeholders *tree.PlaceholderInfo,
+	sv *settings.Values,
 ) stmtBundleBuilder {
-	b := stmtBundleBuilder{db: db, ie: ie, plan: plan, trace: trace, placeholders: placeholders}
+	b := stmtBundleBuilder{
+		flags: flags, db: db, ie: ie, plan: plan, trace: trace, placeholders: placeholders, sv: sv,
+	}
+	b.buildPrettyStatement(stmtRawSQL)
 	b.z.Init()
 	return b
 }
 
-// addStatement adds the pretty-printed statement as file statement.txt.
-func (b *stmtBundleBuilder) addStatement() {
-	cfg := tree.DefaultPrettyCfg()
-	cfg.UseTabs = false
-	cfg.LineWidth = 100
-	cfg.TabWidth = 2
-	cfg.Simplify = true
-	cfg.Align = tree.PrettyNoAlign
-	cfg.JSONFmt = true
-	var output string
-	// If we hit an early error, stmt or stmt.AST might not be initialized yet.
-	switch {
-	case b.plan.stmt == nil:
-		output = "-- No Statement."
-	case b.plan.stmt.AST == nil:
-		output = "-- No AST."
-	default:
-		output = cfg.Pretty(b.plan.stmt.AST)
+// buildPrettyStatement saves the pretty-printed statement (without any
+// placeholder arguments).
+func (b *stmtBundleBuilder) buildPrettyStatement(stmtRawSQL string) {
+	// If we hit an early error, stmt or stmt.AST might not be initialized yet. In
+	// this case use the original raw SQL.
+	if b.plan.stmt == nil || b.plan.stmt.AST == nil {
+		b.stmt = stmtRawSQL
+		// If we're collecting a redacted bundle, redact the raw SQL completely.
+		if b.flags.RedactValues && b.stmt != "" {
+			b.stmt = string(redact.RedactedMarker())
+		}
+	} else {
+		cfg := tree.DefaultPrettyCfg()
+		cfg.UseTabs = false
+		cfg.LineWidth = 100
+		cfg.TabWidth = 2
+		cfg.Simplify = true
+		cfg.Align = tree.PrettyNoAlign
+		cfg.JSONFmt = true
+		cfg.ValueRedaction = b.flags.RedactValues
+		b.stmt = cfg.Pretty(b.plan.stmt.AST)
+
+		// If we had ValueRedaction set, Pretty surrounded all constants with
+		// redaction markers. We must call Redact to fully redact them.
+		if b.flags.RedactValues {
+			b.stmt = string(redact.RedactableString(b.stmt).Redact())
+		}
 	}
+	if b.stmt == "" {
+		b.stmt = "-- no statement"
+	}
+}
+
+// addStatement adds the pretty-printed statement in b.stmt as file
+// statement.txt.
+func (b *stmtBundleBuilder) addStatement() {
+	output := b.stmt
 
 	if b.placeholders != nil && len(b.placeholders.Values) != 0 {
 		var buf bytes.Buffer
 		buf.WriteString(output)
 		buf.WriteString("\n\n-- Arguments:\n")
 		for i, v := range b.placeholders.Values {
-			fmt.Fprintf(&buf, "--  %s: %v\n", tree.PlaceholderIdx(i), v)
+			if b.flags.RedactValues {
+				fmt.Fprintf(&buf, "--  %s: %s\n", tree.PlaceholderIdx(i), redact.RedactedMarker())
+			} else {
+				fmt.Fprintf(&buf, "--  %s: %v\n", tree.PlaceholderIdx(i), v)
+			}
 		}
 		output = buf.String()
 	}
@@ -236,19 +282,23 @@ func (b *stmtBundleBuilder) addStatement() {
 
 // addOptPlans adds the EXPLAIN (OPT) variants as files opt.txt, opt-v.txt,
 // opt-vv.txt.
-func (b *stmtBundleBuilder) addOptPlans() {
+func (b *stmtBundleBuilder) addOptPlans(ctx context.Context) {
 	if b.plan.mem == nil || b.plan.mem.RootExpr() == nil {
 		// No optimizer plans; an error must have occurred during planning.
-		b.z.AddFile("opt.txt", "no plan")
-		b.z.AddFile("opt-v.txt", "no plan")
-		b.z.AddFile("opt-vv.txt", "no plan")
+		b.z.AddFile("opt.txt", noPlan)
+		b.z.AddFile("opt-v.txt", noPlan)
+		b.z.AddFile("opt-vv.txt", noPlan)
 		return
 	}
 
 	formatOptPlan := func(flags memo.ExprFmtFlags) string {
-		f := memo.MakeExprFmtCtx(flags, b.plan.mem, b.plan.catalog)
+		f := memo.MakeExprFmtCtx(ctx, flags, b.flags.RedactValues, b.plan.mem, b.plan.catalog)
 		f.FormatExpr(b.plan.mem.RootExpr())
-		return f.Buffer.String()
+		output := f.Buffer.String()
+		if b.flags.RedactValues {
+			output = string(redact.RedactableString(output).Redact())
+		}
+		return output
 	}
 
 	b.z.AddFile("opt.txt", formatOptPlan(memo.ExprFmtHideAll))
@@ -267,6 +317,10 @@ func (b *stmtBundleBuilder) addExecPlan(plan string) {
 }
 
 func (b *stmtBundleBuilder) addDistSQLDiagrams() {
+	if b.flags.RedactValues {
+		return
+	}
+
 	for i, d := range b.plan.distSQLFlowInfos {
 		d.diagram.AddSpans(b.trace)
 		_, url, err := d.diagram.ToURL()
@@ -312,6 +366,10 @@ func (b *stmtBundleBuilder) addExplainVec() {
 // trace (the default and the jaeger formats), the third one is a human-readable
 // representation.
 func (b *stmtBundleBuilder) addTrace() {
+	if b.flags.RedactValues {
+		return
+	}
+
 	traceJSONStr, err := tracing.TraceToJSON(b.trace)
 	if err != nil {
 		b.z.AddFile("trace.json", err.Error())
@@ -319,25 +377,16 @@ func (b *stmtBundleBuilder) addTrace() {
 		b.z.AddFile("trace.json", traceJSONStr)
 	}
 
-	cfg := tree.DefaultPrettyCfg()
-	cfg.UseTabs = false
-	cfg.LineWidth = 100
-	cfg.TabWidth = 2
-	cfg.Simplify = true
-	cfg.Align = tree.PrettyNoAlign
-	cfg.JSONFmt = true
-	stmt := cfg.Pretty(b.plan.stmt.AST)
-
 	// The JSON is not very human-readable, so we include another format too.
-	b.z.AddFile("trace.txt", fmt.Sprintf("%s\n\n\n\n%s", stmt, b.trace.String()))
+	b.z.AddFile("trace.txt", fmt.Sprintf("%s\n\n\n\n%s", b.stmt, b.trace.String()))
 
 	// Note that we're going to include the non-anonymized statement in the trace.
 	// But then again, nothing in the trace is anonymized.
 	comment := fmt.Sprintf(`This is a trace for SQL statement: %s
 This trace can be imported into Jaeger for visualization. From the Jaeger Search screen, select the JSON File.
 Jaeger can be started using docker with: docker run -d --name jaeger -p 16686:16686 jaegertracing/all-in-one:1.17
-The UI can then be accessed at http://localhost:16686/search`, stmt)
-	jaegerJSON, err := b.trace.ToJaegerJSON(stmt, comment, "")
+The UI can then be accessed at http://localhost:16686/search`, b.stmt)
+	jaegerJSON, err := b.trace.ToJaegerJSON(b.stmt, comment, "")
 	if err != nil {
 		b.z.AddFile("trace-jaeger.txt", err.Error())
 	} else {
@@ -355,7 +404,7 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	fmt.Fprintf(&buf, "\n")
 
 	// Show the values of session variables that can impact planning decisions.
-	if err := c.PrintSessionSettings(&buf); err != nil {
+	if err := c.PrintSessionSettings(&buf, b.sv); err != nil {
 		fmt.Fprintf(&buf, "-- error getting session settings: %v\n", err)
 	}
 
@@ -379,7 +428,7 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	err := b.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		var err error
 		tables, sequences, views, err = mem.Metadata().AllDataSourceNames(
-			func(ds cat.DataSource) (cat.DataSourceName, error) {
+			ctx, b.plan.catalog, func(ds cat.DataSource) (cat.DataSourceName, error) {
 				return b.plan.catalog.fullyQualifiedNameWithTxn(ctx, ds, txn)
 			},
 		)
@@ -400,21 +449,32 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 		}
 		first = false
 	}
+	blankLine()
+	if err := c.printCreateAllSchemas(&buf); err != nil {
+		fmt.Fprintf(&buf, "-- error getting all schemas: %v\n", err)
+	}
 	for i := range sequences {
 		blankLine()
 		if err := c.PrintCreateSequence(&buf, &sequences[i]); err != nil {
 			fmt.Fprintf(&buf, "-- error getting schema for sequence %s: %v\n", sequences[i].String(), err)
 		}
 	}
+	if len(mem.Metadata().AllUserDefinedFunctions()) != 0 {
+		// Get all relevant user-defined functions.
+		blankLine()
+		if err := c.PrintRelevantCreateUdf(&buf, strings.ToLower(b.stmt), b.flags.RedactValues); err != nil {
+			fmt.Fprintf(&buf, "-- error getting schema for udfs: %v\n", err)
+		}
+	}
 	for i := range tables {
 		blankLine()
-		if err := c.PrintCreateTable(&buf, &tables[i]); err != nil {
+		if err := c.PrintCreateTable(&buf, &tables[i], b.flags.RedactValues); err != nil {
 			fmt.Fprintf(&buf, "-- error getting schema for table %s: %v\n", tables[i].String(), err)
 		}
 	}
 	for i := range views {
 		blankLine()
-		if err := c.PrintCreateView(&buf, &views[i]); err != nil {
+		if err := c.PrintCreateView(&buf, &views[i], b.flags.RedactValues); err != nil {
 			fmt.Fprintf(&buf, "-- error getting schema for view %s: %v\n", views[i].String(), err)
 		}
 	}
@@ -424,11 +484,27 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	b.z.AddFile("schema.sql", buf.String())
 	for i := range tables {
 		buf.Reset()
-		if err := c.PrintTableStats(&buf, &tables[i], false /* hideHistograms */); err != nil {
+		hideHistograms := b.flags.RedactValues
+		if err := c.PrintTableStats(&buf, &tables[i], hideHistograms); err != nil {
 			fmt.Fprintf(&buf, "-- error getting statistics for table %s: %v\n", tables[i].String(), err)
 		}
 		b.z.AddFile(fmt.Sprintf("stats-%s.sql", tables[i].String()), buf.String())
 	}
+}
+
+func (b *stmtBundleBuilder) addErrors(queryErr, payloadErr, commErr error) {
+	if b.flags.RedactValues {
+		return
+	}
+
+	if queryErr == nil && payloadErr == nil && commErr == nil {
+		return
+	}
+	output := fmt.Sprintf(
+		"query error:\n%v\n\npayload error:\n%v\n\ncomm error:\n%v\n",
+		queryErr, payloadErr, commErr,
+	)
+	b.z.AddFile("errors.txt", output)
 }
 
 // finalize generates the zipped bundle and returns it as a buffer.
@@ -448,8 +524,7 @@ func makeStmtEnvCollector(ctx context.Context, ie *InternalExecutor) stmtEnvColl
 	return stmtEnvCollector{ctx: ctx, ie: ie}
 }
 
-// environmentQuery is a helper to run a query that returns a single string
-// value.
+// query is a helper to run a query that returns a single string value.
 func (c *stmtEnvCollector) query(query string) (string, error) {
 	row, err := c.ie.QueryRowEx(
 		c.ctx,
@@ -480,6 +555,41 @@ func (c *stmtEnvCollector) query(query string) (string, error) {
 	return string(*s), nil
 }
 
+// queryRows is similar to query() for the case when multiple rows with single
+// string values can be returned.
+func (c *stmtEnvCollector) queryRows(query string) ([]string, error) {
+	rows, err := c.ie.QueryBufferedEx(
+		c.ctx,
+		"stmtEnvCollector",
+		nil, /* txn */
+		sessiondata.NoSessionDataOverride,
+		query,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var values []string
+	for _, row := range rows {
+		if len(row) != 1 {
+			return nil, errors.AssertionFailedf(
+				"expected env query %q to return a single column, returned %d",
+				query, len(row),
+			)
+		}
+		s, ok := row[0].(*tree.DString)
+		if !ok {
+			return nil, errors.AssertionFailedf(
+				"expected env query %q to return a DString, returned %T",
+				query, row[0],
+			)
+		}
+		values = append(values, string(*s))
+	}
+
+	return values, nil
+}
+
 var testingOverrideExplainEnvVersion string
 
 // TestingOverrideExplainEnvVersion overrides the version reported by
@@ -507,7 +617,7 @@ func (c *stmtEnvCollector) PrintVersion(w io.Writer) error {
 
 // PrintSessionSettings appends information about session settings that can
 // impact planning decisions.
-func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
+func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer, sv *settings.Values) error {
 	// Cluster setting encoded default value to session setting value conversion
 	// functions.
 	boolToOnOff := func(boolStr string) string {
@@ -567,6 +677,7 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 		{sessionSetting: "default_transaction_quality_of_service"},
 		{sessionSetting: "default_transaction_read_only"},
 		{sessionSetting: "default_transaction_use_follower_reads"},
+		{sessionSetting: "direct_columnar_scans_enabled", clusterSetting: colfetcher.DirectScansEnabled, convFunc: boolToOnOff},
 		{sessionSetting: "disallow_full_table_scans", clusterSetting: disallowFullTableScans, convFunc: boolToOnOff},
 		{sessionSetting: "distsql", clusterSetting: DistSQLClusterExecMode, convFunc: distsqlConv},
 		{sessionSetting: "enable_implicit_select_for_update", clusterSetting: implicitSelectForUpdateClusterMode, convFunc: boolToOnOff},
@@ -594,6 +705,7 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 		{sessionSetting: "testing_optimizer_disable_rule_probability"},
 		{sessionSetting: "testing_optimizer_random_seed"},
 		{sessionSetting: "timezone"},
+		{sessionSetting: "unbounded_parallel_scans"},
 		{sessionSetting: "unconstrained_non_covering_index_scan_enabled"},
 		{sessionSetting: "vectorize", clusterSetting: VectorizeClusterMode, convFunc: vectorizeConv},
 	}
@@ -608,11 +720,19 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 		if s.clusterSetting == nil {
 			if ok, v, _ := getSessionVar(s.sessionSetting, true); ok {
 				if v.GlobalDefault != nil {
-					def = v.GlobalDefault(nil /* *settings.Values */)
+					def = v.GlobalDefault(sv)
 				}
 			}
 		} else {
 			def = s.clusterSetting.EncodedDefault()
+			if buildutil.CrdbTestBuild {
+				// In test builds we might randomize some setting defaults, so
+				// we need to override them to make the tests deterministic.
+				switch s.sessionSetting {
+				case "direct_columnar_scans_enabled":
+					def = "false"
+				}
+			}
 		}
 		if s.convFunc != nil {
 			// If necessary, convert the encoded cluster setting to a session setting
@@ -655,9 +775,15 @@ func (c *stmtEnvCollector) PrintClusterSettings(w io.Writer) error {
 	return nil
 }
 
-func (c *stmtEnvCollector) PrintCreateTable(w io.Writer, tn *tree.TableName) error {
+func (c *stmtEnvCollector) PrintCreateTable(
+	w io.Writer, tn *tree.TableName, redactValues bool,
+) error {
+	var formatOption string
+	if redactValues {
+		formatOption = " WITH REDACT"
+	}
 	createStatement, err := c.query(
-		fmt.Sprintf("SELECT create_statement FROM [SHOW CREATE TABLE %s]", tn.String()),
+		fmt.Sprintf("SELECT create_statement FROM [SHOW CREATE TABLE %s%s]", tn.String(), formatOption),
 	)
 	if err != nil {
 		return err
@@ -677,9 +803,47 @@ func (c *stmtEnvCollector) PrintCreateSequence(w io.Writer, tn *tree.TableName) 
 	return nil
 }
 
-func (c *stmtEnvCollector) PrintCreateView(w io.Writer, tn *tree.TableName) error {
+func (c *stmtEnvCollector) PrintRelevantCreateUdf(
+	w io.Writer, stmt string, redactValues bool,
+) error {
+	// The select function_name returns a DOidWrapper,
+	// we need to cast it to string for queryRows function to process.
+	// TODO: consider getting the udf sql body statements from the memo metadata.
+	functionNameQuery := "SELECT function_name::STRING as function_name_str FROM [SHOW FUNCTIONS]"
+	udfNames, err := c.queryRows(functionNameQuery)
+	if err != nil {
+		return err
+	}
+	for _, name := range udfNames {
+		if strings.Contains(stmt, name) {
+			createFunctionQuery := fmt.Sprintf(
+				"SELECT create_statement FROM [ SHOW CREATE FUNCTION \"%s\" ]", name,
+			)
+			if redactValues {
+				createFunctionQuery = fmt.Sprintf(
+					"SELECT crdb_internal.redact(crdb_internal.redactable_sql_constants(create_statement)) FROM [ SHOW CREATE FUNCTION \"%s\" ]", name,
+				)
+			}
+			createStatement, err := c.query(createFunctionQuery)
+			if err != nil {
+				fmt.Fprintf(w, "-- error getting user defined function %s: %s\n", name, err)
+				continue
+			}
+			fmt.Fprintf(w, "%s\n", createStatement)
+		}
+	}
+	return nil
+}
+
+func (c *stmtEnvCollector) PrintCreateView(
+	w io.Writer, tn *tree.TableName, redactValues bool,
+) error {
+	var formatOption string
+	if redactValues {
+		formatOption = " WITH REDACT"
+	}
 	createStatement, err := c.query(fmt.Sprintf(
-		"SELECT create_statement FROM [SHOW CREATE VIEW %s]", tn.String(),
+		"SELECT create_statement FROM [SHOW CREATE VIEW %s%s]", tn.String(), formatOption,
 	))
 	if err != nil {
 		return err
@@ -688,12 +852,28 @@ func (c *stmtEnvCollector) PrintCreateView(w io.Writer, tn *tree.TableName) erro
 	return nil
 }
 
+func (c *stmtEnvCollector) printCreateAllSchemas(w io.Writer) error {
+	createAllSchemas, err := c.queryRows("SHOW CREATE ALL SCHEMAS;")
+	if err != nil {
+		return err
+	}
+	for _, r := range createAllSchemas {
+		if r == "CREATE SCHEMA "+catconstants.PublicSchemaName+";" {
+			// The public schema is always present, so exclude it to ease the
+			// recreation of the bundle.
+			continue
+		}
+		fmt.Fprintf(w, "%s\n", r)
+	}
+	return nil
+}
+
 func (c *stmtEnvCollector) PrintTableStats(
 	w io.Writer, tn *tree.TableName, hideHistograms bool,
 ) error {
 	var maybeRemoveHistoBuckets string
 	if hideHistograms {
-		maybeRemoveHistoBuckets = " - 'histo_buckets'"
+		maybeRemoveHistoBuckets = ` - 'histo_buckets' - 'histo_version' || '{"histo_col_type": ""}'`
 	}
 
 	stats, err := c.query(fmt.Sprintf(

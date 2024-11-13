@@ -35,21 +35,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/stretchr/testify/require"
 )
 
 type callbackRemoteComponentCreator struct {
-	newOutboxFn func(*colmem.Allocator, colexecargs.OpWithMetaInfo, []*types.T) (*colrpc.Outbox, error)
+	newOutboxFn func(*colmem.Allocator, *mon.BoundAccount, colexecargs.OpWithMetaInfo, []*types.T) (*colrpc.Outbox, error)
 	newInboxFn  func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
 }
 
+var _ remoteComponentCreator = &callbackRemoteComponentCreator{}
+
 func (c callbackRemoteComponentCreator) newOutbox(
 	allocator *colmem.Allocator,
+	converterMemAcc *mon.BoundAccount,
 	input colexecargs.OpWithMetaInfo,
 	typs []*types.T,
-	_ func() []*execinfrapb.ComponentStats,
+	_ func(context.Context) []*execinfrapb.ComponentStats,
 ) (*colrpc.Outbox, error) {
-	return c.newOutboxFn(allocator, input, typs)
+	return c.newOutboxFn(allocator, converterMemAcc, input, typs)
 }
 
 func (c callbackRemoteComponentCreator) newInbox(
@@ -202,6 +206,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	componentCreator := callbackRemoteComponentCreator{
 		newOutboxFn: func(
 			allocator *colmem.Allocator,
+			converterMemAcc *mon.BoundAccount,
 			input colexecargs.OpWithMetaInfo,
 			typs []*types.T,
 		) (*colrpc.Outbox, error) {
@@ -214,7 +219,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 			require.Len(t, input.MetadataSources, 1)
 			inbox := colexec.MaybeUnwrapInvariantsChecker(input.MetadataSources[0].(colexecop.Operator)).(*colrpc.Inbox)
 			require.Len(t, inboxToNumInputTypes[inbox], numInputTypesToOutbox)
-			return colrpc.NewOutbox(allocator, input, typs, nil /* getStats */)
+			return colrpc.NewOutbox(allocator, converterMemAcc, input, typs, nil /* getStats */)
 		},
 		newInboxFn: func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
 			inbox, err := colrpc.NewInbox(allocator, typs, streamID)
@@ -231,17 +236,18 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 		FlowCtx: execinfra.FlowCtx{
 			Cfg:     &execinfra.ServerConfig{},
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			NodeID:  base.TestingIDContainer,
 		},
 	}
 	var wg sync.WaitGroup
 	vfc := newVectorizedFlowCreator(
-		&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, false, &wg, &execinfra.RowChannel{},
+		f, nil /* helper */, componentCreator, false, false, &wg, &execinfra.RowChannel{},
 		nil /* batchSyncFlowConsumer */, nil /* podNodeDialer */, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
 		nil /* fdSemaphore */, descs.DistSQLTypeResolver{}, admission.WorkInfo{},
 	)
 
-	_, _, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, nil /* localProcessors */, flowinfra.FuseNormally)
+	_, _, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, nil /* localProcessors */, nil /*localVectorSources*/, flowinfra.FuseNormally)
 	defer vfc.cleanup(ctx)
 	require.NoError(t, err)
 
@@ -263,7 +269,7 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	// We use an on-disk engine for this test since we're testing FS interactions
 	// and want to get the same behavior as a non-testing environment.
 	tempPath, dirCleanup := testutils.TempDir(t)
-	ngn, err := storage.Open(ctx, storage.Filesystem(tempPath), storage.CacheSize(0))
+	ngn, err := storage.Open(ctx, storage.Filesystem(tempPath), cluster.MakeClusterSettings(), storage.CacheSize(0))
 	require.NoError(t, err)
 	defer ngn.Close()
 	defer dirCleanup()
@@ -281,6 +287,7 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 						},
 					},
 					EvalCtx:     &evalCtx,
+					Mon:         evalCtx.TestingMon,
 					NodeID:      base.TestingIDContainer,
 					DiskMonitor: execinfra.NewTestDiskMonitor(ctx, st),
 				},

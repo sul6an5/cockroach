@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -26,8 +27,8 @@ import (
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/confchange"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3/confchange"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 // TestAtomicReplicationChange is a simple smoke test for atomic membership
@@ -56,7 +57,7 @@ func TestAtomicReplicationChange(t *testing.T) {
 	desc, err := tc.AddVoters(k, tc.Target(2))
 	require.NoError(t, err)
 
-	runChange := func(expDesc roachpb.RangeDescriptor, chgs []roachpb.ReplicationChange) roachpb.RangeDescriptor {
+	runChange := func(expDesc roachpb.RangeDescriptor, chgs []kvpb.ReplicationChange) roachpb.RangeDescriptor {
 		t.Helper()
 		desc, err := tc.Servers[0].DB().AdminChangeReplicas(ctx, k, expDesc, chgs)
 		require.NoError(t, err)
@@ -86,7 +87,7 @@ func TestAtomicReplicationChange(t *testing.T) {
 				// the descriptor already matches since the descriptor is updated
 				// a hair earlier.
 				cfg, _, err := confchange.Restore(confchange.Changer{
-					Tracker:   tracker.MakeProgressTracker(1),
+					Tracker:   tracker.MakeProgressTracker(1, 0),
 					LastIndex: 1,
 				}, desc.Replicas().ConfState())
 				require.NoError(t, err)
@@ -101,7 +102,7 @@ func TestAtomicReplicationChange(t *testing.T) {
 	}
 
 	// Run a fairly general change.
-	desc = runChange(desc, []roachpb.ReplicationChange{
+	desc = runChange(desc, []kvpb.ReplicationChange{
 		{ChangeType: roachpb.ADD_VOTER, Target: tc.Target(3)},
 		{ChangeType: roachpb.ADD_VOTER, Target: tc.Target(5)},
 		{ChangeType: roachpb.REMOVE_VOTER, Target: tc.Target(2)},
@@ -115,7 +116,7 @@ func TestAtomicReplicationChange(t *testing.T) {
 	require.NoError(t, tc.TransferRangeLease(desc, tc.Target(4)))
 
 	// Rebalance back down all the way.
-	desc = runChange(desc, []roachpb.ReplicationChange{
+	desc = runChange(desc, []kvpb.ReplicationChange{
 		{ChangeType: roachpb.REMOVE_VOTER, Target: tc.Target(0)},
 		{ChangeType: roachpb.REMOVE_VOTER, Target: tc.Target(1)},
 		{ChangeType: roachpb.REMOVE_VOTER, Target: tc.Target(3)},

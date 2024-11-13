@@ -12,25 +12,27 @@ package install
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
 type session interface {
-	CombinedOutput(ctx context.Context, cmd string) ([]byte, error)
-	Run(ctx context.Context, cmd string) error
-	SetWithExitStatus(value bool)
+	CombinedOutput(ctx context.Context) ([]byte, error)
+	Run(ctx context.Context) error
 	SetStdin(r io.Reader)
 	SetStdout(w io.Writer)
 	SetStderr(w io.Writer)
-	Start(cmd string) error
+	Start() error
 	StdinPipe() (io.WriteCloser, error)
 	StdoutPipe() (io.Reader, error)
 	StderrPipe() (io.Reader, error)
@@ -41,31 +43,76 @@ type session interface {
 
 type remoteSession struct {
 	*exec.Cmd
-	cancel         func()
-	logfile        string // captures ssh -vvv
-	withExitStatus bool
+	cancel  func()
+	logfile string // captures ssh -vvv
 }
 
-func newRemoteSession(user, host string, logdir string) (*remoteSession, error) {
-	// TODO(tbg): this is disabled at the time of writing. It was difficult
-	// to assign the logfiles to the roachtest and as a bonus our CI harness
-	// never actually managed to collect the files since they had wrong
-	// permissions; instead they clogged up the roachprod dir.
-	// logfile := filepath.Join(
-	//	logdir,
-	// 	fmt.Sprintf("ssh_%s_%s", host, timeutil.Now().Format(time.RFC3339)),
-	// )
-	const logfile = ""
-	withExitStatus := false
+type remoteCommand struct {
+	node          Node
+	user          string
+	host          string
+	cmd           string
+	debugDisabled bool
+	debugName     string
+
+	// TODO(renato): remove this option once we no longer have AWS
+	// clusters with default hostnames.
+	hostValidationDisabled bool
+}
+
+type remoteSessionOption = func(c *remoteCommand)
+
+func withDebugDisabled() remoteSessionOption {
+	return func(c *remoteCommand) {
+		c.debugDisabled = true
+	}
+}
+
+func withDebugName(name string) remoteSessionOption {
+	return func(c *remoteCommand) {
+		c.debugName = name
+	}
+}
+
+func withHostValidationDisabled() remoteSessionOption {
+	return func(c *remoteCommand) {
+		c.hostValidationDisabled = true
+	}
+}
+
+func newRemoteSession(l *logger.Logger, command *remoteCommand) *remoteSession {
+	var loggingArgs []string
+
+	// NB: -q suppresses -E, at least on *nix.
+	loggingArgs = []string{"-q"}
+	logfile := ""
+	if !command.debugDisabled {
+		var debugName = command.debugName
+		if debugName == "" {
+			debugName = GenFilenameFromArgs(20, command.cmd)
+		}
+
+		cl, err := l.ChildLogger(filepath.Join("ssh", fmt.Sprintf(
+			"ssh_%s_n%v_%s",
+			timeutil.Now().Format(`150405.000000000`),
+			command.node,
+			debugName,
+		)))
+
+		// Check the logger file since running roachprod from the cli will result in a fileless logger.
+		if err == nil && l.File != nil {
+			logfile = cl.File.Name()
+			loggingArgs = []string{
+				"-vvv", "-E", logfile,
+			}
+			cl.Close()
+		}
+	}
+
+	//const logfile = ""
 	args := []string{
-		user + "@" + host,
+		command.user + "@" + command.host,
 
-		// TODO(tbg): see above.
-		//"-vvv", "-E", logfile,
-		// NB: -q suppresses -E, at least on OSX. Difficult decisions will have
-		// to be made if omitting -q leads to annoyance on stdout/stderr.
-
-		"-q",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "StrictHostKeyChecking=no",
 		// Send keep alives every minute to prevent connections without activity
@@ -78,30 +125,23 @@ func newRemoteSession(user, host string, logdir string) (*remoteSession, error) 
 		// context cancellation killing hanging roachprod processes.
 		"-o", "ConnectTimeout=5",
 	}
+	args = append(args, loggingArgs...)
 	args = append(args, sshAuthArgs()...)
+	args = append(args, command.cmd)
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	return &remoteSession{cmd, cancel, logfile, withExitStatus}, nil
+	fullCmd := exec.CommandContext(ctx, "ssh", args...)
+	return &remoteSession{fullCmd, cancel, logfile}
 }
 
 func (s *remoteSession) errWithDebug(err error) error {
 	if err != nil && s.logfile != "" {
-		err = errors.Wrapf(err, "ssh verbose log retained in %s", s.logfile)
+		err = errors.Wrapf(err, "ssh verbose log retained in %s", filepath.Base(s.logfile))
 		s.logfile = "" // prevent removal on close
 	}
 	return err
 }
 
-func (s *remoteSession) CombinedOutput(ctx context.Context, cmd string) ([]byte, error) {
-	if s.withExitStatus {
-		cmd = strings.TrimSpace(cmd)
-		if !strings.HasSuffix(cmd, ";") {
-			cmd += ";"
-		}
-		cmd += "echo -n 'LAST EXIT STATUS: '$?;"
-	}
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-
+func (s *remoteSession) CombinedOutput(ctx context.Context) ([]byte, error) {
 	var b []byte
 	var err error
 	commandFinished := make(chan struct{})
@@ -117,20 +157,11 @@ func (s *remoteSession) CombinedOutput(ctx context.Context, cmd string) ([]byte,
 		s.Close()
 		return nil, ctx.Err()
 	case <-commandFinished:
-		return b, err
+		return b, rperrors.ClassifyCmdError(err)
 	}
 }
 
-func (s *remoteSession) Run(ctx context.Context, cmd string) error {
-	if s.withExitStatus {
-		cmd = strings.TrimSpace(cmd)
-		if !strings.HasSuffix(cmd, ";") {
-			cmd += ";"
-		}
-		cmd += "echo -n 'LAST EXIT STATUS: '$?;"
-	}
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-
+func (s *remoteSession) Run(ctx context.Context) error {
 	var err error
 	commandFinished := make(chan struct{})
 	go func() {
@@ -143,24 +174,12 @@ func (s *remoteSession) Run(ctx context.Context, cmd string) error {
 		s.Close()
 		return ctx.Err()
 	case <-commandFinished:
-		return err
+		return rperrors.ClassifyCmdError(err)
 	}
 }
 
-func (s *remoteSession) Start(cmd string) error {
-	if s.withExitStatus {
-		cmd = strings.TrimSpace(cmd)
-		if !strings.HasSuffix(cmd, ";") {
-			cmd += ";"
-		}
-		cmd += "echo -n 'LAST EXIT STATUS: '$?;"
-	}
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.Start()
-}
-
-func (s *remoteSession) SetWithExitStatus(value bool) {
-	s.withExitStatus = value
+func (s *remoteSession) Start() error {
+	return rperrors.ClassifyCmdError(s.errWithDebug(s.Cmd.Start()))
 }
 
 func (s *remoteSession) SetStdin(r io.Reader) {
@@ -207,27 +226,16 @@ func (s *remoteSession) Close() {
 
 type localSession struct {
 	*exec.Cmd
-	cancel         func()
-	withExitStatus bool
+	cancel func()
 }
 
-func newLocalSession() *localSession {
+func newLocalSession(cmd string) *localSession {
 	ctx, cancel := context.WithCancel(context.Background())
-	withExitStatus := false
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-c")
-	return &localSession{cmd, cancel, withExitStatus}
+	fullCmd := exec.CommandContext(ctx, "/bin/bash", "-c", cmd)
+	return &localSession{fullCmd, cancel}
 }
 
-func (s *localSession) CombinedOutput(ctx context.Context, cmd string) ([]byte, error) {
-	if s.withExitStatus {
-		cmd = strings.TrimSpace(cmd)
-		if !strings.HasSuffix(cmd, ";") {
-			cmd += ";"
-		}
-		cmd += "echo -n 'LAST EXIT STATUS: '$?;"
-	}
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-
+func (s *localSession) CombinedOutput(ctx context.Context) ([]byte, error) {
 	var b []byte
 	var err error
 	commandFinished := make(chan struct{})
@@ -242,20 +250,11 @@ func (s *localSession) CombinedOutput(ctx context.Context, cmd string) ([]byte, 
 		s.Close()
 		return nil, ctx.Err()
 	case <-commandFinished:
-		return b, err
+		return b, rperrors.ClassifyCmdError(err)
 	}
 }
 
-func (s *localSession) Run(ctx context.Context, cmd string) error {
-	if s.withExitStatus {
-		cmd = strings.TrimSpace(cmd)
-		if !strings.HasSuffix(cmd, ";") {
-			cmd += ";"
-		}
-		cmd += "echo -n 'LAST EXIT STATUS: '$?;"
-	}
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-
+func (s *localSession) Run(ctx context.Context) error {
 	var err error
 	commandFinished := make(chan struct{})
 	go func() {
@@ -268,24 +267,12 @@ func (s *localSession) Run(ctx context.Context, cmd string) error {
 		s.Close()
 		return ctx.Err()
 	case <-commandFinished:
-		return err
+		return rperrors.ClassifyCmdError(err)
 	}
 }
 
-func (s *localSession) Start(cmd string) error {
-	if s.withExitStatus {
-		cmd = strings.TrimSpace(cmd)
-		if !strings.HasSuffix(cmd, ";") {
-			cmd += ";"
-		}
-		cmd += "echo -n 'LAST EXIT STATUS: '$?;"
-	}
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.Start()
-}
-
-func (s *localSession) SetWithExitStatus(value bool) {
-	s.withExitStatus = value
+func (s *localSession) Start() error {
+	return rperrors.ClassifyCmdError(s.Cmd.Start())
 }
 
 func (s *localSession) SetStdin(r io.Reader) {

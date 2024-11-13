@@ -22,17 +22,19 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"     // Ensure changefeed init hooks run.
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl" // Ensure we can start tenant.
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamingtest"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationtestutils"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -61,7 +63,7 @@ type pgConnReplicationFeedSource struct {
 	}
 }
 
-var _ streamingtest.FeedSource = (*pgConnReplicationFeedSource)(nil)
+var _ replicationtestutils.FeedSource = (*pgConnReplicationFeedSource)(nil)
 
 type pgConnEventDecoder interface {
 	decode()
@@ -131,6 +133,7 @@ func (d *partitionStreamDecoder) decode() {
 func (f *pgConnReplicationFeedSource) Next() (streamingccl.Event, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// First check if there exists a decoded event.
 	if e := f.mu.codec.pop(); e != nil {
 		return e, true
 	}
@@ -157,12 +160,13 @@ func (f *pgConnReplicationFeedSource) Error() error {
 
 // startReplication starts replication stream, specified as query and its args.
 func startReplication(
+	ctx context.Context,
 	t *testing.T,
-	r *streamingtest.ReplicationHelper,
+	r *replicationtestutils.ReplicationHelper,
 	codecFactory eventDecoderFactory,
 	create string,
 	args ...interface{},
-) (*pgConnReplicationFeedSource, *streamingtest.ReplicationFeed) {
+) (*pgConnReplicationFeedSource, *replicationtestutils.ReplicationFeed) {
 	sink := r.PGUrl
 	sink.RawQuery = r.PGUrl.Query().Encode()
 
@@ -171,11 +175,11 @@ func startReplication(
 	pgxConfig, err := pgx.ParseConfig(sink.String())
 	require.NoError(t, err)
 
-	queryCtx, cancel := context.WithCancel(context.Background())
+	queryCtx, cancel := context.WithCancel(ctx)
 	conn, err := pgx.ConnectConfig(queryCtx, pgxConfig)
 	require.NoError(t, err)
 
-	rows, err := conn.Query(queryCtx, `SET enable_experimental_stream_replication = true`)
+	rows, err := conn.Query(queryCtx, `SET CLUSTER SETTING cross_cluster_replication.enabled = true;`)
 	require.NoError(t, err)
 	rows.Close()
 
@@ -191,13 +195,13 @@ func startReplication(
 	}
 	feedSource.mu.rows = rows
 	feedSource.mu.codec = codecFactory(t, rows)
-	return feedSource, streamingtest.MakeReplicationFeed(t, feedSource)
+	return feedSource, replicationtestutils.MakeReplicationFeed(t, feedSource)
 }
 
 func testStreamReplicationStatus(
 	t *testing.T,
 	runner *sqlutils.SQLRunner,
-	streamID string,
+	streamID streampb.StreamID,
 	streamStatus streampb.StreamReplicationStatus_StreamStatus,
 ) {
 	checkStreamStatus := func(t *testing.T, frontier hlc.Timestamp,
@@ -239,19 +243,20 @@ func TestReplicationStreamInitialization(t *testing.T) {
 		},
 	}
 
-	h, cleanup := streamingtest.NewReplicationHelper(t, serverArgs)
+	h, cleanup := replicationtestutils.NewReplicationHelper(t, serverArgs)
 	defer cleanup()
-	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID())
+	testTenantName := roachpb.TenantName("test-tenant")
+	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID(), testTenantName)
 	defer cleanupTenant()
 
 	// Makes the stream time out really soon
 	h.SysSQL.Exec(t, "SET CLUSTER SETTING stream_replication.job_liveness_timeout = '10ms'")
 	h.SysSQL.Exec(t, "SET CLUSTER SETTING stream_replication.stream_liveness_track_frequency = '1ms'")
 	t.Run("failed-after-timeout", func(t *testing.T) {
-		rows := h.SysSQL.QueryStr(t, "SELECT crdb_internal.start_replication_stream($1)", srcTenant.ID.ToUint64())
-		streamID := rows[0][0]
+		replicationProducerSpec := h.StartReplicationStream(t, testTenantName)
+		streamID := replicationProducerSpec.StreamID
 
-		h.SysSQL.CheckQueryResultsRetry(t, fmt.Sprintf("SELECT status FROM system.jobs WHERE id = %s", streamID),
+		h.SysSQL.CheckQueryResultsRetry(t, fmt.Sprintf("SELECT status FROM system.jobs WHERE id = %d", streamID),
 			[][]string{{"failed"}})
 		testStreamReplicationStatus(t, h.SysSQL, streamID, streampb.StreamReplicationStatus_STREAM_INACTIVE)
 	})
@@ -259,16 +264,16 @@ func TestReplicationStreamInitialization(t *testing.T) {
 	// Make sure the stream does not time out within the test timeout
 	h.SysSQL.Exec(t, "SET CLUSTER SETTING stream_replication.job_liveness_timeout = '500s'")
 	t.Run("continuously-running-within-timeout", func(t *testing.T) {
-		rows := h.SysSQL.QueryStr(t, "SELECT crdb_internal.start_replication_stream($1)", srcTenant.ID.ToUint64())
-		streamID := rows[0][0]
+		replicationProducerSpec := h.StartReplicationStream(t, testTenantName)
+		streamID := replicationProducerSpec.StreamID
 
-		h.SysSQL.CheckQueryResultsRetry(t, fmt.Sprintf("SELECT status FROM system.jobs WHERE id = %s", streamID),
+		h.SysSQL.CheckQueryResultsRetry(t, fmt.Sprintf("SELECT status FROM system.jobs WHERE id = %d", streamID),
 			[][]string{{"running"}})
 
 		// Ensures the job is continuously running for 3 seconds.
 		testDuration, now := 3*time.Second, timeutil.Now()
 		for start, end := now, now.Add(testDuration); start.Before(end); start = start.Add(300 * time.Millisecond) {
-			h.SysSQL.CheckQueryResults(t, fmt.Sprintf("SELECT status FROM system.jobs WHERE id = %s", streamID),
+			h.SysSQL.CheckQueryResults(t, fmt.Sprintf("SELECT status FROM system.jobs WHERE id = %d", streamID),
 				[][]string{{"running"}})
 			testStreamReplicationStatus(t, h.SysSQL, streamID, streampb.StreamReplicationStatus_STREAM_ACTIVE)
 		}
@@ -288,15 +293,16 @@ func TestReplicationStreamInitialization(t *testing.T) {
 	})
 
 	t.Run("nonexistent-replication-stream-has-inactive-status", func(t *testing.T) {
-		testStreamReplicationStatus(t, h.SysSQL, "123", streampb.StreamReplicationStatus_STREAM_INACTIVE)
+		testStreamReplicationStatus(t, h.SysSQL, streampb.StreamID(123), streampb.StreamReplicationStatus_STREAM_INACTIVE)
 	})
 }
 
 func encodeSpec(
 	t *testing.T,
-	h *streamingtest.ReplicationHelper,
-	srcTenant streamingtest.TenantState,
-	startFrom hlc.Timestamp,
+	h *replicationtestutils.ReplicationHelper,
+	srcTenant replicationtestutils.TenantState,
+	initialScanTime hlc.Timestamp,
+	previousHighWater hlc.Timestamp,
 	tables ...string,
 ) []byte {
 	var spans []roachpb.Span
@@ -307,8 +313,9 @@ func encodeSpec(
 	}
 
 	spec := &streampb.StreamPartitionSpec{
-		StartFrom: startFrom,
-		Spans:     spans,
+		InitialScanTimestamp:       initialScanTime,
+		PreviousHighWaterTimestamp: previousHighWater,
+		Spans:                      spans,
 		Config: streampb.StreamPartitionSpec_ExecutionConfig{
 			MinCheckpointFrequency: 10 * time.Millisecond,
 		},
@@ -322,66 +329,67 @@ func encodeSpec(
 func TestStreamPartition(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	h, cleanup := streamingtest.NewReplicationHelper(t,
+	h, cleanup := replicationtestutils.NewReplicationHelper(t,
 		base.TestServerArgs{
 			// Test fails within a test tenant. More investigation is required.
 			// Tracked with #76378.
 			DisableDefaultTestTenant: true,
 		})
 	defer cleanup()
-	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID())
+	testTenantName := roachpb.TenantName("test-tenant")
+	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID(), testTenantName)
 	defer cleanupTenant()
 
 	srcTenant.SQL.Exec(t, `
 CREATE DATABASE d;
 CREATE TABLE d.t1(i int primary key, a string, b string);
-CREATE TABLE d.t2(i int primary key, a string, b string);
 INSERT INTO d.t1 (i) VALUES (42);
-INSERT INTO d.t2 (i) VALUES (42);
 USE d;
 `)
 
 	ctx := context.Background()
-	rows := h.SysSQL.QueryStr(t, "SELECT crdb_internal.start_replication_stream($1)", srcTenant.ID.ToUint64())
-	streamID := rows[0][0]
+	replicationProducerSpec := h.StartReplicationStream(t, testTenantName)
+	streamID := replicationProducerSpec.StreamID
+	initialScanTimestamp := replicationProducerSpec.ReplicationStartTime
 
 	const streamPartitionQuery = `SELECT * FROM crdb_internal.stream_partition($1, $2)`
 	t1Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), srcTenant.Codec, "d", "t1")
-	t2Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), srcTenant.Codec, "d", "t2")
 
 	t.Run("stream-table-cursor-error", func(t *testing.T) {
-		_, feed := startReplication(t, h, makePartitionStreamDecoder,
-			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, hlc.Timestamp{}, "t2"))
+
+		srcTenant.SQL.Exec(t, `
+CREATE TABLE d.t2(i int primary key, a string, b string);
+INSERT INTO d.t2 (i) VALUES (42);
+`)
+		_, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
+			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp, hlc.Timestamp{}, "t2"))
 		defer feed.Close(ctx)
+		t2Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), srcTenant.Codec, "d", "t2")
+		expected := replicationtestutils.EncodeKV(t, srcTenant.Codec, t2Descr, 42)
+		feed.ObserveKey(ctx, expected.Key)
 
 		subscribedSpan := h.TableSpan(srcTenant.Codec, "t2")
 		// Send a ClearRange to trigger rows cursor to return internal error from rangefeed.
-		// Choose 't2' so that it doesn't trigger error on other registered span in rangefeeds,
-		// affecting other tests.
-		_, err := kv.SendWrapped(ctx, h.SysServer.DB().NonTransactionalSender(), &roachpb.ClearRangeRequest{
-			RequestHeader: roachpb.RequestHeader{
+		_, err := kv.SendWrapped(ctx, h.SysServer.DB().NonTransactionalSender(), &kvpb.ClearRangeRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    subscribedSpan.Key,
 				EndKey: subscribedSpan.EndKey,
 			},
 		})
 		require.Nil(t, err)
 
-		expected := streamingtest.EncodeKV(t, srcTenant.Codec, t2Descr, 42)
-		feed.ObserveKey(ctx, expected.Key)
 		feed.ObserveError(ctx, func(err error) bool {
-			return strings.Contains(err.Error(), "unexpected MVCC history mutation") ||
-				// TODO(casper): disabled this once we figured out why we have context cancellation
-				// emitted from ingestion side.
-				strings.Contains(err.Error(), "context canceled")
+			return strings.Contains(err.Error(), "unexpected MVCC history mutation")
 		})
 	})
 
 	t.Run("stream-table", func(t *testing.T) {
-		_, feed := startReplication(t, h, makePartitionStreamDecoder,
-			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, hlc.Timestamp{}, "t1"))
+		_, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
+			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
+				hlc.Timestamp{}, "t1"))
 		defer feed.Close(ctx)
 
-		expected := streamingtest.EncodeKV(t, srcTenant.Codec, t1Descr, 42)
+		expected := replicationtestutils.EncodeKV(t, srcTenant.Codec, t1Descr, 42)
 		firstObserved := feed.ObserveKey(ctx, expected.Key)
 
 		require.Equal(t, expected.Value.RawBytes, firstObserved.Value.RawBytes)
@@ -392,7 +400,7 @@ USE d;
 
 		// Update our row.
 		srcTenant.SQL.Exec(t, `UPDATE d.t1 SET b = 'world' WHERE i = 42`)
-		expected = streamingtest.EncodeKV(t, srcTenant.Codec, t1Descr, 42, nil, "world")
+		expected = replicationtestutils.EncodeKV(t, srcTenant.Codec, t1Descr, 42, nil, "world")
 
 		// Observe its changes.
 		secondObserved := feed.ObserveKey(ctx, expected.Key)
@@ -406,17 +414,18 @@ USE d;
 		srcTenant.SQL.Exec(t, `UPDATE d.t1 SET a = 'привет' WHERE i = 42`)
 		srcTenant.SQL.Exec(t, `UPDATE d.t1 SET b = 'мир' WHERE i = 42`)
 
-		_, feed := startReplication(t, h, makePartitionStreamDecoder,
-			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, beforeUpdateTS, "t1"))
+		_, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
+			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
+				beforeUpdateTS, "t1"))
 		defer feed.Close(ctx)
 
 		// We should observe 2 versions of this key: one with ("привет", "world"), and a later
 		// version ("привет", "мир")
-		expected := streamingtest.EncodeKV(t, srcTenant.Codec, t1Descr, 42, "привет", "world")
+		expected := replicationtestutils.EncodeKV(t, srcTenant.Codec, t1Descr, 42, "привет", "world")
 		firstObserved := feed.ObserveKey(ctx, expected.Key)
 		require.Equal(t, expected.Value.RawBytes, firstObserved.Value.RawBytes)
 
-		expected = streamingtest.EncodeKV(t, srcTenant.Codec, t1Descr, 42, "привет", "мир")
+		expected = replicationtestutils.EncodeKV(t, srcTenant.Codec, t1Descr, 42, "привет", "мир")
 		secondObserved := feed.ObserveKey(ctx, expected.Key)
 		require.Equal(t, expected.Value.RawBytes, secondObserved.Value.RawBytes)
 	})
@@ -424,8 +433,8 @@ USE d;
 	t.Run("stream-batches-events", func(t *testing.T) {
 		srcTenant.SQL.Exec(t, `
 CREATE TABLE t3(
- i INT PRIMARY KEY, 
- a STRING, 
+ i INT PRIMARY KEY,
+ a STRING,
  b STRING,
  INDEX (a,b),   -- Just to have a bit more data in the table
  FAMILY fb (b)
@@ -442,8 +451,9 @@ CREATE TABLE t3(
 		// Add few rows.
 		addRows(0, 10)
 
-		source, feed := startReplication(t, h, makePartitionStreamDecoder,
-			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, hlc.Timestamp{}, "t1"))
+		source, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
+			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
+				hlc.Timestamp{}, "t1"))
 		defer feed.Close(ctx)
 
 		// Few more rows after feed started.
@@ -468,13 +478,14 @@ CREATE TABLE t3(
 func TestStreamAddSSTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	h, cleanup := streamingtest.NewReplicationHelper(t, base.TestServerArgs{
+	h, cleanup := replicationtestutils.NewReplicationHelper(t, base.TestServerArgs{
 		// Test hangs when run within the default test tenant. Tracked with
 		// #76378.
 		DisableDefaultTestTenant: true,
 	})
 	defer cleanup()
-	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID())
+	testTenantName := roachpb.TenantName("test-tenant")
+	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID(), testTenantName)
 	defer cleanupTenant()
 
 	srcTenant.SQL.Exec(t, `
@@ -485,8 +496,8 @@ USE d;
 `)
 
 	ctx := context.Background()
-	rows := h.SysSQL.QueryStr(t, "SELECT crdb_internal.start_replication_stream($1)", srcTenant.ID.ToUint64())
-	streamID := rows[0][0]
+	replicationProducerSpec := h.StartReplicationStream(t, testTenantName)
+	streamID := replicationProducerSpec.StreamID
 
 	const streamPartitionQuery = `SELECT * FROM crdb_internal.stream_partition($1, $2)`
 
@@ -503,18 +514,21 @@ USE d;
 		// Make any import operation to be a AddSSTable operation instead of kv writes.
 		h.SysSQL.Exec(t, "SET CLUSTER SETTING kv.bulk_io_write.small_write_size = '1';")
 
-		var startTime time.Time
+		var clockTime time.Time
 		srcTenant.SQL.Exec(t, fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY, n INT)", table))
-		srcTenant.SQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&startTime)
-		startHlcTime := hlc.Timestamp{WallTime: startTime.UnixNano()}
-		if initialScan {
-			startHlcTime = hlc.Timestamp{}
+		srcTenant.SQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&clockTime)
+
+		var previousHighWater hlc.Timestamp
+		initialScanTimestamp := hlc.Timestamp{WallTime: clockTime.UnixNano()}
+		if !initialScan {
+			previousHighWater = hlc.Timestamp{WallTime: clockTime.UnixNano()}
 		}
 		if addSSTableBeforeRangefeed {
 			srcTenant.SQL.Exec(t, fmt.Sprintf("IMPORT INTO %s CSV DATA ($1)", table), dataSrv.URL)
 		}
-		source, feed := startReplication(t, h, makePartitionStreamDecoder,
-			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, startHlcTime, table))
+		source, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
+			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
+				previousHighWater, table))
 		defer feed.Close(ctx)
 		if !addSSTableBeforeRangefeed {
 			srcTenant.SQL.Exec(t, fmt.Sprintf("IMPORT INTO %s CSV DATA ($1)", table), dataSrv.URL)
@@ -552,7 +566,7 @@ func TestCompleteStreamReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	h, cleanup := streamingtest.NewReplicationHelper(t,
+	h, cleanup := replicationtestutils.NewReplicationHelper(t,
 		base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
@@ -561,7 +575,8 @@ func TestCompleteStreamReplication(t *testing.T) {
 		})
 	defer cleanup()
 	srcTenantID := serverutils.TestTenantID()
-	_, cleanupTenant := h.CreateTenant(t, srcTenantID)
+	testTenantName := roachpb.TenantName("test-tenant")
+	_, cleanupTenant := h.CreateTenant(t, srcTenantID, testTenantName)
 	defer cleanupTenant()
 
 	// Make the producer job times out fast and fastly tracks ingestion cutover signal.
@@ -569,10 +584,8 @@ func TestCompleteStreamReplication(t *testing.T) {
 		"SET CLUSTER SETTING stream_replication.job_liveness_timeout = '2s';",
 		"SET CLUSTER SETTING stream_replication.stream_liveness_track_frequency = '2s';")
 
-	var timedOutStreamID int
-	row := h.SysSQL.QueryRow(t,
-		"SELECT crdb_internal.start_replication_stream($1)", srcTenantID.ToUint64())
-	row.Scan(&timedOutStreamID)
+	replicationProducerSpec := h.StartReplicationStream(t, testTenantName)
+	timedOutStreamID := replicationProducerSpec.StreamID
 	jobutils.WaitForJobToFail(t, h.SysSQL, jobspb.JobID(timedOutStreamID))
 
 	// Makes the producer job not easily time out.
@@ -583,10 +596,8 @@ func TestCompleteStreamReplication(t *testing.T) {
 			timedOutStreamID, successfulIngestion)
 
 		// Create a new replication stream and complete it.
-		var streamID int
-		row := h.SysSQL.QueryRow(t,
-			"SELECT crdb_internal.start_replication_stream($1)", srcTenantID.ToUint64())
-		row.Scan(&streamID)
+		replicationProducerSpec := h.StartReplicationStream(t, testTenantName)
+		streamID := replicationProducerSpec.StreamID
 		jobutils.WaitForJobToRun(t, h.SysSQL, jobspb.JobID(streamID))
 		h.SysSQL.Exec(t, "SELECT crdb_internal.complete_replication_stream($1, $2)",
 			streamID, successfulIngestion)
@@ -601,9 +612,9 @@ func TestCompleteStreamReplication(t *testing.T) {
 		pj, err := jr.LoadJob(ctx, jobspb.JobID(streamID))
 		require.NoError(t, err)
 		payload := pj.Payload()
-		require.ErrorIs(t, h.SysServer.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			ptp := h.SysServer.DistSQLServer().(*distsql.ServerImpl).ServerConfig.ProtectedTimestampProvider
-			_, err = ptp.GetRecord(ctx, txn, payload.GetStreamReplication().ProtectedTimestampRecordID)
+		ptp := h.SysServer.DistSQLServer().(*distsql.ServerImpl).ServerConfig.ProtectedTimestampProvider
+		require.ErrorIs(t, h.SysServer.InternalDB().(isql.DB).Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			_, err = ptp.WithTxn(txn).GetRecord(ctx, payload.GetStreamReplication().ProtectedTimestampRecordID)
 			return err
 		}), protectedts.ErrNotExists)
 	}
@@ -621,7 +632,7 @@ func TestCompleteStreamReplication(t *testing.T) {
 	}
 }
 
-func sortDelRanges(receivedDelRanges []roachpb.RangeFeedDeleteRange) {
+func sortDelRanges(receivedDelRanges []kvpb.RangeFeedDeleteRange) {
 	sort.Slice(receivedDelRanges, func(i, j int) bool {
 		if !receivedDelRanges[i].Timestamp.Equal(receivedDelRanges[j].Timestamp) {
 			return receivedDelRanges[i].Timestamp.Compare(receivedDelRanges[j].Timestamp) < 0
@@ -636,15 +647,18 @@ func sortDelRanges(receivedDelRanges []roachpb.RangeFeedDeleteRange) {
 func TestStreamDeleteRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.WithIssue(t, 93568)
 	skip.UnderStressRace(t, "disabled under stress and race")
 
-	h, cleanup := streamingtest.NewReplicationHelper(t, base.TestServerArgs{
+	h, cleanup := replicationtestutils.NewReplicationHelper(t, base.TestServerArgs{
 		// Test hangs when run within the default test tenant. Tracked with
 		// #76378.
 		DisableDefaultTestTenant: true,
 	})
 	defer cleanup()
-	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID())
+	testTenantName := roachpb.TenantName("test-tenant")
+	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID(), testTenantName)
 	defer cleanupTenant()
 
 	srcTenant.SQL.Exec(t, `
@@ -659,13 +673,15 @@ USE d;
 `)
 
 	ctx := context.Background()
-	rows := h.SysSQL.QueryStr(t, "SELECT crdb_internal.start_replication_stream($1)", srcTenant.ID.ToUint64())
-	streamID := rows[0][0]
+	replicationProducerSpec := h.StartReplicationStream(t, testTenantName)
+	streamID := replicationProducerSpec.StreamID
+	initialScanTimestamp := replicationProducerSpec.ReplicationStartTime
 
 	const streamPartitionQuery = `SELECT * FROM crdb_internal.stream_partition($1, $2)`
 	// Only subscribe to table t1 and t2, not t3.
-	source, feed := startReplication(t, h, makePartitionStreamDecoder,
-		streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, h.SysServer.Clock().Now(), "t1", "t2"))
+	source, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
+		streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
+			hlc.Timestamp{}, "t1", "t2"))
 	defer feed.Close(ctx)
 
 	// TODO(casper): Replace with DROP TABLE once drop table uses the MVCC-compatible DelRange
@@ -684,7 +700,7 @@ USE d;
 	expectedDelRangeSpan3 := roachpb.Span{Key: t2Span.Key, EndKey: t2Span.Key.Next()}
 
 	codec := source.mu.codec.(*partitionStreamDecoder)
-	receivedDelRanges := make([]roachpb.RangeFeedDeleteRange, 0, 3)
+	receivedDelRanges := make([]kvpb.RangeFeedDeleteRange, 0, 3)
 	for {
 		source.mu.Lock()
 		require.True(t, source.mu.rows.Next())
@@ -718,8 +734,8 @@ USE d;
 		// Delete range for t3s - t3e, emitting nothing.
 		storageutils.RangeKV(string(t3Span.Key), string(t3Span.EndKey), ts, ""),
 	})
-	expectedDelRange1 := roachpb.RangeFeedDeleteRange{Span: t1Span, Timestamp: batchHLCTime}
-	expectedDelRange2 := roachpb.RangeFeedDeleteRange{Span: t2Span, Timestamp: batchHLCTime}
+	expectedDelRange1 := kvpb.RangeFeedDeleteRange{Span: t1Span, Timestamp: batchHLCTime}
+	expectedDelRange2 := kvpb.RangeFeedDeleteRange{Span: t2Span, Timestamp: batchHLCTime}
 	require.Equal(t, t1Span.Key, start)
 	require.Equal(t, t3Span.EndKey, end)
 

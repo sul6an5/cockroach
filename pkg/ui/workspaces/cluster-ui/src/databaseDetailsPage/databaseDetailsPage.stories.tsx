@@ -26,12 +26,14 @@ import {
 } from "./databaseDetailsPage";
 
 import * as H from "history";
-import moment from "moment";
+import moment from "moment-timezone";
+import { defaultFilters } from "src/queryFilter";
 const history = H.createHashHistory();
 
 const withLoadingIndicator: DatabaseDetailsPageProps = {
   loading: true,
   loaded: false,
+  lastError: undefined,
   name: randomName(),
   tables: [],
   viewMode: ViewMode.Tables,
@@ -47,7 +49,9 @@ const withLoadingIndicator: DatabaseDetailsPageProps = {
   onSortingGrantsChange: () => {},
   refreshDatabaseDetails: () => {},
   refreshTableDetails: () => {},
-  refreshTableStats: () => {},
+  search: null,
+  filters: defaultFilters,
+  nodeRegions: {},
   location: history.location,
   history,
   match: {
@@ -61,6 +65,7 @@ const withLoadingIndicator: DatabaseDetailsPageProps = {
 const withoutData: DatabaseDetailsPageProps = {
   loading: false,
   loaded: true,
+  lastError: null,
   name: randomName(),
   tables: [],
   viewMode: ViewMode.Tables,
@@ -76,7 +81,9 @@ const withoutData: DatabaseDetailsPageProps = {
   onSortingGrantsChange: () => {},
   refreshDatabaseDetails: () => {},
   refreshTableDetails: () => {},
-  refreshTableStats: () => {},
+  search: null,
+  filters: defaultFilters,
+  nodeRegions: {},
   location: history.location,
   history,
   match: {
@@ -94,10 +101,11 @@ function createTable(): DatabaseDetailsPageDataTable {
   );
 
   return {
+    loading: false,
+    loaded: true,
+    lastError: null,
     name: randomName(),
     details: {
-      loading: false,
-      loaded: true,
       columnCount: _.random(5, 42),
       indexCount: _.random(1, 6),
       userCount: roles.length,
@@ -108,14 +116,8 @@ function createTable(): DatabaseDetailsPageDataTable {
       livePercentage: _.random(0, 100),
       liveBytes: _.random(0, 10000),
       totalBytes: _.random(0, 10000),
-    },
-    stats: {
-      loading: false,
-      loaded: true,
-      replicationSizeInBytes: _.random(1000.0) * 1024 ** _.random(1, 2),
-      rangeCount: _.random(50, 500),
-      nodesByRegionString:
-        "gcp-europe-west1(n8), gcp-us-east1(n1), gcp-us-west1(n6)",
+      replicationSizeInBytes: _.random(0, 10000),
+      rangeCount: _.random(0, 10000),
     },
   };
 }
@@ -123,6 +125,7 @@ function createTable(): DatabaseDetailsPageDataTable {
 const withData: DatabaseDetailsPageProps = {
   loading: false,
   loaded: true,
+  lastError: null,
   name: randomName(),
   tables: [createTable()],
   viewMode: ViewMode.Tables,
@@ -138,7 +141,9 @@ const withData: DatabaseDetailsPageProps = {
   onSortingGrantsChange: () => {},
   refreshDatabaseDetails: () => {},
   refreshTableDetails: () => {},
-  refreshTableStats: () => {},
+  search: null,
+  filters: defaultFilters,
+  nodeRegions: {},
   location: history.location,
   history,
   match: {

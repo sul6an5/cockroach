@@ -634,9 +634,9 @@ query T
 SELECT create_statement FROM [SHOW CREATE t29494]
 ----
 CREATE TABLE public.t29494 (
-   x INT8 NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   CONSTRAINT t29494_pkey PRIMARY KEY (rowid ASC)
+  x INT8 NULL,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT t29494_pkey PRIMARY KEY (rowid ASC)
 )
 
 # Check that the new column is not usable in RETURNING
@@ -716,7 +716,7 @@ subtest visible_returning_columns
 statement ok
 BEGIN; ALTER TABLE tc DROP COLUMN y
 
-query I colnames rowsort
+query I colnames,rowsort
 UPSERT INTO tc VALUES (1), (2) RETURNING *
 ----
 x
@@ -1080,7 +1080,7 @@ SELECT * FROM tdup@tdup_y_z_key
 3  2     NULL
 
 # Verify that duplicate secondary key fails with regular conflict error.
-statement error pq: duplicate key value violates unique constraint "tdup_y_z_key"\nDETAIL: Key \(y,z\)=\(1,2\) already exists\.
+statement error pq: duplicate key value violates unique constraint "tdup_y_z_key"\nDETAIL: Key \(y, z\)=\(1, 2\) already exists\.
 INSERT INTO tdup VALUES (6, 1, 1), (7, 1, 2) ON CONFLICT (y, z) DO UPDATE SET z=2
 
 # With constant grouping columns (no error).
@@ -1317,8 +1317,23 @@ INSERT INTO generated_as_id_t (a, b) VALUES (1, 10) ON CONFLICT (a) DO UPDATE SE
 statement ok
 INSERT INTO generated_as_id_t (a, c) VALUES (1, 10) ON CONFLICT DO NOTHING
 
-query III rowsort
-SELECT * FROM generated_as_id_t ORDER BY a
+
+# Do this fancy query to deal with the fact that transaction restarts on the
+# insert may change the sequence values used for columns b and c. This query
+# just ensures that they have the expected offset from each other.
+query III
+  SELECT a,
+         b - b_min + 1 AS b,
+         c - c_min + 1 AS c
+    FROM generated_as_id_t,
+         (
+              SELECT b AS b_min,
+                     c AS c_min
+                FROM generated_as_id_t
+            ORDER BY a ASC
+               LIMIT 1
+         )
+ORDER BY a
 ----
 1  1  1
 2  2  2
@@ -1330,12 +1345,31 @@ SELECT * FROM generated_as_id_t ORDER BY a
 statement ok
 INSERT INTO generated_as_id_t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b=DEFAULT;
 
-query III rowsort
-SELECT * FROM generated_as_id_t ORDER BY a
+# `SELECT * FROM generated_as_id_t` now should give
+# 1  5  1
+# 2  2  2
+# 3  3  3
+# Do this fancy query to deal with the fact that transaction restarts on the
+# insert may change the sequence values used for columns b and c. This query
+# just ensures that they have the expected offset from each other.
+
+query III
+  SELECT a,
+         b - b_row2 AS b,
+         c - c_row2 AS c
+    FROM generated_as_id_t,
+         (
+              SELECT b AS b_row2,
+                     c AS c_row2
+                FROM generated_as_id_t
+            ORDER BY b
+               LIMIT 1
+         )
+ORDER BY a
 ----
-1  5  1
-2  2  2
-3  3  3
+1  3  -1
+2  0  0
+3  1  1
 
 subtest explicit_arbiter_indexes
 

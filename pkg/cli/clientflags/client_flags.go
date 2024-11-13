@@ -11,6 +11,9 @@
 package clientflags
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/cockroachdb/cockroach/pkg/cli/clienturl"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
@@ -71,7 +74,10 @@ func AddSQLFlags(
 	_ = f.MarkHidden(cliflags.ClientHost.Name)
 
 	// --url.
-	cliflagcfg.VarFlagDepth(1, f, clienturl.NewURLParser(cmd, clientOpts, false /* strictTLS */, nil /* warnFn */), cliflags.URL)
+	warnFn := func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
+	cliflagcfg.VarFlagDepth(1, f, clienturl.NewURLParser(cmd, clientOpts, false /* strictTLS */, warnFn), cliflags.URL)
 
 	// --user/-u
 	cliflagcfg.StringFlagDepth(1, f, &clientOpts.User, cliflags.User)
@@ -94,6 +100,9 @@ func AddSQLFlags(
 		// If the flag is specified on the command line, but is not given a value,
 		// then use the value "true".
 		f.Lookup(cliflags.SafeUpdates.Name).NoOptDefVal = "true"
+
+		// --no-line-editor
+		cliflagcfg.BoolFlagDepth(1, f, &sqlCfg.ShellCtx.DisableLineEditor, cliflags.NoLineEditor)
 
 		// --read-only
 		cliflagcfg.BoolFlagDepth(1, f, &sqlCfg.ReadOnly, cliflags.ReadOnly)

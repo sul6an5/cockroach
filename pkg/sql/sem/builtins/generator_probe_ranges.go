@@ -37,9 +37,11 @@ import (
 func init() {
 	// Add all windows to the Builtins map after a few sanity checks.
 	for k, v := range probeRangesGenerators {
-		if v.props.Class != tree.GeneratorClass {
-			panic(errors.AssertionFailedf("generator functions should be marked with the tree.GeneratorClass "+
-				"function class, found %v", v))
+		for _, g := range v.overloads {
+			if g.Class != tree.GeneratorClass {
+				panic(errors.AssertionFailedf("generator functions should be marked with the tree.GeneratorClass "+
+					"function class, found %v", v))
+			}
 		}
 		registerBuiltin(k, v)
 	}
@@ -49,11 +51,10 @@ var probeRangesGenerators = map[string]builtinDefinition{
 	"crdb_internal.probe_ranges": makeBuiltin(
 		tree.FunctionProperties{
 			Category:     builtinconstants.CategorySystemInfo,
-			Class:        tree.GeneratorClass,
 			Undocumented: true,
 		},
 		makeGeneratorOverload(
-			tree.ArgTypes{
+			tree.ParamTypes{
 				{Name: "timeout", Typ: types.Interval},
 				{Name: "probe_type", Typ: makeEnum()},
 			},
@@ -121,9 +122,11 @@ type probeRangeGenerator struct {
 	ranges []kv.KeyValue
 }
 
-func makeProbeRangeGenerator(evalCtx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeProbeRangeGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	// The user must be an admin to use this builtin.
-	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(evalCtx.Context)
+	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +142,7 @@ func makeProbeRangeGenerator(evalCtx *eval.Context, args tree.Datums) (eval.Valu
 	var ranges []kv.KeyValue
 	{
 		ctx, sp := tracing.EnsureChildSpan(
-			evalCtx.Context, evalCtx.Tracer, "meta2scan",
+			ctx, evalCtx.Tracer, "meta2scan",
 			tracing.WithRecording(tracingpb.RecordingVerbose),
 		)
 		defer sp.Finish()
@@ -206,13 +209,7 @@ func (p *probeRangeGenerator) Next(ctx context.Context) (bool, error) {
 			return err
 		}
 		p.curr.rangeID = int64(desc.RangeID)
-		key := desc.StartKey.AsRawKey()
-		if desc.RangeID == 1 {
-			// The first range starts at KeyMin, but the replicated keyspace starts only at keys.LocalMax,
-			// so there is a special case here.
-			key = keys.LocalMax
-		}
-		return p.rangeProber.RunProbe(ctx, key, p.isWrite)
+		return p.rangeProber.RunProbe(ctx, &desc, p.isWrite)
 	})
 
 	p.curr.latency = timeutil.Since(tBegin)

@@ -53,7 +53,7 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 		return newZeroNode(nil /* columns */), nil
 	}
 
-	idx, err := tableDesc.FindIndexWithName(string(n.Index.Index))
+	idx, err := catalog.MustFindIndexByName(tableDesc, string(n.Index.Index))
 	if err != nil {
 		if n.IfExists {
 			// Noop.
@@ -64,6 +64,11 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 	}
 
 	if err := p.CheckPrivilege(ctx, tableDesc, privilege.CREATE); err != nil {
+		return nil, err
+	}
+
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
 		return nil, err
 	}
 
@@ -99,7 +104,7 @@ func (n *renameIndexNode) startExec(params runParams) error {
 		return nil
 	}
 
-	if foundIndex, _ := tableDesc.FindIndexWithName(string(n.n.NewName)); foundIndex != nil {
+	if foundIndex := catalog.FindIndexByName(tableDesc, string(n.n.NewName)); foundIndex != nil {
 		return pgerror.Newf(pgcode.DuplicateRelation, "index name %q already exists", string(n.n.NewName))
 	}
 

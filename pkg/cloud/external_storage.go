@@ -19,10 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/errors"
 )
@@ -152,10 +151,10 @@ type ExternalStorageContext struct {
 	IOConf            base.ExternalIODirConfig
 	Settings          *cluster.Settings
 	BlobClientFactory blobs.BlobClientFactory
-	InternalExecutor  sqlutil.InternalExecutor
-	DB                *kv.DB
+	DB                isql.DB
 	Options           []ExternalStorageOption
 	Limiters          Limiters
+	MetricsRecorder   MetricsRecorder
 }
 
 // ExternalStorageOptions holds dependencies and values that can be

@@ -15,6 +15,8 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -23,16 +25,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/stretchr/testify/require"
 )
 
 // TODO: move this below cluster interface, maybe into roachprod.
 
+// Map tenantId to instance count so we can uniquify each instance and
+// run multiple instances on one node.
+var tenantIds = make(map[int]int)
+
 // tenantNode corresponds to a running tenant.
 type tenantNode struct {
 	tenantID          int
+	instanceID        int
 	httpPort, sqlPort int
 	kvAddrs           []string
 	pgURL             string
@@ -51,11 +59,51 @@ type createTenantOptions struct {
 	// locally, so if we want a client to work against multiple tenants in a
 	// single test, we need to create the certs with all tenants.
 	otherTenantIDs []int
+
+	// Set this to expand the scope of the nodes added to the tenant certs.
+	certNodes option.NodeListOption
 }
 type createTenantOpt func(*createTenantOptions)
 
 func createTenantOtherTenantIDs(ids []int) createTenantOpt {
 	return func(c *createTenantOptions) { c.otherTenantIDs = ids }
+}
+
+func createTenantCertNodes(nodes option.NodeListOption) createTenantOpt {
+	return func(c *createTenantOptions) { c.certNodes = nodes }
+}
+
+func createTenantNodeInternal(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	kvnodes option.NodeListOption,
+	tenantID, node, httpPort, sqlPort int,
+	certs bool,
+	opts ...createTenantOpt,
+) *tenantNode {
+	var createOptions createTenantOptions
+	for _, o := range opts {
+		o(&createOptions)
+	}
+	instID := tenantIds[tenantID] + 1
+	tenantIds[tenantID] = instID
+	// In secure mode only the internal address works, possibly because its started
+	// with --advertise-addr on internal address?
+	kvAddrs, err := c.InternalAddr(ctx, t.L(), kvnodes)
+	require.NoError(t, err)
+	tn := &tenantNode{
+		tenantID:   tenantID,
+		instanceID: instID,
+		httpPort:   httpPort,
+		kvAddrs:    kvAddrs,
+		node:       node,
+		sqlPort:    sqlPort,
+	}
+	if certs {
+		tn.createTenantCert(ctx, t, c, createOptions.certNodes)
+	}
+	return tn
 }
 
 func createTenantNode(
@@ -66,73 +114,43 @@ func createTenantNode(
 	tenantID, node, httpPort, sqlPort int,
 	opts ...createTenantOpt,
 ) *tenantNode {
-	var createOptions createTenantOptions
-	for _, o := range opts {
-		o(&createOptions)
-	}
-	// In secure mode only the internal address works, possibly because its started
-	// with --advertise-addr on internal address?
-	kvAddrs, err := c.InternalAddr(ctx, t.L(), kvnodes)
-	require.NoError(t, err)
-	tn := &tenantNode{
-		tenantID: tenantID,
-		httpPort: httpPort,
-		kvAddrs:  kvAddrs,
-		node:     node,
-		sqlPort:  sqlPort,
-	}
-	if tn.cockroachBinSupportsTenantScope(ctx, c) {
-		err := tn.recreateClientCertsWithTenantScope(ctx, c, createOptions.otherTenantIDs)
-		require.NoError(t, err)
-	}
-	tn.createTenantCert(ctx, t, c)
-	return tn
+	return createTenantNodeInternal(ctx, t, c, kvnodes, tenantID, node, httpPort, sqlPort, true /* certs */, opts...)
 }
 
-// cockroachBinSupportsTenantScope is a hack to figure out if the version of
-// cockroach on the node supports tenant scoped certificates. We can't use a
-// version comparison here because we need to compare alpha build versions which
-// are compared lexicographically. This is a problem because our alpha versions
-// contain an integer count of commits, which does not sort correctly.  Once
-// this feature ships in a release, it will be easier to do a version comparison
-// on whether this command line flag is supported.
-func (tn *tenantNode) cockroachBinSupportsTenantScope(ctx context.Context, c cluster.Cluster) bool {
-	err := c.RunE(ctx, c.Node(tn.node), "./cockroach cert create-client --help | grep '\\--tenant-scope'")
-	return err == nil
+func createTenantNodeNoCerts(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	kvnodes option.NodeListOption,
+	tenantID, node, httpPort, sqlPort int,
+	opts ...createTenantOpt,
+) *tenantNode {
+	return createTenantNodeInternal(ctx, t, c, kvnodes, tenantID, node, httpPort, sqlPort, false /* certs */, opts...)
 }
 
-func (tn *tenantNode) createTenantCert(ctx context.Context, t test.Test, c cluster.Cluster) {
+func (tn *tenantNode) createTenantCert(
+	ctx context.Context, t test.Test, c cluster.Cluster, certNodes option.NodeListOption,
+) {
+
+	if len(certNodes) == 0 {
+		certNodes = c.Node(tn.node)
+	}
+
 	var names []string
-	eips, err := c.ExternalIP(ctx, t.L(), c.Node(tn.node))
-	require.NoError(t, err)
-	names = append(names, eips...)
-	iips, err := c.InternalIP(ctx, t.L(), c.Node(tn.node))
-	require.NoError(t, err)
-	names = append(names, iips...)
-
+	for _, node := range certNodes {
+		eips, err := c.ExternalIP(ctx, t.L(), c.Node(node))
+		require.NoError(t, err)
+		names = append(names, eips...)
+		iips, err := c.InternalIP(ctx, t.L(), c.Node(node))
+		require.NoError(t, err)
+		names = append(names, iips...)
+	}
 	names = append(names, "localhost", "127.0.0.1")
 
 	cmd := fmt.Sprintf(
-		"./cockroach cert create-tenant-client --certs-dir=certs --ca-key=certs/ca.key %d %s",
+		"./cockroach cert create-tenant-client --certs-dir=certs --ca-key=certs/ca.key %d %s --overwrite",
 		tn.tenantID, strings.Join(names, " "))
 	c.Run(ctx, c.Node(tn.node), cmd)
-}
-
-func (tn *tenantNode) recreateClientCertsWithTenantScope(
-	ctx context.Context, c cluster.Cluster, otherIDs []int,
-) error {
-	tenantArgs := fmt.Sprintf("1,%d", tn.tenantID)
-	for _, id := range otherIDs {
-		tenantArgs = fmt.Sprintf("%s,%d", tenantArgs, id)
-	}
-
-	for _, user := range []username.SQLUsername{username.RootUserName(), username.TestUserName()} {
-		cmd := fmt.Sprintf(
-			"./cockroach cert create-client %s --certs-dir=certs --ca-key=certs/ca.key --tenant-scope %s --overwrite",
-			user.Normalized(), tenantArgs)
-		c.Run(ctx, c.Node(tn.node), cmd)
-	}
-	return c.RefetchCertsFromNode(ctx, tn.node)
 }
 
 func (tn *tenantNode) stop(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -142,17 +160,17 @@ func (tn *tenantNode) stop(ctx context.Context, t test.Test, c cluster.Cluster) 
 	// Must use pkill because the context cancellation doesn't wait for the
 	// process to exit.
 	c.Run(ctx, c.Node(tn.node),
-		fmt.Sprintf("pkill -o -f '^%s mt start.*tenant-id=%d'", tn.binary, tn.tenantID))
+		fmt.Sprintf("pkill -o -f '^%s mt start.*tenant-id=%d.*%d'", tn.binary, tn.tenantID, tn.sqlPort))
 	t.L().Printf("mt cluster exited: %v", <-tn.errCh)
 	tn.errCh = nil
 }
 
 func (tn *tenantNode) logDir() string {
-	return fmt.Sprintf("logs/mt-%d", tn.tenantID)
+	return fmt.Sprintf("logs/mt-%d-%d", tn.tenantID, tn.instanceID)
 }
 
 func (tn *tenantNode) storeDir() string {
-	return fmt.Sprintf("cockroach-data-mt-%d", tn.tenantID)
+	return fmt.Sprintf("cockroach-data-mt-%d-%d", tn.tenantID, tn.instanceID)
 }
 
 // In secure mode the url we get from roachprod contains ssl parameters with
@@ -178,7 +196,7 @@ func (tn *tenantNode) start(ctx context.Context, t test.Test, c cluster.Cluster,
 		extraArgs...,
 	)
 
-	externalUrls, err := c.ExternalPGUrl(ctx, t.L(), c.Node(tn.node))
+	externalUrls, err := c.ExternalPGUrl(ctx, t.L(), c.Node(tn.node), "")
 	require.NoError(t, err)
 	u, err := url.Parse(externalUrls[0])
 	require.NoError(t, err)
@@ -191,7 +209,9 @@ func (tn *tenantNode) start(ctx context.Context, t test.Test, c cluster.Cluster,
 	// pgURL has full paths to local certs embedded, i.e.
 	// /tmp/roachtest-certs3630333874/certs, on the cluster we want just certs
 	// (i.e. to run workload on the tenant).
-	secureUrls, err := roachprod.PgURL(ctx, t.L(), c.MakeNodes(c.Node(tn.node)), "certs", false /*external*/, true /* secure */)
+	secureUrls, err := roachprod.PgURL(ctx, t.L(), c.MakeNodes(c.Node(tn.node)), "certs", roachprod.PGURLOptions{
+		External: false,
+		Secure:   true})
 	require.NoError(t, err)
 	u, err = url.Parse(strings.Trim(secureUrls[0], "'"))
 	require.NoError(t, err)
@@ -222,7 +242,7 @@ func (tn *tenantNode) start(ctx context.Context, t test.Test, c cluster.Cluster,
 		return err
 	})
 
-	t.L().Printf("sql server for tenant %d running at %s", tn.tenantID, tn.pgURL)
+	t.L().Printf("sql server for tenant %d (instance %d) now running", tn.tenantID, tn.instanceID)
 }
 
 func startTenantServer(
@@ -250,9 +270,103 @@ func startTenantServer(
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- c.RunE(tenantCtx, node,
-			append([]string{binary, "mt", "start-sql"}, args...)...,
+			append(append(append([]string{}, config.DefaultEnvVars()...), binary, "mt", "start-sql"), args...)...,
 		)
 		close(errCh)
 	}()
 	return errCh
+}
+
+func newTenantInstance(
+	ctx context.Context, tn *tenantNode, t test.Test, c cluster.Cluster, node, http, sql int,
+) (*tenantNode, error) {
+	instID := tenantIds[tn.tenantID] + 1
+	tenantIds[tn.tenantID] = instID
+	inst := tenantNode{
+		tenantID:   tn.tenantID,
+		instanceID: instID,
+		kvAddrs:    tn.kvAddrs,
+		node:       node,
+		httpPort:   http,
+		sqlPort:    sql,
+	}
+	tenantCertsDir, err := os.MkdirTemp("", "tenant-certs")
+	if err != nil {
+		return nil, err
+	}
+	key, crt := fmt.Sprintf("client-tenant.%d.key", tn.tenantID), fmt.Sprintf("client-tenant.%d.crt", tn.tenantID)
+	err = c.Get(ctx, t.L(), filepath.Join("certs", key), filepath.Join(tenantCertsDir, key), c.Node(tn.node))
+	if err != nil {
+		return nil, err
+	}
+	err = c.Get(ctx, t.L(), filepath.Join("certs", crt), filepath.Join(tenantCertsDir, crt), c.Node(tn.node))
+	if err != nil {
+		return nil, err
+	}
+	c.Put(ctx, filepath.Join(tenantCertsDir, key), filepath.Join("certs", key), c.Node(node))
+	c.Put(ctx, filepath.Join(tenantCertsDir, crt), filepath.Join("certs", crt), c.Node(node))
+	// sigh: locally theses are symlinked which breaks our crypto cert checks
+	if c.IsLocal() {
+		c.Run(ctx, c.Node(node), "rm", filepath.Join("certs", key))
+		c.Run(ctx, c.Node(node), "cp", filepath.Join(tenantCertsDir, key), filepath.Join("certs", key))
+	}
+	c.Run(ctx, c.Node(node), "chmod", "0600", filepath.Join("certs", key))
+	return &inst, nil
+}
+
+// createTenantAdminRole creates a role that can be used to log into a secure cluster's db console.
+func createTenantAdminRole(t test.Test, tenantName string, tenantSQL *sqlutils.SQLRunner) {
+	username := "secure"
+	password := "roach"
+	tenantSQL.Exec(t, fmt.Sprintf(`CREATE ROLE %s WITH LOGIN PASSWORD '%s'`, username, password))
+	tenantSQL.Exec(t, fmt.Sprintf(`GRANT ADMIN TO %s`, username))
+	t.L().Printf(`Log into %s db console with username "%s" and password "%s"`,
+		tenantName, username, password)
+}
+
+// createInMemoryTenant runs through the necessary steps to create an in-memory tenant without
+// resource limits and full dbconsole viewing privileges.
+func createInMemoryTenant(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	tenantName string,
+	nodes option.NodeListOption,
+	secure bool,
+) {
+	sysSQL := sqlutils.MakeSQLRunner(c.Conn(ctx, t.L(), nodes.RandNode()[0]))
+	sysSQL.Exec(t, "CREATE TENANT $1", tenantName)
+	sysSQL.Exec(t, "ALTER TENANT $1 START SERVICE SHARED", tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 GRANT CAPABILITY can_view_node_info=true, can_admin_split=true,can_view_tsdb_metrics=true`, tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 SET CLUSTER SETTING sql.split_at.allow_for_secondary_tenant.enabled=true`, tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 SET CLUSTER SETTING sql.scatter.allow_for_secondary_tenant.enabled=true`, tenantName)
+
+	removeTenantRateLimiters(t, sysSQL, tenantName)
+
+	// Opening a SQL session to a newly created in-process tenant may require a
+	// few retries. Unfortunately, the c.ConnE and MakeSQLRunner APIs do not make
+	// it clear if they eagerly open a session with the tenant or wait until the
+	// first query. Therefore, wrap connection opening and a ping to the tenant
+	// server in a retry loop.
+	var tenantSQL *sqlutils.SQLRunner
+	testutils.SucceedsSoon(t, func() error {
+		tenantConn, err := c.ConnE(ctx, t.L(), nodes.RandNode()[0], option.TenantName(tenantName))
+		if err != nil {
+			return err
+		}
+		if err := tenantConn.Ping(); err != nil {
+			return err
+		}
+		tenantSQL = sqlutils.MakeSQLRunner(tenantConn)
+		return nil
+	})
+
+	if secure {
+		createTenantAdminRole(t, tenantName, tenantSQL)
+	}
+}
+
+// removeTenantRateLimiters ensures the tenant is not throttled by limiters.
+func removeTenantRateLimiters(t test.Test, systemSQL *sqlutils.SQLRunner, tenantName string) {
+	systemSQL.Exec(t, `ALTER TENANT $1 GRANT CAPABILITY exempt_from_rate_limiting=true`, tenantName)
 }

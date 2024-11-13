@@ -27,7 +27,7 @@ import (
 
 // Deleter abstracts the key/value operations for deleting table rows.
 type Deleter struct {
-	Helper    rowHelper
+	Helper    RowHelper
 	FetchCols []catalog.Column
 	// FetchColIDtoRowIndex must be kept in sync with FetchCols.
 	FetchColIDtoRowIndex catalog.TableColMap
@@ -60,7 +60,7 @@ func MakeDeleter(
 	} else {
 		maybeAddCol := func(colID descpb.ColumnID) error {
 			if _, ok := fetchColIDtoRowIndex.Get(colID); !ok {
-				col, err := tableDesc.FindColumnWithID(colID)
+				col, err := catalog.MustFindColumnByID(tableDesc, colID)
 				if err != nil {
 					return err
 				}
@@ -93,7 +93,7 @@ func MakeDeleter(
 	}
 
 	rd := Deleter{
-		Helper:               newRowHelper(codec, tableDesc, indexes, sv, internal, metrics),
+		Helper:               NewRowHelper(codec, tableDesc, indexes, sv, internal, metrics),
 		FetchCols:            fetchCols,
 		FetchColIDtoRowIndex: fetchColIDtoRowIndex,
 	}

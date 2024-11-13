@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/stretchr/testify/require"
@@ -200,6 +202,7 @@ func initTestProber(ctx context.Context, m *mock) *Prober {
 	})
 	readEnabled.Override(ctx, &p.settings.SV, m.read)
 	writeEnabled.Override(ctx, &p.settings.SV, m.write)
+	quarantineWriteEnabled.Override(ctx, &p.settings.SV, m.qWrite)
 	bypassAdmissionControl.Override(ctx, &p.settings.SV, m.bypass)
 	p.readPlanner = m
 	return p
@@ -210,24 +213,33 @@ type mock struct {
 
 	bypass bool
 
-	noPlan  bool
-	planErr error
+	noPlan     bool
+	emptyQPool bool
+	planErr    error
 
 	read     bool
 	write    bool
+	qWrite   bool
 	readErr  error
 	writeErr error
 	txnErr   error
 }
 
 func (m *mock) next(ctx context.Context) (Step, error) {
+	step := Step{}
 	if m.noPlan {
 		m.t.Error("plan call made but not expected")
 	}
-	return Step{}, m.planErr
+	if !m.emptyQPool {
+		step = Step{
+			RangeID: 1,
+			Key:     keys.LocalMax,
+		}
+	}
+	return step, m.planErr
 }
 
-func (m *mock) Read(key interface{}) func(context.Context, *kv.Txn) error {
+func (m *mock) Read(key roachpb.Key) func(context.Context, *kv.Txn) error {
 	return func(context.Context, *kv.Txn) error {
 		if !m.read {
 			m.t.Error("read call made but not expected")
@@ -236,7 +248,7 @@ func (m *mock) Read(key interface{}) func(context.Context, *kv.Txn) error {
 	}
 }
 
-func (m *mock) Write(key interface{}) func(context.Context, *kv.Txn) error {
+func (m *mock) Write(key roachpb.Key) func(context.Context, *kv.Txn) error {
 	return func(context.Context, *kv.Txn) error {
 		if !m.write {
 			m.t.Error("write call made but not expected")

@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -76,7 +77,7 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 		rangefeedErrChan := make(chan error, 1)
 		ctxToCancel, cancel := context.WithCancel(ctx)
 		go func() {
-			rangefeedErrChan <- ds.RangeFeed(ctxToCancel, []roachpb.Span{descTableSpan}, startTS, false /* withDiff */, evChan)
+			rangefeedErrChan <- ds.RangeFeed(ctxToCancel, []roachpb.Span{descTableSpan}, startTS, evChan)
 		}()
 
 		// Note: 42 is a system descriptor.
@@ -136,7 +137,7 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 		})
 		evChan := make(chan kvcoord.RangeFeedMessage)
 		require.Regexp(t, `rangefeeds require the kv\.rangefeed.enabled setting`,
-			ds.RangeFeed(ctx, []roachpb.Span{scratchSpan}, startTS, false /* withDiff */, evChan))
+			ds.RangeFeed(ctx, []roachpb.Span{scratchSpan}, startTS, evChan))
 	})
 }
 
@@ -190,7 +191,6 @@ func TestMergeOfRangeEventTableWhileRunningRangefeed(t *testing.T) {
 		rangefeedErrChan <- ds.RangeFeed(rangefeedCtx,
 			[]roachpb.Span{lhsRepl.Desc().RSpan().AsRawSpanWithNoLocals()},
 			start,
-			false, /* withDiff */
 			eventCh)
 	}()
 
@@ -255,7 +255,6 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 			rangefeedCtx,
 			[]roachpb.Span{desc.RSpan().AsRawSpanWithNoLocals()},
 			startTS,
-			false, /* withDiff */
 			eventCh,
 		)
 	}()
@@ -271,4 +270,81 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	rangefeedCancel()
 	require.Regexp(t, "context canceled", <-rangefeedErrChan)
 	require.Regexp(t, "attempting to create a RangeFeed over replica.*2NON_VOTER", getRecAndFinish().String())
+}
+
+// TestRangefeedWorksOnLivenessRange ensures that a rangefeed works as expected
+// on the liveness range, which uses an expiration-based lease.
+func TestRangefeedWorksOnLivenessRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	// Speed up node liveness heartbeats.
+	var raftCfg base.RaftConfig
+	raftCfg.SetDefaults()
+	raftCfg.RangeLeaseDuration = time.Second
+
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			RaftConfig: raftCfg,
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	_, err := tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true")
+	require.NoError(t, err)
+	_, err = tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
+	require.NoError(t, err)
+
+	db := tc.Server(0).DB()
+	ds := tc.Server(0).DistSenderI().(*kvcoord.DistSender)
+	tc.Server(0)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	startTS := db.Clock().Now()
+	eventC := make(chan kvcoord.RangeFeedMessage)
+	errC := make(chan error, 1)
+	go func() {
+		errC <- ds.RangeFeed(ctx, []roachpb.Span{keys.NodeLivenessSpan}, startTS, eventC)
+	}()
+
+	// Wait for a liveness update.
+	var livenessEvent kvpb.RangeFeedValue
+	timeoutC := time.After(10 * time.Second)
+	for {
+		select {
+		case event := <-eventC:
+			if event.Val == nil {
+				continue
+			}
+			require.Equal(t, keys.NodeLivenessSpan, event.RegisteredSpan)
+			require.NotZero(t, event.Val.Value.Timestamp)
+			livenessEvent = *event.Val
+		case err := <-errC:
+			t.Fatalf("rangefeed unexpectedly exited with err=%v", err)
+		case <-timeoutC:
+			t.Fatal("timed out waiting for checkpoint")
+		}
+		break
+	}
+
+	// Wait for a checkpoint after the liveness update.
+	for {
+		select {
+		case event := <-eventC:
+			if checkpoint := event.Checkpoint; checkpoint == nil {
+				continue
+			} else if checkpoint.ResolvedTS.Less(livenessEvent.Value.Timestamp) {
+				continue
+			}
+		case err := <-errC:
+			t.Fatalf("rangefeed unexpectedly exited with err=%v", err)
+		case <-timeoutC:
+			t.Fatal("timed out waiting for checkpoint")
+		}
+		break
+	}
 }

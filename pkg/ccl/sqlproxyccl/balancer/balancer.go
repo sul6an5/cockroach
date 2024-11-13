@@ -315,12 +315,12 @@ func (b *Balancer) RebalanceTenant(ctx context.Context, tenantID roachpb.TenantI
 // which returns a ServerAssignment.
 func (b *Balancer) SelectTenantPod(pods []*tenant.Pod) (*tenant.Pod, error) {
 	// The second case should not happen if the directory is returning the
-	// right data. Check it regardless or else roachpb.MakeTenantID will panic
+	// right data. Check it regardless or else roachpb.MustMakeTenantID will panic
 	// on a zero TenantID.
 	if len(pods) == 0 || pods[0].TenantID == 0 {
 		return nil, ErrNoAvailablePods
 	}
-	tenantID := roachpb.MakeTenantID(pods[0].TenantID)
+	tenantID := roachpb.MustMakeTenantID(pods[0].TenantID)
 	tenantEntry := b.connTracker.getEntry(tenantID, true /* allowCreate */)
 	pod := selectTenantPod(pods, tenantEntry)
 	if pod == nil {
@@ -690,7 +690,7 @@ func (q *rebalancerQueue) enqueue(req *rebalanceRequest) {
 
 	e = q.queue.PushBack(req)
 	q.elements[req.conn] = e
-	q.metrics.rebalanceReqQueued.Inc(1)
+	q.metrics.RebalanceReqQueued.Inc(1)
 	q.sem.Release(1)
 }
 
@@ -720,6 +720,6 @@ func (q *rebalancerQueue) dequeue(ctx context.Context) (*rebalanceRequest, error
 
 	req := q.queue.Remove(e).(*rebalanceRequest)
 	delete(q.elements, req.conn)
-	q.metrics.rebalanceReqQueued.Dec(1)
+	q.metrics.RebalanceReqQueued.Dec(1)
 	return req, nil
 }

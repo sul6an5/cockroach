@@ -15,15 +15,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/echotest"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/assert"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 func TestLastUpdateTimesMap(t *testing.T) {
@@ -78,31 +79,35 @@ func Test_handleRaftReadyStats_SafeFormat(t *testing.T) {
 		tApplicationBegin: ts(1),
 		tApplicationEnd:   ts(2),
 		apply: applyCommittedEntriesStats{
-			batchesProcessed:      9,
-			entriesProcessed:      2,
-			entriesProcessedBytes: 3,
-			stateAssertions:       4,
-			numEmptyEntries:       5,
-			numConfChangeEntries:  6,
+			numBatchesProcessed: 9,
+			appBatchStats: appBatchStats{
+				numEntriesProcessed:      2,
+				numEntriesProcessedBytes: 3,
+				numEmptyEntries:          5,
+			},
+			stateAssertions:      4,
+			numConfChangeEntries: 6,
 		},
-		tAppendBegin:            ts(2),
-		tAppendEnd:              ts(3),
-		appendedRegularCount:    7,
-		appendedSideloadedCount: 3,
-		appendedSideloadedBytes: 5 * (1 << 20),
-		appendedRegularBytes:    1024,
-		tPebbleCommitBegin:      ts(3),
-		pebbleBatchBytes:        1024 * 5,
-		tPebbleCommitEnd:        ts(4),
-		tSnapBegin:              ts(4),
-		tSnapEnd:                ts(5),
+		append: logstore.AppendStats{
+			Begin:             ts(2),
+			End:               ts(3),
+			RegularEntries:    7,
+			RegularBytes:      1024,
+			SideloadedEntries: 3,
+			SideloadedBytes:   5 * (1 << 20),
+			PebbleBegin:       ts(3),
+			PebbleEnd:         ts(4),
+			PebbleBytes:       1024 * 5,
+			Sync:              true,
+		},
+		tSnapBegin: ts(4),
+		tSnapEnd:   ts(5),
 		snap: handleSnapshotStats{
 			offered: true,
 			applied: true,
 		},
-		sync: true,
 	}
 
 	echotest.Require(t, string(redact.Sprint(stats)),
-		filepath.Join(testutils.TestDataPath(t, "handle_raft_ready_stats.txt")))
+		filepath.Join(datapathutils.TestDataPath(t, "handle_raft_ready_stats.txt")))
 }

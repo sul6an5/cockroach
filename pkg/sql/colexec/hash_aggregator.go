@@ -194,21 +194,19 @@ func randomizeHashAggregatorMaxBuffered() {
 // the disk-backed operator. Pass in nil in order to not track all input
 // tuples.
 func NewHashAggregator(
-	args *colexecagg.NewAggregatorArgs,
+	ctx context.Context,
+	args *colexecagg.NewHashAggregatorArgs,
 	newSpillingQueueArgs *colexecutils.NewSpillingQueueArgs,
-	hashTableAllocator *colmem.Allocator,
-	outputUnlimitedAllocator *colmem.Allocator,
-	maxOutputBatchMemSize int64,
 ) colexecop.ResettableOperator {
 	aggFnsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
-		args, args.Spec.Aggregations, hashAggregatorAllocSize, colexecagg.HashAggKind,
+		ctx, args.NewAggregatorArgs, args.Spec.Aggregations, hashAggregatorAllocSize, colexecagg.HashAggKind,
 	)
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
 	hashAgg := &hashAggregator{
 		OneInputNode:       colexecop.NewOneInputNode(args.Input),
-		hashTableAllocator: hashTableAllocator,
+		hashTableAllocator: args.HashTableAllocator,
 		spec:               args.Spec,
 		state:              hashAggregatorBuffering,
 		inputTypes:         args.InputTypes,
@@ -218,10 +216,10 @@ func NewHashAggregator(
 		aggFnsAlloc:        aggFnsAlloc,
 		hashAlloc:          aggBucketAlloc{allocator: args.Allocator},
 	}
-	hashAgg.accountingHelper.Init(outputUnlimitedAllocator, maxOutputBatchMemSize, args.OutputTypes)
+	hashAgg.accountingHelper.Init(args.OutputUnlimitedAllocator, args.MaxOutputBatchMemSize, args.OutputTypes, false /* alwaysReallocate */)
 	hashAgg.bufferingState.tuples = colexecutils.NewAppendOnlyBufferedBatch(args.Allocator, args.InputTypes, nil /* colsToStore */)
 	hashAgg.datumAlloc.AllocSize = hashAggregatorAllocSize
-	hashAgg.aggHelper = newAggregatorHelper(args, &hashAgg.datumAlloc, true /* isHashAgg */, hashAggregatorMaxBuffered)
+	hashAgg.aggHelper = newAggregatorHelper(args.NewAggregatorArgs, &hashAgg.datumAlloc, true /* isHashAgg */, hashAggregatorMaxBuffered)
 	if newSpillingQueueArgs != nil {
 		hashAgg.inputTrackingState.tuples = colexecutils.NewSpillingQueue(newSpillingQueueArgs)
 	}
@@ -246,6 +244,10 @@ func (op *hashAggregator) Init(ctx context.Context) {
 	op.ht = colexechash.NewHashTable(
 		op.Ctx,
 		op.hashTableAllocator,
+		// The hash aggregator will buffer tuples from the input until it has
+		// hashAggregatorMaxBuffered of them. This is coldata.MaxBatchSize in
+		// production builds.
+		hashAggregatorMaxBuffered,
 		hashTableLoadFactor,
 		hashTableNumBuckets,
 		op.inputTypes,

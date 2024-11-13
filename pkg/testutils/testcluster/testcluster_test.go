@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -208,12 +209,14 @@ func TestStopServer(t *testing.T) {
 
 	ctx := context.Background()
 	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:  roachpb.SystemTenantID,
-		Config:    server1.RPCContext().Config,
-		Clock:     server1.Clock().WallClock(),
-		MaxOffset: server1.Clock().MaxOffset(),
-		Stopper:   tc.Stopper(),
-		Settings:  server1.ClusterSettings(),
+		TenantID:        roachpb.SystemTenantID,
+		Config:          server1.RPCContext().Config,
+		Clock:           server1.Clock().WallClock(),
+		ToleratedOffset: server1.Clock().ToleratedOffset(),
+		Stopper:         tc.Stopper(),
+		Settings:        server1.ClusterSettings(),
+
+		ClientOnly: true,
 	})
 	conn, err := rpcContext.GRPCDialNode(server1.ServingRPCAddr(), server1.NodeID(),
 		rpc.DefaultClass).Connect(ctx)
@@ -305,8 +308,8 @@ func TestRestart(t *testing.T) {
 		ids[i] = tc.Target(i)
 	}
 
-	incArgs := &roachpb.IncrementRequest{
-		RequestHeader: roachpb.RequestHeader{
+	incArgs := &kvpb.IncrementRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: roachpb.Key("b"),
 		},
 		Increment: 9,

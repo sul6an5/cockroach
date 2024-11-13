@@ -16,11 +16,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -31,9 +31,6 @@ import (
 // DeclareCursor implements the DECLARE statement.
 // See https://www.postgresql.org/docs/current/sql-declare.html for details.
 func (p *planner) DeclareCursor(ctx context.Context, s *tree.DeclareCursor) (planNode, error) {
-	if s.Hold {
-		return nil, unimplemented.NewWithIssue(77101, "DECLARE CURSOR WITH HOLD")
-	}
 	if s.Binary {
 		return nil, unimplemented.NewWithIssue(77099, "DECLARE BINARY CURSOR")
 	}
@@ -45,21 +42,33 @@ func (p *planner) DeclareCursor(ctx context.Context, s *tree.DeclareCursor) (pla
 		name: s.String(),
 		constructor: func(ctx context.Context, p *planner) (_ planNode, _ error) {
 			if p.extendedEvalCtx.TxnImplicit {
+				if s.Hold {
+					return nil, unimplemented.NewWithIssue(77101, "DECLARE CURSOR WITH HOLD can only be used in transaction blocks")
+				}
 				return nil, pgerror.Newf(pgcode.NoActiveSQLTransaction, "DECLARE CURSOR can only be used in transaction blocks")
 			}
 
-			ie := p.ExecCfg().InternalExecutorFactory.NewInternalExecutor(p.SessionData())
-			cursorName := s.Name.String()
-			if cursor := p.sqlCursors.getCursor(cursorName); cursor != nil {
-				return nil, pgerror.Newf(pgcode.DuplicateCursor, "cursor %q already exists", cursorName)
+			sd := p.SessionData()
+			// This session variable was introduced as a workaround to #96322.
+			// Today, if a timeout is set, FETCH's timeout is from the point
+			// DECLARE CURSOR is executed rather than the FETCH itself.
+			// The setting allows us to override the setting without affecting
+			// third-party applications.
+			if !p.SessionData().DeclareCursorStatementTimeoutEnabled {
+				sd = sd.Clone()
+				sd.StmtTimeout = 0
+			}
+			ie := p.ExecCfg().InternalDB.NewInternalExecutor(sd)
+			if cursor := p.sqlCursors.getCursor(s.Name); cursor != nil {
+				return nil, pgerror.Newf(pgcode.DuplicateCursor, "cursor %q already exists", s.Name)
 			}
 
-			if p.extendedEvalCtx.PreparedStatementState.HasPortal(cursorName) {
-				return nil, pgerror.Newf(pgcode.DuplicateCursor, "cursor %q already exists as portal", cursorName)
+			if p.extendedEvalCtx.PreparedStatementState.HasPortal(string(s.Name)) {
+				return nil, pgerror.Newf(pgcode.DuplicateCursor, "cursor %q already exists as portal", s.Name)
 			}
 
 			// Try to plan the cursor query to make sure that it's valid.
-			stmt := makeStatement(parser.Statement{AST: s.Select}, clusterunique.ID{})
+			stmt := makeStatement(statements.Statement[tree.Statement]{AST: s.Select}, clusterunique.ID{})
 			pt := planTop{}
 			pt.init(&stmt, &p.instrumentation)
 			opc := &p.optPlanningCtx
@@ -71,9 +80,10 @@ func (p *planner) DeclareCursor(ctx context.Context, s *tree.DeclareCursor) (pla
 				return nil, err
 			}
 			if err := opc.runExecBuilder(
+				ctx,
 				&pt,
 				&stmt,
-				newExecFactory(p),
+				newExecFactory(ctx, p),
 				memo,
 				p.EvalContext(),
 				p.autoCommit,
@@ -86,7 +96,7 @@ func (p *planner) DeclareCursor(ctx context.Context, s *tree.DeclareCursor) (pla
 					"DECLARE CURSOR must not contain data-modifying statements in WITH")
 			}
 
-			statement := formatWithPlaceholders(s.Select, p.EvalContext())
+			statement := formatWithPlaceholders(ctx, s.Select, p.EvalContext())
 			itCtx := context.Background()
 			rows, err := ie.QueryIterator(itCtx, "sql-cursor", p.txn, statement)
 			if err != nil {
@@ -94,13 +104,14 @@ func (p *planner) DeclareCursor(ctx context.Context, s *tree.DeclareCursor) (pla
 			}
 			inputState := p.txn.GetLeafTxnInputState(ctx)
 			cursor := &sqlCursor{
-				InternalRows: rows,
-				readSeqNum:   inputState.ReadSeqNum,
-				txn:          p.txn,
-				statement:    statement,
-				created:      timeutil.Now(),
+				Rows:       rows,
+				readSeqNum: inputState.ReadSeqNum,
+				txn:        p.txn,
+				statement:  statement,
+				created:    timeutil.Now(),
+				withHold:   s.Hold,
 			}
-			if err := p.sqlCursors.addCursor(cursorName, cursor); err != nil {
+			if err := p.sqlCursors.addCursor(s.Name, cursor); err != nil {
 				// This case shouldn't happen because cursor names are scoped to a session,
 				// and sessions can't have more than one statement running at once. But
 				// let's be diligent and clean up if it somehow does happen anyway.
@@ -119,11 +130,10 @@ var errBackwardScan = pgerror.Newf(pgcode.ObjectNotInPrerequisiteState, "cursor 
 func (p *planner) FetchCursor(
 	_ context.Context, s *tree.CursorStmt, isMove bool,
 ) (planNode, error) {
-	cursorName := s.Name.String()
-	cursor := p.sqlCursors.getCursor(cursorName)
+	cursor := p.sqlCursors.getCursor(s.Name)
 	if cursor == nil {
 		return nil, pgerror.Newf(
-			pgcode.InvalidCursorName, "cursor %q does not exist", cursorName,
+			pgcode.InvalidCursorName, "cursor %q does not exist", s.Name,
 		)
 	}
 	if s.Count < 0 || s.FetchType == tree.FetchBackwardAll {
@@ -226,7 +236,7 @@ func (f fetchNode) Values() tree.Datums {
 }
 
 func (f fetchNode) Close(ctx context.Context) {
-	// We explicitly do not pass through the Close to our InternalRows, because
+	// We explicitly do not pass through the Close to our Rows, because
 	// running FETCH on a CURSOR does not close it.
 
 	// Reset the transaction's read sequence number to what it was before the
@@ -243,13 +253,16 @@ func (p *planner) CloseCursor(ctx context.Context, n *tree.CloseCursor) (planNod
 	return &delayedNode{
 		name: n.String(),
 		constructor: func(ctx context.Context, p *planner) (planNode, error) {
-			return newZeroNode(nil /* columns */), p.sqlCursors.closeCursor(n.Name.String())
+			if n.All {
+				return newZeroNode(nil /* columns */), p.sqlCursors.closeAll(false /* errorOnWithHold */)
+			}
+			return newZeroNode(nil /* columns */), p.sqlCursors.closeCursor(n.Name)
 		},
 	}, nil
 }
 
 type sqlCursor struct {
-	sqlutil.InternalRows
+	isql.Rows
 	// txn is the transaction object that the internal executor for this cursor
 	// is running with.
 	txn *kv.Txn
@@ -259,11 +272,12 @@ type sqlCursor struct {
 	statement  string
 	created    time.Time
 	curRow     int64
+	withHold   bool
 }
 
-// Next implements the InternalRows interface.
+// Next implements the Rows interface.
 func (s *sqlCursor) Next(ctx context.Context) (bool, error) {
-	more, err := s.InternalRows.Next(ctx)
+	more, err := s.Rows.Next(ctx)
 	if err == nil {
 		s.curRow++
 	}
@@ -272,34 +286,42 @@ func (s *sqlCursor) Next(ctx context.Context) (bool, error) {
 
 // sqlCursors contains a set of active cursors for a session.
 type sqlCursors interface {
-	// closeAll closes all cursors in the set.
-	closeAll()
+	// closeAll closes all cursors in the set. If any of the cursors were
+	// created WITH HOLD, and the errorOnWithHold flag is true, an error is
+	// returned.
+	closeAll(errorOnWithHold bool) error
 	// closeCursor closes the named cursor, returning an error if that cursor
 	// didn't exist in the set.
-	closeCursor(string) error
+	closeCursor(tree.Name) error
 	// getCursor returns the named cursor, returning nil if that cursor
 	// didn't exist in the set.
-	getCursor(string) *sqlCursor
+	getCursor(tree.Name) *sqlCursor
 	// addCursor adds a new cursor with the given name to the set, returning an
 	// error if the cursor already existed in the set.
-	addCursor(string, *sqlCursor) error
+	addCursor(tree.Name, *sqlCursor) error
 	// list returns all open cursors in the set.
-	list() map[string]*sqlCursor
+	list() map[tree.Name]*sqlCursor
 }
 
 // cursorMap is a sqlCursors that's backed by an actual map.
 type cursorMap struct {
-	cursors map[string]*sqlCursor
+	cursors map[tree.Name]*sqlCursor
 }
 
-func (c *cursorMap) closeAll() {
-	for _, c := range c.cursors {
-		_ = c.Close()
+func (c *cursorMap) closeAll(errorOnWithHold bool) error {
+	for n, c := range c.cursors {
+		if c.withHold && errorOnWithHold {
+			return unimplemented.NewWithIssuef(77101, "cursor %s WITH HOLD must be closed before committing", n)
+		}
+		if err := c.Close(); err != nil {
+			return err
+		}
 	}
 	c.cursors = nil
+	return nil
 }
 
-func (c *cursorMap) closeCursor(s string) error {
+func (c *cursorMap) closeCursor(s tree.Name) error {
 	cursor, ok := c.cursors[s]
 	if !ok {
 		return pgerror.Newf(pgcode.InvalidCursorName, "cursor %q does not exist", s)
@@ -309,13 +331,13 @@ func (c *cursorMap) closeCursor(s string) error {
 	return err
 }
 
-func (c *cursorMap) getCursor(s string) *sqlCursor {
+func (c *cursorMap) getCursor(s tree.Name) *sqlCursor {
 	return c.cursors[s]
 }
 
-func (c *cursorMap) addCursor(s string, cursor *sqlCursor) error {
+func (c *cursorMap) addCursor(s tree.Name, cursor *sqlCursor) error {
 	if c.cursors == nil {
-		c.cursors = make(map[string]*sqlCursor)
+		c.cursors = make(map[tree.Name]*sqlCursor)
 	}
 	if _, ok := c.cursors[s]; ok {
 		return pgerror.Newf(pgcode.DuplicateCursor, "cursor %q already exists", s)
@@ -324,7 +346,7 @@ func (c *cursorMap) addCursor(s string, cursor *sqlCursor) error {
 	return nil
 }
 
-func (c *cursorMap) list() map[string]*sqlCursor {
+func (c *cursorMap) list() map[tree.Name]*sqlCursor {
 	return c.cursors
 }
 
@@ -334,23 +356,23 @@ type connExCursorAccessor struct {
 	ex *connExecutor
 }
 
-func (c connExCursorAccessor) closeAll() {
-	c.ex.extraTxnState.sqlCursors.closeAll()
+func (c connExCursorAccessor) closeAll(errorOnWithHold bool) error {
+	return c.ex.extraTxnState.sqlCursors.closeAll(errorOnWithHold)
 }
 
-func (c connExCursorAccessor) closeCursor(s string) error {
+func (c connExCursorAccessor) closeCursor(s tree.Name) error {
 	return c.ex.extraTxnState.sqlCursors.closeCursor(s)
 }
 
-func (c connExCursorAccessor) getCursor(s string) *sqlCursor {
+func (c connExCursorAccessor) getCursor(s tree.Name) *sqlCursor {
 	return c.ex.extraTxnState.sqlCursors.getCursor(s)
 }
 
-func (c connExCursorAccessor) addCursor(s string, cursor *sqlCursor) error {
+func (c connExCursorAccessor) addCursor(s tree.Name, cursor *sqlCursor) error {
 	return c.ex.extraTxnState.sqlCursors.addCursor(s, cursor)
 }
 
-func (c connExCursorAccessor) list() map[string]*sqlCursor {
+func (c connExCursorAccessor) list() map[tree.Name]*sqlCursor {
 	return c.ex.extraTxnState.sqlCursors.list()
 }
 

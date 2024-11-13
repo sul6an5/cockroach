@@ -16,8 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -40,9 +42,9 @@ const (
 // newErrBufferCapacityExceeded creates an error that is returned to subscribers
 // if the rangefeed processor is not able to keep up with the flow of incoming
 // events and is forced to drop events in order to not block.
-func newErrBufferCapacityExceeded() *roachpb.Error {
-	return roachpb.NewError(
-		roachpb.NewRangeFeedRetryError(roachpb.RangeFeedRetryError_REASON_SLOW_CONSUMER),
+func newErrBufferCapacityExceeded() *kvpb.Error {
+	return kvpb.NewError(
+		kvpb.NewRangeFeedRetryError(kvpb.RangeFeedRetryError_REASON_SLOW_CONSUMER),
 	)
 }
 
@@ -123,7 +125,7 @@ type Processor struct {
 	filterResC chan *Filter
 	eventC     chan *event
 	spanErrC   chan spanErr
-	stopC      chan *roachpb.Error
+	stopC      chan *kvpb.Error
 	stoppedC   chan struct{}
 }
 
@@ -148,27 +150,44 @@ func putPooledEvent(ev *event) {
 // to be informed of. It is used so that all events can be sent over the same
 // channel, which is necessary to prevent reordering.
 type event struct {
-	ops     []enginepb.MVCCLogicalOp
-	ct      hlc.Timestamp
-	sst     []byte
-	sstSpan roachpb.Span
-	sstWTS  hlc.Timestamp
-	initRTS bool
-	syncC   chan struct{}
-	// This setting is used in conjunction with syncC in tests in order to ensure
-	// that all registrations have fully finished outputting their buffers. This
-	// has to be done by the processor in order to avoid race conditions with the
+	// Event variants. Only one set.
+	ops     opsEvent
+	ct      ctEvent
+	initRTS initRTSEvent
+	sst     *sstEvent
+	sync    *syncEvent
+	// Budget allocated to process the event.
+	alloc *SharedBudgetAllocation
+}
+
+type opsEvent []enginepb.MVCCLogicalOp
+
+type ctEvent struct {
+	hlc.Timestamp
+}
+
+type initRTSEvent bool
+
+type sstEvent struct {
+	data []byte
+	span roachpb.Span
+	ts   hlc.Timestamp
+}
+
+type syncEvent struct {
+	c chan struct{}
+	// This setting is used in conjunction with c in tests in order to ensure that
+	// all registrations have fully finished outputting their buffers. This has to
+	// be done by the processor in order to avoid race conditions with the
 	// registry. Should be used only in tests.
-	testRegCatchupSpan roachpb.Span
-	// Budget allocated to process the event
-	allocation *SharedBudgetAllocation
+	testRegCatchupSpan *roachpb.Span
 }
 
 // spanErr is an error across a key span that will disconnect overlapping
 // registrations.
 type spanErr struct {
 	span roachpb.Span
-	pErr *roachpb.Error
+	pErr *kvpb.Error
 }
 
 // NewProcessor creates a new rangefeed Processor. The corresponding goroutine
@@ -178,7 +197,7 @@ func NewProcessor(cfg Config) *Processor {
 	cfg.AmbientContext.AddLogTag("rangefeed", nil)
 	p := &Processor{
 		Config: cfg,
-		reg:    makeRegistry(),
+		reg:    makeRegistry(cfg.Metrics),
 		rts:    makeResolvedTimestamp(),
 
 		regC:       make(chan registration),
@@ -189,7 +208,7 @@ func NewProcessor(cfg Config) *Processor {
 		filterResC: make(chan *Filter),
 		eventC:     make(chan *event, cfg.EventChanCap),
 		spanErrC:   make(chan spanErr),
-		stopC:      make(chan *roachpb.Error, 1),
+		stopC:      make(chan *kvpb.Error, 1),
 		stoppedC:   make(chan struct{}),
 	}
 	return p
@@ -220,7 +239,7 @@ func (p *Processor) Start(stopper *stop.Stopper, rtsIterFunc IntentScannerConstr
 	if err := stopper.RunAsyncTask(ctx, "rangefeed.Processor", func(ctx context.Context) {
 		p.run(ctx, p.RangeID, rtsIterFunc, stopper)
 	}); err != nil {
-		p.reg.DisconnectWithErr(all, roachpb.NewError(err))
+		p.reg.DisconnectWithErr(all, kvpb.NewError(err))
 		close(p.stoppedC)
 		return err
 	}
@@ -234,10 +253,15 @@ func (p *Processor) run(
 	rtsIterFunc IntentScannerConstructor,
 	stopper *stop.Stopper,
 ) {
+	// Close the memory budget last, or there will be a period of time during
+	// which requests are still ongoing but will run into the closed budget,
+	// causing shutdown noise and busy retries.
+	// Closing the budget after stoppedC ensures that all other goroutines are
+	// (very close to being) shut down by the time the budget goes away.
+	defer p.MemBudget.Close(ctx)
 	defer close(p.stoppedC)
 	ctx, cancelOutputLoops := context.WithCancel(ctx)
 	defer cancelOutputLoops()
-	defer p.MemBudget.Close(ctx)
 
 	// Launch an async task to scan over the resolved timestamp iterator and
 	// initialize the unresolvedIntentQueue. Ignore error if quiescing.
@@ -296,11 +320,14 @@ func (p *Processor) run(
 				r.runOutputLoop(ctx, p.RangeID)
 				select {
 				case p.unregC <- &r:
+					if r.unreg != nil {
+						r.unreg()
+					}
 				case <-p.stoppedC:
 				}
 			}
 			if err := stopper.RunAsyncTask(ctx, "rangefeed: output loop", runOutputLoop); err != nil {
-				r.disconnect(roachpb.NewError(err))
+				r.disconnect(kvpb.NewError(err))
 				p.reg.Unregister(ctx, &r)
 			}
 
@@ -326,7 +353,7 @@ func (p *Processor) run(
 		// Transform and route events.
 		case e := <-p.eventC:
 			p.consumeEvent(ctx, e)
-			e.allocation.Release(ctx)
+			e.alloc.Release(ctx)
 			putPooledEvent(e)
 
 		// Check whether any unresolved intents need a push.
@@ -377,7 +404,7 @@ func (p *Processor) run(
 
 		// Exit on stopper.
 		case <-stopper.ShouldQuiesce():
-			pErr := roachpb.NewError(&roachpb.NodeUnavailableError{})
+			pErr := kvpb.NewError(&kvpb.NodeUnavailableError{})
 			p.reg.DisconnectWithErr(all, pErr)
 			return
 		}
@@ -394,7 +421,7 @@ func (p *Processor) Stop() {
 // StopWithErr shuts down the processor and closes all registrations with the
 // specified error. Safe to call on nil Processor. It is not valid to restart a
 // processor after it has been stopped.
-func (p *Processor) StopWithErr(pErr *roachpb.Error) {
+func (p *Processor) StopWithErr(pErr *kvpb.Error) {
 	if p == nil {
 		return
 	}
@@ -406,7 +433,7 @@ func (p *Processor) StopWithErr(pErr *roachpb.Error) {
 
 // DisconnectSpanWithErr disconnects all rangefeed registrations that overlap
 // the given span with the given error.
-func (p *Processor) DisconnectSpanWithErr(span roachpb.Span, pErr *roachpb.Error) {
+func (p *Processor) DisconnectSpanWithErr(span roachpb.Span, pErr *kvpb.Error) {
 	if p == nil {
 		return
 	}
@@ -417,7 +444,7 @@ func (p *Processor) DisconnectSpanWithErr(span roachpb.Span, pErr *roachpb.Error
 	}
 }
 
-func (p *Processor) sendStop(pErr *roachpb.Error) {
+func (p *Processor) sendStop(pErr *kvpb.Error) {
 	select {
 	case p.stopC <- pErr:
 		// stopC has non-zero capacity so this should not block unless
@@ -451,7 +478,8 @@ func (p *Processor) Register(
 	catchUpIterConstructor CatchUpIteratorConstructor,
 	withDiff bool,
 	stream Stream,
-	errC chan<- *roachpb.Error,
+	disconnectFn func(),
+	done *future.ErrorFuture,
 ) (bool, *Filter) {
 	// Synchronize the event channel so that this registration doesn't see any
 	// events that were consumed before this registration was called. Instead,
@@ -460,7 +488,7 @@ func (p *Processor) Register(
 
 	r := newRegistration(
 		span.AsRawSpanWithNoLocals(), startTS, catchUpIterConstructor, withDiff,
-		p.Config.EventChanCap, p.Metrics, stream, errC,
+		p.Config.EventChanCap, p.Metrics, stream, disconnectFn, done,
 	)
 	select {
 	case p.regC <- r:
@@ -530,7 +558,7 @@ func (p *Processor) ConsumeSSTable(
 	if p == nil {
 		return true
 	}
-	return p.sendEvent(ctx, event{sst: sst, sstSpan: sstSpan, sstWTS: writeTS}, p.EventChanTimeout)
+	return p.sendEvent(ctx, event{sst: &sstEvent{sst, sstSpan, writeTS}}, p.EventChanTimeout)
 }
 
 // ForwardClosedTS indicates that the closed timestamp that serves as the basis
@@ -546,7 +574,7 @@ func (p *Processor) ForwardClosedTS(ctx context.Context, closedTS hlc.Timestamp)
 	if closedTS.IsEmpty() {
 		return true
 	}
-	return p.sendEvent(ctx, event{ct: closedTS}, p.EventChanTimeout)
+	return p.sendEvent(ctx, event{ct: ctEvent{closedTS}}, p.EventChanTimeout)
 }
 
 // sendEvent informs the Processor of a new event. If a timeout is specified,
@@ -555,16 +583,18 @@ func (p *Processor) ForwardClosedTS(ctx context.Context, closedTS hlc.Timestamp)
 func (p *Processor) sendEvent(ctx context.Context, e event, timeout time.Duration) bool {
 	// The code is a bit unwieldy because we try to avoid any allocations on fast
 	// path where we have enough budget and outgoing channel is free. If not, we
-	// try to set up timeout for acquiring budget and then reuse it for inserting
-	// value into channel.
-	var allocation *SharedBudgetAllocation
+	// try to set up timeout for acquiring budget and then reuse this timeout when
+	// inserting value into channel.
+	var alloc *SharedBudgetAllocation
 	if p.MemBudget != nil {
 		size := calculateDateEventSize(e)
 		if size > 0 {
 			var err error
 			// First we will try non-blocking fast path to allocate memory budget.
-			allocation, err = p.MemBudget.TryGet(ctx, size)
-			if err != nil {
+			alloc, err = p.MemBudget.TryGet(ctx, size)
+			// If budget is already closed, then just let it through because processor
+			// is terminating.
+			if err != nil && !errors.Is(err, budgetClosedError) {
 				// Since we don't have enough budget, we should try to wait for
 				// allocation returns before failing.
 				if timeout > 0 {
@@ -576,20 +606,24 @@ func (p *Processor) sendEvent(ctx context.Context, e event, timeout time.Duratio
 					timeout = 0
 				}
 				p.Metrics.RangeFeedBudgetBlocked.Inc(1)
-				allocation, err = p.MemBudget.WaitAndGet(ctx, size)
+				alloc, err = p.MemBudget.WaitAndGet(ctx, size)
 			}
-			if err != nil {
+			if err != nil && !errors.Is(err, budgetClosedError) {
 				p.Metrics.RangeFeedBudgetExhausted.Inc(1)
 				p.sendStop(newErrBufferCapacityExceeded())
 				return false
 			}
+			// Always release allocation pointer after sending as it is nil safe.
+			// In normal case its value is moved into event, in case of allocation
+			// errors it is nil, in case of send errors it is non-nil and this call
+			// ensures that unused allocation is released.
 			defer func() {
-				allocation.Release(ctx)
+				alloc.Release(ctx)
 			}()
 		}
 	}
 	ev := getPooledEvent(e)
-	ev.allocation = allocation
+	ev.alloc = alloc
 	if timeout == 0 {
 		// Timeout is zero if no timeout was requested or timeout is already set on
 		// the context by budget allocation. Just try to write using context as a
@@ -597,8 +631,8 @@ func (p *Processor) sendEvent(ctx context.Context, e event, timeout time.Duratio
 		select {
 		case p.eventC <- ev:
 			// Reset allocation after successful posting to prevent deferred cleanup
-			// from freeing it.
-			allocation = nil
+			// from freeing it (see comment on defer for explanation).
+			alloc = nil
 		case <-p.stoppedC:
 			// Already stopped. Do nothing.
 		case <-ctx.Done():
@@ -611,8 +645,8 @@ func (p *Processor) sendEvent(ctx context.Context, e event, timeout time.Duratio
 		select {
 		case p.eventC <- ev:
 			// Reset allocation after successful posting to prevent deferred cleanup
-			// from freeing it.
-			allocation = nil
+			// from freeing it (see comment on defer for explanation).
+			alloc = nil
 		case <-p.stoppedC:
 			// Already stopped. Do nothing.
 		default:
@@ -624,8 +658,8 @@ func (p *Processor) sendEvent(ctx context.Context, e event, timeout time.Duratio
 			select {
 			case p.eventC <- ev:
 				// Reset allocation after successful posting to prevent deferred cleanup
-				// from freeing it.
-				allocation = nil
+				// from freeing it  (see comment on defer for explanation).
+				alloc = nil
 			case <-p.stoppedC:
 				// Already stopped. Do nothing.
 			case <-ctx.Done():
@@ -650,7 +684,7 @@ func (p *Processor) setResolvedTSInitialized(ctx context.Context) {
 // It does so by flushing the event pipeline.
 func (p *Processor) syncEventC() {
 	syncC := make(chan struct{})
-	ev := getPooledEvent(event{syncC: syncC})
+	ev := getPooledEvent(event{sync: &syncEvent{c: syncC}})
 	select {
 	case p.eventC <- ev:
 		select {
@@ -666,17 +700,17 @@ func (p *Processor) syncEventC() {
 
 func (p *Processor) consumeEvent(ctx context.Context, e *event) {
 	switch {
-	case len(e.ops) > 0:
-		p.consumeLogicalOps(ctx, e.ops, e.allocation)
-	case len(e.sst) > 0:
-		p.consumeSSTable(ctx, e.sst, e.sstSpan, e.sstWTS, e.allocation)
+	case e.ops != nil:
+		p.consumeLogicalOps(ctx, e.ops, e.alloc)
 	case !e.ct.IsEmpty():
-		p.forwardClosedTS(ctx, e.ct)
-	case e.initRTS:
+		p.forwardClosedTS(ctx, e.ct.Timestamp)
+	case bool(e.initRTS):
 		p.initResolvedTS(ctx)
-	case e.syncC != nil:
-		if e.testRegCatchupSpan.Valid() {
-			if err := p.reg.waitForCaughtUp(e.testRegCatchupSpan); err != nil {
+	case e.sst != nil:
+		p.consumeSSTable(ctx, e.sst.data, e.sst.span, e.sst.ts, e.alloc)
+	case e.sync != nil:
+		if e.sync.testRegCatchupSpan != nil {
+			if err := p.reg.waitForCaughtUp(*e.sync.testRegCatchupSpan); err != nil {
 				log.Errorf(
 					ctx,
 					"error waiting for registries to catch up during test, results might be impacted: %s",
@@ -684,25 +718,25 @@ func (p *Processor) consumeEvent(ctx context.Context, e *event) {
 				)
 			}
 		}
-		close(e.syncC)
+		close(e.sync.c)
 	default:
 		panic(fmt.Sprintf("missing event variant: %+v", e))
 	}
 }
 
 func (p *Processor) consumeLogicalOps(
-	ctx context.Context, ops []enginepb.MVCCLogicalOp, allocation *SharedBudgetAllocation,
+	ctx context.Context, ops []enginepb.MVCCLogicalOp, alloc *SharedBudgetAllocation,
 ) {
 	for _, op := range ops {
 		// Publish RangeFeedValue updates, if necessary.
 		switch t := op.GetValue().(type) {
 		case *enginepb.MVCCWriteValueOp:
 			// Publish the new value directly.
-			p.publishValue(ctx, t.Key, t.Timestamp, t.Value, t.PrevValue, allocation)
+			p.publishValue(ctx, t.Key, t.Timestamp, t.Value, t.PrevValue, alloc)
 
 		case *enginepb.MVCCDeleteRangeOp:
 			// Publish the range deletion directly.
-			p.publishDeleteRange(ctx, t.StartKey, t.EndKey, t.Timestamp, allocation)
+			p.publishDeleteRange(ctx, t.StartKey, t.EndKey, t.Timestamp, alloc)
 
 		case *enginepb.MVCCWriteIntentOp:
 			// No updates to publish.
@@ -712,7 +746,7 @@ func (p *Processor) consumeLogicalOps(
 
 		case *enginepb.MVCCCommitIntentOp:
 			// Publish the newly committed value.
-			p.publishValue(ctx, t.Key, t.Timestamp, t.Value, t.PrevValue, allocation)
+			p.publishValue(ctx, t.Key, t.Timestamp, t.Value, t.PrevValue, alloc)
 
 		case *enginepb.MVCCAbortIntentOp:
 			// No updates to publish.
@@ -737,9 +771,9 @@ func (p *Processor) consumeSSTable(
 	sst []byte,
 	sstSpan roachpb.Span,
 	sstWTS hlc.Timestamp,
-	allocation *SharedBudgetAllocation,
+	alloc *SharedBudgetAllocation,
 ) {
-	p.publishSSTable(ctx, sst, sstSpan, sstWTS, allocation)
+	p.publishSSTable(ctx, sst, sstSpan, sstWTS, alloc)
 }
 
 func (p *Processor) forwardClosedTS(ctx context.Context, newClosedTS hlc.Timestamp) {
@@ -759,7 +793,7 @@ func (p *Processor) publishValue(
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	value, prevValue []byte,
-	allocation *SharedBudgetAllocation,
+	alloc *SharedBudgetAllocation,
 ) {
 	if !p.Span.ContainsKey(roachpb.RKey(key)) {
 		log.Fatalf(ctx, "key %v not in Processor's key range %v", key, p.Span)
@@ -769,8 +803,8 @@ func (p *Processor) publishValue(
 	if prevValue != nil {
 		prevVal.RawBytes = prevValue
 	}
-	var event roachpb.RangeFeedEvent
-	event.MustSetValue(&roachpb.RangeFeedValue{
+	var event kvpb.RangeFeedEvent
+	event.MustSetValue(&kvpb.RangeFeedValue{
 		Key: key,
 		Value: roachpb.Value{
 			RawBytes:  value,
@@ -778,26 +812,26 @@ func (p *Processor) publishValue(
 		},
 		PrevValue: prevVal,
 	})
-	p.reg.PublishToOverlapping(ctx, roachpb.Span{Key: key}, &event, allocation)
+	p.reg.PublishToOverlapping(ctx, roachpb.Span{Key: key}, &event, alloc)
 }
 
 func (p *Processor) publishDeleteRange(
 	ctx context.Context,
 	startKey, endKey roachpb.Key,
 	timestamp hlc.Timestamp,
-	allocation *SharedBudgetAllocation,
+	alloc *SharedBudgetAllocation,
 ) {
 	span := roachpb.Span{Key: startKey, EndKey: endKey}
 	if !p.Span.ContainsKeyRange(roachpb.RKey(startKey), roachpb.RKey(endKey)) {
 		log.Fatalf(ctx, "span %s not in Processor's key range %v", span, p.Span)
 	}
 
-	var event roachpb.RangeFeedEvent
-	event.MustSetValue(&roachpb.RangeFeedDeleteRange{
+	var event kvpb.RangeFeedEvent
+	event.MustSetValue(&kvpb.RangeFeedDeleteRange{
 		Span:      span,
 		Timestamp: timestamp,
 	})
-	p.reg.PublishToOverlapping(ctx, span, &event, allocation)
+	p.reg.PublishToOverlapping(ctx, span, &event, alloc)
 }
 
 func (p *Processor) publishSSTable(
@@ -805,7 +839,7 @@ func (p *Processor) publishSSTable(
 	sst []byte,
 	sstSpan roachpb.Span,
 	sstWTS hlc.Timestamp,
-	allocation *SharedBudgetAllocation,
+	alloc *SharedBudgetAllocation,
 ) {
 	if sstSpan.Equal(roachpb.Span{}) {
 		panic(errors.AssertionFailedf("received SSTable without span"))
@@ -813,13 +847,13 @@ func (p *Processor) publishSSTable(
 	if sstWTS.IsEmpty() {
 		panic(errors.AssertionFailedf("received SSTable without write timestamp"))
 	}
-	p.reg.PublishToOverlapping(ctx, sstSpan, &roachpb.RangeFeedEvent{
-		SST: &roachpb.RangeFeedSSTable{
+	p.reg.PublishToOverlapping(ctx, sstSpan, &kvpb.RangeFeedEvent{
+		SST: &kvpb.RangeFeedSSTable{
 			Data:    sst,
 			Span:    sstSpan,
 			WriteTS: sstWTS,
 		},
-	}, allocation)
+	}, alloc)
 }
 
 func (p *Processor) publishCheckpoint(ctx context.Context) {
@@ -830,12 +864,12 @@ func (p *Processor) publishCheckpoint(ctx context.Context) {
 	p.reg.PublishToOverlapping(ctx, all, event, nil)
 }
 
-func (p *Processor) newCheckpointEvent() *roachpb.RangeFeedEvent {
+func (p *Processor) newCheckpointEvent() *kvpb.RangeFeedEvent {
 	// Create a RangeFeedCheckpoint over the Processor's entire span. Each
 	// individual registration will trim this down to just the key span that
 	// it is listening on in registration.maybeStripEvent before publishing.
-	var event roachpb.RangeFeedEvent
-	event.MustSetValue(&roachpb.RangeFeedCheckpoint{
+	var event kvpb.RangeFeedEvent
+	event.MustSetValue(&kvpb.RangeFeedCheckpoint{
 		Span:       p.Span.AsRawSpanWithNoLocals(),
 		ResolvedTS: p.rts.Get(),
 	})
@@ -852,6 +886,8 @@ func calculateDateEventSize(e event) int64 {
 	for _, op := range e.ops {
 		size += int64(op.Size())
 	}
-	size += int64(len(e.sst))
+	if e.sst != nil {
+		size += int64(len(e.sst.data))
+	}
 	return size
 }

@@ -10,7 +10,7 @@
 
 syntax = "proto3";
 package cockroach.util.log.eventpb;
-option go_package = "eventpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/util/log/eventpb";
 
 import "gogoproto/gogo.proto";
 import "sql/catalog/descpb/structured.proto";
@@ -161,6 +161,32 @@ message SampledQuery {
   // The number of network messages sent by nodes for this query.
   int64 network_messages = 44 [(gogoproto.jsontag) = ',omitempty'];
 
+  // Generated index recommendations for this query.
+  repeated string index_recommendations = 45 [(gogoproto.jsontag) = ',omitempty', (gogoproto.moretags) = "redact:\"nonsensitive\""];
+
+  // The number of scans in the query plan.
+  int64 scan_count = 46 [(gogoproto.jsontag) = ",omitempty"];
+
+  // The number of scans using statistics (including forecasted statistics) in
+  // the query plan.
+  int64 scan_with_stats_count = 47 [(gogoproto.jsontag) = ",omitempty"];
+
+  // The number of scans using forecasted statistics in the query plan.
+  int64 scan_with_stats_forecast_count = 48 [(gogoproto.jsontag) = ",omitempty"];
+
+  // Total number of rows read by all scans in the query, as estimated by the
+  // optimizer without using forecasts.
+  double total_scan_rows_without_forecasts_estimate = 49 [(gogoproto.jsontag) = ",omitempty"];
+
+  // The greatest quantity of nanoseconds that have passed since the forecast
+  // time (or until the forecast time, if it is in the future, in which case it
+  // will be negative) for any table with forecasted stats scanned by this
+  // query.
+  int64 nanos_since_stats_forecasted = 50 [(gogoproto.jsontag) = ",omitempty"];
+
+  // The list of indexes used by this query.
+  repeated string indexes = 51 [(gogoproto.jsontag) = ',omitempty', (gogoproto.moretags) = "redact:\"nonsensitive\""];
+
   reserved 12;
 }
 
@@ -213,6 +239,8 @@ message CapturedIndexUsageStats {
 // ChangefeedFailed events.
 message CreateChangefeed {
   CommonChangefeedEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+
+  bool transformation = 2 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
 }
 
 // ChangefeedFailed is an event for any Changefeed failure since the plan hook
@@ -223,6 +251,23 @@ message ChangefeedFailed {
   // The reason / environment with which the changefeed failed (ex:
   // connection_closed, changefeed_behind)
   string failure_type = 2 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
+}
+
+// ChangefeedEmittedBytes is an event representing the bytes emitted by a changefeed over an interval.
+message ChangefeedEmittedBytes {
+  CommonChangefeedEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+
+  // The job id for enterprise changefeeds.
+  int64 job_id = 2 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) =  "redact:\"nonsensitive\""];
+
+  // The number of bytes emitted.
+  int64 emitted_bytes = 3 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
+
+  // The time period in nanoseconds between emitting telemetry events of this type (per-aggregator).
+  int64 logging_interval = 4 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
+
+  // Flag to indicate that the changefeed is closing.
+  bool closing = 5 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
 }
 
 // RecoveryEvent is an event that is logged on every invocation of BACKUP,
@@ -341,6 +386,11 @@ message RecoveryEvent {
   // created even if a backup is already present in its destination.
   bool ignore_existing_backup = 29 [(gogoproto.jsontag) = ",omitempty"];
 
+  // The application name for the session where recovery event was created.
+  string application_name = 30 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
+
+  // NumRows is the number of rows successfully imported, backed up or restored.
+  int64 num_rows = 31 [(gogoproto.jsontag) = ",omitempty"];
 }
 
 // SchemaDescriptor is an event for schema telemetry, whose purpose is

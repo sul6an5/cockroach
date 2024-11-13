@@ -13,10 +13,12 @@ package server
 import (
 	"context"
 	"io"
+	"math"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
@@ -25,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -70,10 +73,10 @@ var (
 // This method is part of the serverpb.AdminClient interface.
 func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_DrainServer) error {
 	ctx := stream.Context()
-	ctx = s.server.AnnotateCtx(ctx)
+	ctx = s.AnnotateCtx(ctx)
 
 	// Which node is this request for?
-	nodeID, local, err := s.server.status.parseNodeID(req.NodeId)
+	nodeID, local, err := s.serverIterator.parseServerID(req.NodeId)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, err.Error())
 	}
@@ -85,21 +88,24 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 		// response. We must forward all of them.
 
 		// Connect to the target node.
-		client, err := s.dialNode(ctx, nodeID)
+		client, err := s.dialNode(ctx, roachpb.NodeID(nodeID))
 		if err != nil {
 			return serverError(ctx, err)
 		}
 		return delegateDrain(ctx, req, client, stream)
 	}
 
-	return s.server.drain.handleDrain(ctx, req, stream)
+	return s.drainServer.handleDrain(ctx, req, stream)
 }
 
 type drainServer struct {
-	stopper      *stop.Stopper
+	stopper *stop.Stopper
+	// stopTrigger is used to request that the server is shut down.
+	stopTrigger  *stopTrigger
 	grpc         *grpcServer
 	sqlServer    *SQLServer
 	drainSleepFn func(time.Duration)
+	serverCtl    *serverController
 
 	kvServer struct {
 		nodeLiveness *liveness.NodeLiveness
@@ -109,7 +115,11 @@ type drainServer struct {
 
 // newDrainServer constructs a drainServer suitable for any kind of server.
 func newDrainServer(
-	cfg BaseConfig, stopper *stop.Stopper, grpc *grpcServer, sqlServer *SQLServer,
+	cfg BaseConfig,
+	stopper *stop.Stopper,
+	stopTrigger *stopTrigger,
+	grpc *grpcServer,
+	sqlServer *SQLServer,
 ) *drainServer {
 	var drainSleepFn = time.Sleep
 	if cfg.TestingKnobs.Server != nil {
@@ -119,6 +129,7 @@ func newDrainServer(
 	}
 	return &drainServer{
 		stopper:      stopper,
+		stopTrigger:  stopTrigger,
 		grpc:         grpc,
 		sqlServer:    sqlServer,
 		drainSleepFn: drainSleepFn,
@@ -175,7 +186,7 @@ func (s *drainServer) maybeShutdownAfterDrain(
 		// away (and who knows whether gRPC-goroutines are tied up in some
 		// stopper task somewhere).
 		s.grpc.Stop()
-		s.stopper.Stop(ctx)
+		s.stopTrigger.signalStop(ctx, MakeShutdownRequest(ShutdownReasonDrainRPC, nil /* err */))
 	}()
 
 	select {
@@ -298,11 +309,33 @@ func (s *drainServer) runDrain(
 func (s *drainServer) drainInner(
 	ctx context.Context, reporter func(int, redact.SafeString), verbose bool,
 ) (err error) {
+	if s.serverCtl != nil {
+		// We are on a KV node, with a server controller.
+		//
+		// First tell the controller to stop starting new servers.
+		s.serverCtl.draining.Set(true)
+
+		// Then shut down tenant servers orchestrated from
+		// this node.
+		stillRunning := s.serverCtl.drain(ctx)
+		reporter(stillRunning, "tenant servers")
+		// If we still have tenant servers, we can't make progress on
+		// draining SQL clients (on the system tenant) and the KV node,
+		// because that would block the graceful drain of the tenant
+		// server(s).
+		if stillRunning > 0 {
+			return nil
+		}
+		log.Infof(ctx, "all tenant servers stopped")
+	}
+
 	// Drain the SQL layer.
 	// Drains all SQL connections, distributed SQL execution flows, and SQL table leases.
 	if err = s.drainClients(ctx, reporter); err != nil {
 		return err
 	}
+	log.Infof(ctx, "done draining clients")
+
 	// Mark the node as draining in liveness and drain all range leases.
 	return s.drainNode(ctx, reporter, verbose)
 }
@@ -317,6 +350,11 @@ func (s *drainServer) isDraining() bool {
 func (s *drainServer) drainClients(
 	ctx context.Context, reporter func(int, redact.SafeString),
 ) error {
+	// Setup a cancelable context so that the logOpenConns goroutine exits when
+	// this function returns.
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	defer cancel()
 	shouldDelayDraining := !s.isDraining()
 
 	// Set the gRPC mode of the node to "draining" and mark the node as "not ready".
@@ -347,6 +385,18 @@ func (s *drainServer) drainClients(
 		return err
 	}
 
+	// Inform the job system that the node is draining.
+	//
+	// We cannot do this before SQL clients disconnect, because
+	// otherwise there is a risk that one of the remaining SQL sessions
+	// issues a BACKUP or some other job-based statement before it
+	// disconnects, and encounters a job error as a result -- that the
+	// registry is now unavailable due to the drain.
+	s.sqlServer.jobRegistry.SetDraining()
+
+	// Inform the auto-stats tasks that the node is draining.
+	s.sqlServer.statsRefresher.SetDraining()
+
 	// Drain any remaining SQL connections.
 	// The queryWait duration is a timeout for waiting for SQL queries to finish.
 	// If the timeout is reached, any remaining connections
@@ -361,11 +411,40 @@ func (s *drainServer) drainClients(
 	s.sqlServer.distSQLServer.Drain(ctx, queryMaxWait, reporter)
 
 	// Flush in-memory SQL stats into the statement stats system table.
-	s.sqlServer.pgServer.SQLServer.GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+	statsProvider := s.sqlServer.pgServer.SQLServer.GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
+	statsProvider.Flush(ctx)
+	statsProvider.Stop(ctx)
+
+	// Inform the async tasks for table stats that the node is draining
+	// and wait for task shutdown.
+	s.sqlServer.statsRefresher.WaitForAutoStatsShutdown(ctx)
+
+	// Inform the job system that the node is draining and wait for task
+	// shutdown.
+	s.sqlServer.jobRegistry.WaitForRegistryShutdown(ctx)
 
 	// Drain all SQL table leases. This must be done after the pgServer has
-	// given sessions a chance to finish ongoing work.
+	// given sessions a chance to finish ongoing work and after the background
+	// tasks that may issue SQL statements have shut down.
 	s.sqlServer.leaseMgr.SetDraining(ctx, true /* drain */, reporter)
+
+	// Mark this phase in the logs to clarify the context of any subsequent
+	// errors/warnings, if any.
+	log.Infof(ctx, "SQL server drained successfully; SQL queries cannot execute any more")
+
+	session, err := s.sqlServer.sqlLivenessProvider.Release(ctx)
+	if err != nil {
+		return err
+	}
+
+	instanceID := s.sqlServer.sqlIDContainer.SQLInstanceID()
+	err = s.sqlServer.sqlInstanceStorage.ReleaseInstance(ctx, session, instanceID)
+	if err != nil {
+		return err
+	}
+
+	// Mark the node as fully drained.
+	s.sqlServer.gracefulDrainComplete.Set(true)
 
 	// Done. This executes the defers set above to drain SQL leases.
 	return nil
@@ -380,6 +459,7 @@ func (s *drainServer) drainNode(
 		// No KV subsystem. Nothing to do.
 		return nil
 	}
+
 	// Set the node's liveness status to "draining".
 	if err = s.kvServer.nodeLiveness.SetDraining(ctx, true /* drain */, reporter); err != nil {
 		return err
@@ -405,3 +485,65 @@ func (s *drainServer) logOpenConns(ctx context.Context) error {
 		}
 	})
 }
+
+// CallDrainServerSide is a reference implementation for a server-side
+// function that wishes to shut down a server gracefully via the Drain
+// interface. The Drain interface is responsible for notifying clients
+// and shutting down systems in a particular order that prevents
+// client app disruptions. We generally prefer graceful drains to the
+// disorderly shutdown caused by either a process crash or a direct
+// call to the stopper's Stop() method.
+//
+// By default, this code will wait forever for a graceful drain to
+// complete. The caller can override this behavior by passing a context
+// with a deadline.
+//
+// For an example client-side implementation (drain client over RPC),
+// see the code in pkg/cli/node.go, doDrain().
+func CallDrainServerSide(ctx context.Context, drainFn ServerSideDrainFn) {
+	var (
+		prevRemaining = uint64(math.MaxUint64)
+		verbose       = false
+	)
+
+	ctx = logtags.AddTag(ctx, "call-graceful-drain", nil)
+	for {
+		// Let the caller interrupt the process via context cancellation
+		// if so desired.
+		select {
+		case <-ctx.Done():
+			log.Ops.Errorf(ctx, "drain interrupted by caller: %v", ctx.Err())
+			return
+		default:
+		}
+
+		remaining, _, err := drainFn(ctx, verbose)
+		if err != nil {
+			log.Ops.Errorf(ctx, "graceful drain failed: %v", err)
+			return
+		}
+		if remaining == 0 {
+			// No more work to do.
+			log.Ops.Infof(ctx, "graceful drain complete")
+			return
+		}
+
+		// If range lease transfer stalls or the number of
+		// remaining leases somehow increases, verbosity is set
+		// to help with troubleshooting.
+		if remaining >= prevRemaining {
+			verbose = true
+		}
+
+		// Avoid a busy wait with high CPU usage if the server replies
+		// with an incomplete drain too quickly.
+		time.Sleep(200 * time.Millisecond)
+
+		// Remember the remaining work to set the verbose flag in the next
+		// iteration.
+		prevRemaining = remaining
+	}
+}
+
+// ServerSideDrainFn is the interface of the server-side handler for the Drain logic.
+type ServerSideDrainFn func(ctx context.Context, verbose bool) (uint64, redact.RedactableString, error)

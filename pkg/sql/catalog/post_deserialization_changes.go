@@ -10,7 +10,7 @@
 
 package catalog
 
-import "github.com/cockroachdb/cockroach/pkg/util"
+import "github.com/cockroachdb/cockroach/pkg/util/intsets"
 
 // PostDeserializationChangeType is used to indicate the type of
 // PostDeserializationChange which occurred for a descriptor.
@@ -19,7 +19,7 @@ type PostDeserializationChangeType int
 // PostDeserializationChanges are a set of booleans to indicate which types of
 // upgrades or fixes occurred when filling in the descriptor after
 // deserialization.
-type PostDeserializationChanges struct{ s util.FastIntSet }
+type PostDeserializationChanges struct{ s intsets.Fast }
 
 // HasChanges returns true if the set of changes is non-empty.
 func (c PostDeserializationChanges) HasChanges() bool {
@@ -90,4 +90,24 @@ const (
 	// UpgradedSequenceReference indicates that the table/view had upgraded
 	// their sequence references, if any, from by-name to by-ID, if not already.
 	UpgradedSequenceReference
+
+	// SetModTimeToMVCCTimestamp indicates that a descriptor's ModificationTime
+	// field was unset and that the MVCC timestamp value was assigned to it.
+	SetModTimeToMVCCTimestamp
+
+	// SetCreateAsOfTimeUsingModTime indicates that a table's CreateAsOfTime field
+	// was unset and the ModificationTime value was assigned to it.
+	SetCreateAsOfTimeUsingModTime
+
+	// SetSystemDatabaseDescriptorVersion indicates that the system database
+	// descriptor did not have its version set.
+	SetSystemDatabaseDescriptorVersion
+
+	// SetCheckConstraintColumnIDs indicates that a table's check constraint's
+	// ColumnIDs slice hadn't been set yet, and was set to a non-empty slice.
+	SetCheckConstraintColumnIDs
+
+	// UpgradedDeclarativeSchemaChangerState indicates the declarative schema changer
+	// state was modified.
+	UpgradedDeclarativeSchemaChangerState = 15
 )

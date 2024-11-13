@@ -69,12 +69,12 @@ var _ execopnode.OpNode = &invertedFilterer{}
 const invertedFiltererProcName = "inverted filterer"
 
 func newInvertedFilterer(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.InvertedFiltererSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.RowSourcedProcessor, error) {
 	ifr := &invertedFilterer{
 		input:          input,
@@ -96,7 +96,7 @@ func newInvertedFilterer(
 
 	// Initialize ProcessorBase.
 	if err := ifr.ProcessorBase.Init(
-		ifr, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
+		ctx, ifr, post, outputColTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ifr.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -108,9 +108,8 @@ func newInvertedFilterer(
 		return nil, err
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
 	// Initialize memory monitor and row container for input rows.
-	ifr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "inverted-filterer-limited")
+	ifr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "inverted-filterer-limited")
 	ifr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "inverted-filterer-disk")
 	ifr.rc = rowcontainer.NewDiskBackedNumberedRowContainer(
 		true, /* deDup */
@@ -121,7 +120,7 @@ func newInvertedFilterer(
 		ifr.diskMonitor,
 	)
 
-	if execstats.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx.CollectStats) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		ifr.input = newInputStatCollector(ifr.input)
 		ifr.ExecStatsForTrace = ifr.execStatsForTrace
 	}
@@ -130,7 +129,7 @@ func newInvertedFilterer(
 		semaCtx := flowCtx.NewSemaContext(flowCtx.Txn)
 		var exprHelper execinfrapb.ExprHelper
 		colTypes := []*types.T{spec.PreFiltererSpec.Type}
-		if err := exprHelper.Init(spec.PreFiltererSpec.Expression, colTypes, semaCtx, ifr.EvalCtx); err != nil {
+		if err := exprHelper.Init(ctx, spec.PreFiltererSpec.Expression, colTypes, semaCtx, ifr.EvalCtx); err != nil {
 			return nil, err
 		}
 		preFilterer, preFiltererState, err := invertedidx.NewBoundPreFilterer(
@@ -169,7 +168,7 @@ func (ifr *invertedFilterer) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMe
 		case ifrEmittingRows:
 			ifr.runningState, row, meta = ifr.emitRow()
 		default:
-			log.Fatalf(ifr.Ctx, "unsupported state: %d", ifr.runningState)
+			log.Fatalf(ifr.Ctx(), "unsupported state: %d", ifr.runningState)
 		}
 		if row == nil && meta == nil {
 			continue
@@ -194,9 +193,9 @@ func (ifr *invertedFilterer) readInput() (invertedFiltererState, *execinfrapb.Pr
 		return ifrReadingInput, meta
 	}
 	if row == nil {
-		log.VEventf(ifr.Ctx, 1, "no more input rows")
+		log.VEventf(ifr.Ctx(), 1, "no more input rows")
 		evalResult := ifr.invertedEval.evaluate()
-		ifr.rc.SetupForRead(ifr.Ctx, evalResult)
+		ifr.rc.SetupForRead(ifr.Ctx(), evalResult)
 		// invertedEval had a single expression in the batch, and the results
 		// for that expression are in evalResult[0].
 		ifr.evalResult = evalResult[0]
@@ -245,7 +244,7 @@ func (ifr *invertedFilterer) readInput() (invertedFiltererState, *execinfrapb.Pr
 		// evaluator.
 		copy(ifr.keyRow, row[:ifr.invertedColIdx])
 		copy(ifr.keyRow[ifr.invertedColIdx:], row[ifr.invertedColIdx+1:])
-		keyIndex, err := ifr.rc.AddRow(ifr.Ctx, ifr.keyRow)
+		keyIndex, err := ifr.rc.AddRow(ifr.Ctx(), ifr.keyRow)
 		if err != nil {
 			ifr.MoveToDraining(err)
 			return ifrStateUnknown, ifr.DrainHelper()
@@ -273,11 +272,11 @@ func (ifr *invertedFilterer) emitRow() (
 	}
 	if ifr.resultIdx >= len(ifr.evalResult) {
 		// We are done emitting all rows.
-		return drainFunc(ifr.rc.UnsafeReset(ifr.Ctx))
+		return drainFunc(ifr.rc.UnsafeReset(ifr.Ctx()))
 	}
 	curRowIdx := ifr.resultIdx
 	ifr.resultIdx++
-	keyRow, err := ifr.rc.GetRow(ifr.Ctx, ifr.evalResult[curRowIdx], false /* skip */)
+	keyRow, err := ifr.rc.GetRow(ifr.Ctx(), ifr.evalResult[curRowIdx], false /* skip */)
 	if err != nil {
 		return drainFunc(err)
 	}
@@ -301,12 +300,12 @@ func (ifr *invertedFilterer) ConsumerClosed() {
 
 func (ifr *invertedFilterer) close() {
 	if ifr.InternalClose() {
-		ifr.rc.Close(ifr.Ctx)
+		ifr.rc.Close(ifr.Ctx())
 		if ifr.MemMonitor != nil {
-			ifr.MemMonitor.Stop(ifr.Ctx)
+			ifr.MemMonitor.Stop(ifr.Ctx())
 		}
 		if ifr.diskMonitor != nil {
-			ifr.diskMonitor.Stop(ifr.Ctx)
+			ifr.diskMonitor.Stop(ifr.Ctx())
 		}
 	}
 }

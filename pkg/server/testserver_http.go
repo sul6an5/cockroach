@@ -19,9 +19,11 @@ import (
 	"net/url"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
@@ -33,6 +35,7 @@ type httpTestServer struct {
 		// of *Server, which are also embedded in TestServer.
 		authentication *authenticationServer
 		sqlServer      *SQLServer
+		tenantName     roachpb.TenantName
 	}
 
 	// authClient is an http.Client that has been authenticated to access the
@@ -45,29 +48,62 @@ type httpTestServer struct {
 	}
 }
 
+type tenantHeaderDecorator struct {
+	http.RoundTripper
+
+	tenantName roachpb.TenantName
+}
+
+func (t tenantHeaderDecorator) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.tenantName != "" {
+		req.Header.Add(TenantSelectHeader, string(t.tenantName))
+	}
+	return t.RoundTripper.RoundTrip(req)
+}
+
+var _ http.RoundTripper = &tenantHeaderDecorator{}
+
 // AdminURL implements TestServerInterface.
 func (ts *httpTestServer) AdminURL() string {
-	return ts.t.sqlServer.execCfg.RPCContext.Config.AdminURL().String()
+	u := ts.t.sqlServer.execCfg.RPCContext.Config.AdminURL()
+	if ts.t.tenantName != "" {
+		q := u.Query()
+		q.Add(TenantNameParamInQueryURL, string(ts.t.tenantName))
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 // GetUnauthenticatedHTTPClient implements TestServerInterface.
 func (ts *httpTestServer) GetUnauthenticatedHTTPClient() (http.Client, error) {
-	return ts.t.sqlServer.execCfg.RPCContext.GetHTTPClient()
+	client, err := ts.t.sqlServer.execCfg.RPCContext.GetHTTPClient()
+	if err != nil {
+		return client, err
+	}
+	client.Transport = &tenantHeaderDecorator{
+		RoundTripper: client.Transport,
+		tenantName:   ts.t.tenantName,
+	}
+	return client, nil
 }
 
 // GetAdminHTTPClient implements the TestServerInterface.
 func (ts *httpTestServer) GetAdminHTTPClient() (http.Client, error) {
-	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authenticatedUserName(), true)
+	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(
+		authenticatedUserName(), true, serverutils.SingleTenantSession,
+	)
 	return httpClient, err
 }
 
 // GetAuthenticatedHTTPClient implements the TestServerInterface.
-func (ts *httpTestServer) GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, error) {
+func (ts *httpTestServer) GetAuthenticatedHTTPClient(
+	isAdmin bool, session serverutils.SessionType,
+) (http.Client, error) {
 	authUser := authenticatedUserName()
 	if !isAdmin {
 		authUser = authenticatedUserNameNoAdmin()
 	}
-	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authUser, isAdmin)
+	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authUser, isAdmin, session)
 	return httpClient, err
 }
 
@@ -77,12 +113,12 @@ func (ts *httpTestServer) GetAuthSession(isAdmin bool) (*serverpb.SessionCookie,
 	if !isAdmin {
 		authUser = authenticatedUserNameNoAdmin()
 	}
-	_, cookie, err := ts.getAuthenticatedHTTPClientAndCookie(authUser, isAdmin)
+	_, cookie, err := ts.getAuthenticatedHTTPClientAndCookie(authUser, isAdmin, serverutils.SingleTenantSession)
 	return cookie, err
 }
 
 func (ts *httpTestServer) getAuthenticatedHTTPClientAndCookie(
-	authUser username.SQLUsername, isAdmin bool,
+	authUser username.SQLUsername, isAdmin bool, session serverutils.SessionType,
 ) (http.Client, *serverpb.SessionCookie, error) {
 	authIdx := 0
 	if isAdmin {
@@ -118,6 +154,10 @@ func (ts *httpTestServer) getAuthenticatedHTTPClientAndCookie(
 			if err != nil {
 				return err
 			}
+			if session == serverutils.MultiTenantSession {
+				cookie.Name = SessionCookieName
+				cookie.Value = fmt.Sprintf("%s,%s", cookie.Value, ts.t.tenantName)
+			}
 			cookieJar.SetCookies(url, []*http.Cookie{cookie})
 			// Create an httpClient and attach the cookie jar to the client.
 			authClient.httpClient, err = ts.t.sqlServer.execCfg.RPCContext.GetHTTPClient()
@@ -128,9 +168,12 @@ func (ts *httpTestServer) getAuthenticatedHTTPClientAndCookie(
 			if err != nil {
 				return err
 			}
-			authClient.httpClient.Transport = &v2AuthDecorator{
-				RoundTripper: authClient.httpClient.Transport,
-				session:      base64.StdEncoding.EncodeToString(rawCookieBytes),
+			authClient.httpClient.Transport = &tenantHeaderDecorator{
+				RoundTripper: &v2AuthDecorator{
+					RoundTripper: authClient.httpClient.Transport,
+					session:      base64.StdEncoding.EncodeToString(rawCookieBytes),
+				},
+				tenantName: ts.t.tenantName,
 			}
 			authClient.httpClient.Jar = cookieJar
 			authClient.cookie = rawCookie
@@ -144,18 +187,16 @@ func (ts *httpTestServer) getAuthenticatedHTTPClientAndCookie(
 func (ts *httpTestServer) createAuthUser(userName username.SQLUsername, isAdmin bool) error {
 	if _, err := ts.t.sqlServer.internalExecutor.ExecEx(context.TODO(),
 		"create-auth-user", nil,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		fmt.Sprintf("CREATE USER %s", userName.Normalized()),
 	); err != nil {
 		return err
 	}
 	if isAdmin {
-		// We can't use the GRANT statement here because we don't want
-		// to rely on CCL code.
 		if _, err := ts.t.sqlServer.internalExecutor.ExecEx(context.TODO(),
 			"grant-admin", nil,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-			"INSERT INTO system.role_members (role, member, \"isAdmin\") VALUES ('admin', $1, true)", userName.Normalized(),
+			sessiondata.RootUserSessionDataOverride,
+			fmt.Sprintf("GRANT admin TO %s WITH ADMIN OPTION", userName.Normalized()),
 		); err != nil {
 			return err
 		}

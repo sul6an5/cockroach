@@ -14,24 +14,88 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
 
+// Logger is the log sink used by kvnemesis.
+type Logger interface {
+	Helper()
+	Logf(string, ...interface{})
+	WriteFile(basename string, contents string) string
+}
+
 // Env manipulates the environment (cluster settings, zone configurations) that
 // the Applier operates in.
 type Env struct {
-	sqlDBs []*gosql.DB
+	SQLDBs  []*gosql.DB
+	Tracker *SeqTracker
+	L       Logger
 }
 
 func (e *Env) anyNode() *gosql.DB {
 	// NOTE: There is currently no need to round-robin through the sql gateways,
 	// so we always just return the first DB.
-	return e.sqlDBs[0]
+	return e.SQLDBs[0]
+}
+
+// CheckConsistency runs a consistency check on all ranges in the given span,
+// primarily to verify that MVCC stats are accurate. Any failures are returned
+// as a list of errors. RANGE_CONSISTENT_STATS_ESTIMATED is considered a
+// success, since stats estimates are fine (if unfortunate).
+func (e *Env) CheckConsistency(ctx context.Context, span roachpb.Span) []error {
+	rows, err := e.anyNode().QueryContext(ctx, fmt.Sprintf(`
+		SELECT range_id, start_key_pretty, status, detail
+		FROM crdb_internal.check_consistency(false, b'\x%x', b'\x%x')
+		ORDER BY range_id ASC`,
+		span.Key, span.EndKey,
+	))
+	if err != nil {
+		return []error{err}
+	}
+	defer rows.Close()
+
+	var failures []error
+	for rows.Next() {
+		var rangeID int
+		var key, status, detail string
+		if err := rows.Scan(&rangeID, &key, &status, &detail); err != nil {
+			return []error{err}
+		}
+		// TODO(erikgrinaker): There's a known issue that can result in a SysBytes
+		// discrepancy due to lease requests racing with merges. Ignore them for
+		// now, see: https://github.com/cockroachdb/cockroach/issues/93896
+		if status == kvpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT.String() {
+			m := regexp.MustCompile(`.*\ndelta \(stats-computed\): \{(.*)\}`).FindStringSubmatch(detail)
+			if len(m) > 1 {
+				delta := m[1]
+				// Strip out LastUpdateNanos and all zero-valued fields.
+				delta = regexp.MustCompile(`LastUpdateNanos:\d+`).ReplaceAllString(delta, "")
+				delta = regexp.MustCompile(`\S+:0\b`).ReplaceAllString(delta, "")
+				if regexp.MustCompile(`^\s*SysBytes:\S+(\s+SysCount:\S+)?\s*$`).MatchString(delta) {
+					continue
+				}
+			}
+		}
+		switch status {
+		case kvpb.CheckConsistencyResponse_RANGE_INDETERMINATE.String():
+			// Can't do anything, so let it slide.
+		case kvpb.CheckConsistencyResponse_RANGE_CONSISTENT.String():
+			// Good.
+		case kvpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_ESTIMATED.String():
+			// Ok.
+		default:
+			failures = append(failures, errors.Errorf("range %d (%s) %s:\n%s", rangeID, key, status, detail))
+		}
+	}
+	return failures
 }
 
 // SetClosedTimestampInterval sets the kv.closed_timestamp.target_duration

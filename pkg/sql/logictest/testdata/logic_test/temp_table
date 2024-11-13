@@ -19,6 +19,15 @@ SELECT table_name, type FROM [SHOW TABLES]
 ----
 tbl  table
 
+# Verify that temp schema is visible in pg_namespace index.
+let $tempSchemaOID
+SELECT oid FROM pg_namespace where nspname LIKE 'pg_temp%'
+
+query B
+SELECT nspname LIKE 'pg_temp%' FROM pg_namespace where oid = $tempSchemaOID
+----
+true
+
 statement ok
 DROP TABLE tbl
 
@@ -347,4 +356,68 @@ to_drop.pg_temp.testuser_tmp
 to_drop.pg_temp.tempuser_view
 to_drop.pg_temp.root_temp
 
+subtest create_after_discard_and_drop_database
+
+statement ok
+ALTER ROLE testuser WITH CREATEDB;
+
 user testuser
+
+statement ok
+CREATE DATABASE to_drop
+
+statement ok
+USE to_drop
+
+statement ok
+CREATE TEMPORARY TABLE t (i INT PRIMARY KEY);
+
+statement ok
+SELECT * FROM pg_temp.t
+
+statement ok
+DISCARD TEMP
+
+statement error pgcode 42P01 relation "pg_temp.t" does not exist
+SELECT * FROM pg_temp.t
+
+statement ok
+USE defaultdb;
+DROP DATABASE to_drop CASCADE;
+
+statement ok
+CREATE DATABASE to_drop
+
+statement ok
+CREATE TEMPORARY TABLE t (i INT PRIMARY KEY);
+
+statement ok
+SELECT * FROM pg_temp.t
+
+statement ok
+USE defaultdb;
+DROP DATABASE to_drop CASCADE;
+
+subtest end
+
+subtest temp_table_in_other_session
+
+user testuser
+
+statement ok
+USE defaultdb;
+CREATE TEMPORARY TABLE from_other_session(i INT PRIMARY KEY)
+
+user root
+
+statement ok
+USE defaultdb
+
+query TT
+SELECT c.relname, a.attname FROM pg_attribute a
+INNER LOOKUP JOIN pg_class c ON c.oid = a.attrelid
+WHERE c.relname = 'from_other_session'
+----
+from_other_session  i
+
+subtest end

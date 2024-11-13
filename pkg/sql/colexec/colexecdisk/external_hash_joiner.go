@@ -68,6 +68,7 @@ func NewExternalHashJoiner(
 	leftInput, rightInput colexecop.Operator,
 	createDiskBackedSorter DiskBackedSorterConstructor,
 	diskAcc *mon.BoundAccount,
+	converterMemAcc *mon.BoundAccount,
 ) colexecop.ClosableOperator {
 	// This memory limit will restrict the size of the batches output by the
 	// in-memory hash joiner in the main strategy as well as by the merge joiner
@@ -84,12 +85,16 @@ func NewExternalHashJoiner(
 		// to join using in-memory hash joiner fit under the limit, so we use
 		// the same unlimited allocator for both buildSideAllocator and
 		// outputUnlimitedAllocator arguments.
-		return colexecjoin.NewHashJoiner(
-			unlimitedAllocator, unlimitedAllocator, spec, partitionedInputs[0], partitionedInputs[1],
+		return colexecjoin.NewHashJoiner(colexecjoin.NewHashJoinerArgs{
+			BuildSideAllocator:       unlimitedAllocator,
+			OutputUnlimitedAllocator: unlimitedAllocator,
+			Spec:                     spec,
+			LeftSource:               partitionedInputs[0],
+			RightSource:              partitionedInputs[1],
 			// We start with relatively large initial number of buckets since we
 			// expect each partition to be of significant size.
-			uint64(coldata.BatchSize()),
-		)
+			InitialNumBuckets: uint64(coldata.BatchSize()),
+		})
 	}
 	diskBackedFallbackOpConstructor := func(
 		partitionedInputs []*partitionerToOperator,
@@ -111,7 +116,7 @@ func NewExternalHashJoiner(
 		return colexecjoin.NewMergeJoinOp(
 			unlimitedAllocator, memoryLimit, args.DiskQueueCfg, fdSemaphore, spec.JoinType,
 			leftPartitionSorter, rightPartitionSorter, spec.Left.SourceTypes,
-			spec.Right.SourceTypes, leftOrdering, rightOrdering, diskAcc, flowCtx.EvalCtx,
+			spec.Right.SourceTypes, leftOrdering, rightOrdering, diskAcc, converterMemAcc, flowCtx.EvalCtx,
 		)
 	}
 	return newHashBasedPartitioner(
@@ -125,6 +130,7 @@ func NewExternalHashJoiner(
 		inMemMainOpConstructor,
 		diskBackedFallbackOpConstructor,
 		diskAcc,
+		converterMemAcc,
 		colexecop.ExternalHJMinPartitions,
 	)
 }

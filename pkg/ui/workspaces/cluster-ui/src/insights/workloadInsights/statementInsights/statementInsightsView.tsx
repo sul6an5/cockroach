@@ -8,11 +8,10 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import classNames from "classnames/bind";
 import { useHistory } from "react-router-dom";
 import {
-  ColumnDescriptor,
   ISortedTablePagination,
   SortSetting,
 } from "src/sortedtable/sortedtable";
@@ -24,48 +23,69 @@ import {
   defaultFilters,
   Filter,
   getFullFiltersAsStringRecord,
+  SelectedFilters,
 } from "src/queryFilter/filter";
 import { getWorkloadInsightEventFiltersFromURL } from "src/queryFilter/utils";
 import { Pagination } from "src/pagination";
 import { queryByName, syncHistory } from "src/util/query";
 import { getTableSortFromURL } from "src/sortedtable/getTableSortFromURL";
 import { TableStatistics } from "src/tableStatistics";
+import { isSelectedColumn } from "src/columnsSelector/utils";
 
-import { StatementInsights } from "src/api/insightsApi";
 import {
   filterStatementInsights,
+  StmtInsightEvent,
   getAppsFromStatementInsights,
   makeStatementInsightsColumns,
   WorkloadInsightEventFilters,
-  populateStatementInsightsFromProblemAndCauses,
-  StatementInsightEvent,
 } from "src/insights";
 import { EmptyInsightsTablePlaceholder } from "../util";
 import { StatementInsightsTable } from "./statementInsightsTable";
 import { InsightsError } from "../../insightsErrorComponent";
+import ColumnsSelector from "../../../columnsSelector/columnsSelector";
+import { SelectOption } from "../../../multiSelectCheckbox/multiSelectCheckbox";
+import {
+  defaultTimeScaleOptions,
+  TimeScale,
+  TimeScaleDropdown,
+  timeScaleRangeToObj,
+} from "../../../timeScaleDropdown";
+import { StmtInsightsReq } from "src/api/stmtInsightsApi";
+import moment from "moment-timezone";
 
 import styles from "src/statementsPage/statementsPage.module.scss";
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
-import ColumnsSelector from "../../../columnsSelector/columnsSelector";
-import { SelectOption } from "../../../multiSelectCheckbox/multiSelectCheckbox";
+import { commonStyles } from "../../../common";
+import { useScheduleFunction } from "src/util/hooks";
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import { insights } from "src/util";
+import { Anchor } from "src/anchor";
 
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
 
 export type StatementInsightsViewStateProps = {
-  statements: StatementInsights;
+  isDataValid: boolean;
+  lastUpdated: moment.Moment;
+  statements: StmtInsightEvent[];
   statementsError: Error | null;
+  insightTypes: string[];
   filters: WorkloadInsightEventFilters;
   sortSetting: SortSetting;
   selectedColumnNames: string[];
+  isLoading?: boolean;
   dropDownSelect?: React.ReactElement;
+  timeScale?: TimeScale;
+  maxSizeApiReached?: boolean;
+  isTenant?: boolean;
 };
 
 export type StatementInsightsViewDispatchProps = {
   onFiltersChange: (filters: WorkloadInsightEventFilters) => void;
   onSortChange: (ss: SortSetting) => void;
-  refreshStatementInsights: () => void;
+  refreshStatementInsights: (req: StmtInsightsReq) => void;
   onColumnsChange: (selectedColumns: string[]) => void;
+  setTimeScale: (ts: TimeScale) => void;
 };
 
 export type StatementInsightsViewProps = StatementInsightsViewStateProps &
@@ -74,37 +94,26 @@ export type StatementInsightsViewProps = StatementInsightsViewStateProps &
 const INSIGHT_STMT_SEARCH_PARAM = "q";
 const INTERNAL_APP_NAME_PREFIX = "$ internal";
 
-function isSelected(
-  column: ColumnDescriptor<StatementInsightEvent>,
-  selectedColumns: string[],
-): boolean {
-  if (column.alwaysShow) {
-    return true;
-  }
-
-  if (selectedColumns === null || selectedColumns === undefined) {
-    return column.showByDefault;
-  }
-
-  return selectedColumns.includes(column.name);
-}
-
-export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
-  props: StatementInsightsViewProps,
-) => {
-  const {
-    sortSetting,
-    statements,
-    statementsError,
-    filters,
-    refreshStatementInsights,
-    onFiltersChange,
-    onSortChange,
-    onColumnsChange,
-    selectedColumnNames,
-    dropDownSelect,
-  } = props;
-
+export const StatementInsightsView: React.FC<StatementInsightsViewProps> = ({
+  isDataValid,
+  lastUpdated,
+  sortSetting,
+  statements,
+  statementsError,
+  insightTypes,
+  filters,
+  timeScale,
+  isLoading,
+  refreshStatementInsights,
+  onFiltersChange,
+  onSortChange,
+  onColumnsChange,
+  setTimeScale,
+  selectedColumnNames,
+  dropDownSelect,
+  maxSizeApiReached,
+  isTenant,
+}: StatementInsightsViewProps) => {
   const [pagination, setPagination] = useState<ISortedTablePagination>({
     current: 1,
     pageSize: 10,
@@ -114,14 +123,22 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
     queryByName(history.location, INSIGHT_STMT_SEARCH_PARAM),
   );
 
+  const refresh = useCallback(() => {
+    const req = timeScaleRangeToObj(timeScale);
+    refreshStatementInsights(req);
+  }, [refreshStatementInsights, timeScale]);
+
+  const shouldPoll = timeScale.key !== "Custom";
+  const [refetch, clearPolling] = useScheduleFunction(
+    refresh,
+    shouldPoll, // Don't reschedule refresh if we have a custom time interval.
+    10 * 1000, // 10s polling interval
+    lastUpdated,
+  );
+
   useEffect(() => {
-    // Refresh every 10 seconds.
-    refreshStatementInsights();
-    const interval = setInterval(refreshStatementInsights, 10 * 1000);
-    return () => {
-      clearInterval(interval);
-    };
-  }, [refreshStatementInsights]);
+    if (!isDataValid) refetch();
+  }, [isDataValid, refetch]);
 
   useEffect(() => {
     // We use this effect to sync settings defined on the URL (sort, filters),
@@ -196,13 +213,22 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
 
   const defaultColumns = makeStatementInsightsColumns();
 
+  const onSetTimeScale = useCallback(
+    (ts: TimeScale) => {
+      clearPolling();
+      setTimeScale(ts);
+    },
+    [setTimeScale, clearPolling],
+  );
+
   const visibleColumns = defaultColumns.filter(x =>
-    isSelected(x, selectedColumnNames),
+    isSelectedColumn(selectedColumnNames, x),
   );
 
   const clearFilters = () =>
     onSubmitFilters({
       app: defaultFilters.app,
+      workloadInsightType: defaultFilters.workloadInsightType,
     });
 
   const apps = getAppsFromStatementInsights(
@@ -217,14 +243,13 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
     search,
   );
 
-  populateStatementInsightsFromProblemAndCauses(filteredStatements);
   const tableColumns = defaultColumns
     .filter(c => !c.alwaysShow)
     .map(
       (c): SelectOption => ({
         label: (c.title as React.ReactElement).props.children,
         value: c.name,
-        isSelected: isSelected(c, selectedColumnNames),
+        isSelected: isSelectedColumn(selectedColumnNames, c),
       }),
     );
 
@@ -246,15 +271,30 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
             onSubmitFilters={onSubmitFilters}
             appNames={apps}
             filters={filters}
+            workloadInsightTypes={insightTypes.sort()}
+            showWorkloadInsightTypes={true}
+          />
+        </PageConfigItem>
+        <PageConfigItem className={commonStyles("separator")}>
+          <TimeScaleDropdown
+            options={defaultTimeScaleOptions}
+            currentScale={timeScale}
+            setTimeScale={onSetTimeScale}
           />
         </PageConfigItem>
       </PageConfig>
+      <SelectedFilters
+        filters={filters}
+        onRemoveFilter={onSubmitFilters}
+        onClearFilters={clearFilters}
+        className={cx("margin-adjusted")}
+      />
       <div className={cx("table-area")}>
         <Loading
-          loading={statements === null}
+          loading={isLoading}
           page="statement insights"
           error={statementsError}
-          renderError={() => InsightsError()}
+          renderError={() => InsightsError(statementsError?.message)}
         >
           <div>
             <section className={sortableTableCx("cl-table-container")}>
@@ -262,6 +302,7 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
                 <ColumnsSelector
                   options={tableColumns}
                   onSubmitColumns={onColumnsChange}
+                  size={"small"}
                 />
                 <TableStatistics
                   pagination={pagination}
@@ -269,7 +310,6 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
                   totalCount={filteredStatements?.length}
                   arrayItemName="statement insights"
                   activeFilters={countActiveFilters}
-                  onClearFilters={clearFilters}
                 />
               </div>
               <StatementInsightsTable
@@ -280,7 +320,8 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
                 renderNoResult={
                   <EmptyInsightsTablePlaceholder
                     isEmptySearchResults={
-                      search?.length > 0 && filteredStatements?.length === 0
+                      (search?.length > 0 || countActiveFilters > 0) &&
+                      filteredStatements?.length === 0
                     }
                   />
                 }
@@ -293,6 +334,20 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = (
               total={filteredStatements?.length}
               onChange={onChangePage}
             />
+            {maxSizeApiReached && (
+              <InlineAlert
+                intent="info"
+                title={
+                  <>
+                    Not all insights are displayed because the maximum number of
+                    insights was reached in the console.&nbsp;
+                    <Anchor href={insights} target="_blank">
+                      Learn more
+                    </Anchor>
+                  </>
+                }
+              />
+            )}
           </div>
         </Loading>
       </div>

@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -48,7 +48,7 @@ type encodingTest struct {
 
 func readEncodingTests(t testing.TB) []*encodingTest {
 	var tests []*encodingTest
-	f, err := os.Open(testutils.TestDataPath(t, "encodings.json"))
+	f, err := os.Open(datapathutils.TestDataPath(t, "encodings.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, err := eval.Expr(&evalCtx, te)
+		d, err := eval.Expr(ctx, &evalCtx, te)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -126,8 +126,8 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 // and ensure they are identical to what Postgres produces. Regenerate that
 // file by:
 //
-//	Starting a postgres server on :5432 then running:
-//	cd pkg/cmd/generate-binary; go run main.go > ../../sql/pgwire/testdata/encodings.json
+//	Starting a postgres server with PostGIS installed on :5432 then running:
+//	bazel run pkg/cmd/generate-binary > ../../sql/pgwire/testdata/encodings.json
 func TestEncodings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -272,6 +272,7 @@ func TestEncodings(t *testing.T) {
 				}
 
 				d, err := pgwirebase.DecodeDatum(
+					ctx,
 					&evalCtx,
 					types.OidToType[tc.Oid],
 					code,
@@ -335,6 +336,7 @@ func TestExoticNumericEncodings(t *testing.T) {
 	for i, c := range testCases {
 		t.Run(fmt.Sprintf("%d_%s", i, c.Value), func(t *testing.T) {
 			d, err := pgwirebase.DecodeDatum(
+				context.Background(),
 				&evalCtx,
 				types.Decimal,
 				pgwirebase.FormatBinary,

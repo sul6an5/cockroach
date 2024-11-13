@@ -6,6 +6,7 @@ go_library(
     srcs = [
         "kv.go",
         "mocking.go",
+        "mvcc.go",
         "scan.go",
         "sst.go",
         "stats.go",
@@ -14,6 +15,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/roachpb",
         "//pkg/settings/cluster",

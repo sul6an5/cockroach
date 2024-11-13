@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -27,7 +28,7 @@ var backpressureLogLimiter = log.Every(500 * time.Millisecond)
 // range's size must grow to before backpressure will be applied on writes. Set
 // to 0 to disable backpressure altogether.
 var backpressureRangeSizeMultiplier = settings.RegisterFloatSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.range.backpressure_range_size_multiplier",
 	"multiple of range_max_bytes that a range is allowed to grow to without "+
 		"splitting before writes to that range are blocked, or 0 to disable",
@@ -65,7 +66,7 @@ var backpressureRangeSizeMultiplier = settings.RegisterFloatSetting(
 //     currently backpressuring than ranges which are larger but are not
 //     applying backpressure.
 var backpressureByteTolerance = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.range.backpressure_byte_tolerance",
 	"defines the number of bytes above the product of "+
 		"backpressure_range_size_multiplier and the range_max_size at which "+
@@ -84,7 +85,7 @@ var backpressurableSpans = []roachpb.Span{
 
 // canBackpressureBatch returns whether the provided BatchRequest is eligible
 // for backpressure.
-func canBackpressureBatch(ba *roachpb.BatchRequest) bool {
+func canBackpressureBatch(ba *kvpb.BatchRequest) bool {
 	// Don't backpressure splits themselves.
 	if ba.Txn != nil && ba.Txn.Name == splitTxnName {
 		return false
@@ -94,7 +95,7 @@ func canBackpressureBatch(ba *roachpb.BatchRequest) bool {
 	// method that is within a "backpressurable" key span.
 	for _, ru := range ba.Requests {
 		req := ru.GetInner()
-		if !roachpb.CanBackpressure(req) {
+		if !kvpb.CanBackpressure(req) {
 			continue
 		}
 
@@ -112,10 +113,10 @@ func canBackpressureBatch(ba *roachpb.BatchRequest) bool {
 // poison.Policy_Wait, in which case it's a neverTripSignaller. In particular,
 // `(signaller).C() == nil` signals that the request bypasses the circuit
 // breakers.
-func (r *Replica) signallerForBatch(ba *roachpb.BatchRequest) signaller {
+func (r *Replica) signallerForBatch(ba *kvpb.BatchRequest) signaller {
 	for _, ru := range ba.Requests {
 		req := ru.GetInner()
-		if roachpb.BypassesReplicaCircuitBreaker(req) {
+		if kvpb.BypassesReplicaCircuitBreaker(req) {
 			return neverTripSignaller{}
 		}
 	}
@@ -149,7 +150,7 @@ func (r *Replica) shouldBackpressureWrites() bool {
 
 // maybeBackpressureBatch blocks to apply backpressure if the replica deems
 // that backpressure is necessary.
-func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *roachpb.BatchRequest) error {
+func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *kvpb.BatchRequest) error {
 	if !canBackpressureBatch(ba) {
 		return nil
 	}
@@ -180,17 +181,21 @@ func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *roachpb.BatchR
 			return nil
 		}
 
+		const errHint = `For help understanding this error and troubleshooting, visit:
+
+    https://www.cockroachlabs.com/docs/stable/common-errors.html#split-failed-while-applying-backpressure-are-rows-updated-in-a-tight-loop`
+
 		// Wait for the callback to be called.
 		select {
 		case <-ctx.Done():
-			return errors.Wrapf(
+			return errors.WithHint(errors.Wrapf(
 				ctx.Err(), "aborted while applying backpressure to %s on range %s", ba, r.Desc(),
-			)
+			), errHint)
 		case err := <-splitC:
 			if err != nil {
-				return errors.Wrapf(
+				return errors.WithHint(errors.Wrapf(
 					err, "split failed while applying backpressure to %s on range %s", ba, r.Desc(),
-				)
+				), errHint)
 			}
 		}
 	}

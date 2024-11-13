@@ -12,13 +12,17 @@ package tests
 
 import (
 	"context"
+	"runtime"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/pmezard/go-difflib/difflib"
 )
 
 func registerValidateSystemSchemaAfterVersionUpgrade(r registry.Registry) {
@@ -29,11 +33,13 @@ func registerValidateSystemSchemaAfterVersionUpgrade(r registry.Registry) {
 	// and assert that the output matches the expected output content.
 	r.Add(registry.TestSpec{
 		Name:    "systemschema/validate-after-version-upgrade",
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			const mainVersion = ""
-			predecessorVersion, err := PredecessorVersion(*t.BuildVersion())
+			if c.IsLocal() && runtime.GOARCH == "arm64" {
+				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+			}
+			predecessorVersion, err := version.PredecessorVersion(*t.BuildVersion())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -61,8 +67,7 @@ func registerValidateSystemSchemaAfterVersionUpgrade(r registry.Registry) {
 			}
 
 			// expected and actual output of `SHOW CREATE ALL TABLES;`.
-			var expected string
-			var actual string
+			var expected, actual string
 
 			// Query node `SHOW CREATE ALL TABLES` and store return in output.
 			obtainSystemSchemaStep := func(node int, output *string) versionStep {
@@ -79,19 +84,29 @@ func registerValidateSystemSchemaAfterVersionUpgrade(r registry.Registry) {
 			}
 
 			// Compare whether two strings are equal -- used to compare expected and actual.
-			validateEquivalenceStep := func(str1, str2 string) versionStep {
+			validateEquivalenceStep := func(str1, str2 *string) versionStep {
 				return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-					if str1 != str2 {
-						t.Fatal("After upgrading, `USE system; SHOW CREATE ALL TABLES;` " +
-							"does not match expected output after version upgrade.\n")
+					if *str1 != *str2 {
+						diff, diffErr := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+							A:       difflib.SplitLines(*str1),
+							B:       difflib.SplitLines(*str2),
+							Context: 5,
+						})
+						if diffErr != nil {
+							diff = diffErr.Error()
+							t.Errorf("failed to produce diff: %v", diffErr)
+						}
+						t.Fatalf("After upgrading, `USE system; SHOW CREATE ALL TABLES;` "+
+							"does not match expected output after version upgrade."+
+							"\nDiff:\n%s", diff)
 					}
-					t.L().Printf("validating succeeded")
+					t.L().Printf("validating succeeded:\n%v", *str1)
 				}
 			}
 
 			u := newVersionUpgradeTest(c,
 				// Start the node with the latest binary version.
-				uploadAndStart(c.Node(1), mainVersion),
+				uploadAndStart(c.Node(1), clusterupgrade.MainVersion),
 
 				// Obtain expected output from the node.
 				obtainSystemSchemaStep(1, &expected),
@@ -103,7 +118,7 @@ func registerValidateSystemSchemaAfterVersionUpgrade(r registry.Registry) {
 				uploadAndStart(c.Node(1), predecessorVersion),
 
 				// Upgrade the node version.
-				binaryUpgradeStep(c.Node(1), mainVersion),
+				binaryUpgradeStep(c.Node(1), clusterupgrade.MainVersion),
 
 				// Wait for the cluster version to also bump up to make sure the migration logic is run.
 				waitForUpgradeStep(c.Node(1)),
@@ -112,7 +127,7 @@ func registerValidateSystemSchemaAfterVersionUpgrade(r registry.Registry) {
 				obtainSystemSchemaStep(1, &actual),
 
 				// Compare the results.
-				validateEquivalenceStep(expected, actual),
+				validateEquivalenceStep(&expected, &actual),
 			)
 			u.run(ctx, t)
 		},

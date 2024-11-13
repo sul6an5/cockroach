@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -32,8 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -155,7 +154,7 @@ func (pt *partitioningTest) parse() error {
 			return err
 		}
 		pt.parsed.tableDesc = mutDesc
-		if err := descbuilder.ValidateSelf(pt.parsed.tableDesc, clusterversion.TestingClusterVersion); err != nil {
+		if err := desctestutils.TestingValidateSelf(pt.parsed.tableDesc); err != nil {
 			return err
 		}
 	}
@@ -206,7 +205,7 @@ func (pt *partitioningTest) parse() error {
 		if !strings.HasPrefix(indexName, "@") {
 			panic(errors.Errorf("unsupported config: %s", c))
 		}
-		idx, err := pt.parsed.tableDesc.FindIndexWithName(indexName[1:])
+		idx, err := catalog.MustFindIndexByName(pt.parsed.tableDesc, indexName[1:])
 		if err != nil {
 			return errors.Wrapf(err, "could not find index %s", indexName)
 		}
@@ -1282,7 +1281,7 @@ func TestRepartitioning(t *testing.T) {
 				}
 				sqlDB.Exec(t, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", test.old.parsed.tableName, test.new.parsed.tableName))
 
-				testIndex, err := test.new.parsed.tableDesc.FindIndexWithName(test.index)
+				testIndex, err := catalog.MustFindIndexByName(test.new.parsed.tableDesc, test.index)
 				if err != nil {
 					t.Fatalf("%+v", err)
 				}
@@ -1299,6 +1298,7 @@ func TestRepartitioning(t *testing.T) {
 					if err := sql.ShowCreatePartitioning(
 						&tree.DatumAlloc{}, keys.SystemSQLCodec, test.new.parsed.tableDesc, testIndex,
 						testIndex.GetPartitioning(), &repartition, 0 /* indent */, 0, /* colOffset */
+						false, /* redactableValues */
 					); err != nil {
 						t.Fatalf("%+v", err)
 					}
@@ -1418,7 +1418,8 @@ func TestRemovePartitioningExpiredLicense(t *testing.T) {
 
 	ctx := context.Background()
 	s, sqlDBRaw, _ := serverutils.StartServer(t, base.TestServerArgs{
-		UseDatabase: "d",
+		UseDatabase:              "d",
+		DisableDefaultTestTenant: true,
 	})
 	defer s.Stopper().Stop(ctx)
 

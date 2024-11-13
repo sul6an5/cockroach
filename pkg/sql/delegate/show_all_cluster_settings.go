@@ -13,37 +13,75 @@ package delegate
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 )
 
 func (d *delegator) delegateShowClusterSettingList(
 	stmt *tree.ShowClusterSettingList,
 ) (tree.Statement, error) {
-	isAdmin, err := d.catalog.HasAdminRole(d.ctx)
-	if err != nil {
+
+	// First check system privileges.
+	hasModify := false
+	hasSqlModify := false
+	hasView := false
+	if err := d.catalog.CheckPrivilege(d.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING); err == nil {
+		hasModify = true
+		hasSqlModify = true
+		hasView = true
+	} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
 		return nil, err
 	}
-	hasModify, err := d.catalog.HasRoleOption(d.ctx, roleoption.MODIFYCLUSTERSETTING)
-	if err != nil {
-		return nil, err
+	if !hasSqlModify {
+		if err := d.catalog.CheckPrivilege(d.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYSQLCLUSTERSETTING); err == nil {
+			hasSqlModify = true
+			hasView = true
+		} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
+			return nil, err
+		}
 	}
-	hasView, err := d.catalog.HasRoleOption(d.ctx, roleoption.VIEWCLUSTERSETTING)
-	if err != nil {
-		return nil, err
+	if !hasView {
+		if err := d.catalog.CheckPrivilege(d.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING); err == nil {
+			hasView = true
+		} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
+			return nil, err
+		}
 	}
-	if !hasModify && !hasView && !isAdmin {
+
+	// Fallback to role option if the user doesn't have the privilege.
+	if !hasModify {
+		ok, err := d.catalog.HasRoleOption(d.ctx, roleoption.MODIFYCLUSTERSETTING)
+		if err != nil {
+			return nil, err
+		}
+		hasModify = hasModify || ok
+		hasView = hasView || ok
+	}
+
+	if !hasView {
+		ok, err := d.catalog.HasRoleOption(d.ctx, roleoption.VIEWCLUSTERSETTING)
+		if err != nil {
+			return nil, err
+		}
+		hasView = hasView || ok
+	}
+
+	// If user is not admin and has neither privilege, return an error.
+	if !hasView && !hasModify && !hasSqlModify {
 		return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-			"only users with either %s or %s privileges are allowed to SHOW CLUSTER SETTINGS",
-			roleoption.MODIFYCLUSTERSETTING, roleoption.VIEWCLUSTERSETTING)
+			"only users with %s, %s or %s privileges are allowed to SHOW CLUSTER SETTINGS",
+			privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, privilege.VIEWCLUSTERSETTING)
 	}
+
 	if stmt.All {
-		return parse(
+		return d.parse(
 			`SELECT variable, value, type AS setting_type, public, description
        FROM   crdb_internal.cluster_settings`,
 		)
 	}
-	return parse(
+	return d.parse(
 		`SELECT variable, value, type AS setting_type, description
      FROM   crdb_internal.cluster_settings
      WHERE  public IS TRUE`,
@@ -79,18 +117,14 @@ func (d *delegator) delegateShowTenantClusterSettingList(
 	// Note: we do the validation in SQL (via CASE...END) because the
 	// TenantID expression may be complex (incl subqueries, etc) and we
 	// cannot evaluate it in the go code.
-	return parse(`
+	return d.parse(`
 WITH
-  tenant_id AS (SELECT (` + stmt.TenantID.String() + `):::INT AS tenant_id),
+  tenant_id AS (SELECT id AS tenant_id FROM [SHOW TENANT ` + stmt.TenantSpec.String() + `]),
   isvalid AS (
     SELECT
       CASE
-       WHEN tenant_id=0 THEN
-         crdb_internal.force_error('22023', 'tenant ID must be non-zero')
        WHEN tenant_id=1 THEN
          crdb_internal.force_error('22023', 'use SHOW CLUSTER SETTINGS to display settings for the system tenant')
-       WHEN st.id IS NULL THEN
-         crdb_internal.force_error('22023', 'no tenant found with ID '||tenant_id)
        ELSE 0
       END AS ok
     FROM      tenant_id

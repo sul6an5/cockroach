@@ -24,8 +24,7 @@ import (
 	"time"
 
 	// Enable CCL statements.
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -37,7 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -47,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -375,7 +375,7 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 		nb := <-namedBuiltinChan
 		var args []string
 		switch ft := nb.builtin.Types.(type) {
-		case tree.ArgTypes:
+		case tree.ParamTypes:
 			for _, arg := range ft {
 				// CollatedString's default has no Locale, and so GenerateRandomArg will panic
 				// on RandDatumWithNilChance. Copy the typ and fake a locale.
@@ -613,7 +613,7 @@ var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
 func TestRandomSyntaxSQLSmith(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
 	var smither *sqlsmith.Smither
 
@@ -721,7 +721,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		datum1, err := eval.Expr(&ec, typed1)
+		datum1, err := eval.Expr(ctx, &ec, typed1)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -735,7 +735,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		datum2, err := eval.Expr(&ec, typed2)
+		datum2, err := eval.Expr(ctx, &ec, typed2)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -767,7 +767,7 @@ func testRandomSyntax(
 		skip.IgnoreLint(t, "enable with '-rsg <duration>'")
 	}
 	ctx := context.Background()
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
 	params, _ := tests.CreateTestServerParams()
 	params.UseDatabase = databaseName
@@ -778,8 +778,16 @@ func testRandomSyntax(
 	s, rawDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 	db := &verifyFormatDB{db: rawDB}
+	err := db.exec(t, ctx, "SET CLUSTER SETTING schemachanger.job.max_retry_backoff='1s'")
+	require.NoError(t, err)
 
-	yBytes, err := os.ReadFile(testutils.TestDataPath(t, "rsg", "sql.y"))
+	// Disable the test object generator. This merely causes the built-in function to report
+	// an error when called. This is OK -- we are testing syntax, so this will still ensure
+	// the function syntax is exercised.
+	err = db.exec(t, ctx, "SET CLUSTER SETTING sql.schema.test_object_generator.enabled = false")
+	require.NoError(t, err)
+
+	yBytes, err := os.ReadFile(datapathutils.TestDataPath(t, "rsg", "sql.y"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -36,7 +36,7 @@ interface TableStatistics {
 // This component has also a clear filter option.
 export const TableStatistics: React.FC<TableStatistics> = ({
   pagination,
-  totalCount,
+  totalCount = 0,
   search,
   arrayItemName,
   onClearFilters,
@@ -64,14 +64,20 @@ export const TableStatistics: React.FC<TableStatistics> = ({
     </>
   );
 
+  const clearBtn = (
+    <>
+      | &nbsp;
+      <Button onClick={() => onClearFilters()} type="flat" size="small">
+        Clear filters
+      </Button>
+    </>
+  );
+
   const resultsCountAndClear = (
     <>
       {totalCount} {totalCount === 1 ? "result" : "results"}
       {period && periodLabel}
-      &nbsp;&nbsp;&nbsp;| &nbsp;
-      <Button onClick={() => onClearFilters()} type="flat" size="small">
-        clear filter
-      </Button>
+      &nbsp;&nbsp;&nbsp;{onClearFilters && clearBtn}
     </>
   );
 

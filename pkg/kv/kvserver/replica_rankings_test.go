@@ -18,6 +18,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
+	aload "github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -33,52 +37,65 @@ func TestReplicaRankings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rr := newReplicaRankings()
+	dimensions := []aload.Dimension{aload.Queries, aload.CPU}
+	rr := NewReplicaRankings()
 
 	testCases := []struct {
-		replicasByQPS []float64
+		replicasByLoad []float64
 	}{
-		{replicasByQPS: []float64{}},
-		{replicasByQPS: []float64{0}},
-		{replicasByQPS: []float64{1, 0}},
-		{replicasByQPS: []float64{3, 2, 1, 0}},
-		{replicasByQPS: []float64{3, 3, 2, 2, 1, 1, 0, 0}},
-		{replicasByQPS: []float64{1.1, 1.0, 0.9, -0.9, -1.0, -1.1}},
+		{replicasByLoad: []float64{}},
+		{replicasByLoad: []float64{0}},
+		{replicasByLoad: []float64{1, 0}},
+		{replicasByLoad: []float64{3, 2, 1, 0}},
+		{replicasByLoad: []float64{3, 3, 2, 2, 1, 1, 0, 0}},
+		{replicasByLoad: []float64{1.1, 1.0, 0.9, -0.9, -1.0, -1.1}},
 	}
 
 	for _, tc := range testCases {
-		acc := rr.newAccumulator()
+		for _, dimension := range dimensions {
+			acc := NewReplicaAccumulator(dimensions...)
 
-		// Randomize the order of the inputs each time the test is run.
-		want := make([]float64, len(tc.replicasByQPS))
-		copy(want, tc.replicasByQPS)
-		rand.Shuffle(len(tc.replicasByQPS), func(i, j int) {
-			tc.replicasByQPS[i], tc.replicasByQPS[j] = tc.replicasByQPS[j], tc.replicasByQPS[i]
-		})
+			// Randomize the order of the inputs each time the test is run. Also make
+			// a copy so that we can test on the copy for each dimension without
+			// mutating the underlying test case slice.
+			rLoad := make([]float64, len(tc.replicasByLoad))
+			want := make([]float64, len(tc.replicasByLoad))
+			copy(want, tc.replicasByLoad)
+			copy(rLoad, tc.replicasByLoad)
 
-		for i, replQPS := range tc.replicasByQPS {
-			acc.addReplica(replicaWithStats{
-				repl: &Replica{RangeID: roachpb.RangeID(i)},
-				qps:  replQPS,
+			rand.Shuffle(len(rLoad), func(i, j int) {
+				rLoad[i], rLoad[j] = rLoad[j], rLoad[i]
 			})
-		}
-		rr.update(acc)
 
-		// Make sure we can read off all expected replicas in the correct order.
-		repls := rr.topQPS()
-		if len(repls) != len(want) {
-			t.Errorf("wrong number of replicas in output; got: %v; want: %v", repls, tc.replicasByQPS)
-			continue
-		}
-		for i := range want {
-			if repls[i].qps != want[i] {
-				t.Errorf("got %f for %d'th element; want %f (input: %v)", repls[i].qps, i, want, tc.replicasByQPS)
-				break
+			for i, replLoad := range rLoad {
+				acc.AddReplica(candidateReplica{
+					Replica: &Replica{RangeID: roachpb.RangeID(i)},
+					usage: allocator.RangeUsageInfo{
+						// We should get the same ordering for both QPS and CPU.
+						QueriesPerSecond:         replLoad,
+						RequestCPUNanosPerSecond: replLoad,
+					},
+				})
 			}
-		}
-		replsCopy := rr.topQPS()
-		if !reflect.DeepEqual(repls, replsCopy) {
-			t.Errorf("got different replicas on second call to topQPS; first call: %v, second call: %v", repls, replsCopy)
+			rr.Update(acc)
+
+			// Make sure we can read off all expected replicas in the correct order.
+			repls := rr.TopLoad(dimension)
+			if len(repls) != len(want) {
+				t.Errorf("wrong number of replicas in output; got: %v; want: %v", repls, rLoad)
+				continue
+			}
+			for i := range want {
+				if repls[i].RangeUsageInfo().Load().Dim(dimension) != want[i] {
+					t.Errorf("got %f for %d'th element; want %f (input: %v)",
+						repls[i].RangeUsageInfo().Load().Dim(dimension), i, want, rLoad)
+					break
+				}
+			}
+			replsCopy := rr.TopLoad(dimension)
+			if !reflect.DeepEqual(repls, replsCopy) {
+				t.Errorf("got different replicas on second call to topQPS; first call: %v, second call: %v", repls, replsCopy)
+			}
 		}
 	}
 }
@@ -112,18 +129,18 @@ func TestAddSSTQPSStat(t *testing.T) {
 	sst, start, end := storageutils.MakeSST(t, ts.ClusterSettings(), sstKeys)
 	requestSize := float64(len(sst))
 
-	sstReq := &roachpb.AddSSTableRequest{
-		RequestHeader: roachpb.RequestHeader{Key: start, EndKey: end},
+	sstReq := &kvpb.AddSSTableRequest{
+		RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end},
 		Data:          sst,
 		MVCCStats:     storageutils.SSTStats(t, sst, 0),
 	}
 
-	get := &roachpb.GetRequest{
-		RequestHeader: roachpb.RequestHeader{Key: start},
+	get := &kvpb.GetRequest{
+		RequestHeader: kvpb.RequestHeader{Key: start},
 	}
 
-	addSSTBA := roachpb.BatchRequest{}
-	nonSSTBA := roachpb.BatchRequest{}
+	addSSTBA := &kvpb.BatchRequest{}
+	nonSSTBA := &kvpb.BatchRequest{}
 	addSSTBA.Add(sstReq)
 	nonSSTBA.Add(get)
 
@@ -134,7 +151,7 @@ func TestAddSSTQPSStat(t *testing.T) {
 	testCases := []struct {
 		addsstRequestFactor int
 		expectedQPS         float64
-		ba                  roachpb.BatchRequest
+		ba                  *kvpb.BatchRequest
 	}{
 		{0, 1, addSSTBA},
 		{100, 1, nonSSTBA},
@@ -162,15 +179,12 @@ func TestAddSSTQPSStat(t *testing.T) {
 		sqlDB.Exec(t, fmt.Sprintf(`SET CLUSTER setting kv.replica_stats.addsst_request_size_factor = %d`, testCase.addsstRequestFactor))
 
 		// Reset the request counts to 0 before sending to clear previous requests.
-		repl.loadStats.reset()
+		repl.loadStats.Reset()
 
 		_, pErr = db.NonTransactionalSender().Send(ctx, testCase.ba)
 		require.Nil(t, pErr)
 
-		repl.loadStats.batchRequests.Mu.Lock()
-		queriesAfter, _ := repl.loadStats.batchRequests.SumLocked()
-		repl.loadStats.batchRequests.Mu.Unlock()
-
+		queriesAfter := repl.loadStats.TestingGetSum(load.Queries)
 		// If queries are correctly recorded, we should see increase in query
 		// count by the expected QPS. However, it is possible to to get a
 		// slightly higher number due to interleaving requests. To avoid a
@@ -184,9 +198,9 @@ func TestAddSSTQPSStat(t *testing.T) {
 }
 
 // genVariableRead returns a batch request containing, start-end sequential key reads.
-func genVariableRead(ctx context.Context, start, end roachpb.Key) roachpb.BatchRequest {
-	scan := roachpb.NewScan(start, end, false)
-	readBa := roachpb.BatchRequest{}
+func genVariableRead(ctx context.Context, start, end roachpb.Key) *kvpb.BatchRequest {
+	scan := kvpb.NewScan(start, end, false)
+	readBa := &kvpb.BatchRequest{}
 	readBa.Add(scan)
 	return readBa
 }
@@ -196,19 +210,16 @@ func assertGreaterThanInDelta(t *testing.T, expected float64, actual float64, de
 	require.InDelta(t, expected, actual, delta)
 }
 
-func headVal(f func() (float64, int)) float64 {
-	ret, _ := f()
-	return ret
-}
-
 func TestWriteLoadStatsAccounting(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+	args := base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
-	})
+	}
+	args.ServerArgs.Knobs.Store = &StoreTestingKnobs{DisableCanAckBeforeApplication: true}
+	tc := serverutils.StartNewTestCluster(t, 1, args)
 
 	const epsilonAllowed = 4
 
@@ -232,6 +243,8 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 		{1, 1, 1, 0, writeSize, 0},
 		{4, 4, 4, 0, 4 * writeSize, 0},
 		{64, 64, 64, 0, 64 * writeSize, 0},
+		{111, 111, 111, 0, 111 * writeSize, 0},
+		{1234, 1234, 1234, 0, 1234 * writeSize, 0},
 	}
 
 	store, err := ts.GetStores().(*Stores).GetStore(ts.GetFirstStoreID())
@@ -253,27 +266,13 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 		// should succeed soon, if it fails on the first.
 		testutils.SucceedsSoon(t, func() error {
 			// Reset the request counts to 0 before sending to clear previous requests.
-			repl.loadStats.reset()
+			repl.loadStats.Reset()
 
-			repl.loadStats.requests.Mu.Lock()
-			repl.loadStats.writeKeys.Mu.Lock()
-			repl.loadStats.readKeys.Mu.Lock()
-			repl.loadStats.writeBytes.Mu.Lock()
-			repl.loadStats.readBytes.Mu.Lock()
-			repl.loadStats.batchRequests.Mu.Lock()
-
-			requestsBefore := headVal(repl.loadStats.requests.SumLocked)
-			writesBefore := headVal(repl.loadStats.writeKeys.SumLocked)
-			readsBefore := headVal(repl.loadStats.readKeys.SumLocked)
-			readBytesBefore := headVal(repl.loadStats.readBytes.SumLocked)
-			writeBytesBefore := headVal(repl.loadStats.writeBytes.SumLocked)
-
-			repl.loadStats.requests.Mu.Unlock()
-			repl.loadStats.writeKeys.Mu.Unlock()
-			repl.loadStats.readKeys.Mu.Unlock()
-			repl.loadStats.writeBytes.Mu.Unlock()
-			repl.loadStats.readBytes.Mu.Unlock()
-			repl.loadStats.batchRequests.Mu.Unlock()
+			requestsBefore := repl.loadStats.TestingGetSum(load.Requests)
+			writesBefore := repl.loadStats.TestingGetSum(load.WriteKeys)
+			readsBefore := repl.loadStats.TestingGetSum(load.ReadKeys)
+			readBytesBefore := repl.loadStats.TestingGetSum(load.ReadBytes)
+			writeBytesBefore := repl.loadStats.TestingGetSum(load.WriteBytes)
 
 			for i := 0; i < testCase.writes; i++ {
 				_, pErr := db.Inc(ctx, scratchKey, 1)
@@ -285,32 +284,21 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 			require.Equal(t, 0.0, writeBytesBefore)
 			require.Equal(t, 0.0, readBytesBefore)
 
-			repl.loadStats.requests.Mu.Lock()
-			repl.loadStats.writeKeys.Mu.Lock()
-			repl.loadStats.readKeys.Mu.Lock()
-			repl.loadStats.writeBytes.Mu.Lock()
-			repl.loadStats.readBytes.Mu.Lock()
-			repl.loadStats.batchRequests.Mu.Lock()
-
-			requestsAfter := headVal(repl.loadStats.requests.SumLocked)
-			writesAfter := headVal(repl.loadStats.writeKeys.SumLocked)
-			readsAfter := headVal(repl.loadStats.readKeys.SumLocked)
-			readBytesAfter := headVal(repl.loadStats.readBytes.SumLocked)
-			writeBytesAfter := headVal(repl.loadStats.writeBytes.SumLocked)
-
-			repl.loadStats.requests.Mu.Unlock()
-			repl.loadStats.writeKeys.Mu.Unlock()
-			repl.loadStats.readKeys.Mu.Unlock()
-			repl.loadStats.writeBytes.Mu.Unlock()
-			repl.loadStats.readBytes.Mu.Unlock()
-			repl.loadStats.batchRequests.Mu.Unlock()
+			requestsAfter := repl.loadStats.TestingGetSum(load.Requests)
+			writesAfter := repl.loadStats.TestingGetSum(load.WriteKeys)
+			readsAfter := repl.loadStats.TestingGetSum(load.ReadKeys)
+			readBytesAfter := repl.loadStats.TestingGetSum(load.ReadBytes)
+			writeBytesAfter := repl.loadStats.TestingGetSum(load.WriteBytes)
 
 			assertGreaterThanInDelta(t, testCase.expectedRQPS, requestsAfter, epsilonAllowed)
 			assertGreaterThanInDelta(t, testCase.expectedWPS, writesAfter, epsilonAllowed)
 			assertGreaterThanInDelta(t, testCase.expectedRPS, readsAfter, epsilonAllowed)
-			assertGreaterThanInDelta(t, testCase.expectedWBPS, writeBytesAfter, epsilonAllowed)
 			assertGreaterThanInDelta(t, testCase.expectedRBPS, readBytesAfter, epsilonAllowed)
-
+			// NB: We assert that the written bytes is greater than the write
+			// batch request size. However the size multiplication factor,
+			// varies between 3 and 5 so we instead assert that it is greater
+			// than the logical bytes.
+			require.GreaterOrEqual(t, writeBytesAfter, testCase.expectedWBPS)
 			return nil
 		})
 	}
@@ -344,35 +332,35 @@ func TestReadLoadMetricAccounting(t *testing.T) {
 		nextKey = nextKey.Next()
 	}
 	sst, start, end := storageutils.MakeSST(t, ts.ClusterSettings(), sstKeys)
-	sstReq := &roachpb.AddSSTableRequest{
-		RequestHeader: roachpb.RequestHeader{Key: start, EndKey: end},
+	sstReq := &kvpb.AddSSTableRequest{
+		RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end},
 		Data:          sst,
 		MVCCStats:     storageutils.SSTStats(t, sst, 0),
 	}
 
-	addSSTBA := roachpb.BatchRequest{}
+	addSSTBA := &kvpb.BatchRequest{}
 	addSSTBA.Add(sstReq)
 
 	// Send an AddSSTRequest once to create the key range.
 	_, pErr := db.NonTransactionalSender().Send(ctx, addSSTBA)
 	require.Nil(t, pErr)
 
-	get := &roachpb.GetRequest{
-		RequestHeader: roachpb.RequestHeader{Key: start},
+	get := &kvpb.GetRequest{
+		RequestHeader: kvpb.RequestHeader{Key: start},
 	}
 
-	getReadBA := roachpb.BatchRequest{}
+	getReadBA := &kvpb.BatchRequest{}
 	getReadBA.Add(get)
 
-	scan := &roachpb.ScanRequest{
-		RequestHeader: roachpb.RequestHeader{Key: start, EndKey: end},
+	scan := &kvpb.ScanRequest{
+		RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end},
 	}
 
-	scanReadBA := roachpb.BatchRequest{}
+	scanReadBA := &kvpb.BatchRequest{}
 	scanReadBA.Add(scan)
 
 	testCases := []struct {
-		ba           roachpb.BatchRequest
+		ba           *kvpb.BatchRequest
 		expectedRQPS float64
 		expectedWPS  float64
 		expectedRPS  float64
@@ -410,27 +398,13 @@ func TestReadLoadMetricAccounting(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			// Reset the request counts to 0 before sending to clear previous requests.
 			// Reset the request counts to 0 before sending to clear previous requests.
-			repl.loadStats.reset()
+			repl.loadStats.Reset()
 
-			repl.loadStats.requests.Mu.Lock()
-			repl.loadStats.writeKeys.Mu.Lock()
-			repl.loadStats.readKeys.Mu.Lock()
-			repl.loadStats.writeBytes.Mu.Lock()
-			repl.loadStats.readBytes.Mu.Lock()
-			repl.loadStats.batchRequests.Mu.Lock()
-
-			requestsBefore := headVal(repl.loadStats.requests.SumLocked)
-			writesBefore := headVal(repl.loadStats.writeKeys.SumLocked)
-			readsBefore := headVal(repl.loadStats.readKeys.SumLocked)
-			readBytesBefore := headVal(repl.loadStats.readBytes.SumLocked)
-			writeBytesBefore := headVal(repl.loadStats.writeBytes.SumLocked)
-
-			repl.loadStats.requests.Mu.Unlock()
-			repl.loadStats.writeKeys.Mu.Unlock()
-			repl.loadStats.readKeys.Mu.Unlock()
-			repl.loadStats.writeBytes.Mu.Unlock()
-			repl.loadStats.readBytes.Mu.Unlock()
-			repl.loadStats.batchRequests.Mu.Unlock()
+			requestsBefore := repl.loadStats.TestingGetSum(load.Requests)
+			writesBefore := repl.loadStats.TestingGetSum(load.WriteKeys)
+			readsBefore := repl.loadStats.TestingGetSum(load.ReadKeys)
+			readBytesBefore := repl.loadStats.TestingGetSum(load.ReadBytes)
+			writeBytesBefore := repl.loadStats.TestingGetSum(load.WriteBytes)
 
 			_, pErr = db.NonTransactionalSender().Send(ctx, testCase.ba)
 			require.Nil(t, pErr)
@@ -441,25 +415,11 @@ func TestReadLoadMetricAccounting(t *testing.T) {
 			require.Equal(t, 0.0, writeBytesBefore)
 			require.Equal(t, 0.0, readBytesBefore)
 
-			repl.loadStats.requests.Mu.Lock()
-			repl.loadStats.writeKeys.Mu.Lock()
-			repl.loadStats.readKeys.Mu.Lock()
-			repl.loadStats.writeBytes.Mu.Lock()
-			repl.loadStats.readBytes.Mu.Lock()
-			repl.loadStats.batchRequests.Mu.Lock()
-
-			requestsAfter := headVal(repl.loadStats.requests.SumLocked)
-			writesAfter := headVal(repl.loadStats.writeKeys.SumLocked)
-			readsAfter := headVal(repl.loadStats.readKeys.SumLocked)
-			readBytesAfter := headVal(repl.loadStats.readBytes.SumLocked)
-			writeBytesAfter := headVal(repl.loadStats.writeBytes.SumLocked)
-
-			repl.loadStats.requests.Mu.Unlock()
-			repl.loadStats.writeKeys.Mu.Unlock()
-			repl.loadStats.readKeys.Mu.Unlock()
-			repl.loadStats.writeBytes.Mu.Unlock()
-			repl.loadStats.readBytes.Mu.Unlock()
-			repl.loadStats.batchRequests.Mu.Unlock()
+			requestsAfter := repl.loadStats.TestingGetSum(load.Requests)
+			writesAfter := repl.loadStats.TestingGetSum(load.WriteKeys)
+			readsAfter := repl.loadStats.TestingGetSum(load.ReadKeys)
+			readBytesAfter := repl.loadStats.TestingGetSum(load.ReadBytes)
+			writeBytesAfter := repl.loadStats.TestingGetSum(load.WriteBytes)
 
 			assertGreaterThanInDelta(t, testCase.expectedRQPS, requestsAfter, epsilonAllowed)
 			assertGreaterThanInDelta(t, testCase.expectedWPS, writesAfter, epsilonAllowed)
@@ -475,5 +435,75 @@ func TestReadLoadMetricAccounting(t *testing.T) {
 
 			return nil
 		})
+	}
+}
+
+func TestNewReplicaRankingsMap(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	rr := NewReplicaRankingsMap()
+
+	type testCase struct {
+		tenantID uint64
+		qps      float64
+	}
+
+	testCases := [][]testCase{
+		{},
+		{{1, 1}, {1, 2}, {1, 3}, {1, 4}},
+		{{1, 1}, {1, 2}, {2, 0}, {3, 0}},
+		{{1, 1}, {1, 2}, {1, 3}, {1, 4},
+			{2, 1}, {2, 2}, {2, 3}, {2, 4},
+			{3, 1}, {3, 2}, {3, 3}, {3, 4}},
+	}
+
+	for _, tc := range testCases {
+		acc := NewTenantReplicaAccumulator()
+
+		// Randomize the order of the inputs each time the test is run.
+		rand.Shuffle(len(tc), func(i, j int) {
+			tc[i], tc[j] = tc[j], tc[i]
+		})
+
+		expectedReplicasPerTenant := make(map[uint64]int)
+
+		for i, c := range tc {
+			cr := candidateReplica{
+				Replica: &Replica{RangeID: roachpb.RangeID(i)},
+				usage:   allocator.RangeUsageInfo{QueriesPerSecond: c.qps},
+			}
+			cr.mu.tenantID = roachpb.MustMakeTenantID(c.tenantID)
+			acc.AddReplica(cr)
+
+			if c.qps <= 1 {
+				continue
+			}
+
+			if l, ok := expectedReplicasPerTenant[c.tenantID]; ok {
+				expectedReplicasPerTenant[c.tenantID] = l + 1
+			} else {
+				expectedReplicasPerTenant[c.tenantID] = 1
+			}
+		}
+		rr.Update(acc)
+
+		for tID, count := range expectedReplicasPerTenant {
+			repls := rr.TopQPS(roachpb.MustMakeTenantID(tID))
+			if len(repls) != count {
+				t.Errorf("wrong number of replicas in output; got: %v; want: %v", repls, tc)
+				continue
+			}
+			for i := 0; i < len(repls)-1; i++ {
+				if repls[i].RangeUsageInfo().QueriesPerSecond < repls[i+1].RangeUsageInfo().QueriesPerSecond {
+					t.Errorf("got %f for %d'th element; it's smaller than QPS of the next element %f", repls[i].RangeUsageInfo().QueriesPerSecond, i, repls[i+1].RangeUsageInfo().QueriesPerSecond)
+					break
+				}
+			}
+			replsCopy := rr.TopQPS(roachpb.MustMakeTenantID(tID))
+			if !reflect.DeepEqual(repls, replsCopy) {
+				t.Errorf("got different replicas on second call to topQPS; first call: %v, second call: %v", repls, replsCopy)
+			}
+		}
 	}
 }

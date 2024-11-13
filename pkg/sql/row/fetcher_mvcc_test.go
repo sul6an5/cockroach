@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
@@ -57,13 +57,13 @@ func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
 			if !it.UnsafeKey().IsValue() {
 				return errors.Errorf("found intent key %v", it.UnsafeKey())
 			}
-			mvccValue, err := storage.DecodeMVCCValue(it.Value())
+			mvccValue, err := storage.DecodeMVCCValueAndErr(it.Value())
 			if err != nil {
 				t.Fatal(err)
 			}
 			value := mvccValue.Value
 			value.Timestamp = it.UnsafeKey().Timestamp
-			kv := roachpb.KeyValue{Key: it.Key().Key, Value: value}
+			kv := roachpb.KeyValue{Key: it.UnsafeKey().Key.Clone(), Value: value}
 			kvs = append(kvs, kv)
 		}
 		return nil
@@ -87,7 +87,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		FAMILY (a, b, c), FAMILY (d)
 	)`)
 	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
-	var spec descpb.IndexFetchSpec
+	var spec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(
 		&spec, keys.SystemSQLCodec, desc, desc.GetPrimaryIndex(), desc.PublicColumnIDs(),
 	); err != nil {
@@ -97,9 +97,9 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 	if err := rf.Init(
 		ctx,
 		row.FetcherInitArgs{
-			WillUseCustomKVBatchFetcher: true,
-			Alloc:                       &tree.DatumAlloc{},
-			Spec:                        &spec,
+			WillUseKVProvider: true,
+			Alloc:             &tree.DatumAlloc{},
+			Spec:              &spec,
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -115,7 +115,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 			log.Infof(ctx, "%v %v %v", kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
 		}
 
-		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}); err != nil {
+		if err := rf.ConsumeKVProvider(ctx, &row.KVProvider{KVs: kvs}); err != nil {
 			t.Fatal(err)
 		}
 		var rows []rowWithMVCCMetadata
@@ -149,7 +149,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		SELECT cluster_logical_timestamp();
 	END;`).Scan(&ts1)
 
-	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.Engine())), []rowWithMVCCMetadata{
+	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.TODOEngine())), []rowWithMVCCMetadata{
 		{[]string{`1`, `a`, `a`, `a`}, false, ts1},
 		{[]string{`2`, `b`, `b`, `b`}, false, ts1},
 	}; !reflect.DeepEqual(expected, actual) {
@@ -163,7 +163,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		SELECT cluster_logical_timestamp();
 	END;`).Scan(&ts2)
 
-	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.Engine())), []rowWithMVCCMetadata{
+	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.TODOEngine())), []rowWithMVCCMetadata{
 		{[]string{`1`, `NULL`, `NULL`, `NULL`}, false, ts2},
 		{[]string{`2`, `b`, `b`, `NULL`}, false, ts2},
 	}; !reflect.DeepEqual(expected, actual) {
@@ -175,7 +175,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		DELETE FROM parent WHERE a = '1';
 		SELECT cluster_logical_timestamp();
 	END;`).Scan(&ts3)
-	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.Engine())), []rowWithMVCCMetadata{
+	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.TODOEngine())), []rowWithMVCCMetadata{
 		{[]string{`1`, `NULL`, `NULL`, `NULL`}, true, ts3},
 		{[]string{`2`, `b`, `b`, `NULL`}, false, ts2},
 	}; !reflect.DeepEqual(expected, actual) {

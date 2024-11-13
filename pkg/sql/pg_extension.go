@@ -46,11 +46,13 @@ func postgisColumnsTablePopulator(
 			p,
 			dbContext,
 			hideVirtual,
-			func(db catalog.DatabaseDescriptor, scName string, table catalog.TableDescriptor) error {
+			func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor) error {
 				if !table.IsPhysicalTable() {
 					return nil
 				}
-				if p.CheckAnyPrivilege(ctx, table) != nil {
+				if ok, err := p.HasAnyPrivilege(ctx, table); err != nil {
+					return err
+				} else if !ok {
 					return nil
 				}
 				for _, col := range table.PublicColumns() {
@@ -103,7 +105,7 @@ func postgisColumnsTablePopulator(
 
 					if err := addRow(
 						tree.NewDString(db.GetName()),
-						tree.NewDString(scName),
+						tree.NewDString(sc.GetName()),
 						tree.NewDString(table.GetName()),
 						tree.NewDString(col.GetName()),
 						datumNDims,

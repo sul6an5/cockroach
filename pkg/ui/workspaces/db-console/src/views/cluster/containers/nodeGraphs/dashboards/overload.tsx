@@ -9,9 +9,8 @@
 // licenses/APL.txt.
 
 import React from "react";
-import _ from "lodash";
 
-import { LineGraph } from "src/views/cluster/components/linegraph";
+import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
 import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
@@ -22,7 +21,13 @@ import {
 } from "./dashboardUtils";
 
 export default function (props: GraphDashboardProps) {
-  const { nodeIDs, nodesSummary, nodeSources, storeSources } = props;
+  const {
+    nodeIDs,
+    nodeSources,
+    storeSources,
+    nodeDisplayNameByID,
+    storeIDsByNodeID,
+  } = props;
 
   return [
     <LineGraph title="CPU Percent" sources={nodeSources}>
@@ -30,9 +35,29 @@ export default function (props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.cpu.combined.percent-normalized"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
           />
+        ))}
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Goroutine Scheduling Latency: 99th percentile"
+      sources={nodeSources}
+      tooltip={`P99 scheduling latency for goroutines`}
+    >
+      <Axis units={AxisUnits.Duration} label="latency">
+        {nodeIDs.map(nid => (
+          <>
+            <Metric
+              key={nid}
+              name="cr.node.go.scheduler_latency-p99"
+              title={nodeDisplayName(nodeDisplayNameByID, nid)}
+              sources={[nid]}
+              downsampleMax
+            />
+          </>
         ))}
       </Axis>
     </LineGraph>,
@@ -46,7 +71,7 @@ export default function (props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.runnable.goroutines.per.cpu"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
           />
         ))}
@@ -64,14 +89,16 @@ export default function (props: GraphDashboardProps) {
             <Metric
               key={nid}
               name="cr.store.storage.l0-sublevels"
-              title={"L0 Sublevels " + nodeDisplayName(nodesSummary, nid)}
-              sources={storeIDsForNode(nodesSummary, nid)}
+              title={
+                "L0 Sublevels " + nodeDisplayName(nodeDisplayNameByID, nid)
+              }
+              sources={storeIDsForNode(storeIDsByNodeID, nid)}
             />
             <Metric
               key={nid}
               name="cr.store.storage.l0-num-files"
-              title={"L0 Files " + nodeDisplayName(nodesSummary, nid)}
-              sources={storeIDsForNode(nodesSummary, nid)}
+              title={"L0 Files " + nodeDisplayName(nodeDisplayNameByID, nid)}
+              sources={storeIDsForNode(storeIDsByNodeID, nid)}
             />
           </>
         ))}
@@ -85,13 +112,13 @@ export default function (props: GraphDashboardProps) {
             <Metric
               key={nid}
               name="cr.node.admission.granter.total_slots.kv"
-              title={"Total Slots " + nodeDisplayName(nodesSummary, nid)}
+              title={"Total Slots " + nodeDisplayName(nodeDisplayNameByID, nid)}
               sources={[nid]}
             />
             <Metric
               key={nid}
               name="cr.node.admission.granter.used_slots.kv"
-              title={"Used Slots " + nodeDisplayName(nodesSummary, nid)}
+              title={"Used Slots " + nodeDisplayName(nodeDisplayNameByID, nid)}
               sources={[nid]}
             />
           </>
@@ -108,7 +135,7 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.node.admission.granter.io_tokens_exhausted_duration.kv"
-            title={"IO Exhausted " + nodeDisplayName(nodesSummary, nid)}
+            title={"IO Exhausted " + nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
             nonNegativeRate
           />
@@ -123,7 +150,9 @@ export default function (props: GraphDashboardProps) {
             <Metric
               key={nid}
               name="cr.node.admission.admitted.kv"
-              title={"KV request rate " + nodeDisplayName(nodesSummary, nid)}
+              title={
+                "KV request rate " + nodeDisplayName(nodeDisplayNameByID, nid)
+              }
               sources={[nid]}
               nonNegativeRate
             />
@@ -131,7 +160,8 @@ export default function (props: GraphDashboardProps) {
               key={nid}
               name="cr.node.admission.admitted.kv-stores"
               title={
-                "KV write request rate " + nodeDisplayName(nodesSummary, nid)
+                "KV write request rate " +
+                nodeDisplayName(nodeDisplayNameByID, nid)
               }
               sources={[nid]}
               nonNegativeRate
@@ -140,7 +170,8 @@ export default function (props: GraphDashboardProps) {
               key={nid}
               name="cr.node.admission.admitted.sql-kv-response"
               title={
-                "SQL-KV response rate " + nodeDisplayName(nodesSummary, nid)
+                "SQL-KV response rate " +
+                nodeDisplayName(nodeDisplayNameByID, nid)
               }
               sources={[nid]}
               nonNegativeRate
@@ -149,7 +180,8 @@ export default function (props: GraphDashboardProps) {
               key={nid}
               name="cr.node.admission.admitted.sql-sql-response"
               title={
-                "SQL-SQL response rate " + nodeDisplayName(nodesSummary, nid)
+                "SQL-SQL response rate " +
+                nodeDisplayName(nodeDisplayNameByID, nid)
               }
               sources={[nid]}
               nonNegativeRate
@@ -166,28 +198,32 @@ export default function (props: GraphDashboardProps) {
             <Metric
               key={nid}
               name="cr.node.admission.wait_sum.kv"
-              title={"KV " + nodeDisplayName(nodesSummary, nid)}
+              title={"KV " + nodeDisplayName(nodeDisplayNameByID, nid)}
               sources={[nid]}
               nonNegativeRate
             />
             <Metric
               key={nid}
               name="cr.node.admission.wait_sum.kv-stores"
-              title={"KV write " + nodeDisplayName(nodesSummary, nid)}
+              title={"KV write " + nodeDisplayName(nodeDisplayNameByID, nid)}
               sources={[nid]}
               nonNegativeRate
             />
             <Metric
               key={nid}
               name="cr.node.admission.wait_sum.sql-kv-response"
-              title={"SQL-KV response " + nodeDisplayName(nodesSummary, nid)}
+              title={
+                "SQL-KV response " + nodeDisplayName(nodeDisplayNameByID, nid)
+              }
               sources={[nid]}
               nonNegativeRate
             />
             <Metric
               key={nid}
               name="cr.node.admission.wait_sum.sql-sql-response"
-              title={"SQL-SQL response " + nodeDisplayName(nodesSummary, nid)}
+              title={
+                "SQL-SQL response " + nodeDisplayName(nodeDisplayNameByID, nid)
+              }
               sources={[nid]}
               nonNegativeRate
             />
@@ -197,34 +233,38 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph title="Admission Delay: 75th percentile" sources={nodeSources}>
-      <Axis label="delay for requests that waited (nanos)">
+      <Axis units={AxisUnits.Duration} label="delay for requests that waited">
         {nodeIDs.map(nid => (
           <>
             <Metric
               key={nid}
               name="cr.node.admission.wait_durations.kv-p75"
-              title={"KV " + nodeDisplayName(nodesSummary, nid)}
+              title={"KV " + nodeDisplayName(nodeDisplayNameByID, nid)}
               sources={[nid]}
               downsampleMax
             />
             <Metric
               key={nid}
               name="cr.node.admission.wait_durations.kv-stores-p75"
-              title={"KV write " + nodeDisplayName(nodesSummary, nid)}
+              title={"KV write " + nodeDisplayName(nodeDisplayNameByID, nid)}
               sources={[nid]}
               downsampleMax
             />
             <Metric
               key={nid}
               name="cr.node.admission.wait_durations.sql-kv-response-p75"
-              title={"SQL-KV response " + nodeDisplayName(nodesSummary, nid)}
+              title={
+                "SQL-KV response " + nodeDisplayName(nodeDisplayNameByID, nid)
+              }
               sources={[nid]}
               downsampleMax
             />
             <Metric
               key={nid}
               name="cr.node.admission.wait_durations.sql-sql-response-p75"
-              title={"SQL-SQL response " + nodeDisplayName(nodesSummary, nid)}
+              title={
+                "SQL-SQL response " + nodeDisplayName(nodeDisplayNameByID, nid)
+              }
               sources={[nid]}
               downsampleMax
             />

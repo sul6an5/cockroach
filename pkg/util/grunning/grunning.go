@@ -21,23 +21,39 @@ func Time() time.Duration {
 	return time.Duration(grunningnanos())
 }
 
-// Subtract is a helper function to subtract a duration from another. It's
-// commonly used to measure how much running time is spent doing some piece of
-// work.
+// Difference is a helper function to compute the absolute difference between
+// two durations.
+func Difference(a, b time.Duration) time.Duration {
+	diff := a.Nanoseconds() - b.Nanoseconds()
+	if diff < 0 {
+		diff = -diff
+	}
+	return time.Duration(diff)
+}
+
+// Elapsed returns the running time spent doing some piece of work, with
+// grunning.Time() measurements from the start and end.
 //
-//gcassert:inline
-func Subtract(end, start time.Duration) time.Duration {
-	return time.Duration(end.Nanoseconds() - start.Nanoseconds())
+// NB: This only exists due to grunning.Time()'s non-monotonicity, a bug in our
+// runtime patch: https://github.com/cockroachdb/cockroach/issues/95529. We can
+// get rid of this, keeping just grunning.Difference(), if that bug is fixed.
+// The bug results in slight {over,under}-estimation of the running time (the
+// latter breaking monotonicity), but is livable with our current uses of this
+// library.
+func Elapsed(start, end time.Duration) time.Duration {
+	diff := end.Nanoseconds() - start.Nanoseconds()
+	if diff < 0 {
+		diff = 0
+	}
+	return time.Duration(diff)
 }
 
 // Supported returns true iff per-goroutine running time is available in this
 // build. We use a patched Go runtime for all platforms officially supported for
-// CRDB when built using Bazel. Engineers commonly building CRDB also use happen
-// to use two platforms we don't use a patched Go for:
-// - FreeBSD (we don't have cross-compilers setup), and
-// - M1/M2 Macs (we don't have a code-signing pipeline, yet).
-// We use '(darwin && arm64) || freebsd || !bazel' as the build tag to exclude
-// unsupported platforms.
+// CRDB when built using Bazel. Some engineers commonly building CRDB also
+// happen to use FreeBSD, which we don't use a patched Go for (we don't have
+// cross-compilers setup, yet). We use 'freebsd || !bazel' as the build tag to
+// exclude unsupported platforms.
 func Supported() bool {
 	return supported()
 }

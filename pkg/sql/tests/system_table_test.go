@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -27,13 +26,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -52,9 +52,9 @@ func TestInitialKeys(t *testing.T) {
 		var nonDescKeys int
 		if systemTenant {
 			codec = keys.SystemSQLCodec
-			nonDescKeys = 11
+			nonDescKeys = 16
 		} else {
-			codec = keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+			codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 			nonDescKeys = 4
 		}
 
@@ -87,7 +87,7 @@ func TestInitialKeys(t *testing.T) {
 
 		// Verify that IDGenerator value is correct.
 		found := false
-		idgen := codec.DescIDSequenceKey()
+		idgen := codec.SequenceKey(keys.DescIDSequenceID)
 		var idgenkv roachpb.KeyValue
 		for _, v := range kv {
 			if v.Key.Equal(idgen) {
@@ -114,7 +114,7 @@ func TestInitialKeys(t *testing.T) {
 func TestInitialKeysAndSplits(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	datadriven.RunTest(t, testutils.TestDataPath(t, "initial_keys"), func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "initial_keys"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "initial-keys":
 			var tenant string
@@ -128,7 +128,7 @@ func TestInitialKeysAndSplits(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				codec = keys.MakeSQLCodec(roachpb.MakeTenantID(id))
+				codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(id))
 			}
 
 			ms := bootstrap.MakeMetadataSchema(
@@ -181,17 +181,17 @@ func TestSystemTableLiterals(t *testing.T) {
 	s := tc.Servers[0]
 
 	testcases := make(map[string]testcase)
-	for schema, desc := range systemschema.SystemTableDescriptors {
-		if _, alreadyExists := testcases[desc.GetName()]; alreadyExists {
-			t.Fatalf("system table %q already exists", desc.GetName())
+	for _, table := range systemschema.MakeSystemTables() {
+		if _, alreadyExists := testcases[table.GetName()]; alreadyExists {
+			t.Fatalf("system table %q already exists", table.GetName())
 		}
-		testcases[desc.GetName()] = testcase{
-			schema: schema,
-			pkg:    desc,
+		testcases[table.GetName()] = testcase{
+			schema: table.Schema,
+			pkg:    table,
 		}
 	}
 
-	const expectedNumberOfSystemTables = 42
+	const expectedNumberOfSystemTables = bootstrap.NumSystemTablesForSystemTenant
 	require.Equal(t, expectedNumberOfSystemTables, len(testcases))
 
 	runTest := func(name string, test testcase) {
@@ -204,7 +204,7 @@ func TestSystemTableLiterals(t *testing.T) {
 			desc = mut.ImmutableCopy().(catalog.TableDescriptor)
 		}
 		leaseManager := s.LeaseManager().(*lease.Manager)
-		collection := descs.MakeTestCollection(ctx, leaseManager)
+		collection := descs.MakeTestCollection(ctx, keys.SystemSQLCodec, leaseManager)
 
 		gen, err := sql.CreateTestTableDescriptor(
 			context.Background(),
@@ -218,7 +218,24 @@ func TestSystemTableLiterals(t *testing.T) {
 		if err != nil {
 			t.Fatalf("test: %+v, err: %v", test, err)
 		}
-		require.NoError(t, descbuilder.ValidateSelf(gen, clusterversion.TestingClusterVersion))
+		require.NoError(t, desctestutils.TestingValidateSelf(gen))
+
+		// The tables with regional by row compatible indexes had their
+		// indexes rewritten to ID 2. There is no way to specify index
+		// ids in SQL, so we need to manually patch the descriptor to
+		// get the sql constructed descriptor to match the statically
+		// constructed descriptor.
+		switch gen.GetID() {
+		case keys.SqllivenessID:
+			gen.TableDescriptor.PrimaryIndex.ID = 2
+			gen.TableDescriptor.NextIndexID = 3
+		case keys.SQLInstancesTableID:
+			gen.TableDescriptor.PrimaryIndex.ID = 2
+			gen.TableDescriptor.NextIndexID = 3
+		case keys.LeaseTableID:
+			gen.TableDescriptor.PrimaryIndex.ID = 2
+			gen.TableDescriptor.NextIndexID = 3
+		}
 
 		if desc.TableDesc().Equal(gen.TableDesc()) {
 			return

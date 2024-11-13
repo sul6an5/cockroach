@@ -5,7 +5,7 @@ go_test(
     name = "3node-tenant_test",
     size = "enormous",
     srcs = ["generated_test.go"],
-    args = ["-test.timeout=3595s"],
+    args = ["-test.timeout=7195s"],
     data = [
         "//c-deps:libgeos",  # keep
         "@com_github_cockroachdb_sqllogictest//:testfiles",  # keep
@@ -15,7 +15,6 @@ go_test(
     deps = [
         "//pkg/build/bazel",
         "//pkg/ccl",
-        "//pkg/ccl/utilccl",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",

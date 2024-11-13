@@ -16,12 +16,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
@@ -164,15 +166,17 @@ func (db *DB) PollSource(
 // time series data from the DataSource and store it.
 func (p *poller) start() {
 	// Poll once immediately and synchronously.
-	p.poll()
+	// Wrap context as a startup context to enable access to kv on startup path
+	// without retries.
+	p.poll(p.AnnotateCtx(startup.WithoutChecks(context.Background())))
 	bgCtx := p.AnnotateCtx(context.Background())
-	_ = p.stopper.RunAsyncTask(bgCtx, "ts-poller", func(context.Context) {
+	_ = p.stopper.RunAsyncTask(bgCtx, "ts-poller", func(ctx context.Context) {
 		ticker := time.NewTicker(p.frequency)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				p.poll()
+				p.poll(ctx)
 			case <-p.stopper.ShouldQuiesce():
 				return
 			}
@@ -182,12 +186,11 @@ func (p *poller) start() {
 
 // poll retrieves data from the underlying DataSource a single time, storing any
 // returned time series data on the server.
-func (p *poller) poll() {
+func (p *poller) poll(ctx context.Context) {
 	if !TimeseriesStorageEnabled.Get(&p.db.st.SV) {
 		return
 	}
 
-	ctx := p.AnnotateCtx(context.Background())
 	if err := p.stopper.RunTask(ctx, "ts.poller: poll", func(ctx context.Context) {
 		data := p.source.GetTimeSeriesData()
 		if len(data) == 0 {
@@ -307,8 +310,8 @@ func (db *DB) tryStoreRollup(ctx context.Context, r Resolution, data []rollupDat
 func (db *DB) storeKvs(ctx context.Context, kvs []roachpb.KeyValue) error {
 	b := &kv.Batch{}
 	for _, kv := range kvs {
-		b.AddRawRequest(&roachpb.MergeRequest{
-			RequestHeader: roachpb.RequestHeader{
+		b.AddRawRequest(&kvpb.MergeRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key: kv.Key,
 			},
 			Value: kv.Value,

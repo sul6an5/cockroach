@@ -217,6 +217,28 @@ func ParseAndNormalize(val string) (*hba.Conf, error) {
 		conf.Entries = entries
 	}
 
+	// If not rule for ConnInternalLoopback connections has been specified, add
+	// one similar to the default.
+	found := false
+	for _, e := range conf.Entries {
+		if e.ConnType == hba.ConnInternalLoopback {
+			found = true
+			break
+		}
+	}
+	if !found {
+		entries := make([]hba.Entry, 1, len(conf.Entries)+1)
+		entries[0] = hba.Entry{
+			ConnType: hba.ConnInternalLoopback,
+			User:     []hba.String{{Value: "all", Quoted: false}},
+			Address:  hba.AnyAddr{},
+			Method:   hba.String{Value: "trust"},
+			Input:    "loopback all all all trust       # built-in CockroachDB default",
+		}
+		entries = append(entries, conf.Entries...)
+		conf.Entries = entries
+	}
+
 	// Lookup and cache the auth methods.
 	for i := range conf.Entries {
 		method := conf.Entries[i].Method.Value
@@ -247,6 +269,13 @@ var sessionRevivalEntry = hba.Entry{
 	Method:   hba.String{Value: "session_revival_token"},
 }
 
+var jwtAuthEntry = hba.Entry{
+	ConnType: hba.ConnHostAny,
+	User:     []hba.String{{Value: "all", Quoted: false}},
+	Address:  hba.AnyAddr{},
+	Method:   hba.String{Value: "jwt_token"},
+}
+
 var rootEntry = hba.Entry{
 	ConnType: hba.ConnHostAny,
 	User:     []hba.String{{Value: username.RootUser, Quoted: false}},
@@ -269,8 +298,9 @@ var rootLocalEntry = hba.Entry{
 var DefaultHBAConfig = func() *hba.Conf {
 	loadDefaultMethods()
 	conf, err := ParseAndNormalize(`
-host  all all  all cert-password # built-in CockroachDB default
-local all all      password      # built-in CockroachDB default
+loopback all all all trust       # built-in CockroachDB default
+host     all all all cert-password # built-in CockroachDB default
+local    all all     password      # built-in CockroachDB default
 `)
 	if err != nil {
 		panic(err)

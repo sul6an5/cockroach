@@ -20,14 +20,20 @@ export function QueriesCell(
   transactionQueries: string[],
   textLimit: number,
 ): React.ReactElement {
+  // Filter out null or undefined values from array
+  if (transactionQueries) {
+    transactionQueries = transactionQueries.filter(x => x);
+  }
   if (
-    transactionQueries.length < 2 &&
-    transactionQueries[0].length < textLimit
+    !transactionQueries?.length ||
+    (transactionQueries.length === 1 &&
+      transactionQueries[0]?.length < textLimit)
   ) {
-    return <div>{transactionQueries[0]}</div>;
+    const query = transactionQueries?.length ? transactionQueries[0] : "";
+    return <div>{query}</div>;
   }
 
-  const combinedQuery = transactionQueries.map((query, idx, arr) => (
+  const combinedQuery = transactionQueries?.map((query, idx, arr) => (
     <div key={idx}>
       {idx != 0 && <br />}
       {query}

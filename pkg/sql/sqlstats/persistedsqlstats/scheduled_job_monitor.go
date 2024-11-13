@@ -12,16 +12,15 @@ package persistedsqlstats
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -61,14 +60,21 @@ var longIntervalWarningThreshold = time.Hour * 24
 // periodically every scanInterval (subject to jittering).
 type jobMonitor struct {
 	st           *cluster.Settings
-	ie           sqlutil.InternalExecutor
-	db           *kv.DB
+	db           isql.DB
 	scanInterval time.Duration
 	jitterFn     func(time.Duration) time.Duration
+	testingKnobs struct {
+		updateCheckInterval time.Duration
+	}
 }
 
-func (j *jobMonitor) start(ctx context.Context, stopper *stop.Stopper) {
-	_ = stopper.RunAsyncTask(ctx, "sql-stats-scheduled-compaction-job-monitor", func(ctx context.Context) {
+func (j *jobMonitor) start(
+	ctx context.Context, stopper *stop.Stopper, drain chan struct{}, tasksWG *sync.WaitGroup,
+) {
+	tasksWG.Add(1)
+	err := stopper.RunAsyncTask(ctx, "sql-stats-scheduled-compaction-job-monitor", func(ctx context.Context) {
+		defer tasksWG.Done()
+
 		nextJobScheduleCheck := timeutil.Now()
 		currentRecurrence := SQLStatsCleanupRecurrence.Get(&j.st.SV)
 
@@ -80,6 +86,11 @@ func (j *jobMonitor) start(ctx context.Context, stopper *stop.Stopper) {
 		timer.Reset(0)
 		defer timer.Stop()
 
+		updateCheckInterval := time.Minute
+		if j.testingKnobs.updateCheckInterval != 0 {
+			updateCheckInterval = j.testingKnobs.updateCheckInterval
+		}
+
 		// This loop runs every minute to check if we need to update the job schedule.
 		// We only hit the jobs table if the schedule needs to be updated due to a
 		// change in the recurrence cluster setting or as a scheduled check to
@@ -88,30 +99,40 @@ func (j *jobMonitor) start(ctx context.Context, stopper *stop.Stopper) {
 			select {
 			case <-timer.C:
 				timer.Read = true
+			case <-drain:
+				// Graceful shutdown.
+				return
 			case <-stopCtx.Done():
+				// Expedited shutdown.
 				return
 			}
-			if SQLStatsCleanupRecurrence.Get(&j.st.SV) != currentRecurrence || nextJobScheduleCheck.Before(timeutil.Now()) {
-				j.updateSchedule(stopCtx, j.ie)
+
+			// Read the config once to avoid race condition if config is changed during
+			// the update process.
+			newRecurrence := SQLStatsCleanupRecurrence.Get(&j.st.SV)
+			if newRecurrence != currentRecurrence || nextJobScheduleCheck.Before(timeutil.Now()) {
+				j.updateSchedule(stopCtx, newRecurrence)
 				nextJobScheduleCheck = timeutil.Now().Add(j.jitterFn(j.scanInterval))
-				currentRecurrence = SQLStatsCleanupRecurrence.Get(&j.st.SV)
+				currentRecurrence = newRecurrence
 			}
 
-			timer.Reset(time.Minute)
+			timer.Reset(updateCheckInterval)
 		}
 	})
+	if err != nil {
+		tasksWG.Done()
+		log.Warningf(ctx, "error starting sql stats scheduled compaction job monitor: %v", err)
+	}
 }
 
 func (j *jobMonitor) getSchedule(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn isql.Txn,
 ) (sj *jobs.ScheduledJob, _ error) {
-	row, err := j.ie.QueryRowEx(
+	row, err := txn.QueryRowEx(
 		ctx,
 		"load-sql-stats-scheduled-job",
-		txn,
-		sessiondata.InternalExecutorOverride{
-			User: username.NodeUserName(),
-		},
+		txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		"SELECT schedule_id FROM system.scheduled_jobs WHERE schedule_name = $1",
 		compactionScheduleName,
 	)
@@ -125,7 +146,7 @@ func (j *jobMonitor) getSchedule(
 
 	scheduledJobID := int64(tree.MustBeDInt(row[0]))
 
-	sj, err = jobs.LoadScheduledJob(ctx, scheduledjobs.ProdJobSchedulerEnv, scheduledJobID, j.ie, txn)
+	sj, err = jobs.ScheduledJobTxn(txn).Load(ctx, scheduledjobs.ProdJobSchedulerEnv, scheduledJobID)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +154,7 @@ func (j *jobMonitor) getSchedule(
 	return sj, nil
 }
 
-func (j *jobMonitor) updateSchedule(ctx context.Context, ie sqlutil.InternalExecutor) {
+func (j *jobMonitor) updateSchedule(ctx context.Context, cronExpr string) {
 	var sj *jobs.ScheduledJob
 	var err error
 	retryOptions := retry.Options{
@@ -141,21 +162,21 @@ func (j *jobMonitor) updateSchedule(ctx context.Context, ie sqlutil.InternalExec
 		MaxBackoff:     10 * time.Minute,
 	}
 	for r := retry.StartWithCtx(ctx, retryOptions); r.Next(); {
-		if err = j.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		if err = j.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			// We check if we can get load the schedule, if the schedule cannot be
 			// loaded because it's not found, we recreate the schedule.
 			sj, err = j.getSchedule(ctx, txn)
+
 			if err != nil {
 				if !jobs.HasScheduledJobNotFoundError(err) && !errors.Is(err, errScheduleNotFound) {
 					return err
 				}
-				sj, err = CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, j.ie, txn, j.st)
+				sj, err = CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, txn, j.st)
 				if err != nil {
 					return err
 				}
 			}
-			// Update schedule with new recurrence, if different.
-			cronExpr := SQLStatsCleanupRecurrence.Get(&j.st.SV)
+
 			if sj.ScheduleExpr() == cronExpr {
 				return nil
 			}
@@ -163,7 +184,7 @@ func (j *jobMonitor) updateSchedule(ctx context.Context, ie sqlutil.InternalExec
 				return err
 			}
 			sj.SetScheduleStatus(string(jobs.StatusPending))
-			return sj.Update(ctx, ie, txn)
+			return jobs.ScheduledJobTxn(txn).Update(ctx, sj)
 		}); err != nil && ctx.Err() == nil {
 			log.Errorf(ctx, "failed to update stats scheduled compaction job: %s", err)
 		} else {

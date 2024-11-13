@@ -53,7 +53,7 @@ func TestRouteToNode(t *testing.T) {
 			sourceServerID:          1,
 			nodeIDRequestedInCookie: "local",
 			expectStatusCode:        200,
-			expectRegex:             regexp.MustCompile(`ranges_underreplicated{store="2"}`),
+			expectRegex:             regexp.MustCompile(`ranges_underreplicated{store="2",node_id="2"}`),
 		},
 		{
 			name:                    "remote _status/vars on node 2 from node 1 using cookie",
@@ -61,7 +61,7 @@ func TestRouteToNode(t *testing.T) {
 			sourceServerID:          0,
 			nodeIDRequestedInCookie: "2",
 			expectStatusCode:        200,
-			expectRegex:             regexp.MustCompile(`ranges_underreplicated{store="2"}`),
+			expectRegex:             regexp.MustCompile(`ranges_underreplicated{store="2",node_id="2"}`),
 		},
 		{
 			name:                    "remote _status/vars on node 1 from node 2 using cookie",
@@ -69,7 +69,7 @@ func TestRouteToNode(t *testing.T) {
 			sourceServerID:          1,
 			nodeIDRequestedInCookie: "1",
 			expectStatusCode:        200,
-			expectRegex:             regexp.MustCompile(`ranges_underreplicated{store="1"}`),
+			expectRegex:             regexp.MustCompile(`ranges_underreplicated{store="1",node_id="1"}`),
 		},
 		{
 			name:                        "remote _status/vars on node 2 from node 1 using query param",
@@ -77,7 +77,7 @@ func TestRouteToNode(t *testing.T) {
 			sourceServerID:              0,
 			nodeIDRequestedInQueryParam: "2",
 			expectStatusCode:            200,
-			expectRegex:                 regexp.MustCompile(`ranges_underreplicated{store="2"}`),
+			expectRegex:                 regexp.MustCompile(`ranges_underreplicated{store="2",node_id="2"}`),
 		},
 		{
 			name:                        "query param overrides cookie",
@@ -86,7 +86,7 @@ func TestRouteToNode(t *testing.T) {
 			nodeIDRequestedInCookie:     "local",
 			nodeIDRequestedInQueryParam: "2",
 			expectStatusCode:            200,
-			expectRegex:                 regexp.MustCompile(`ranges_underreplicated{store="2"}`),
+			expectRegex:                 regexp.MustCompile(`ranges_underreplicated{store="2",node_id="2"}`),
 		},
 		{
 			name:                    "remote / root HTML on node 2 from node 1 using cookie",
@@ -145,7 +145,7 @@ func TestRouteToNode(t *testing.T) {
 			require.Equal(t, rt.sourceServerID+1, int(s.NodeID()))
 			client, err := s.GetUnauthenticatedHTTPClient()
 			if rt.requireAuth {
-				client, err = s.GetAuthenticatedHTTPClient(rt.requireAdmin)
+				client, err = s.GetAuthenticatedHTTPClient(rt.requireAdmin, serverutils.SingleTenantSession)
 			}
 			require.NoError(t, err)
 
@@ -193,6 +193,7 @@ func TestRouteToNode(t *testing.T) {
 
 		resp, err := client.Get(s.AdminURL() + fmt.Sprintf("/_status/vars?%s=%s", RemoteNodeID, "2"))
 		require.NoError(t, err)
+		defer resp.Body.Close()
 		// We expect some error here. It's difficult to know what
 		// will happen because in different stress scenarios, the
 		// node may still have an address available, in which

@@ -13,15 +13,16 @@ package sctestdeps
 import (
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -39,9 +40,8 @@ var _ Option = (optionFunc)(nil)
 // WithNamespace sets the TestState namespace to the provided value.
 func WithNamespace(c nstree.Catalog) Option {
 	return optionFunc(func(state *TestState) {
-		_ = c.ForEachNamespaceEntry(func(e catalog.NameEntry) error {
-			state.committed.UpsertNamespaceEntry(e, e.GetID())
-			state.uncommitted.UpsertNamespaceEntry(e, e.GetID())
+		_ = c.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
+			state.committed.UpsertNamespaceEntry(e, e.GetID(), e.GetMVCCTimestamp())
 			return nil
 		})
 	})
@@ -52,21 +52,20 @@ func WithNamespace(c nstree.Catalog) Option {
 func WithDescriptors(c nstree.Catalog) Option {
 	modifTime := hlc.Timestamp{WallTime: defaultOverriddenCreatedAt.UnixNano()}
 	return optionFunc(func(state *TestState) {
-		_ = c.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
-			pb := desc.DescriptorProto()
-			if table, isTable := desc.(catalog.TableDescriptor); isTable {
-				mut := table.NewBuilder().BuildExistingMutable().(*tabledesc.Mutable)
-				for _, idx := range mut.AllIndexes() {
+		_ = c.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			mut := desc.NewBuilder().BuildCreatedMutable()
+			switch m := mut.(type) {
+			case *tabledesc.Mutable:
+				for _, idx := range m.AllIndexes() {
 					if !idx.CreatedAt().IsZero() {
-						idx.IndexDesc().CreatedAtNanos = defaultOverriddenCreatedAt.UnixNano()
+						idx.IndexDesc().CreatedAtNanos = modifTime.WallTime
 					}
 				}
-				mut.ModificationTime = modifTime
-				pb = mut.DescriptorProto()
+				m.CreateAsOfTime = modifTime
 			}
-			b := descbuilder.NewBuilderWithMVCCTimestamp(pb, modifTime)
-			state.committed.UpsertDescriptorEntry(b.BuildImmutable())
-			state.uncommitted.UpsertDescriptorEntry(b.BuildExistingMutable())
+			mut.ResetModificationTime()
+			desc = mut.ImmutableCopy()
+			state.committed.UpsertDescriptor(desc)
 			return nil
 		})
 	})
@@ -80,9 +79,11 @@ func WithSessionData(sessionData sessiondata.SessionData) Option {
 }
 
 // WithZoneConfigs sets the TestStates zone config map to the provided value.
-func WithZoneConfigs(zoneConfigs map[catid.DescID]*zonepb.ZoneConfig) Option {
+func WithZoneConfigs(zoneConfigs map[catid.DescID]catalog.ZoneConfig) Option {
 	return optionFunc(func(state *TestState) {
-		state.zoneConfigs = zoneConfigs
+		for id, zc := range zoneConfigs {
+			state.committed.UpsertZoneConfig(id, zc.ZoneConfigProto(), zc.GetRawBytesInStorage())
+		}
 	})
 }
 
@@ -126,9 +127,13 @@ func WithBackfiller(backfiller scexec.Backfiller) Option {
 }
 
 // WithComments injects sets comment cache of TestState to the provided value.
-func WithComments(comments map[descmetadata.CommentKey]string) Option {
+func WithComments(comments map[catalogkeys.CommentKey]string) Option {
 	return optionFunc(func(state *TestState) {
-		state.comments = comments
+		for key, cmt := range comments {
+			if err := state.committed.UpsertComment(key, cmt); err != nil {
+				panic(err)
+			}
+		}
 	})
 }
 
@@ -137,6 +142,18 @@ func WithComments(comments map[descmetadata.CommentKey]string) Option {
 func WithMerger(merger scexec.Merger) Option {
 	return optionFunc(func(state *TestState) {
 		state.merger = merger
+	})
+}
+
+func WithIDGenerator(s serverutils.TestServerInterface) Option {
+	return optionFunc(func(state *TestState) {
+		state.idGenerator = descidgen.NewGenerator(s.ClusterSettings(), s.Codec(), s.DB())
+	})
+}
+
+func WithReferenceProviderFactory(f scbuild.ReferenceProviderFactory) Option {
+	return optionFunc(func(state *TestState) {
+		state.refProviderFactory = f
 	})
 }
 
@@ -158,6 +175,5 @@ var defaultOptions = []Option{
 		state.merger = &testBackfiller{s: state}
 		state.indexSpanSplitter = &indexSpanSplitter{}
 		state.approximateTimestamp = defaultCreatedAt
-		state.zoneConfigs = make(map[catid.DescID]*zonepb.ZoneConfig)
 	}),
 }

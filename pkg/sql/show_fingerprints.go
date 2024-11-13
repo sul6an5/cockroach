@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -116,21 +115,21 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 		}
 	} else {
 		for i := 0; i < index.NumKeyColumns(); i++ {
-			col, err := n.tableDesc.FindColumnWithID(index.GetKeyColumnID(i))
+			col, err := catalog.MustFindColumnByID(n.tableDesc, index.GetKeyColumnID(i))
 			if err != nil {
 				return false, err
 			}
 			addColumn(col)
 		}
 		for i := 0; i < index.NumKeySuffixColumns(); i++ {
-			col, err := n.tableDesc.FindColumnWithID(index.GetKeySuffixColumnID(i))
+			col, err := catalog.MustFindColumnByID(n.tableDesc, index.GetKeySuffixColumnID(i))
 			if err != nil {
 				return false, err
 			}
 			addColumn(col)
 		}
 		for i := 0; i < index.NumSecondaryStoredColumns(); i++ {
-			col, err := n.tableDesc.FindColumnWithID(index.GetStoredColumnID(i))
+			col, err := catalog.MustFindColumnByID(n.tableDesc, index.GetStoredColumnID(i))
 			if err != nil {
 				return false, err
 			}
@@ -165,10 +164,10 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 		sql = sql + " AS OF SYSTEM TIME " + ts.AsOfSystemTime()
 	}
 
-	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
+	fingerprintCols, err := params.p.InternalSQLTxn().QueryRowEx(
 		params.ctx, "hash-fingerprint",
 		params.p.txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		sql,
 	)
 	if err != nil {

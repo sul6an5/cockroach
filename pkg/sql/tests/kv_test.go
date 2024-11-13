@@ -22,10 +22,14 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	kv2 "github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 type kvInterface interface {
@@ -34,7 +38,7 @@ type kvInterface interface {
 	Delete(rows, run int) error
 	Scan(rows, run int) error
 
-	prep(rows int, initData bool) error
+	prep(rows int) error
 	done()
 }
 
@@ -58,6 +62,27 @@ func newKVNative(b *testing.B) kvInterface {
 			s.Stopper().Stop(context.Background())
 		},
 	}
+}
+
+func newKVNativeAndEngine(tb testing.TB, valueBlocks bool) (*kvNative, storage.Engine) {
+	st := cluster.MakeTestingClusterSettings()
+	version := st.Version.ActiveVersionOrEmpty(context.Background())
+	if version.Less(clusterversion.ByKey(
+		clusterversion.V23_1EnablePebbleFormatSSTableValueBlocks)) {
+		tb.Fatalf("cluster version is too old %s", version.String())
+	}
+	storage.ValueBlocksEnabled.Override(context.Background(), &st.SV, valueBlocks)
+	s, _, db := serverutils.StartServer(tb, base.TestServerArgs{Settings: st})
+	engines := s.Engines()
+	if len(engines) != 1 {
+		tb.Fatalf("unexpected number of engines %d", len(engines))
+	}
+	return &kvNative{
+		db: db,
+		doneFn: func() {
+			s.Stopper().Stop(context.Background())
+		},
+	}, engines[0]
 }
 
 func (kv *kvNative) Insert(rows, run int) error {
@@ -110,22 +135,34 @@ func (kv *kvNative) Delete(rows, run int) error {
 }
 
 func (kv *kvNative) Scan(rows, run int) error {
+	return kv.scanWithRowCountExpectation(rows, rows)
+}
+
+func (kv *kvNative) scanWithRowCountExpectation(rows, expectedRows int) error {
 	var kvs []kv2.KeyValue
 	err := kv.db.Txn(context.Background(), func(ctx context.Context, txn *kv2.Txn) error {
 		var err error
 		kvs, err = txn.Scan(ctx, fmt.Sprintf("%s%08d", kv.prefix, 0), fmt.Sprintf("%s%08d", kv.prefix, rows), int64(rows))
 		return err
 	})
-	if len(kvs) != rows {
+	if len(kvs) != expectedRows {
 		return errors.Errorf("expected %d rows; got %d", rows, len(kvs))
 	}
 	return err
 }
 
-func (kv *kvNative) prep(rows int, initData bool) error {
+func (kv *kvNative) prepWithAdditionalLength(rows int, addKeyLen int) error {
 	kv.epoch++
-	kv.prefix = fmt.Sprintf("%d/", kv.epoch)
-	if !initData {
+	addKeyLenPrefix := make([]byte, addKeyLen)
+	for i := range addKeyLenPrefix {
+		addKeyLenPrefix[i] = byte(i % 128)
+	}
+	var addKeyLenPrefixStr string
+	if len(addKeyLenPrefix) > 0 {
+		addKeyLenPrefixStr = string(addKeyLenPrefix)
+	}
+	kv.prefix = fmt.Sprintf("%d/%s", kv.epoch, addKeyLenPrefixStr)
+	if rows == 0 {
 		return nil
 	}
 	err := kv.db.Txn(context.Background(), func(ctx context.Context, txn *kv2.Txn) error {
@@ -136,6 +173,10 @@ func (kv *kvNative) prep(rows int, initData bool) error {
 		return txn.CommitInBatch(ctx, b)
 	})
 	return err
+}
+
+func (kv *kvNative) prep(rows int) error {
+	return kv.prepWithAdditionalLength(rows, 0)
 }
 
 func (kv *kvNative) done() {
@@ -209,8 +250,18 @@ func (kv *kvSQL) Delete(rows, run int) error {
 		fmt.Fprintf(&kv.buf, `'%08d'`, j+firstRow)
 	}
 	kv.buf.WriteString(`)`)
-	_, err := kv.db.Exec(kv.buf.String())
-	return err
+	res, err := kv.db.Exec(kv.buf.String())
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected != int64(rows) {
+		return errors.Errorf("expected %d rows affected, found %d", rows, rowsAffected)
+	}
+	return nil
 }
 
 func (kv *kvSQL) Scan(count, run int) error {
@@ -232,7 +283,7 @@ func (kv *kvSQL) Scan(count, run int) error {
 	return nil
 }
 
-func (kv *kvSQL) prep(rows int, initData bool) error {
+func (kv *kvSQL) prep(rows int) error {
 	if _, err := kv.db.Exec(`DROP TABLE IF EXISTS bench.kv`); err != nil {
 		return err
 	}
@@ -246,7 +297,7 @@ CREATE TABLE IF NOT EXISTS bench.kv (
 	if _, err := kv.db.Exec(schema); err != nil {
 		return err
 	}
-	if !initData {
+	if rows == 0 {
 		return nil
 	}
 	defer kv.buf.Reset()
@@ -307,7 +358,21 @@ func BenchmarkKV(b *testing.B) {
 							kv := kvFn(b)
 							defer kv.done()
 
-							if err := kv.prep(rows, i != 0 /* Insert */ && i != 2 /* Delete */); err != nil {
+							var prepRows int
+							switch i {
+							case 0: // Insert
+								prepRows = 0
+							case 1: // Update
+								prepRows = rows
+							case 2: // Delete
+								prepRows = rows * b.N
+							case 3: // Scan
+								prepRows = rows
+							default:
+								b.Fatal("unexpected op")
+							}
+
+							if err := kv.prep(prepRows); err != nil {
 								b.Fatal(err)
 							}
 							b.ResetTimer()
@@ -398,7 +463,7 @@ func BenchmarkKVAndStorageUsingSQL(b *testing.B) {
 			// more keys, resulting in more files in the engine, which makes it
 			// slower.
 			rowsToInit := b.N * rowsToUpdate
-			if err := kv.prep(rowsToInit, true); err != nil {
+			if err := kv.prep(rowsToInit); err != nil {
 				b.Fatal(err)
 			}
 			b.ResetTimer()
@@ -408,6 +473,62 @@ func BenchmarkKVAndStorageUsingSQL(b *testing.B) {
 				}
 			}
 			b.StopTimer()
+		})
+	}
+}
+
+// TODO(sumeer): also benchmark via SQL like the other benchmarks in this
+// file.
+//
+// Benchmarks scanning a span of 1000 keys, where the keys are ~50 bytes in
+// length and values are tiny (integers), with a varying number of versions
+// per key, and the latest version being alive or a tombstone. It only
+// measures the CPU effect since the total amount of data is tiny. The
+// underlying Pebble engine is varied in the sstable format, with or without
+// value blocks.
+func BenchmarkKVAndStorageMultipleVersions(b *testing.B) {
+	defer log.Scope(b).Close(b)
+	const numRows = 1000
+	const additionalLen = 50
+	for _, numVersions := range []int{1, 2, 4, 8, 16, 32} {
+		b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
+			for _, lastVersionIsTombstone := range []bool{false, true} {
+				if numVersions == 1 && lastVersionIsTombstone == true {
+					// Invalid combination of params.
+					continue
+				}
+				b.Run(fmt.Sprintf("last-is-tombstone=%t", lastVersionIsTombstone), func(b *testing.B) {
+					for _, valueBlocks := range []bool{false, true} {
+						b.Run(fmt.Sprintf("value-blocks=%t", valueBlocks), func(b *testing.B) {
+							kv, eng := newKVNativeAndEngine(b, valueBlocks)
+							defer kv.done()
+							if err := kv.prepWithAdditionalLength(numRows, additionalLen); err != nil {
+								b.Fatal(err)
+							}
+							for i := 1; i < numVersions-1; i++ {
+								require.NoError(b, kv.Update(numRows, 0))
+							}
+							expectedRows := numRows
+							if numVersions > 1 {
+								if lastVersionIsTombstone {
+									require.NoError(b, kv.Delete(numRows, 0))
+									expectedRows = 0
+								} else {
+									require.NoError(b, kv.Update(numRows, 0))
+								}
+							}
+							require.NoError(b, eng.Flush())
+							b.ResetTimer()
+							for i := 0; i < b.N; i++ {
+								if err := kv.scanWithRowCountExpectation(numRows, expectedRows); err != nil {
+									b.Fatal(err)
+								}
+							}
+							b.StopTimer()
+						})
+					}
+				})
+			}
 		})
 	}
 }

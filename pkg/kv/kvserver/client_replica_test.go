@@ -29,13 +29,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptutil"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -45,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
@@ -66,7 +70,7 @@ import (
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 // TestReplicaClockUpdates verifies that the leaseholder updates its clocks
@@ -117,13 +121,13 @@ func TestReplicaClockUpdates(t *testing.T) {
 		// Pick a timestamp in the future of all nodes by less than the
 		// MaxOffset. Set the synthetic flag according to the test case.
 		reqTS := clocks[0].Now().Add(clocks[0].MaxOffset().Nanoseconds()/2, 0).WithSynthetic(synthetic)
-		h := roachpb.Header{Timestamp: reqTS}
+		h := kvpb.Header{Timestamp: reqTS}
 		if !reqTS.Synthetic {
 			h.Now = hlc.ClockTimestamp(reqTS)
 		}
 
 		// Execute the command.
-		var req roachpb.Request
+		var req kvpb.Request
 		if write {
 			req = incrementArgs(reqKey, 5)
 		} else {
@@ -163,6 +167,7 @@ func TestLeaseholdersRejectClockUpdateWithJump(t *testing.T) {
 			Server: &server.TestingKnobs{
 				WallClock: manual,
 			},
+			Store: &kvserver.StoreTestingKnobs{DisableCanAckBeforeApplication: true},
 		},
 	})
 	s := serv.(*server.TestServer)
@@ -182,7 +187,7 @@ func TestLeaseholdersRejectClockUpdateWithJump(t *testing.T) {
 	clockOffset := s.Clock().MaxOffset() / numCmds
 	for i := int64(1); i <= numCmds; i++ {
 		ts := hlc.ClockTimestamp(ts1.Add(i*clockOffset.Nanoseconds(), 0))
-		if _, err := kv.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{Now: ts}, incArgs); err != nil {
+		if _, err := kv.SendWrappedWith(context.Background(), store.TestSender(), kvpb.Header{Now: ts}, incArgs); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -194,7 +199,7 @@ func TestLeaseholdersRejectClockUpdateWithJump(t *testing.T) {
 
 	// Once the accumulated offset reaches MaxOffset, commands will be rejected.
 	tsFuture := hlc.ClockTimestamp(ts1.Add(s.Clock().MaxOffset().Nanoseconds()+1, 0))
-	_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Now: tsFuture}, incArgs)
+	_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{Now: tsFuture}, incArgs)
 	if !testutils.IsPError(pErr, "remote wall time is too far ahead") {
 		t.Fatalf("unexpected error %v", pErr)
 	}
@@ -204,12 +209,12 @@ func TestLeaseholdersRejectClockUpdateWithJump(t *testing.T) {
 	if advance := ts3.GoTime().Sub(ts2.GoTime()); advance != 0 {
 		t.Fatalf("expected clock not to advance, but it advanced by %s", advance)
 	}
-	val, _, err := storage.MVCCGet(context.Background(), store.Engine(), key, ts3,
+	valRes, err := storage.MVCCGet(context.Background(), store.TODOEngine(), key, ts3,
 		storage.MVCCGetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := mustGetInt(val), incArgs.Increment*numCmds; a != e {
+	if a, e := mustGetInt(valRes.Value), incArgs.Increment*numCmds; a != e {
 		t.Errorf("expected %d, got %d", e, a)
 	}
 }
@@ -252,18 +257,14 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 		restartKey = "restart"
 	)
 	// Set up a filter to so that the get operation at Step 3 will return an error.
-	var numGets int32
+	var shouldFailGet atomic.Value
 
-	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-		if _, ok := filterArgs.Req.(*roachpb.GetRequest); ok &&
+	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+		if _, ok := filterArgs.Req.(*kvpb.GetRequest); ok &&
 			filterArgs.Req.Header().Key.Equal(roachpb.Key(key)) &&
 			filterArgs.Hdr.Txn == nil {
-			// The Reader executes two get operations, each of which triggers two get requests
-			// (the first request fails and triggers txn push, and then the second request
-			// succeeds). Returns an error for the fourth get request to avoid timestamp cache
-			// update after the third get operation pushes the txn timestamp.
-			if atomic.AddInt32(&numGets, 1) == 4 {
-				return roachpb.NewErrorWithTxn(errors.Errorf("Test"), filterArgs.Hdr.Txn)
+			if shouldFail := shouldFailGet.Load(); shouldFail != nil && shouldFail.(bool) {
+				return kvpb.NewErrorWithTxn(errors.Errorf("Test"), filterArgs.Hdr.Txn)
 			}
 		}
 		return nil
@@ -369,21 +370,21 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 	manual.Increment(100)
 
 	priority := roachpb.UserPriority(-math.MaxInt32)
-	requestHeader := roachpb.RequestHeader{
+	requestHeader := kvpb.RequestHeader{
 		Key: roachpb.Key(key),
 	}
-	h := roachpb.Header{
+	h := kvpb.Header{
 		Timestamp:    s.Clock().Now(),
 		UserPriority: priority,
 	}
 	if _, err := kv.SendWrappedWith(
-		context.Background(), store.TestSender(), h, &roachpb.GetRequest{RequestHeader: requestHeader},
+		context.Background(), store.TestSender(), h, &kvpb.GetRequest{RequestHeader: requestHeader},
 	); err != nil {
 		t.Fatalf("failed to get: %+v", err)
 	}
 	// Write to the restart key so that the Writer's txn must restart.
-	putReq := &roachpb.PutRequest{
-		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key(restartKey)},
+	putReq := &kvpb.PutRequest{
+		RequestHeader: kvpb.RequestHeader{Key: roachpb.Key(restartKey)},
 		Value:         roachpb.MakeValueFromBytes([]byte("restart-value")),
 	}
 	if _, err := kv.SendWrappedWith(context.Background(), store.TestSender(), h, putReq); err != nil {
@@ -401,8 +402,9 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 	manual.Increment(100)
 
 	h.Timestamp = s.Clock().Now()
+	shouldFailGet.Store(true)
 	if _, err := kv.SendWrappedWith(
-		context.Background(), store.TestSender(), h, &roachpb.GetRequest{RequestHeader: requestHeader},
+		context.Background(), store.TestSender(), h, &kvpb.GetRequest{RequestHeader: requestHeader},
 	); err == nil {
 		t.Fatal("unexpected success of get")
 	}
@@ -433,67 +435,88 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 // timestamp is below the committed value's timestamp. As a result, the
 // transaction observes the committed value in its certain future, allowing it
 // to avoid the ReadWithinUncertaintyIntervalError.
+//
+// Each test variant is run using the three different forms of transactional
+// read-only operations: Get, Scan, and ReverseScan.
 func TestTxnReadWithinUncertaintyInterval(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	testutils.RunTrueAndFalse(t, "observedTS", func(t *testing.T, observedTS bool) {
-		ctx := context.Background()
-		manual := hlc.NewHybridManualClock()
-		srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					WallClock: manual,
-				},
-			},
+		readOps := []interface{}{"get", "scan", "revScan"}
+		testutils.RunValues(t, "readOp", readOps, func(t *testing.T, readOp interface{}) {
+			testTxnReadWithinUncertaintyInterval(t, observedTS, readOp.(string))
 		})
-		s := srv.(*server.TestServer)
-		defer s.Stopper().Stop(ctx)
-		store, err := s.Stores().GetStore(s.GetFirstStoreID())
-		require.NoError(t, err)
-
-		// Split off a scratch range.
-		key, err := s.ScratchRange()
-		require.NoError(t, err)
-
-		// Pause the server's clocks going forward.
-		manual.Pause()
-
-		// Create a new transaction.
-		now := s.Clock().Now()
-		maxOffset := s.Clock().MaxOffset().Nanoseconds()
-		require.NotZero(t, maxOffset)
-		txn := roachpb.MakeTransaction("test", key, 1, now, maxOffset, int32(s.SQLInstanceID()))
-		require.True(t, txn.ReadTimestamp.Less(txn.GlobalUncertaintyLimit))
-		require.Len(t, txn.ObservedTimestamps, 0)
-
-		// If the test variant wants an observed timestamp from the server at a
-		// timestamp below the value, collect one now.
-		if observedTS {
-			get := getArgs(key)
-			resp, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Txn: &txn}, get)
-			require.Nil(t, pErr)
-			txn.Update(resp.Header().Txn)
-			require.Len(t, txn.ObservedTimestamps, 1)
-		}
-
-		// Perform a non-txn write. This will grab a timestamp from the clock.
-		put := putArgs(key, []byte("val"))
-		_, pErr := kv.SendWrapped(ctx, store.TestSender(), put)
-		require.Nil(t, pErr)
-
-		// Perform another read on the same key. Depending on whether or not the txn
-		// had collected an observed timestamp, it may or may not observe the value
-		// in its uncertainty interval and throw an error.
-		get := getArgs(key)
-		_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Txn: &txn}, get)
-		if observedTS {
-			require.Nil(t, pErr)
-		} else {
-			require.NotNil(t, pErr)
-			require.IsType(t, &roachpb.ReadWithinUncertaintyIntervalError{}, pErr.GetDetail())
-		}
 	})
+}
+
+func testTxnReadWithinUncertaintyInterval(t *testing.T, observedTS bool, readOp string) {
+	ctx := context.Background()
+	manual := hlc.NewHybridManualClock()
+	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Server: &server.TestingKnobs{
+				WallClock: manual,
+			},
+		},
+	})
+	s := srv.(*server.TestServer)
+	defer s.Stopper().Stop(ctx)
+	store, err := s.Stores().GetStore(s.GetFirstStoreID())
+	require.NoError(t, err)
+
+	// Split off a scratch range.
+	key, err := s.ScratchRange()
+	require.NoError(t, err)
+
+	// Pause the server's clocks going forward.
+	manual.Pause()
+
+	// Create a new transaction.
+	now := s.Clock().Now()
+	maxOffset := s.Clock().MaxOffset().Nanoseconds()
+	require.NotZero(t, maxOffset)
+	txn := roachpb.MakeTransaction("test", key, 1, now, maxOffset, int32(s.SQLInstanceID()))
+	require.True(t, txn.ReadTimestamp.Less(txn.GlobalUncertaintyLimit))
+	require.Len(t, txn.ObservedTimestamps, 0)
+
+	// If the test variant wants an observed timestamp from the server at a
+	// timestamp below the value, collect one now.
+	if observedTS {
+		get := getArgs(key)
+		resp, pErr := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{Txn: &txn}, get)
+		require.Nil(t, pErr)
+		txn.Update(resp.Header().Txn)
+		require.Len(t, txn.ObservedTimestamps, 1)
+	}
+
+	// Perform a non-txn write. This will grab a timestamp from the clock.
+	put := putArgs(key, []byte("val"))
+	_, pErr := kv.SendWrapped(ctx, store.TestSender(), put)
+	require.Nil(t, pErr)
+
+	// Perform another read on the same key. Depending on whether or not the txn
+	// had collected an observed timestamp, it may or may not observe the value
+	// in its uncertainty interval and throw an error.
+
+	var read kvpb.Request
+	switch readOp {
+	case "get":
+		read = getArgs(key)
+	case "scan":
+		read = scanArgs(key, key.Next())
+	case "revScan":
+		read = revScanArgs(key, key.Next())
+	default:
+		t.Fatalf("unknown op: %q", readOp)
+	}
+	_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{Txn: &txn}, read)
+	if observedTS {
+		require.Nil(t, pErr)
+	} else {
+		require.NotNil(t, pErr)
+		require.IsType(t, &kvpb.ReadWithinUncertaintyIntervalError{}, pErr.GetDetail())
+	}
 }
 
 // TestTxnReadWithinUncertaintyIntervalAfterIntentResolution tests cases where a
@@ -610,7 +633,7 @@ func testTxnReadWithinUncertaintyIntervalAfterIntentResolution(
 	// Write to key A and key B in the writer transaction.
 	for _, key := range []roachpb.Key{keyA, keyB} {
 		put := putArgs(key, []byte("val"))
-		resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[0].DistSender(), roachpb.Header{Txn: &writerTxn}, put)
+		resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[0].DistSender(), kvpb.Header{Txn: &writerTxn}, put)
 		require.Nil(t, pErr)
 		writerTxn.Update(resp.Header().Txn)
 	}
@@ -663,25 +686,25 @@ func testTxnReadWithinUncertaintyIntervalAfterIntentResolution(
 	// transactions are always an observed timestamp from their own gateway node.
 	for i, key := range []roachpb.Key{keyB, keyA} {
 		get := getArgs(key.Next())
-		resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), roachpb.Header{Txn: &readerTxn}, get)
+		resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), kvpb.Header{Txn: &readerTxn}, get)
 		require.Nil(t, pErr)
-		require.Nil(t, resp.(*roachpb.GetResponse).Value)
+		require.Nil(t, resp.(*kvpb.GetResponse).Value)
 		readerTxn.Update(resp.Header().Txn)
 		require.Len(t, readerTxn.ObservedTimestamps, i+1)
 	}
 
 	// Resolve the intent on key B zero, one, or two times.
 	{
-		resolveIntentArgs := func(status roachpb.TransactionStatus) roachpb.Request {
+		resolveIntentArgs := func(status roachpb.TransactionStatus) kvpb.Request {
 			if rangedResolution {
-				return &roachpb.ResolveIntentRangeRequest{
-					RequestHeader: roachpb.RequestHeader{Key: keyB, EndKey: keyB.Next()},
+				return &kvpb.ResolveIntentRangeRequest{
+					RequestHeader: kvpb.RequestHeader{Key: keyB, EndKey: keyB.Next()},
 					IntentTxn:     writerTxn.TxnMeta,
 					Status:        status,
 				}
 			} else {
-				return &roachpb.ResolveIntentRequest{
-					RequestHeader: roachpb.RequestHeader{Key: keyB},
+				return &kvpb.ResolveIntentRequest{
+					RequestHeader: kvpb.RequestHeader{Key: keyB},
 					IntentTxn:     writerTxn.TxnMeta,
 					Status:        status,
 				}
@@ -731,14 +754,14 @@ func testTxnReadWithinUncertaintyIntervalAfterIntentResolution(
 	// ReadWithinUncertaintyIntervalErrors.
 	for _, key := range []roachpb.Key{keyA, keyB} {
 		get := getArgs(key)
-		_, pErr := kv.SendWrappedWith(ctx, tc.Servers[0].DistSender(), roachpb.Header{Txn: &readerTxn}, get)
+		_, pErr := kv.SendWrappedWith(ctx, tc.Servers[0].DistSender(), kvpb.Header{Txn: &readerTxn}, get)
 		require.NotNil(t, pErr)
-		var rwuiErr *roachpb.ReadWithinUncertaintyIntervalError
+		var rwuiErr *kvpb.ReadWithinUncertaintyIntervalError
 		require.True(t, errors.As(pErr.GetDetail(), &rwuiErr))
 		require.Equal(t, readerTxn.ReadTimestamp, rwuiErr.ReadTimestamp)
 		require.Equal(t, readerTxn.GlobalUncertaintyLimit, rwuiErr.GlobalUncertaintyLimit)
 		require.Equal(t, readerTxn.ObservedTimestamps, rwuiErr.ObservedTimestamps)
-		require.Equal(t, writerTxn.WriteTimestamp, rwuiErr.ExistingTimestamp)
+		require.Equal(t, writerTxn.WriteTimestamp, rwuiErr.ValueTimestamp)
 	}
 }
 
@@ -812,7 +835,7 @@ func TestTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 
 	// Collect an observed timestamp in that transaction from node 2.
 	getB := getArgs(keyB)
-	resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), roachpb.Header{Txn: &txn}, getB)
+	resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), kvpb.Header{Txn: &txn}, getB)
 	require.Nil(t, pErr)
 	txn.Update(resp.Header().Txn)
 	require.Len(t, txn.ObservedTimestamps, 1)
@@ -835,7 +858,7 @@ func TestTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 	// flakiness. For now, we just re-order the operations and assert that we
 	// receive an uncertainty error even though its absence would not be a true
 	// stale read.
-	ba := roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.Add(putArgs(keyA, []byte("val")))
 	br, pErr := tc.Servers[0].DistSender().Send(ctx, ba)
 	require.Nil(t, pErr)
@@ -859,9 +882,9 @@ func TestTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 	// avoid the uncertainty error. This is a good thing, as doing so would allow
 	// for a stale read.
 	getA := getArgs(keyA)
-	_, pErr = kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), roachpb.Header{Txn: &txn}, getA)
+	_, pErr = kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), kvpb.Header{Txn: &txn}, getA)
 	require.NotNil(t, pErr)
-	require.IsType(t, &roachpb.ReadWithinUncertaintyIntervalError{}, pErr.GetDetail())
+	require.IsType(t, &kvpb.ReadWithinUncertaintyIntervalError{}, pErr.GetDetail())
 }
 
 // TestTxnReadWithinUncertaintyIntervalAfterRangeMerge verifies that on a merge of two
@@ -997,7 +1020,7 @@ func TestTxnReadWithinUncertaintyIntervalAfterRangeMerge(t *testing.T) {
 		txn2 := roachpb.MakeTransaction("txn2", keyA, 1, now, maxOffset, instanceId)
 
 		// Simulate a read which will cause the observed time to be set to now
-		resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), roachpb.Header{Txn: &txn}, getArgs(keyA))
+		resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), kvpb.Header{Txn: &txn}, getArgs(keyA))
 		require.Nil(t, pErr)
 		// The client needs to update its transaction to the returned transaction which has observed timestamps in it
 		txn = *resp.Header().Txn
@@ -1023,8 +1046,8 @@ func TestTxnReadWithinUncertaintyIntervalAfterRangeMerge(t *testing.T) {
 
 		// Try and read the transaction from the context of a new transaction. This
 		// will fail as expected as the observed timestamp will not be set.
-		_, pErr = kv.SendWrappedWith(ctx, tc.Servers[0].DistSender(), roachpb.Header{Txn: &txn2}, getArgs(keyC))
-		require.IsType(t, &roachpb.ReadWithinUncertaintyIntervalError{}, pErr.GetDetail())
+		_, pErr = kv.SendWrappedWith(ctx, tc.Servers[0].DistSender(), kvpb.Header{Txn: &txn2}, getArgs(keyC))
+		require.IsType(t, &kvpb.ReadWithinUncertaintyIntervalError{}, pErr.GetDetail())
 
 		// Try and read the key from the existing transaction. This should fail the
 		// same way.
@@ -1033,8 +1056,8 @@ func TestTxnReadWithinUncertaintyIntervalAfterRangeMerge(t *testing.T) {
 		// - Other error (Bad) - We expect an uncertainty error so the client can choose a new timestamp and retry.
 		// - Not found (Bad) - Error because the data was written before us.
 		// - Found (Bad) - The write HLC timestamp is after our timestamp.
-		_, pErr = kv.SendWrappedWith(ctx, tc.Servers[0].DistSender(), roachpb.Header{Txn: &txn}, getArgs(keyC))
-		require.IsType(t, &roachpb.ReadWithinUncertaintyIntervalError{}, pErr.GetDetail())
+		_, pErr = kv.SendWrappedWith(ctx, tc.Servers[0].DistSender(), kvpb.Header{Txn: &txn}, getArgs(keyC))
+		require.IsType(t, &kvpb.ReadWithinUncertaintyIntervalError{}, pErr.GetDetail())
 	}
 
 	testutils.RunTrueAndFalse(t, "alignLeaseholders", func(t *testing.T, alignLeaseholders bool) {
@@ -1068,7 +1091,7 @@ func TestNonTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 	type nonTxnGetKey struct{}
 	nonTxnOrigTsC := make(chan hlc.Timestamp, 1)
 	nonTxnBlockerC := make(chan struct{})
-	requestFilter := func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	requestFilter := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if ctx.Value(nonTxnGetKey{}) != nil {
 			// Give the test the server-assigned timestamp.
 			require.NotNil(t, ba.TimestampFromServerClock)
@@ -1083,9 +1106,9 @@ func TestNonTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 		return nil
 	}
 	var uncertaintyErrs int32
-	concurrencyRetryFilter := func(ctx context.Context, _ roachpb.BatchRequest, pErr *roachpb.Error) {
+	concurrencyRetryFilter := func(ctx context.Context, _ *kvpb.BatchRequest, pErr *kvpb.Error) {
 		if ctx.Value(nonTxnGetKey{}) != nil {
-			if _, ok := pErr.GetDetail().(*roachpb.ReadWithinUncertaintyIntervalError); ok {
+			if _, ok := pErr.GetDetail().(*kvpb.ReadWithinUncertaintyIntervalError); ok {
 				atomic.AddInt32(&uncertaintyErrs, 1)
 			}
 		}
@@ -1139,13 +1162,13 @@ func TestNonTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 	// consulted the lease. We'll transfer the lease to node 2 before the request
 	// checks, so that it ends up evaluating on node 2.
 	type resp struct {
-		*roachpb.BatchResponse
-		*roachpb.Error
+		*kvpb.BatchResponse
+		*kvpb.Error
 	}
 	nonTxnRespC := make(chan resp, 1)
 	_ = tc.Stopper().RunAsyncTask(ctx, "non-txn get", func(ctx context.Context) {
 		ctx = context.WithValue(ctx, nonTxnGetKey{}, "foo")
-		ba := roachpb.BatchRequest{}
+		ba := &kvpb.BatchRequest{}
 		ba.RangeID = desc.RangeID
 		ba.Add(getArgs(key))
 		br, pErr := tc.GetFirstStoreFromServer(t, 1).Send(ctx, ba)
@@ -1180,7 +1203,7 @@ func TestNonTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 	// possible that we could avoid flakiness. For now, we just re-order the
 	// operations and assert that we observe an uncertainty error even though its
 	// absence would not be a true stale read.
-	ba := roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.Add(putArgs(key, []byte("val")))
 	br, pErr := tc.Servers[0].DistSender().Send(ctx, ba)
 	require.Nil(t, pErr)
@@ -1240,7 +1263,7 @@ func TestRangeLookupUseReverse(t *testing.T) {
 
 	// Init test ranges:
 	// ["","a"), ["a","c"), ["c","e"), ["e","g") and ["g","\xff\xff").
-	splits := []*roachpb.AdminSplitRequest{
+	splits := []*kvpb.AdminSplitRequest{
 		adminSplitArgs(roachpb.Key("g")),
 		adminSplitArgs(roachpb.Key("e")),
 		adminSplitArgs(roachpb.Key("c")),
@@ -1260,8 +1283,8 @@ func TestRangeLookupUseReverse(t *testing.T) {
 	}
 
 	// Resolve the intents.
-	scanArgs := roachpb.ScanRequest{
-		RequestHeader: roachpb.RequestHeader{
+	scanArgs := kvpb.ScanRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    keys.RangeMetaKey(roachpb.RKeyMin.Next()).AsRawKey(),
 			EndKey: keys.RangeMetaKey(roachpb.RKeyMax).AsRawKey(),
 		},
@@ -1339,7 +1362,7 @@ func TestRangeLookupUseReverse(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(fmt.Sprintf("key=%s", test.key), func(t *testing.T) {
 			rs, preRs, err := kv.RangeLookup(context.Background(), store.TestSender(),
-				test.key.AsRawKey(), roachpb.READ_UNCOMMITTED, test.maxResults-1, true /* prefetchReverse */)
+				test.key.AsRawKey(), kvpb.READ_UNCOMMITTED, test.maxResults-1, true /* prefetchReverse */)
 			if err != nil {
 				t.Fatalf("LookupRange error: %+v", err)
 			}
@@ -1372,7 +1395,8 @@ type leaseTransferTest struct {
 	replica0Desc, replica1Desc roachpb.ReplicaDescriptor
 	leftKey                    roachpb.Key
 	filterMu                   syncutil.Mutex
-	filter                     func(filterArgs kvserverbase.FilterArgs) *roachpb.Error
+	evalFilter                 kvserverbase.ReplicaCommandFilter
+	propFilter                 kvserverbase.ReplicaProposalFilter
 	waitForTransferBlocked     atomic.Value
 	transferBlocked            chan struct{}
 	manualClock                *hlc.HybridManualClock
@@ -1384,12 +1408,22 @@ func setupLeaseTransferTest(t *testing.T) *leaseTransferTest {
 		manualClock: hlc.NewHybridManualClock(),
 	}
 
-	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
+	testingEvalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
 		l.filterMu.Lock()
-		filterCopy := l.filter
+		filterCopy := l.evalFilter
 		l.filterMu.Unlock()
 		if filterCopy != nil {
-			return filterCopy(filterArgs)
+			return filterCopy(args)
+		}
+		return nil
+	}
+
+	testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+		l.filterMu.Lock()
+		filterCopy := l.propFilter
+		l.filterMu.Unlock()
+		if filterCopy != nil {
+			return filterCopy(args)
 		}
 		return nil
 	}
@@ -1413,6 +1447,7 @@ func setupLeaseTransferTest(t *testing.T) *leaseTransferTest {
 						EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 							TestingEvalFilter: testingEvalFilter,
 						},
+						TestingProposalFilter:                testingProposalFilter,
 						LeaseTransferBlockedOnExtensionEvent: leaseTransferBlockedOnExtensionEvent,
 					},
 					Server: &server.TestingKnobs{
@@ -1450,16 +1485,16 @@ func setupLeaseTransferTest(t *testing.T) *leaseTransferTest {
 	return l
 }
 
-func (l *leaseTransferTest) sendRead(t *testing.T, storeIdx int) *roachpb.Error {
+func (l *leaseTransferTest) sendRead(t *testing.T, storeIdx int) *kvpb.Error {
 	desc := l.tc.GetFirstStoreFromServer(t, storeIdx).LookupReplica(keys.MustAddr(l.leftKey))
 	replicaDesc, err := desc.GetReplicaDescriptor()
 	if err != nil {
-		return roachpb.NewError(err)
+		return kvpb.NewError(err)
 	}
 	_, pErr := kv.SendWrappedWith(
 		context.Background(),
 		l.tc.GetFirstStoreFromServer(t, storeIdx).TestSender(),
-		roachpb.Header{RangeID: desc.RangeID, Replica: replicaDesc},
+		kvpb.Header{RangeID: desc.RangeID, Replica: replicaDesc},
 		getArgs(l.leftKey),
 	)
 	if pErr != nil {
@@ -1487,14 +1522,14 @@ func (l *leaseTransferTest) setFilter(setTo bool, extensionSem chan struct{}) {
 	l.filterMu.Lock()
 	defer l.filterMu.Unlock()
 	if !setTo {
-		l.filter = nil
+		l.evalFilter = nil
 		return
 	}
-	l.filter = func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
+	l.evalFilter = func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
 		if filterArgs.Sid != l.tc.Target(1).StoreID {
 			return nil
 		}
-		llReq, ok := filterArgs.Req.(*roachpb.RequestLeaseRequest)
+		llReq, ok := filterArgs.Req.(*kvpb.RequestLeaseRequest)
 		if !ok {
 			return nil
 		}
@@ -1502,7 +1537,7 @@ func (l *leaseTransferTest) setFilter(setTo bool, extensionSem chan struct{}) {
 			// Notify the main thread that the extension is in progress and wait for
 			// the signal to proceed.
 			l.filterMu.Lock()
-			l.filter = nil
+			l.evalFilter = nil
 			l.filterMu.Unlock()
 			extensionSem <- struct{}{}
 			log.Infof(filterArgs.Ctx, "filter blocking request: %s", llReq)
@@ -1519,15 +1554,16 @@ func (l *leaseTransferTest) setFilter(setTo bool, extensionSem chan struct{}) {
 func (l *leaseTransferTest) forceLeaseExtension(
 	t *testing.T, storeIdx int, lease roachpb.Lease,
 ) error {
-	// Set the clock close to the lease's expiration.
-	l.manualClock.Increment(lease.Expiration.WallTime - l.manualClock.UnixNano() - 10)
+	// Set the clock far enough forward to cause a lease extension, but not far
+	// enough to make the node appear unhealthy.
+	l.manualClock.Increment((lease.Expiration.WallTime - l.manualClock.UnixNano()) / 2)
 	err := l.sendRead(t, storeIdx).GoError()
 	// We can sometimes receive an error from our renewal attempt because the
 	// lease transfer ends up causing the renewal to re-propose and second
 	// attempt fails because it's already been renewed. This used to work
 	// before we compared the proposer's lease with the actual lease because
 	// the renewed lease still encompassed the previous request.
-	if errors.HasType(err, (*roachpb.NotLeaseHolderError)(nil)) {
+	if errors.HasType(err, (*kvpb.NotLeaseHolderError)(nil)) {
 		err = nil
 	}
 	return err
@@ -1589,7 +1625,7 @@ func TestLeaseExpirationBasedRangeTransfer(t *testing.T) {
 	origLease, _ := l.replica0.GetLease()
 	{
 		// Transferring the lease to ourself should be a no-op.
-		if err := l.replica0.AdminTransferLease(ctx, l.replica0Desc.StoreID); err != nil {
+		if err := l.replica0.AdminTransferLease(ctx, l.replica0Desc.StoreID, false /* bypassSafetyChecks */); err != nil {
 			t.Fatal(err)
 		}
 		newLease, _ := l.replica0.GetLease()
@@ -1601,20 +1637,20 @@ func TestLeaseExpirationBasedRangeTransfer(t *testing.T) {
 	{
 		// An invalid target should result in an error.
 		const expected = "unable to find store .* in range"
-		if err := l.replica0.AdminTransferLease(ctx, 1000); !testutils.IsError(err, expected) {
+		if err := l.replica0.AdminTransferLease(ctx, 1000, false /* bypassSafetyChecks */); !testutils.IsError(err, expected) {
 			t.Fatalf("expected %s, but found %v", expected, err)
 		}
 	}
 
-	if err := l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID); err != nil {
+	if err := l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID, false /* bypassSafetyChecks */); err != nil {
 		t.Fatal(err)
 	}
 
 	// Check that replica0 doesn't serve reads any more.
 	pErr := l.sendRead(t, 0)
-	nlhe, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError)
+	nlhe, ok := pErr.GetDetail().(*kvpb.NotLeaseHolderError)
 	if !ok {
-		t.Fatalf("expected %T, got %s", &roachpb.NotLeaseHolderError{}, pErr)
+		t.Fatalf("expected %T, got %s", &kvpb.NotLeaseHolderError{}, pErr)
 	}
 	if !nlhe.Lease.Replica.Equal(&l.replica1Desc) {
 		t.Fatalf("expected lease holder %+v, got %+v",
@@ -1651,7 +1687,7 @@ func TestLeaseExpirationBasedRangeTransferWithExtension(t *testing.T) {
 	l := setupLeaseTransferTest(t)
 	defer l.tc.Stopper().Stop(ctx)
 	// Ensure that replica1 has the lease.
-	if err := l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID); err != nil {
+	if err := l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID, false /* bypassSafetyChecks */); err != nil {
 		t.Fatal(err)
 	}
 	l.checkHasLease(t, 1)
@@ -1673,9 +1709,9 @@ func TestLeaseExpirationBasedRangeTransferWithExtension(t *testing.T) {
 	transferErrCh := make(chan error)
 	go func() {
 		// Transfer back from replica1 to replica0.
-		err := l.replica1.AdminTransferLease(context.Background(), l.replica0Desc.StoreID)
+		err := l.replica1.AdminTransferLease(context.Background(), l.replica0Desc.StoreID, false /* bypassSafetyChecks */)
 		// Ignore not leaseholder errors which can arise due to re-proposals.
-		if errors.HasType(err, (*roachpb.NotLeaseHolderError)(nil)) {
+		if errors.HasType(err, (*kvpb.NotLeaseHolderError)(nil)) {
 			err = nil
 		}
 		transferErrCh <- err
@@ -1712,9 +1748,9 @@ func TestLeaseExpirationBasedDrainTransfer(t *testing.T) {
 
 	// Check that replica0 doesn't serve reads any more.
 	pErr := l.sendRead(t, 0)
-	nlhe, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError)
+	nlhe, ok := pErr.GetDetail().(*kvpb.NotLeaseHolderError)
 	if !ok {
-		t.Fatalf("expected %T, got %s", &roachpb.NotLeaseHolderError{}, pErr)
+		t.Fatalf("expected %T, got %s", &kvpb.NotLeaseHolderError{}, pErr)
 	}
 	if nlhe.Lease.Empty() || !nlhe.Lease.Replica.Equal(&l.replica1Desc) {
 		t.Fatalf("expected lease holder %+v, got %+v",
@@ -1738,7 +1774,7 @@ func TestLeaseExpirationBasedDrainTransferWithExtension(t *testing.T) {
 	l := setupLeaseTransferTest(t)
 	defer l.tc.Stopper().Stop(ctx)
 	// Ensure that replica1 has the lease.
-	if err := l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID); err != nil {
+	if err := l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID, false /* bypassSafetyChecks */); err != nil {
 		t.Fatal(err)
 	}
 	l.checkHasLease(t, 1)
@@ -1774,6 +1810,74 @@ func TestLeaseExpirationBasedDrainTransferWithExtension(t *testing.T) {
 	}
 }
 
+// TestLeaseExpirationBasedDrainTransferWithProscribed verifies that a draining
+// store reacquires proscribed leases for ranges before transferring those
+// leases away.
+func TestLeaseExpirationBasedDrainTransferWithProscribed(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	l := setupLeaseTransferTest(t)
+	defer l.tc.Stopper().Stop(ctx)
+	// Ensure that replica1 has the lease.
+	if err := l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID, false /* bypassSafetyChecks */); err != nil {
+		t.Fatal(err)
+	}
+	l.checkHasLease(t, 1)
+
+	var failedOnce sync.Once
+	failedCh := make(chan struct{})
+	failLeaseTransfers := func(fail bool) {
+		l.filterMu.Lock()
+		defer l.filterMu.Unlock()
+		if !fail {
+			l.propFilter = nil
+			return
+		}
+		l.propFilter = func(filterArgs kvserverbase.ProposalFilterArgs) *kvpb.Error {
+			if filterArgs.Req.IsSingleTransferLeaseRequest() {
+				target := filterArgs.Req.Requests[0].GetTransferLease().Lease.Replica
+				if target == l.replica0Desc {
+					failedOnce.Do(func() { close(failedCh) })
+					return kvpb.NewError(kvserver.NewLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(
+						target, raftutil.ReplicaStateProbe))
+				}
+			}
+			return nil
+		}
+	}
+
+	// Fail lease transfers on the target range after the previous lease has been
+	// revoked (after evaluation, during raft proposal). In doing so, we leave the
+	// range with a PROSCRIBED lease.
+	failLeaseTransfers(true /* fail */)
+
+	// Drain node 1.
+	drainedCh := make(chan struct{})
+	go func() {
+		l.tc.GetFirstStoreFromServer(t, 1).SetDraining(true, nil /* reporter */, false /* verbose */)
+		close(drainedCh)
+	}()
+
+	// Wait until the lease transfer has failed at least once.
+	<-failedCh
+
+	// The drain should be unable to succeed.
+	select {
+	case <-drainedCh:
+		t.Fatalf("drain unexpectedly succeeded")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	// Stop failing lease transfers.
+	failLeaseTransfers(false /* fail */)
+
+	// The drain should succeed.
+	<-drainedCh
+	l.checkHasLease(t, 0)
+}
+
 // TestLeaseExpirationBelowFutureTimeRequest tests two cases where a
 // request is sent to a range with a future-time timestamp that is past
 // the current expiration time of the range's lease. In the first case,
@@ -1791,7 +1895,7 @@ func TestLeaseExpirationBelowFutureTimeRequest(t *testing.T) {
 
 		// Ensure that replica1 has the lease, and that replica0 has also picked up
 		// on the lease transfer.
-		require.NoError(t, l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID))
+		require.NoError(t, l.replica0.AdminTransferLease(ctx, l.replica1Desc.StoreID, false /* bypassSafetyChecks */))
 		l.checkHasLease(t, 1)
 		preLease, _ := l.replica1.GetLease()
 		require.Eventually(t, func() bool {
@@ -1822,7 +1926,7 @@ func TestLeaseExpirationBelowFutureTimeRequest(t *testing.T) {
 
 		// Issue a get with the request timestamp.
 		args := getArgs(l.leftKey)
-		_, pErr := kv.SendWrappedWith(ctx, l.tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
+		_, pErr := kv.SendWrappedWith(ctx, l.tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
 			RangeID: l.replica0.RangeID, Replica: l.replica1Desc, Timestamp: reqTime,
 		}, args)
 
@@ -1929,7 +2033,7 @@ func TestRangeLocalUncertaintyLimitAfterNewLease(t *testing.T) {
 	// leaseholder. If the max timestamp were not being properly limited,
 	// we would end up incorrectly reading nothing for keyA. Instead we
 	// expect to see an uncertainty interval error.
-	h := roachpb.Header{Txn: &txn}
+	h := kvpb.Header{Txn: &txn}
 	if _, pErr := kv.SendWrappedWith(
 		ctx, tc.Servers[0].DistSender(), h, getArgs(keyA),
 	); !testutils.IsPError(pErr, "uncertainty") {
@@ -1944,8 +2048,8 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	var injectLeaseTransferError atomic.Value
-	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-		if args, ok := filterArgs.Req.(*roachpb.TransferLeaseRequest); ok {
+	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+		if args, ok := filterArgs.Req.(*kvpb.TransferLeaseRequest); ok {
 			if val := injectLeaseTransferError.Load(); val != nil && val.(bool) {
 				// Note that we can't just return an error here as we only
 				// end up counting failures in the metrics if the command
@@ -1956,11 +2060,14 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 		return nil
 	}
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 	manualClock := hlc.NewHybridManualClock()
 	tc := testcluster.StartTestCluster(t, 2,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings: st,
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
 						EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
@@ -2007,8 +2114,11 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 	if a, e := metrics.LeaseTransferSuccessCount.Count(), int64(1); a != e {
 		t.Errorf("expected %d lease transfer successes; got %d", e, a)
 	}
-	if a, e := metrics.LeaseTransferErrorCount.Count(), int64(1); a != e {
-		t.Errorf("expected %d lease transfer errors; got %d", e, a)
+	// We mostly expect precisely one error, but there's a retry loop in
+	// `AdminTransferLease` that prevents transfers to followers who might need a
+	// snapshot. This can sometimes lead to additional errors being reported.
+	if a := metrics.LeaseTransferErrorCount.Count(); a == 0 {
+		t.Errorf("expected at least one lease transfer errors; got %d", a)
 	}
 
 	// Expire current leases and put a key to the epoch based scratch range to
@@ -2024,7 +2134,7 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 		var expirationLeases int64
 		var epochLeases int64
 		for i := range tc.Servers {
-			if err := tc.GetFirstStoreFromServer(t, i).ComputeMetrics(context.Background(), 0); err != nil {
+			if err := tc.GetFirstStoreFromServer(t, i).ComputeMetrics(context.Background()); err != nil {
 				return err
 			}
 			metrics = tc.GetFirstStoreFromServer(t, i).Metrics()
@@ -2069,7 +2179,7 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 						StickyEngineRegistry: stickyEngineRegistry,
 					},
 					Store: &kvserver.StoreTestingKnobs{
-						LeaseRequestEvent: func(ts hlc.Timestamp, _ roachpb.StoreID, _ roachpb.RangeID) *roachpb.Error {
+						LeaseRequestEvent: func(ts hlc.Timestamp, _ roachpb.StoreID, _ roachpb.RangeID) *kvpb.Error {
 							val := leaseAcquisitionTrap.Load()
 							if val == nil {
 								return nil
@@ -2142,7 +2252,7 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	readBlocked := make(chan struct{})
-	cmdFilter := func(fArgs kvserverbase.FilterArgs) *roachpb.Error {
+	cmdFilter := func(fArgs kvserverbase.FilterArgs) *kvpb.Error {
 		if fArgs.Hdr.UserPriority == 42 {
 			// Signal that the read is blocked.
 			readBlocked <- struct{}{}
@@ -2173,13 +2283,13 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 	key := roachpb.Key("a")
 	errChan := make(chan error)
 	go func() {
-		getReq := roachpb.GetRequest{
-			RequestHeader: roachpb.RequestHeader{
+		getReq := kvpb.GetRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key: key,
 			},
 		}
 		if _, pErr := kv.SendWrappedWith(ctx, s.DB().NonTransactionalSender(),
-			roachpb.Header{UserPriority: 42},
+			kvpb.Header{UserPriority: 42},
 			&getReq); pErr != nil {
 			errChan <- pErr.GoError()
 		}
@@ -2203,14 +2313,16 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 			t.Fatalf("replica descriptor for key %s not found", rKey)
 		}
 
-		leaseReq := roachpb.RequestLeaseRequest{
-			RequestHeader: roachpb.RequestHeader{
+		now := s.Clock().NowAsClockTimestamp()
+		leaseReq := kvpb.RequestLeaseRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key: key,
 			},
 			Lease: roachpb.Lease{
-				Start:      s.Clock().NowAsClockTimestamp(),
-				Expiration: s.Clock().Now().Add(time.Second.Nanoseconds(), 0).Clone(),
+				Start:      now,
+				Expiration: now.ToTimestamp().Add(time.Second.Nanoseconds(), 0).Clone(),
 				Replica:    replDesc,
+				ProposedTS: &now,
 			},
 		}
 
@@ -2222,11 +2334,11 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 			leaseReq.PrevLease = leaseInfo.CurrentOrProspective()
 
 			_, pErr := kv.SendWrapped(ctx, s.DB().NonTransactionalSender(), &leaseReq)
-			if _, ok := pErr.GetDetail().(*roachpb.AmbiguousResultError); ok {
+			if _, ok := pErr.GetDetail().(*kvpb.AmbiguousResultError); ok {
 				log.Infof(ctx, "retrying lease after %s", pErr)
 				continue
 			}
-			if _, ok := pErr.GetDetail().(*roachpb.LeaseRejectedError); ok {
+			if _, ok := pErr.GetDetail().(*kvpb.LeaseRejectedError); ok {
 				// Lease rejected? Try again. The extension should work because
 				// extending is idempotent (assuming the PrevLease matches).
 				log.Infof(ctx, "retrying lease after %s", pErr)
@@ -2258,20 +2370,20 @@ func validateLeaseholderSoon(
 
 func getLeaseInfoOrFatal(
 	t *testing.T, ctx context.Context, db *kv.DB, key roachpb.Key,
-) *roachpb.LeaseInfoResponse {
-	header := roachpb.Header{
+) *kvpb.LeaseInfoResponse {
+	header := kvpb.Header{
 		// INCONSISTENT read with a NEAREST routing policy, since we want to make
 		// sure that the node used to send this is the one that processes the
 		// command, regardless of whether it is the leaseholder.
-		ReadConsistency: roachpb.INCONSISTENT,
-		RoutingPolicy:   roachpb.RoutingPolicy_NEAREST,
+		ReadConsistency: kvpb.INCONSISTENT,
+		RoutingPolicy:   kvpb.RoutingPolicy_NEAREST,
 	}
-	leaseInfoReq := &roachpb.LeaseInfoRequest{RequestHeader: roachpb.RequestHeader{Key: key}}
+	leaseInfoReq := &kvpb.LeaseInfoRequest{RequestHeader: kvpb.RequestHeader{Key: key}}
 	reply, pErr := kv.SendWrappedWith(ctx, db.NonTransactionalSender(), header, leaseInfoReq)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
-	return reply.(*roachpb.LeaseInfoResponse)
+	return reply.(*kvpb.LeaseInfoResponse)
 }
 
 func TestRemoveLeaseholder(t *testing.T) {
@@ -2365,20 +2477,20 @@ func TestLeaseInfoRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaseInfoReq := &roachpb.LeaseInfoRequest{
-		RequestHeader: roachpb.RequestHeader{
+	leaseInfoReq := &kvpb.LeaseInfoRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: rangeDesc.StartKey.AsRawKey(),
 		},
 	}
 	reply, pErr := kv.SendWrappedWith(
-		context.Background(), s, roachpb.Header{
+		context.Background(), s, kvpb.Header{
 			RangeID:         rangeDesc.RangeID,
-			ReadConsistency: roachpb.INCONSISTENT,
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, leaseInfoReq)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
-	resp := *(reply.(*roachpb.LeaseInfoResponse))
+	resp := *(reply.(*kvpb.LeaseInfoResponse))
 
 	if !resp.Lease.Replica.Equal(replicas[2]) {
 		t.Fatalf("lease holder should be replica %s, but is: %s", replicas[2], resp.Lease.Replica)
@@ -2398,9 +2510,9 @@ func TestLeaseInfoRequest(t *testing.T) {
 func TestErrorHandlingForNonKVCommand(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	cmdFilter := func(fArgs kvserverbase.FilterArgs) *roachpb.Error {
+	cmdFilter := func(fArgs kvserverbase.FilterArgs) *kvpb.Error {
 		if fArgs.Hdr.UserPriority == 42 {
-			return roachpb.NewErrorf("injected error")
+			return kvpb.NewErrorf("injected error")
 		}
 		return nil
 	}
@@ -2419,15 +2531,15 @@ func TestErrorHandlingForNonKVCommand(t *testing.T) {
 
 	// Send the lease request.
 	key := roachpb.Key("a")
-	leaseReq := roachpb.LeaseInfoRequest{
-		RequestHeader: roachpb.RequestHeader{
+	leaseReq := kvpb.LeaseInfoRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: key,
 		},
 	}
 	_, pErr := kv.SendWrappedWith(
 		context.Background(),
 		s.DB().NonTransactionalSender(),
-		roachpb.Header{UserPriority: 42},
+		kvpb.Header{UserPriority: 42},
 		&leaseReq,
 	)
 	if !testutils.IsPError(pErr, "injected error") {
@@ -2484,16 +2596,16 @@ func TestRangeInfoAfterSplit(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ba := roachpb.BatchRequest{
-				Header: roachpb.Header{
+			ba := &kvpb.BatchRequest{
+				Header: kvpb.Header{
 					RangeID: tc.rangeID,
 					ClientRangeInfo: roachpb.ClientRangeInfo{
 						DescriptorGeneration: preSplitDesc.Generation,
 					},
 				},
 			}
-			gArgs := &roachpb.GetRequest{
-				RequestHeader: roachpb.RequestHeader{
+			gArgs := &kvpb.GetRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key: tc.key.AsRawKey(),
 				},
 			}
@@ -2533,7 +2645,7 @@ func TestDrainRangeRejection(t *testing.T) {
 
 	drainingIdx := 1
 	tc.GetFirstStoreFromServer(t, 1).SetDraining(true, nil /* reporter */, false /* verbose */)
-	chgs := roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(drainingIdx))
+	chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(drainingIdx))
 	if _, err := repl.ChangeReplicas(context.Background(), repl.Desc(), kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs); !testutils.IsError(err, "store is draining") {
 		t.Fatalf("unexpected error: %+v", err)
 	}
@@ -2553,7 +2665,7 @@ func TestChangeReplicasGeneration(t *testing.T) {
 	repl := tc.GetFirstStoreFromServer(t, 0).LookupReplica(roachpb.RKey(key))
 
 	oldGeneration := repl.Desc().Generation
-	chgs := roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1))
+	chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1))
 	if _, err := repl.ChangeReplicas(context.Background(), repl.Desc(), kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2576,6 +2688,8 @@ func TestChangeReplicasGeneration(t *testing.T) {
 func TestSystemZoneConfigs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.WithIssue(t, 98905)
 
 	// This test is relatively slow and resource intensive. When run under
 	// stressrace on a loaded machine (as in the nightly tests), sometimes the
@@ -2622,7 +2736,7 @@ func TestSystemZoneConfigs(t *testing.T) {
 	waitForReplicas := func() error {
 		replicas := make(map[roachpb.RangeID]roachpb.RangeDescriptor)
 		for _, s := range tc.Servers {
-			if err := kvserver.IterateRangeDescriptorsFromDisk(ctx, s.Engines()[0], func(desc roachpb.RangeDescriptor) error {
+			if err := kvstorage.IterateRangeDescriptorsFromDisk(ctx, s.Engines()[0], func(desc roachpb.RangeDescriptor) error {
 				if len(desc.Replicas().LearnerDescriptors()) > 0 {
 					return fmt.Errorf("descriptor contains learners: %v", desc)
 				}
@@ -2688,7 +2802,13 @@ func TestClearRange(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
+			// This makes sure that our writes are visible when we go
+			// straight to the engine to check them.
+			DisableCanAckBeforeApplication: true,
+		}},
+	})
 	s := serv.(*server.TestServer)
 	defer s.Stopper().Stop(ctx)
 	store, err := s.Stores().GetStore(s.GetFirstStoreID())
@@ -2696,8 +2816,8 @@ func TestClearRange(t *testing.T) {
 
 	clearRange := func(start, end roachpb.Key) {
 		t.Helper()
-		if _, err := kv.SendWrapped(ctx, store.DB().NonTransactionalSender(), &roachpb.ClearRangeRequest{
-			RequestHeader: roachpb.RequestHeader{
+		if _, err := kv.SendWrapped(ctx, store.DB().NonTransactionalSender(), &kvpb.ClearRangeRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    start,
 				EndKey: end,
 			},
@@ -2710,7 +2830,7 @@ func TestClearRange(t *testing.T) {
 		t.Helper()
 		start := prefix
 		end := prefix.PrefixEnd()
-		kvs, err := storage.Scan(store.Engine(), start, end, 0 /* maxRows */)
+		kvs, err := storage.Scan(store.TODOEngine(), start, end, 0 /* maxRows */)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2780,9 +2900,6 @@ func TestLeaseTransferInSnapshotUpdatesTimestampCache(t *testing.T) {
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
-					Store: &kvserver.StoreTestingKnobs{
-						AllowLeaseTransfersWhenTargetMayNeedSnapshot: true,
-					},
 					Server: &server.TestingKnobs{
 						WallClock: manualClock,
 					},
@@ -2825,7 +2942,7 @@ func TestLeaseTransferInSnapshotUpdatesTimestampCache(t *testing.T) {
 
 		// Read the key at readTS.
 		// NB: don't use SendWrapped because we want access to br.Timestamp.
-		var ba roachpb.BatchRequest
+		ba := &kvpb.BatchRequest{}
 		ba.Timestamp = readTS
 		ba.Add(getArgs(keyA))
 		br, pErr := tc.Servers[0].DistSender().Send(ctx, ba)
@@ -2872,7 +2989,11 @@ func TestLeaseTransferInSnapshotUpdatesTimestampCache(t *testing.T) {
 		// Finally, transfer the lease to node 2 while it is still unavailable and
 		// behind. We try to avoid this case when picking new leaseholders in practice,
 		// but we're never 100% successful.
-		tc.TransferRangeLeaseOrFatal(t, *repl0.Desc(), tc.Target(2))
+		// NOTE: we bypass safety checks because the target node is behind on its log,
+		// so the lease transfer would be rejected otherwise.
+		err = tc.Servers[0].DB().AdminTransferLeaseBypassingSafetyChecks(ctx,
+			repl0.Desc().StartKey.AsRawKey(), tc.Target(2).StoreID)
+		require.Nil(t, err)
 
 		// Remove the partition. A snapshot to node 2 should follow. This snapshot
 		// will inform node 2 that it is the new leaseholder for the range. Node 2
@@ -2886,7 +3007,7 @@ func TestLeaseTransferInSnapshotUpdatesTimestampCache(t *testing.T) {
 		// snapshot had an empty timestamp cache and would simply let us write
 		// under the previous read.
 		// NB: don't use SendWrapped because we want access to br.Timestamp.
-		ba = roachpb.BatchRequest{}
+		ba = &kvpb.BatchRequest{}
 		ba.Timestamp = readTS
 		ba.Add(incrementArgs(keyA, 1))
 		br, pErr = tc.Servers[0].DistSender().Send(ctx, ba)
@@ -2925,7 +3046,7 @@ func TestLeaseTransferRejectedIfTargetNeedsSnapshot(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						TestingRequestFilter: func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+						TestingRequestFilter: func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 							if rejectAfterRevoke && ba.IsSingleTransferLeaseRequest() {
 								transferLeaseReqBlockOnce.Do(func() {
 									close(transferLeaseReqBlockedC)
@@ -3049,11 +3170,14 @@ func TestLeaseTransferRejectedIfTargetNeedsSnapshot(t *testing.T) {
 		// the lease transfer rejection came after the previous lease was revoked,
 		// then node 0 must have re-acquired the lease (with a new sequence number)
 		// in order to transfer it to node 2.
+		// NB: we use LessOrEqual and not Equal to avoid flakiness if the lease is
+		// lost and reacquired multiple times. This assertion is not the focus of
+		// the test.
 		expSeq := preLease.Sequence + 1
 		if rejectAfterRevoke {
 			expSeq++
 		}
-		require.Equal(t, expSeq, postLease.Sequence)
+		require.LessOrEqual(t, expSeq, postLease.Sequence)
 	})
 }
 
@@ -3094,12 +3218,12 @@ func TestConcurrentAdminChangeReplicasRequests(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		res1, err1 = db.AdminChangeReplicas(
-			ctx, key, expects1, roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, targets1...))
+			ctx, key, expects1, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, targets1...))
 		wg.Done()
 	}()
 	go func() {
 		res2, err2 = db.AdminChangeReplicas(
-			ctx, key, expects2, roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, targets2...))
+			ctx, key, expects2, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, targets2...))
 		wg.Done()
 	}()
 	wg.Wait()
@@ -3182,7 +3306,7 @@ func TestRandomConcurrentAdminChangeReplicasRequests(t *testing.T) {
 		if rand.Intn(2) == 0 {
 			op = roachpb.ADD_NON_VOTER
 		}
-		_, err := db.AdminChangeReplicas(ctx, key, rangeInfo.Desc, roachpb.MakeReplicationChanges(op, pickTargets()...))
+		_, err := db.AdminChangeReplicas(ctx, key, rangeInfo.Desc, kvpb.MakeReplicationChanges(op, pickTargets()...))
 		return err
 	}
 	wg.Add(actors)
@@ -3281,7 +3405,7 @@ func TestReplicaTombstone(t *testing.T) {
 			unreliableRaftHandlerFuncs: funcs,
 		})
 		tc.RemoveVotersOrFatal(t, key, tc.Target(1))
-		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		tombstone := waitForTombstone(t, store.TODOEngine(), rangeID)
 		require.Equal(t, roachpb.ReplicaID(3), tombstone.NextReplicaID)
 	})
 	t.Run("(2) ReplicaTooOldError", func(t *testing.T) {
@@ -3292,10 +3416,8 @@ func TestReplicaTombstone(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				RaftConfig: base.RaftConfig{
 					// Make the tick interval short so we don't need to wait too long for
-					// the partitioned node to time out but increase the lease timeout
-					// so expiration-based leases still work.
-					RaftTickInterval:                        time.Millisecond,
-					RangeLeaseRaftElectionTimeoutMultiplier: 10000,
+					// the partitioned node to time out.
+					RaftTickInterval: time.Millisecond,
 				},
 				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 					DisableReplicaGCQueue: true,
@@ -3320,8 +3442,8 @@ func TestReplicaTombstone(t *testing.T) {
 		sawTooOld := make(chan struct{}, 1)
 		raftFuncs := noopRaftHandlerFuncs()
 		raftFuncs.dropResp = func(resp *kvserverpb.RaftMessageResponse) bool {
-			if pErr, ok := resp.Union.GetValue().(*roachpb.Error); ok {
-				if _, isTooOld := pErr.GetDetail().(*roachpb.ReplicaTooOldError); isTooOld {
+			if pErr, ok := resp.Union.GetValue().(*kvpb.Error); ok {
+				if _, isTooOld := pErr.GetDetail().(*kvpb.ReplicaTooOldError); isTooOld {
 					select {
 					case sawTooOld <- struct{}{}:
 					default:
@@ -3349,7 +3471,7 @@ func TestReplicaTombstone(t *testing.T) {
 		// Wait until we're sure that the replica has seen ReplicaTooOld,
 		// then go look for the tombstone.
 		<-sawTooOld
-		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		tombstone := waitForTombstone(t, store.TODOEngine(), rangeID)
 		require.Equal(t, roachpb.ReplicaID(4), tombstone.NextReplicaID)
 	})
 	t.Run("(3) ReplicaGCQueue", func(t *testing.T) {
@@ -3385,7 +3507,7 @@ func TestReplicaTombstone(t *testing.T) {
 		repl, err := store.GetReplica(desc.RangeID)
 		require.NoError(t, err)
 		require.NoError(t, store.ManualReplicaGC(repl))
-		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		tombstone := waitForTombstone(t, store.TODOEngine(), rangeID)
 		require.Equal(t, roachpb.ReplicaID(4), tombstone.NextReplicaID)
 	})
 	// This case also detects the tombstone for nodes which processed the merge.
@@ -3432,11 +3554,11 @@ func TestReplicaTombstone(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, store.ManualReplicaGC(repl))
 		// Verify the tombstone generated from replica GC of a merged range.
-		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		tombstone := waitForTombstone(t, store.TODOEngine(), rangeID)
 		require.Equal(t, roachpb.ReplicaID(math.MaxInt32), tombstone.NextReplicaID)
 		// Verify the tombstone generated from processing a merge trigger.
 		store3, _ := getFirstStoreReplica(t, tc.Server(0), key)
-		tombstone = waitForTombstone(t, store3.Engine(), rangeID)
+		tombstone = waitForTombstone(t, store3.TODOEngine(), rangeID)
 		require.Equal(t, roachpb.ReplicaID(math.MaxInt32), tombstone.NextReplicaID)
 	})
 	t.Run("(4) (4.1) raft messages to newer replicaID ", func(t *testing.T) {
@@ -3447,10 +3569,8 @@ func TestReplicaTombstone(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				RaftConfig: base.RaftConfig{
 					// Make the tick interval short so we don't need to wait too long
-					// for a heartbeat to be sent. Increase the election timeout so
-					// expiration based leases still work.
-					RaftTickInterval:                        time.Millisecond,
-					RangeLeaseRaftElectionTimeoutMultiplier: 10000,
+					// for a heartbeat to be sent.
+					RaftTickInterval: time.Millisecond,
 				},
 				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 					DisableReplicaGCQueue: true,
@@ -3529,10 +3649,10 @@ func TestReplicaTombstone(t *testing.T) {
 		// Don't use tc.AddVoter; this would retry internally as we're faking
 		// a snapshot error here (and these are all considered retriable).
 		_, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, key, tc.LookupRangeOrFatal(t, key), roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(2)),
+			ctx, key, tc.LookupRangeOrFatal(t, key), kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(2)),
 		)
 		require.Regexp(t, "boom", err)
-		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		tombstone := waitForTombstone(t, store.TODOEngine(), rangeID)
 		require.Equal(t, roachpb.ReplicaID(4), tombstone.NextReplicaID)
 		// Try adding it again and again block the snapshot until a heartbeat
 		// at a higher ID has been sent. This is case (4.1) where a raft message
@@ -3547,12 +3667,12 @@ func TestReplicaTombstone(t *testing.T) {
 		// also should be rare. Note this is not new with learner replicas.
 		setMinHeartbeat(5)
 		_, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, key, tc.LookupRangeOrFatal(t, key), roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(2)),
+			ctx, key, tc.LookupRangeOrFatal(t, key), kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(2)),
 		)
 		require.Regexp(t, "boom", err)
 		// We will start out reading the old tombstone so keep retrying.
 		testutils.SucceedsSoon(t, func() error {
-			tombstone = waitForTombstone(t, store.Engine(), rangeID)
+			tombstone = waitForTombstone(t, store.TODOEngine(), rangeID)
 			if tombstone.NextReplicaID != 5 {
 				return errors.Errorf("read tombstone with NextReplicaID %d, want %d",
 					tombstone.NextReplicaID, 5)
@@ -3566,7 +3686,7 @@ func TestReplicaTombstone(t *testing.T) {
 
 		ctx := context.Background()
 		var proposalFilter atomic.Value
-		noopProposalFilter := func(kvserverbase.ProposalFilterArgs) *roachpb.Error {
+		noopProposalFilter := func(kvserverbase.ProposalFilterArgs) *kvpb.Error {
 			return nil
 		}
 		proposalFilter.Store(noopProposalFilter)
@@ -3574,9 +3694,9 @@ func TestReplicaTombstone(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 					DisableReplicaGCQueue: true,
-					TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+					TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 						return proposalFilter.
-							Load().(func(kvserverbase.ProposalFilterArgs) *roachpb.Error)(args)
+							Load().(func(kvserverbase.ProposalFilterArgs) *kvpb.Error)(args)
 					},
 				}},
 			},
@@ -3615,7 +3735,7 @@ func TestReplicaTombstone(t *testing.T) {
 				unreliableRaftHandlerFuncs: raftFuncs,
 			},
 		})
-		proposalFilter.Store(func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+		proposalFilter.Store(func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 			merge := args.Cmd.ReplicatedEvalResult.Merge
 			if merge != nil && merge.LeftDesc.RangeID == lhsDesc.RangeID {
 				partActive.Store(true)
@@ -3639,7 +3759,7 @@ func TestReplicaTombstone(t *testing.T) {
 			}
 			tombstoneKey := keys.RangeTombstoneKey(rhsDesc.RangeID)
 			ok, err := storage.MVCCGetProto(
-				context.Background(), store.Engine(), tombstoneKey, hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
+				context.Background(), store.TODOEngine(), tombstoneKey, hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
 			)
 			require.NoError(t, err)
 			if !ok {
@@ -3669,9 +3789,9 @@ func TestAdminRelocateRangeSafety(t *testing.T) {
 	var useSeenAdd atomic.Value
 	useSeenAdd.Store(false)
 	seenAdd := make(chan struct{}, 1)
-	responseFilter := func(ctx context.Context, ba roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
+	responseFilter := func(ctx context.Context, ba *kvpb.BatchRequest, _ *kvpb.BatchResponse) *kvpb.Error {
 		if ba.IsSingleRequest() {
-			changeReplicas, ok := ba.Requests[0].GetInner().(*roachpb.AdminChangeReplicasRequest)
+			changeReplicas, ok := ba.Requests[0].GetInner().(*kvpb.AdminChangeReplicasRequest)
 			if ok && changeReplicas.Changes()[0].ChangeType == roachpb.ADD_VOTER && useSeenAdd.Load().(bool) {
 				seenAdd <- struct{}{}
 			}
@@ -3736,7 +3856,7 @@ func TestAdminRelocateRangeSafety(t *testing.T) {
 	var changedDesc *roachpb.RangeDescriptor // only populated if changeErr == nil
 	change := func() {
 		<-seenAdd
-		chgs := roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, makeReplicationTargets(2)...)
+		chgs := kvpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, makeReplicationTargets(2)...)
 		changedDesc, changeErr = r1.ChangeReplicas(ctx, &expDescAfterAdd, kvserverpb.SnapshotRequest_REBALANCE, "replicate", "testing", chgs)
 	}
 	relocate := func() {
@@ -3800,11 +3920,11 @@ func TestChangeReplicasLeaveAtomicRacesWithMerge(t *testing.T) {
 		var rangeToBlockRangeDescriptorRead atomic.Value
 		rangeToBlockRangeDescriptorRead.Store(roachpb.RangeID(0))
 		blockRangeDescriptorReadChan := make(chan struct{}, 1)
-		blockOnChangeReplicasRead := kvserverbase.ReplicaRequestFilter(func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
-			if req, isGet := ba.GetArg(roachpb.Get); !isGet ||
+		blockOnChangeReplicasRead := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+			if req, isGet := ba.GetArg(kvpb.Get); !isGet ||
 				ba.RangeID != rangeToBlockRangeDescriptorRead.Load().(roachpb.RangeID) ||
 				!ba.IsSingleRequest() ||
-				!bytes.HasSuffix(req.(*roachpb.GetRequest).Key,
+				!bytes.HasSuffix(req.(*kvpb.GetRequest).Key,
 					keys.LocalRangeDescriptorSuffix) {
 				return nil
 			}
@@ -3815,7 +3935,7 @@ func TestChangeReplicasLeaveAtomicRacesWithMerge(t *testing.T) {
 			default:
 			}
 			return nil
-		})
+		}
 		tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
@@ -3860,7 +3980,7 @@ func TestChangeReplicasLeaveAtomicRacesWithMerge(t *testing.T) {
 		// not yet support atomic replication changes.
 		db := tc.Servers[0].DB()
 		swapReplicas := func(key roachpb.Key, desc roachpb.RangeDescriptor, add, remove int) (*roachpb.RangeDescriptor, error) {
-			return db.AdminChangeReplicas(ctx, key, desc, []roachpb.ReplicationChange{
+			return db.AdminChangeReplicas(ctx, key, desc, []kvpb.ReplicationChange{
 				{ChangeType: roachpb.ADD_VOTER, Target: tc.Target(add)},
 				{ChangeType: roachpb.REMOVE_VOTER, Target: tc.Target(remove)},
 			})
@@ -3892,7 +4012,7 @@ func TestChangeReplicasLeaveAtomicRacesWithMerge(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_, err := db.AdminChangeReplicas(
-				ctx, rhs, *rhsDesc, roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(2)),
+				ctx, rhs, *rhsDesc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(2)),
 			)
 			// We'll ultimately fail because we're going to race with the work below.
 			msg := `descriptor changed:`
@@ -3973,12 +4093,12 @@ func TestTransferLeaseBlocksWrites(t *testing.T) {
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
-				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					if args.Req.RangeID != scratchRangeID.Load().(roachpb.RangeID) {
 						return nil
 					}
 					// Block increment requests on blockInc.
-					if _, isInc := args.Req.GetArg(roachpb.Increment); isInc {
+					if _, isInc := args.Req.GetArg(kvpb.Increment); isInc {
 						unblock := make(chan struct{})
 						blockInc <- unblock
 						<-unblock
@@ -4227,6 +4347,7 @@ func TestStrictGCEnforcement(t *testing.T) {
 				require.NoError(t, r.ReadProtectedTimestampsForTesting(ctx))
 			}
 		}
+		insqlDB = tc.Server(0).InternalDB().(isql.DB)
 	)
 
 	{
@@ -4244,6 +4365,11 @@ func TestStrictGCEnforcement(t *testing.T) {
 		// not be updated for the duration of the test.
 		protectedts.PollInterval.Override(ctx, &tc.Server(0).ClusterSettings().SV, 500*time.Hour)
 		defer protectedts.PollInterval.Override(ctx, &tc.Server(0).ClusterSettings().SV, 2*time.Minute)
+
+		// Disable follower reads. When metamorphically enabling expiration-based
+		// leases, an expired lease will cause a follower read which bypasses the
+		// strict GC enforcement.
+		sqlDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = false")
 
 		sqlDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10 ms'")
 		defer sqlDB.Exec(t, `SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = DEFAULT`)
@@ -4361,12 +4487,12 @@ func TestStrictGCEnforcement(t *testing.T) {
 		// Create a protected timestamp, and make sure it's not respected since the
 		// KVSubscriber is blocked.
 		rec := mkRecord()
-		require.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return ptp.Protect(ctx, txn, &rec)
+		require.NoError(t, insqlDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			return ptp.WithTxn(txn).Protect(ctx, &rec)
 		}))
 		defer func() {
-			require.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				return ptp.Release(ctx, txn, rec.ID.GetUUID())
+			require.NoError(t, insqlDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				return ptp.WithTxn(txn).Release(ctx, rec.ID.GetUUID())
 			}))
 		}()
 		assertScanRejected(t)
@@ -4400,15 +4526,15 @@ func TestProposalOverhead(t *testing.T) {
 	var overhead uint32
 	var key atomic.Value
 	key.Store(roachpb.Key{})
-	filter := func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+	filter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 		if len(args.Req.Requests) != 1 {
 			return nil
 		}
-		req, ok := args.Req.GetArg(roachpb.Put)
+		req, ok := args.Req.GetArg(kvpb.Put)
 		if !ok {
 			return nil
 		}
-		put := req.(*roachpb.PutRequest)
+		put := req.(*kvpb.PutRequest)
 		if !bytes.Equal(put.Key, key.Load().(roachpb.Key)) {
 			return nil
 		}
@@ -4493,25 +4619,11 @@ func TestDiscoverIntentAcrossLeaseTransferAwayAndBack(t *testing.T) {
 	var txn2ID atomic.Value
 	var txn2BBlockOnce sync.Once
 	txn2BlockedC := make(chan chan struct{})
-	postEvalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
-		if txn := args.Hdr.Txn; txn != nil && txn.ID == txn2ID.Load() {
-			txn2BBlockOnce.Do(func() {
-				if !errors.HasType(args.Err, (*roachpb.WriteIntentError)(nil)) {
-					t.Errorf("expected WriteIntentError; got %v", args.Err)
-				}
-
-				unblockCh := make(chan struct{})
-				txn2BlockedC <- unblockCh
-				<-unblockCh
-			})
-		}
-		return nil
-	}
 
 	// Detect when txn4 discovers txn3's intent and begins to push.
 	var txn4ID atomic.Value
 	txn4PushingC := make(chan struct{}, 1)
-	requestFilter := func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	requestFilter := func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if !ba.IsSinglePushTxnRequest() {
 			return nil
 		}
@@ -4527,10 +4639,20 @@ func TestDiscoverIntentAcrossLeaseTransferAwayAndBack(t *testing.T) {
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-					TestingPostEvalFilter: postEvalFilter,
-				},
 				TestingRequestFilter: requestFilter,
+				TestingConcurrencyRetryFilter: func(ctx context.Context, ba *kvpb.BatchRequest, pErr *kvpb.Error) {
+					if txn := ba.Txn; txn != nil && txn.ID == txn2ID.Load() {
+						txn2BBlockOnce.Do(func() {
+							if !errors.HasType(pErr.GoError(), (*kvpb.WriteIntentError)(nil)) {
+								t.Errorf("expected WriteIntentError; got %v", pErr)
+							}
+
+							unblockCh := make(chan struct{})
+							txn2BlockedC <- unblockCh
+							<-unblockCh
+						})
+					}
+				},
 				// Required by TestCluster.MoveRangeLeaseNonCooperatively.
 				AllowLeaseRequestProposalsWhenNotLeader: true,
 			},
@@ -4563,7 +4685,12 @@ func TestDiscoverIntentAcrossLeaseTransferAwayAndBack(t *testing.T) {
 		_, err := txn2.Get(ctx, key)
 		err2C <- err
 	}()
-	txn2UnblockC := <-txn2BlockedC
+	var txn2UnblockC chan struct{}
+	select {
+	case txn2UnblockC = <-txn2BlockedC:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for txn2 to block")
+	}
 
 	// Transfer the lease to Server 1. Do so non-cooperatively instead of using
 	// a lease transfer, because the cooperative lease transfer would get stuck
@@ -4620,8 +4747,8 @@ func getRangeInfo(
 ) (ri *roachpb.RangeInfo, err error) {
 	err = db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		b := txn.NewBatch()
-		b.AddRawRequest(&roachpb.RangeStatsRequest{
-			RequestHeader: roachpb.RequestHeader{Key: key},
+		b.AddRawRequest(&kvpb.RangeStatsRequest{
+			RequestHeader: kvpb.RequestHeader{Key: key},
 		})
 		if err = db.Run(ctx, b); err != nil {
 			return err
@@ -4662,13 +4789,8 @@ func TestTenantID(t *testing.T) {
 	// We also configure the settings to be as robust as possible to problems
 	// during stressrace as the setup of the rpc connections seems to somehow
 	// fail sometimes when using secure connections.
-	raftConfig := base.RaftConfig{
-		// Prevent failures under stressrace.
-		RangeLeaseRaftElectionTimeoutMultiplier: 10000,
-	}
 	stickySpecTestServerArgs := base.TestServerArgs{
-		RaftConfig: raftConfig,
-		Insecure:   true,
+		Insecure: true,
 		StoreSpecs: []base.StoreSpec{
 			{
 				InMemory:               true,
@@ -4687,7 +4809,7 @@ func TestTenantID(t *testing.T) {
 	})
 	defer tc.Stopper().Stop(ctx)
 
-	tenant2 := roachpb.MakeTenantID(2)
+	tenant2 := roachpb.MustMakeTenantID(2)
 	tenant2Prefix := keys.MakeTenantPrefix(tenant2)
 	t.Run("(1) initial set", func(t *testing.T) {
 		// Ensure that a normal range has the system tenant.
@@ -4709,8 +4831,7 @@ func TestTenantID(t *testing.T) {
 		sawSnapshot := make(chan struct{}, 1)
 		blockSnapshot := make(chan struct{})
 		tc.AddAndStartServer(t, base.TestServerArgs{
-			RaftConfig: raftConfig,
-			Insecure:   true,
+			Insecure: true,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					BeforeSnapshotSSTIngestion: func(
@@ -4834,7 +4955,7 @@ func TestUninitializedMetric(t *testing.T) {
 	targetStore := tc.GetFirstStoreFromServer(t, 1)
 
 	// Force the store to compute the replica metrics
-	require.NoError(t, targetStore.ComputeMetrics(ctx, 0))
+	require.NoError(t, targetStore.ComputeMetrics(ctx))
 
 	// Blocked snapshot on the second server (1) should realize 1 uninitialized replica.
 	require.Equal(t, int64(1), targetStore.Metrics().UninitializedCount.Value())
@@ -4844,7 +4965,7 @@ func TestUninitializedMetric(t *testing.T) {
 	require.NoError(t, <-addReplicaErr)
 
 	// Again force the store to compute metrics, increment tick counter 0 -> 1
-	require.NoError(t, targetStore.ComputeMetrics(ctx, 1))
+	require.NoError(t, targetStore.ComputeMetrics(ctx))
 
 	// There should now be no uninitialized replicas in the recorded metrics
 	require.Equal(t, int64(0), targetStore.Metrics().UninitializedCount.Value())
@@ -4894,7 +5015,7 @@ func TestRangeMigration(t *testing.T) {
 		}
 
 		sl := stateloader.Make(rangeID)
-		persistedV, err := sl.LoadVersion(ctx, store.Engine())
+		persistedV, err := sl.LoadVersion(ctx, store.TODOEngine())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -4913,7 +5034,7 @@ func TestRangeMigration(t *testing.T) {
 
 	kvDB := tc.Servers[0].DB()
 	req := migrateArgs(desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey(), endV)
-	if _, pErr := kv.SendWrappedWith(ctx, kvDB.GetFactory().NonTransactionalSender(), roachpb.Header{RangeID: desc.RangeID}, req); pErr != nil {
+	if _, pErr := kv.SendWrappedWith(ctx, kvDB.GetFactory().NonTransactionalSender(), kvpb.Header{RangeID: desc.RangeID}, req); pErr != nil {
 		t.Fatal(pErr)
 	}
 

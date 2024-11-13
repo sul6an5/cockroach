@@ -11,6 +11,7 @@
 package opgen
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -21,10 +22,36 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_BACKFILL_ONLY,
-				emit(func(this *scpb.SecondaryIndex) *scop.MakeAddedIndexBackfilling {
-					return &scop.MakeAddedIndexBackfilling{
+				emit(func(this *scpb.SecondaryIndex) *scop.MakeAbsentIndexBackfilling {
+					return &scop.MakeAbsentIndexBackfilling{
 						Index:            *protoutil.Clone(&this.Index).(*scpb.Index),
 						IsSecondaryIndex: true,
+					}
+				}),
+				emit(func(this *scpb.SecondaryIndex) *scop.MaybeAddSplitForIndex {
+					return &scop.MaybeAddSplitForIndex{
+						TableID: this.TableID,
+						IndexID: this.IndexID,
+					}
+				}),
+				emit(func(this *scpb.SecondaryIndex) *scop.SetAddedIndexPartialPredicate {
+					if this.EmbeddedExpr == nil {
+						return nil
+					}
+					return &scop.SetAddedIndexPartialPredicate{
+						TableID: this.TableID,
+						IndexID: this.IndexID,
+						Expr:    this.EmbeddedExpr.Expr,
+					}
+				}),
+				emit(func(this *scpb.SecondaryIndex) *scop.UpdateTableBackReferencesInTypes {
+					if this.EmbeddedExpr == nil ||
+						len(this.EmbeddedExpr.UsesTypeIDs) == 0 {
+						return nil
+					}
+					return &scop.UpdateTableBackReferencesInTypes{
+						TypeIDs:               this.EmbeddedExpr.UsesTypeIDs,
+						BackReferencedTableID: this.TableID,
 					}
 				}),
 			),
@@ -77,20 +104,23 @@ func init() {
 				}),
 			),
 			to(scpb.Status_VALIDATED,
-				emit(func(this *scpb.SecondaryIndex) *scop.ValidateUniqueIndex {
-					// TODO(ajwerner): Should this say something other than
-					// ValidateUniqueIndex for a non-unique index?
-					return &scop.ValidateUniqueIndex{
+				emit(func(this *scpb.SecondaryIndex) *scop.ValidateIndex {
+					return &scop.ValidateIndex{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
 					}
 				}),
 			),
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.SecondaryIndex) *scop.MakeAddedSecondaryIndexPublic {
-					return &scop.MakeAddedSecondaryIndexPublic{
+				emit(func(this *scpb.SecondaryIndex) *scop.MakeValidatedSecondaryIndexPublic {
+					return &scop.MakeValidatedSecondaryIndexPublic{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
+					}
+				}),
+				emit(func(this *scpb.SecondaryIndex) *scop.RefreshStats {
+					return &scop.RefreshStats{
+						TableID: this.TableID,
 					}
 				}),
 			),
@@ -98,9 +128,9 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_VALIDATED,
-				emit(func(this *scpb.SecondaryIndex) *scop.MakeDroppedNonPrimaryIndexDeleteAndWriteOnly {
+				emit(func(this *scpb.SecondaryIndex) *scop.MakePublicSecondaryIndexWriteOnly {
 					// Most of this logic is taken from MakeMutationComplete().
-					return &scop.MakeDroppedNonPrimaryIndexDeleteAndWriteOnly{
+					return &scop.MakePublicSecondaryIndexWriteOnly{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
 					}
@@ -112,25 +142,43 @@ func init() {
 			equiv(scpb.Status_MERGE_ONLY),
 			equiv(scpb.Status_MERGED),
 			to(scpb.Status_DELETE_ONLY,
-				emit(func(this *scpb.SecondaryIndex) *scop.MakeDroppedIndexDeleteOnly {
-					return &scop.MakeDroppedIndexDeleteOnly{
+				emit(func(this *scpb.SecondaryIndex) *scop.MakeWriteOnlyIndexDeleteOnly {
+					return &scop.MakeWriteOnlyIndexDeleteOnly{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
+					}
+				}),
+				emit(func(this *scpb.SecondaryIndex) *scop.RemoveDroppedIndexPartialPredicate {
+					if this.EmbeddedExpr == nil {
+						return nil
+					}
+					return &scop.RemoveDroppedIndexPartialPredicate{
+						TableID: this.TableID,
+						IndexID: this.IndexID,
+					}
+				}),
+				emit(func(this *scpb.SecondaryIndex) *scop.UpdateTableBackReferencesInTypes {
+					if this.EmbeddedExpr == nil || len(this.EmbeddedExpr.UsesTypeIDs) == 0 {
+						return nil
+					}
+					return &scop.UpdateTableBackReferencesInTypes{
+						TypeIDs:               this.EmbeddedExpr.UsesTypeIDs,
+						BackReferencedTableID: this.TableID,
 					}
 				}),
 			),
 			equiv(scpb.Status_BACKFILLED),
 			equiv(scpb.Status_BACKFILL_ONLY),
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.SecondaryIndex, md *targetsWithElementMap) *scop.LogEvent {
-					return newLogEventOp(this, md)
-				}),
-				emit(func(this *scpb.SecondaryIndex, md *targetsWithElementMap) *scop.CreateGcJobForIndex {
-					return &scop.CreateGcJobForIndex{
-						TableID:             this.TableID,
-						IndexID:             this.IndexID,
-						StatementForDropJob: statementForDropJob(this, md),
+				emit(func(this *scpb.SecondaryIndex, md *opGenContext) *scop.CreateGCJobForIndex {
+					if !md.ActiveVersion.IsActive(clusterversion.V23_1) {
+						return &scop.CreateGCJobForIndex{
+							TableID:             this.TableID,
+							IndexID:             this.IndexID,
+							StatementForDropJob: statementForDropJob(this, md),
+						}
 					}
+					return nil
 				}),
 				emit(func(this *scpb.SecondaryIndex) *scop.MakeIndexAbsent {
 					return &scop.MakeIndexAbsent{

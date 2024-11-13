@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import _ from "lodash";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import {
   FixLong,
@@ -61,6 +60,41 @@ export function aggregateNumericStats(
   };
 }
 
+export function aggregateLatencyInfo(
+  a: StatementStatistics,
+  b: StatementStatistics,
+): protos.cockroach.sql.ILatencyInfo {
+  const min =
+    a.latency_info?.min == 0 || a.latency_info?.min > b.latency_info?.min
+      ? b.latency_info?.min
+      : a.latency_info?.min;
+  const max =
+    a.latency_info?.max > b.latency_info?.max
+      ? a.latency_info?.max
+      : b.latency_info?.max;
+
+  let p50 = b.latency_info?.p50;
+  let p90 = b.latency_info?.p90;
+  let p99 = b.latency_info?.p99;
+  // Use the latest value we have that is not zero.
+  if (
+    b.last_exec_timestamp < a.last_exec_timestamp &&
+    b.latency_info?.p50 != 0
+  ) {
+    p50 = a.latency_info?.p50;
+    p90 = a.latency_info?.p90;
+    p99 = a.latency_info?.p99;
+  }
+
+  return {
+    min,
+    max,
+    p50,
+    p90,
+    p99,
+  };
+}
+
 export function coalesceSensitiveInfo(
   a: protos.cockroach.sql.ISensitiveInfo,
   b: protos.cockroach.sql.ISensitiveInfo,
@@ -81,7 +115,7 @@ export function addMaybeUnsetNumericStat(
   return a && b ? aggregateNumericStats(a, b, countA, countB) : null;
 }
 
-export function addExecStats(a: ExecStats, b: ExecStats): Required<ExecStats> {
+export function addExecStats(a: ExecStats, b: ExecStats): ExecStats {
   let countA = FixLong(a.count).toInt();
   const countB = FixLong(b.count).toInt();
   if (countA === 0 && countB === 0) {
@@ -121,6 +155,12 @@ export function addExecStats(a: ExecStats, b: ExecStats): Required<ExecStats> {
       countA,
       countB,
     ),
+    cpu_sql_nanos: addMaybeUnsetNumericStat(
+      a.cpu_sql_nanos,
+      b.cpu_sql_nanos,
+      countA,
+      countB,
+    ),
   };
 }
 
@@ -130,6 +170,16 @@ export function addStatementStats(
 ): Required<StatementStatistics> {
   const countA = FixLong(a.count).toInt();
   const countB = FixLong(b.count).toInt();
+
+  let regions: string[] = [];
+  if (a.regions && b.regions) {
+    regions = unique(a.regions.concat(b.regions));
+  } else if (a.regions) {
+    regions = a.regions;
+  } else if (b.regions) {
+    regions = b.regions;
+  }
+
   let planGists: string[] = [];
   if (a.plan_gists && b.plan_gists) {
     planGists = unique(a.plan_gists.concat(b.plan_gists));
@@ -148,6 +198,15 @@ export function addStatementStats(
     indexRec = b.index_recommendations;
   }
 
+  let indexes: string[] = [];
+  if (a.indexes && b.indexes) {
+    indexes = unique(a.indexes.concat(b.indexes));
+  } else if (a.indexes) {
+    indexes = a.indexes;
+  } else if (b.indexes) {
+    indexes = b.indexes;
+  }
+
   return {
     count: a.count.add(b.count),
     first_attempt_count: a.first_attempt_count.add(b.first_attempt_count),
@@ -155,6 +214,7 @@ export function addStatementStats(
       ? a.max_retries
       : b.max_retries,
     num_rows: aggregateNumericStats(a.num_rows, b.num_rows, countA, countB),
+    idle_lat: aggregateNumericStats(a.idle_lat, b.idle_lat, countA, countB),
     parse_lat: aggregateNumericStats(a.parse_lat, b.parse_lat, countA, countB),
     plan_lat: aggregateNumericStats(a.plan_lat, b.plan_lat, countA, countB),
     run_lat: aggregateNumericStats(a.run_lat, b.run_lat, countA, countB),
@@ -195,33 +255,13 @@ export function addStatementStats(
         ? a.last_exec_timestamp
         : b.last_exec_timestamp,
     nodes: uniqueLong([...a.nodes, ...b.nodes]),
+    regions: regions,
     plan_gists: planGists,
     index_recommendations: indexRec,
+    indexes: indexes,
+    latency_info: aggregateLatencyInfo(a, b),
+    last_error_code: "",
   };
-}
-
-export function aggregateStatementStats(
-  statementStats: CollectedStatementStatistics[],
-): CollectedStatementStatistics[] {
-  const statementsMap: {
-    [statement: string]: CollectedStatementStatistics[];
-  } = {};
-  statementStats.forEach((statement: CollectedStatementStatistics) => {
-    const matches =
-      statementsMap[statement.key.key_data.query] ||
-      (statementsMap[statement.key.key_data.query] = []);
-    matches.push(statement);
-  });
-
-  return _.values(statementsMap).map(statements =>
-    _.reduce(
-      statements,
-      (a: CollectedStatementStatistics, b: CollectedStatementStatistics) => ({
-        key: a.key,
-        stats: addStatementStats(a.stats, b.stats),
-      }),
-    ),
-  );
 }
 
 export interface ExecutionStatistics {
@@ -238,7 +278,7 @@ export interface ExecutionStatistics {
   full_scan: boolean;
   failed: boolean;
   node_id: number;
-  transaction_fingerprint_id: Long;
+  txn_fingerprint_ids: Long[];
   stats: StatementStatistics;
 }
 
@@ -259,22 +299,10 @@ export function flattenStatementStats(
     full_scan: stmt.key.key_data.full_scan,
     failed: stmt.key.key_data.failed,
     node_id: stmt.key.node_id,
-    transaction_fingerprint_id: stmt.key.key_data.transaction_fingerprint_id,
+    txn_fingerprint_ids: stmt.txn_fingerprint_ids,
     stats: stmt.stats,
   }));
 }
-
-export function combineStatementStats(
-  statementStats: StatementStatistics[],
-): StatementStatistics {
-  return _.reduce(statementStats, addStatementStats);
-}
-
-export const getSearchParams = (searchParams: string) => {
-  const sp = new URLSearchParams(searchParams);
-  return (key: string, defaultValue?: string | boolean | number) =>
-    sp.get(key) || defaultValue;
-};
 
 // This function returns a key based on all parameters
 // that should be used to group statements.
@@ -290,7 +318,7 @@ export function statementKey(stmt: ExecutionStatistics): string {
 export function transactionScopedStatementKey(
   stmt: ExecutionStatistics,
 ): string {
-  return statementKey(stmt) + stmt.transaction_fingerprint_id.toString();
+  return statementKey(stmt) + stmt.txn_fingerprint_ids?.toString();
 }
 
 export const generateStmtDetailsToID = (

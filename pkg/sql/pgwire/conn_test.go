@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -38,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -51,8 +51,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgconn"
-	"github.com/jackc/pgproto3/v2"
-	"github.com/jackc/pgx/v4"
+	pgproto3 "github.com/jackc/pgproto3/v2"
+	pgx "github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -159,6 +159,9 @@ func TestConn(t *testing.T) {
 	if err := finishQuery(generateError, conn); err != nil {
 		t.Fatal(err)
 	}
+	expectExecStmt(ctx, t, "DECLARE \"a b\" CURSOR FOR SELECT 10", &rd, conn, queryStringComplete)
+	expectExecStmt(ctx, t, "FETCH 1 \"a b\"", &rd, conn, queryStringComplete)
+	expectExecStmt(ctx, t, "CLOSE \"a b\"", &rd, conn, queryStringComplete)
 	// We got to the COMMIT at the end of the batch.
 	expectExecStmt(ctx, t, "COMMIT TRANSACTION", &rd, conn, queryStringComplete)
 	expectSync(ctx, t, &rd)
@@ -433,7 +436,7 @@ func processPgxStartup(ctx context.Context, s serverutils.TestServerInterface, c
 func execQuery(
 	ctx context.Context, query string, s serverutils.TestServerInterface, c *conn,
 ) error {
-	it, err := s.InternalExecutor().(sqlutil.InternalExecutor).QueryIteratorEx(
+	it, err := s.InternalExecutor().(isql.Executor).QueryIteratorEx(
 		ctx, "test", nil, /* txn */
 		sessiondata.InternalExecutorOverride{User: username.RootUserName(), Database: "system"},
 		query,
@@ -505,6 +508,9 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 	batch.Queue("BEGIN")
 	batch.Queue("select 7")
 	batch.Queue("select 8")
+	batch.Queue("declare \"a b\" cursor for select 10")
+	batch.Queue("fetch 1 \"a b\"")
+	batch.Queue("close \"a b\"")
 	batch.Queue("COMMIT")
 
 	batchResults := conn.SendBatch(ctx, batch)
@@ -530,41 +536,54 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 // waitForClientConn blocks until a client connects and performs the pgwire
 // handshake. This emulates what pgwire.Server does.
 func waitForClientConn(ln net.Listener) (*conn, error) {
-	conn, _, err := getSessionArgs(ln, false /* trustRemoteAddr */)
+	conn, _, err := getSessionArgs(ln, false)
 	if err != nil {
 		return nil, err
 	}
 
-	metrics := makeServerMetrics(sql.MemoryMetrics{} /* sqlMemMetrics */, metric.TestSampleInterval)
+	metrics := makeTenantSpecificMetrics(sql.MemoryMetrics{} /* sqlMemMetrics */, metric.TestSampleInterval)
 	pgwireConn := newConn(conn, sql.SessionArgs{ConnResultsBufferSize: 16 << 10}, &metrics, timeutil.Now(), nil)
 	return pgwireConn, nil
 }
 
 // getSessionArgs blocks until a client connects and returns the connection
 // together with session arguments or an error.
-func getSessionArgs(ln net.Listener, trustRemoteAddr bool) (net.Conn, sql.SessionArgs, error) {
-	conn, err := ln.Accept()
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
-	}
+func getSessionArgs(
+	ln net.Listener, trustRemoteAddr bool,
+) (conn net.Conn, _ sql.SessionArgs, err error) {
+	for {
+		conn, err = ln.Accept()
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
 
-	buf := pgwirebase.MakeReadBuffer()
-	_, err = buf.ReadUntypedMsg(conn)
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
-	}
-	version, err := buf.GetUint32()
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
-	}
-	if version != version30 {
-		return nil, sql.SessionArgs{}, errors.Errorf("unexpected protocol version: %d", version)
-	}
+		buf := pgwirebase.MakeReadBuffer()
+		_, err = buf.ReadUntypedMsg(conn)
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
+		version, err := buf.GetUint32()
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
+		if version == versionCancel {
+			// The pgx driver can send a cancel message asynchronously if the
+			// context expired, but these test should ignore it.
+			continue
+		}
+		if version != version30 {
+			return nil, sql.SessionArgs{}, errors.Errorf("unexpected protocol version: %d", version)
+		}
 
-	args, err := parseClientProvidedSessionParameters(
-		context.Background(), nil, &buf, conn.RemoteAddr(), trustRemoteAddr,
-	)
-	return conn, args, err
+		ctx := context.Background()
+		cp, err := parseClientProvidedSessionParameters(ctx, &buf, conn.RemoteAddr(), trustRemoteAddr,
+			false /* acceptTenantName */, false /* acceptSystemIdentityOption */)
+		if err != nil {
+			return conn, sql.SessionArgs{}, err
+		}
+		args, err := finalizeClientParameters(ctx, cp, nil)
+		return conn, args, err
+	}
 }
 
 func makeTestingConvCfg() (sessiondatapb.DataConversionConfig, *time.Location) {
@@ -676,7 +695,7 @@ func expectPrepareStmt(
 func expectDescribeStmt(
 	ctx context.Context,
 	t *testing.T,
-	expName string,
+	expName tree.Name,
 	expType pgwirebase.PrepareType,
 	rd *sql.StmtBufReader,
 	c *conn,
@@ -1064,7 +1083,7 @@ func TestMaliciousInputs(t *testing.T) {
 			}(tc)
 
 			sqlMetrics := sql.MakeMemMetrics("test" /* endpoint */, time.Second /* histogramWindow */)
-			metrics := makeServerMetrics(sqlMetrics, time.Second /* histogramWindow */)
+			metrics := makeTenantSpecificMetrics(sqlMetrics, time.Second /* histogramWindow */)
 
 			conn := newConn(
 				r,
@@ -1338,6 +1357,7 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = ln.Close() }()
 	serverAddr := ln.Addr()
 	log.Infof(context.Background(), "started listener on %s", serverAddr)
 	testCases := []struct {
@@ -1463,6 +1483,46 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 			},
 		},
 		{
+			desc:  "success parsing crdb:jwt_auth_enabled from true option",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=1",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.True(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "success parsing crdb:jwt_auth_enabled from false option",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=false",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "success parsing crdb:jwt_auth_enabled when there is some capitalization",
+			query: "user=root&options=-c CrDb:JwT_AUth_eNaBLEd=False",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "default crdb:jwt_auth_enabled value is false if not provided",
+			query: "user=root",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "crdb:jwt_auth_enabled must be a boolean if provided",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=notaboolean",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.Error(t, err)
+				require.Regexp(t, "crdb:jwt_auth_enabled: strconv.ParseBool: parsing \"notaboolean\": invalid syntax", err)
+			},
+		},
+		{
 			desc:  "remote_addr missing port",
 			query: "user=root&crdb:remote_addr=5.4.3.2",
 			assert: func(t *testing.T, args sql.SessionArgs, err error) {
@@ -1510,6 +1570,15 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 				require.Equal(t, "ISO,YMD", args.SessionDefaults["datestyle"])
 			},
 		},
+		{
+			// Regression test for issue #98301.
+			desc:  "special characters that look like urlencoded must not be decoded during option parsing",
+			query: "options=-c application_name=%2566%256f%256f",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.Equal(t, "%66%6f%6f", args.SessionDefaults["application_name"])
+			},
+		},
 	}
 
 	baseURL := fmt.Sprintf("postgres://%s/system?sslmode=disable", serverAddr)
@@ -1517,13 +1586,14 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 
-			var connErr error
+			wg := sync.WaitGroup{}
+			wg.Add(1)
 			go func(query string) {
+				defer wg.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 				defer cancel()
 				url := fmt.Sprintf("%s&%s", baseURL, query)
-				var c *pgx.Conn
-				c, connErr = pgx.Connect(ctx, url)
+				c, connErr := pgx.Connect(ctx, url)
 				if connErr != nil {
 					return
 				}
@@ -1532,10 +1602,125 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 				_ = c.Ping(ctx)
 				// closing connection immediately, since getSessionArgs is blocking
 				_ = c.Close(ctx)
+
+				select {
+				case <-c.PgConn().CleanupDone():
+				case <-time.After(20 * time.Second):
+					// 20 seconds was picked because pgconn has an internal deadline of
+					// 15 seconds when performing the async close request.
+					t.Error("pgconn asyncClose did not clean up on time")
+				}
 			}(tc.query)
 			// Wait for the client to connect and perform the handshake.
 			_, args, err := getSessionArgs(ln, true /* trustRemoteAddr */)
+			wg.Wait()
 			tc.assert(t, args, err)
+		})
+	}
+}
+
+func TestParseSearchPathInConnectionString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		desc               string
+		query              string
+		expectedErr        string
+		expectedSearchPath string
+	}{
+		{
+			desc:               "mixed-case schemas require double quotes",
+			query:              `options=-c search_path="Abc",Def,Ghi`,
+			expectedSearchPath: `"Abc", def, ghi`,
+		},
+		{
+			desc:               "commas can be used in schemas in the search_path",
+			query:              `options=-c search_path="a,b",other_schema`,
+			expectedSearchPath: `"a,b", other_schema`,
+		},
+		{
+			desc:        "search_path cannot have an empty element",
+			query:       `options=-c search_path="Abc",Def,,`,
+			expectedErr: `invalid value for parameter "search_path": ""Abc",Def,,"`,
+		},
+		{
+			// Note: This is more permissive than Postgres. But this behaves the same
+			// as `SET search_path = "",Def;` so this is acceptable.
+			desc:               "search_path can have a quoted empty element",
+			query:              `options=-c search_path="",Def`,
+			expectedSearchPath: `"", def`,
+		},
+
+		{
+			desc:        "search_path cannot have a quoted whitespace element",
+			query:       `options=-c search_path="  ",Def`,
+			expectedErr: `option "\",Def" is invalid`,
+		},
+		{
+			desc:               "search_path can have a quoted whitespace element if not in the options param",
+			query:              `search_path="  ",Def`,
+			expectedSearchPath: `"  ", def`,
+		},
+		{
+			// This is a slight departure from Postgres. For some reason, Postgres
+			// will just ignore the backslashes, even though it doesn't ignore the
+			// hyphens.
+			desc:               "search_path can handle backslashes and other special characters",
+			query:              `search_path=a-b-c,d\ef,"g-hi","j\kl"`,
+			expectedSearchPath: `"a-b-c", "d\ef", "g-hi", "j\kl"`,
+		},
+		{
+			desc:        "search_path cannot end in a comma",
+			query:       `options=-c search_path="Abc",Def,`,
+			expectedErr: `invalid value for parameter "search_path": ""Abc",Def,"`,
+		},
+		{
+			desc:        "space cannot be in search_path",
+			query:       `options=-c search_path="Abc",Def,  Ghi`,
+			expectedErr: `option "Ghi" is invalid`,
+		},
+		{
+			desc:        "empty search_path is not allowed",
+			query:       `options=-c search_path=`,
+			expectedErr: `invalid value for parameter "search_path": ""`,
+		},
+		{
+			desc:        "unbalanced quotes in search_path are not allowed",
+			query:       `options=-c search_path="a,b","other_schema`,
+			expectedErr: `invalid value for parameter "search_path": ""a,b","other_schema"`,
+		},
+		{
+			desc:        "out-of-place quotes in search_path are not allowed",
+			query:       `options=-c search_path="a,b",""other_schema`,
+			expectedErr: `invalid value for parameter "search_path": ""a,b",""other_schema"`,
+		},
+	}
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+	defer db.Close()
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			pgURL, cleanupFunc := sqlutils.PGUrl(
+				t, s.ServingSQLAddr(), "TestParseSearchPathInConnectionString" /* prefix */, url.User(username.RootUser),
+			)
+			defer cleanupFunc()
+
+			pgURL.RawQuery += "&" + tc.query
+			c, connErr := pgx.Connect(ctx, pgURL.String())
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, connErr, tc.expectedErr)
+				return
+			}
+			require.NoError(t, connErr)
+
+			var sp string
+			err := c.QueryRow(ctx, `SHOW search_path`).Scan(&sp)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedSearchPath, sp)
 		})
 	}
 }
@@ -1553,14 +1738,12 @@ func TestSetSessionArguments(t *testing.T) {
 	)
 	defer cleanupFunc()
 
-	q := pgURL.Query()
-	q.Add("options", "  --user=test -c    search_path=public,testsp %20 "+
-		"--default-transaction-isolation=read\\ uncommitted   "+
-		"-capplication_name=test  "+
-		"--DateStyle=ymd\\ ,\\ iso\\  "+
-		"-c intervalstyle%3DISO_8601 "+
-		"-ccustom_option.custom_option=test2")
-	pgURL.RawQuery = q.Encode()
+	pgURL.RawQuery += `&options=` + `  --user=test -c    search_path=public,testsp,"Abc",Def %20 ` +
+		"--default-transaction-isolation=read\\ uncommitted   " +
+		"-capplication_name=test  " +
+		"--DateStyle=ymd\\ ,\\ iso\\  " +
+		"-c intervalstyle%3DISO_8601 " +
+		"-ccustom_option.custom_option=test2"
 	noBufferDB, err := gosql.Open("postgres", pgURL.String())
 
 	if err != nil {
@@ -1584,7 +1767,7 @@ func TestSetSessionArguments(t *testing.T) {
 	}
 
 	expectedOptions := map[string]string{
-		"search_path": "public, testsp",
+		"search_path": "public, testsp, \"Abc\", def",
 		// setting an isolation level is a noop:
 		// all transactions execute with serializable isolation.
 		"default_transaction_isolation": "serializable",
@@ -1790,8 +1973,9 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 	defer testServer.Stopper().Stop(ctx)
 
 	// Users.
-	admin := username.RootUser
+	rootUser := username.RootUser
 	nonAdmin := username.TestUser
+	admin := "testadmin"
 
 	// openConnWithUser opens a connection to the testServer for the given user
 	// and always returns an associated cleanup function, even in case of error,
@@ -1802,7 +1986,7 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 			testServer.ServingSQLAddr(),
 			t.Name(),
 			url.UserPassword(user, user),
-			user == admin,
+			user == rootUser,
 		)
 		defer cleanup()
 		conn, err := pgx.Connect(ctx, pgURL.String())
@@ -1846,7 +2030,7 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 	}
 
 	getMaxConnections := func() int {
-		conn, cleanup := openConnWithUserSuccess(admin)
+		conn, cleanup := openConnWithUserSuccess(rootUser)
 		defer cleanup()
 		var maxConnections int
 		err := conn.QueryRow(ctx, "SHOW CLUSTER SETTING server.max_connections_per_gateway").Scan(&maxConnections)
@@ -1855,21 +2039,41 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 	}
 
 	setMaxConnections := func(maxConnections int) {
-		conn, cleanup := openConnWithUserSuccess(admin)
+		conn, cleanup := openConnWithUserSuccess(rootUser)
 		defer cleanup()
 		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.max_connections_per_gateway = $1", maxConnections)
 		require.NoError(t, err)
 	}
 
-	createUser := func(user string) {
-		conn, cleanup := openConnWithUserSuccess(admin)
+	setMaxNonRootConnections := func(maxConnections int) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
 		defer cleanup()
-		_, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %[1]s WITH PASSWORD '%[1]s'", user))
+		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.cockroach_cloud.max_client_connections_per_gateway = $1", maxConnections)
 		require.NoError(t, err)
 	}
 
+	setMaxNonRootConnectionsReason := func(reason string) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.cockroach_cloud.max_client_connections_per_gateway_reason = $1", reason)
+		require.NoError(t, err)
+	}
+
+	createUser := func(user string, isAdmin bool) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		_, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %[1]s WITH PASSWORD '%[1]s'", user))
+		require.NoError(t, err)
+
+		if isAdmin {
+			_, err := conn.Exec(ctx, fmt.Sprintf("grant admin to %[1]s", user))
+			require.NoError(t, err)
+		}
+	}
+
 	// create nonAdmin
-	createUser(nonAdmin)
+	createUser(nonAdmin, false)
+	createUser(admin, true)
 	requireConnectionCount(t, 0)
 
 	// assert default value
@@ -1935,6 +2139,46 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 		nonAdminCleanup2()
 		requireConnectionCount(t, 0)
 	})
+
+	t.Run("0 max_non_root_connections", func(t *testing.T) {
+		setMaxNonRootConnections(0)
+		requireConnectionCount(t, 0)
+		// can connect with root
+		_, rootCleanup := openConnWithUserSuccess(rootUser)
+		requireConnectionCount(t, 1)
+		// can't connect with non root
+		openConnWithUserError(admin)
+		requireConnectionCount(t, 1)
+		rootCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("1 max_non_root_connections", func(t *testing.T) {
+		setMaxNonRootConnections(1)
+		requireConnectionCount(t, 0)
+		// can connect with root
+		_, rootCleanup := openConnWithUserSuccess(rootUser)
+		requireConnectionCount(t, 1)
+		// can connect with non root
+		_, nonAdminCleanup := openConnWithUserSuccess(nonAdmin)
+		requireConnectionCount(t, 2)
+		rootCleanup()
+		nonAdminCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("max_non_root_connections_reason", func(t *testing.T) {
+		setMaxNonRootConnections(0)
+		setMaxNonRootConnectionsReason("foobar")
+		requireConnectionCount(t, 0)
+		_, cleanup, err := openConnWithUser(admin)
+		defer cleanup()
+		require.Error(t, err)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, pgcode.TooManyConnections.String(), pgErr.Code)
+		require.Regexp(t, "foobar", pgErr.Error())
+	})
 }
 
 func TestConnCloseReleasesReservedMem(t *testing.T) {
@@ -1944,7 +2188,7 @@ func TestConnCloseReleasesReservedMem(t *testing.T) {
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
-	before := s.PGServer().(*Server).connMonitor.AllocBytes()
+	before := s.PGServer().(*Server).tenantSpecificConnMonitor.AllocBytes()
 
 	pgURL, cleanupFunc := sqlutils.PGUrl(
 		t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(username.RootUser),
@@ -1963,6 +2207,6 @@ func TestConnCloseReleasesReservedMem(t *testing.T) {
 	require.Regexp(t, "pq: option .* is invalid", err.Error())
 
 	// Check that no accounted-for memory is leaked, after the connection attempt fails.
-	after := s.PGServer().(*Server).connMonitor.AllocBytes()
+	after := s.PGServer().(*Server).tenantSpecificConnMonitor.AllocBytes()
 	require.Equal(t, before, after)
 }

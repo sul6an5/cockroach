@@ -43,8 +43,8 @@ func TestRejectedFilename(t *testing.T) {
 		},
 		{
 			name:     "nodelocal",
-			fname:    "nodelocal://0/file.csv",
-			rejected: "nodelocal://0/file.csv.rejected",
+			fname:    "nodelocal://1/file.csv",
+			rejected: "nodelocal://1/file.csv.rejected",
 		},
 	}
 	for _, tc := range tests {
@@ -91,7 +91,7 @@ type errorReturningConsumer struct {
 }
 
 func (d *errorReturningConsumer) FillDatums(
-	_ interface{}, _ int64, c *row.DatumRowConverter,
+	_ context.Context, _ interface{}, _ int64, c *row.DatumRowConverter,
 ) error {
 	return d.err
 }
@@ -102,7 +102,9 @@ var _ importRowConsumer = &errorReturningConsumer{}
 // it implements importRowConsumer.
 type nilDataConsumer struct{}
 
-func (n *nilDataConsumer) FillDatums(_ interface{}, _ int64, c *row.DatumRowConverter) error {
+func (n *nilDataConsumer) FillDatums(
+	_ context.Context, _ interface{}, _ int64, c *row.DatumRowConverter,
+) error {
 	c.Datums[0] = tree.DNull
 	return nil
 }

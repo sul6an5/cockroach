@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"google.golang.org/grpc/codes"
@@ -32,14 +33,14 @@ func (s *statusServer) Statements(
 		return s.CombinedStatementStats(ctx, &combinedRequest)
 	}
 
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
-	if s.gossip.NodeID.Get() == 0 {
+	if s.serverIterator.getID() == 0 {
 		return nil, status.Errorf(codes.Unavailable, "nodeID not set")
 	}
 
@@ -62,8 +63,8 @@ func (s *statusServer) Statements(
 		if local {
 			return statementsLocal(
 				ctx,
-				s.gossip.NodeID.Get(),
-				s.admin.server.sqlServer,
+				roachpb.NodeID(s.serverIterator.getID()),
+				s.sqlServer,
 				req.FetchMode)
 		}
 		status, err := s.dialNode(ctx, requestedNodeID)
@@ -109,8 +110,8 @@ func statementsLocal(
 	sqlServer *SQLServer,
 	fetchMode serverpb.StatementsRequest_FetchMode,
 ) (*serverpb.StatementsResponse, error) {
-	var stmtStats []roachpb.CollectedStatementStatistics
-	var txnStats []roachpb.CollectedTransactionStatistics
+	var stmtStats []appstatspb.CollectedStatementStatistics
+	var txnStats []appstatspb.CollectedTransactionStatistics
 	var err error
 
 	if fetchMode != serverpb.StatementsRequest_TxnStatsOnly {

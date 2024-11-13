@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -124,13 +125,17 @@ func (r *StmtBufReader) AdvanceOne() {
 // interface{} so that external packages can call NewInternalPlanner and pass
 // the result) and executes a sql statement through the DistSQLPlanner.
 func (dsp *DistSQLPlanner) Exec(
-	ctx context.Context, localPlanner interface{}, stmt parser.Statement, distribute bool,
+	ctx context.Context,
+	localPlanner interface{},
+	stmt statements.Statement[tree.Statement],
+	distribute bool,
 ) error {
 	p := localPlanner.(*planner)
 	p.stmt = makeStatement(stmt, clusterunique.ID{} /* queryID */)
 	if err := p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
+	defer p.curPlan.close(ctx)
 	rw := NewCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
 		return nil
 	})
@@ -143,8 +148,6 @@ func (dsp *DistSQLPlanner) Exec(
 		p.txn,
 		execCfg.Clock,
 		p.ExtendedEvalContext().Tracing,
-		execCfg.ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
@@ -157,7 +160,7 @@ func (dsp *DistSQLPlanner) Exec(
 		distributionType)
 	planCtx.stmtType = recv.stmtType
 
-	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.main, recv)()
+	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.main, recv, nil /* finishedSetupFn */)
 	return rw.Err()
 }
 
@@ -166,6 +169,7 @@ func (dsp *DistSQLPlanner) Exec(
 func (dsp *DistSQLPlanner) ExecLocalAll(
 	ctx context.Context, execCfg ExecutorConfig, p *planner, res RestrictedCommandResult,
 ) error {
+	defer p.curPlan.close(ctx)
 	recv := MakeDistSQLReceiver(
 		ctx,
 		res,
@@ -174,8 +178,6 @@ func (dsp *DistSQLPlanner) ExecLocalAll(
 		p.txn,
 		execCfg.Clock,
 		p.ExtendedEvalContext().Tracing,
-		execCfg.ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
@@ -185,17 +187,11 @@ func (dsp *DistSQLPlanner) ExecLocalAll(
 		distributionType)
 	planCtx.stmtType = recv.stmtType
 
-	var evalCtxFactory func() *extendedEvalContext
-	var factoryEvalCtx extendedEvalContext = extendedEvalContext{
-		Tracing: &SessionTracing{},
-	}
-	evalCtxFactory = func() *extendedEvalContext {
+	var factoryEvalCtx = extendedEvalContext{Tracing: &SessionTracing{}}
+	evalCtxFactory := func(bool) *extendedEvalContext {
+		factoryEvalCtx.Context = evalCtx.Context
 		factoryEvalCtx.Placeholders = &p.semaCtx.Placeholders
 		factoryEvalCtx.Annotations = &p.semaCtx.Annotations
-		// Query diagnostics can change the Context; make sure we are using the
-		// same one.
-		// TODO(radu): consider removing this if/when #46164 is addressed.
-		factoryEvalCtx.Context = evalCtx.Context
 		return &factoryEvalCtx
 	}
 	return dsp.PlanAndRunAll(ctx, evalCtx, planCtx, p, recv, evalCtxFactory)

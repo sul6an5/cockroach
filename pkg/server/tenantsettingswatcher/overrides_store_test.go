@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -26,10 +27,10 @@ func TestOverridesStore(t *testing.T) {
 
 	var s overridesStore
 	s.Init()
-	t1 := roachpb.MakeTenantID(1)
-	t2 := roachpb.MakeTenantID(2)
-	st := func(name, val string) roachpb.TenantSetting {
-		return roachpb.TenantSetting{
+	t1 := roachpb.MustMakeTenantID(1)
+	t2 := roachpb.MustMakeTenantID(2)
+	st := func(name, val string) kvpb.TenantSetting {
+		return kvpb.TenantSetting{
 			Name: name,
 			Value: settings.EncodedValue{
 				Value: val,
@@ -56,7 +57,7 @@ func TestOverridesStore(t *testing.T) {
 	}
 	o1 := s.GetTenantOverrides(t1)
 	expect(o1, "")
-	s.SetAll(map[roachpb.TenantID][]roachpb.TenantSetting{
+	s.SetAll(map[roachpb.TenantID][]kvpb.TenantSetting{
 		t1: {st("a", "aa"), st("b", "bb"), st("d", "dd")},
 		t2: {st("x", "xx")},
 	})
@@ -82,7 +83,7 @@ func TestOverridesStore(t *testing.T) {
 	expect(o1, "a=aa c=cc d=dd")
 
 	// Set an override for a tenant that has no existing data.
-	t3 := roachpb.MakeTenantID(3)
+	t3 := roachpb.MustMakeTenantID(3)
 	s.SetTenantOverride(t3, st("x", "xx"))
 	o3 := s.GetTenantOverrides(t3)
 	expect(o3, "x=xx")

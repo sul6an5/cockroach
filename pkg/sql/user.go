@@ -14,24 +14,21 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/password"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -78,11 +75,7 @@ import (
 //     lookup succeeded before and there haven't been any CREATE/ALTER/DROP ROLE
 //     commands since, then the cache is used without a KV lookup.
 func GetUserSessionInitInfo(
-	ctx context.Context,
-	execCfg *ExecutorConfig,
-	ie *InternalExecutor,
-	user username.SQLUsername,
-	databaseName string,
+	ctx context.Context, execCfg *ExecutorConfig, user username.SQLUsername, databaseName string,
 ) (
 	exists bool,
 	canLoginSQL bool,
@@ -92,7 +85,7 @@ func GetUserSessionInitInfo(
 	pwRetrieveFn func(ctx context.Context) (expired bool, hashedPassword password.PasswordHash, err error),
 	err error,
 ) {
-	runFn := getUserInfoRunFn(execCfg, user, "get-user-timeout")
+	runFn := getUserInfoRunFn(execCfg, user, "get-user-session")
 
 	if user.IsRootUser() {
 		// As explained above, for root we report that the user exists
@@ -100,7 +93,7 @@ func GetUserSessionInitInfo(
 		// necessary.
 		rootFn := func(ctx context.Context) (expired bool, ret password.PasswordHash, err error) {
 			err = runFn(ctx, func(ctx context.Context) error {
-				authInfo, _, err := retrieveSessionInitInfoWithCache(ctx, execCfg, ie, user, databaseName)
+				authInfo, _, err := retrieveSessionInitInfoWithCache(ctx, execCfg, user, databaseName)
 				if err != nil {
 					return err
 				}
@@ -126,28 +119,47 @@ func GetUserSessionInitInfo(
 		// Other users must reach for system.users no matter what, because
 		// only that contains the truth about whether the user exists.
 		authInfo, settingsEntries, err = retrieveSessionInitInfoWithCache(
-			ctx, execCfg, ie, user, databaseName,
+			ctx, execCfg, user, databaseName,
 		)
 		if err != nil {
 			return err
 		}
 
-		// Find whether the user is an admin.
-		return execCfg.CollectionFactory.Txn(ctx, execCfg.DB, func(
-			ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+		// Find whether the user is an admin and has the NOSQLLOGIN global
+		// privilege. These calls have their own caches, so it's OK to make them
+		// outside of the retrieveSessionInitInfoWithCache call above.
+		return execCfg.InternalDB.DescsTxn(ctx, func(
+			ctx context.Context, txn descs.Txn,
 		) error {
-			memberships, err := MemberOfWithAdminOption(
-				ctx,
-				execCfg,
-				ie,
-				descsCol,
-				txn,
-				user,
-			)
+			memberships, err := MemberOfWithAdminOption(ctx, execCfg, txn, user)
 			if err != nil {
 				return err
 			}
 			_, isSuperuser = memberships[username.AdminRoleName()]
+
+			// If we already know that the user has CanLoginSQLRoleOpt=false, there's
+			// no need to check the global privilege.
+			canLoginSQL = authInfo.CanLoginSQLRoleOpt
+			if canLoginSQL {
+				privs, err := execCfg.SyntheticPrivilegeCache.Get(
+					ctx, txn, txn.Descriptors(), syntheticprivilege.GlobalPrivilegeObject,
+				)
+				if err != nil {
+					return err
+				}
+				// Check the user and its role hierarchy.
+				if privs.CheckPrivilege(user, privilege.NOSQLLOGIN) {
+					canLoginSQL = false
+				} else {
+					for parentRole := range memberships {
+						if privs.CheckPrivilege(parentRole, privilege.NOSQLLOGIN) {
+							canLoginSQL = false
+							break
+						}
+					}
+				}
+			}
+
 			return nil
 		},
 		)
@@ -157,8 +169,8 @@ func GetUserSessionInitInfo(
 	}
 
 	return authInfo.UserExists,
-		authInfo.CanLoginSQL,
-		authInfo.CanLoginDBConsole,
+		canLoginSQL,
+		authInfo.CanLoginDBConsoleRoleOpt,
 		isSuperuser,
 		settingsEntries,
 		func(ctx context.Context) (expired bool, ret password.PasswordHash, err error) {
@@ -203,35 +215,18 @@ func getUserInfoRunFn(
 }
 
 func retrieveSessionInitInfoWithCache(
-	ctx context.Context,
-	execCfg *ExecutorConfig,
-	ie *InternalExecutor,
-	userName username.SQLUsername,
-	databaseName string,
+	ctx context.Context, execCfg *ExecutorConfig, userName username.SQLUsername, databaseName string,
 ) (aInfo sessioninit.AuthInfo, settingsEntries []sessioninit.SettingsCacheEntry, err error) {
 	if err = func() (retErr error) {
-		makePlanner := func(opName string) (interface{}, func()) {
-			return NewInternalPlanner(
-				opName,
-				execCfg.DB.NewTxn(ctx, opName),
-				username.RootUserName(),
-				&MemoryMetrics{},
-				execCfg,
-				sessiondatapb.SessionData{},
-			)
-		}
 		aInfo, retErr = execCfg.SessionInitCache.GetAuthInfo(
 			ctx,
 			execCfg.Settings,
-			ie,
-			execCfg.DB,
-			execCfg.CollectionFactory,
+			execCfg.InternalDB,
 			userName,
 			retrieveAuthInfo,
-			makePlanner,
 		)
 		if retErr != nil {
-			return retErr
+			return errors.Wrap(retErr, "get auth info error")
 		}
 		// Avoid looking up default settings for root and non-existent users.
 		if userName.IsRootUser() || !aInfo.UserExists {
@@ -240,14 +235,12 @@ func retrieveSessionInitInfoWithCache(
 		settingsEntries, retErr = execCfg.SessionInitCache.GetDefaultSettings(
 			ctx,
 			execCfg.Settings,
-			ie,
-			execCfg.DB,
-			execCfg.CollectionFactory,
+			execCfg.InternalDB,
 			userName,
 			databaseName,
 			retrieveDefaultSettings,
 		)
-		return retErr
+		return errors.Wrap(retErr, "get default settings error")
 	}(); err != nil {
 		// Failed to retrieve the user account. Report in logs for later investigation.
 		log.Warningf(ctx, "user lookup for %q failed: %v", userName, err)
@@ -257,21 +250,19 @@ func retrieveSessionInitInfoWithCache(
 }
 
 func retrieveAuthInfo(
-	ctx context.Context,
-	ie sqlutil.InternalExecutor,
-	user username.SQLUsername,
-	makePlanner func(opName string) (interface{}, func()),
-	settings *cluster.Settings,
+	ctx context.Context, f descs.DB, user username.SQLUsername,
 ) (aInfo sessioninit.AuthInfo, retErr error) {
 	// Use fully qualified table name to avoid looking up "".system.users.
 	// We use a nil txn as login is not tied to any transaction state, and
 	// we should always look up the latest data.
 	const getHashedPassword = `SELECT "hashedPassword" FROM system.public.users ` +
 		`WHERE username=$1`
+	ie := f.Executor()
 	values, err := ie.QueryRowEx(
 		ctx, "get-hashed-pwd", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		getHashedPassword, user)
+
 	if err != nil {
 		return aInfo, errors.Wrapf(err, "error looking up user %s", user)
 	}
@@ -299,10 +290,11 @@ func retrieveAuthInfo(
 
 	roleOptsIt, err := ie.QueryIteratorEx(
 		ctx, "get-login-dependencies", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		getLoginDependencies,
 		user,
 	)
+
 	if err != nil {
 		return aInfo, errors.Wrapf(err, "error looking up user %s", user)
 	}
@@ -312,38 +304,20 @@ func retrieveAuthInfo(
 
 	// To support users created before 20.1, allow all USERS/ROLES to login
 	// if NOLOGIN is not found.
-	aInfo.CanLoginSQL = true
-	aInfo.CanLoginDBConsole = true
+	aInfo.CanLoginSQLRoleOpt = true
+	aInfo.CanLoginDBConsoleRoleOpt = true
 	var ok bool
-
-	// Check system privilege to see if user can sql login.
-	planner, cleanup := makePlanner("check-privilege")
-	defer cleanup()
-	aa := planner.(AuthorizationAccessor)
-	hasAdmin, err := aa.HasAdminRole(ctx)
-	if err != nil {
-		return aInfo, err
-	}
-	if !hasAdmin {
-		if settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-			if noSQLLogin := aa.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.NOSQLLOGIN, user) == nil; noSQLLogin {
-				aInfo.CanLoginSQL = false
-			}
-		}
-	}
 
 	for ok, err = roleOptsIt.Next(ctx); ok; ok, err = roleOptsIt.Next(ctx) {
 		row := roleOptsIt.Cur()
 		option := string(tree.MustBeDString(row[0]))
 
 		if option == "NOLOGIN" {
-			aInfo.CanLoginSQL = false
-			aInfo.CanLoginDBConsole = false
+			aInfo.CanLoginSQLRoleOpt = false
+			aInfo.CanLoginDBConsoleRoleOpt = false
 		}
-		// If the user did not have the NOSQLLOGIN system privilege but has the
-		// equivalent role option set the flag to false.
-		if option == "NOSQLLOGIN" && aInfo.CanLoginSQL {
-			aInfo.CanLoginSQL = false
+		if option == "NOSQLLOGIN" {
+			aInfo.CanLoginSQLRoleOpt = false
 		}
 
 		if option == "VALID UNTIL" {
@@ -352,7 +326,7 @@ func retrieveAuthInfo(
 				// This is okay because the VALID UNTIL is stored as a string
 				// representation of a TimestampTZ which has the same underlying
 				// representation in the table as a Timestamp (UTC time).
-				timeCtx := tree.NewParseTimeContext(timeutil.Now())
+				timeCtx := tree.NewParseContext(timeutil.Now())
 				aInfo.ValidUntil, _, err = tree.ParseDTimestamp(timeCtx, ts, time.Microsecond)
 				if err != nil {
 					return aInfo, errors.Wrap(err,
@@ -366,7 +340,7 @@ func retrieveAuthInfo(
 }
 
 func retrieveDefaultSettings(
-	ctx context.Context, ie sqlutil.InternalExecutor, user username.SQLUsername, databaseID descpb.ID,
+	ctx context.Context, f descs.DB, user username.SQLUsername, databaseID descpb.ID,
 ) (settingsEntries []sessioninit.SettingsCacheEntry, retErr error) {
 	// Add an empty slice for all the keys so that something gets cached and
 	// prevents a lookup for the same key from happening later.
@@ -398,13 +372,15 @@ WHERE
 `
 	// We use a nil txn as role settings are not tied to any transaction state,
 	// and we should always look up the latest data.
+	ie := f.Executor()
 	defaultSettingsIt, err := ie.QueryIteratorEx(
 		ctx, "get-default-settings", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		getDefaultSettings,
 		user,
 		databaseID,
 	)
+
 	if err != nil {
 		return nil, errors.Wrapf(err, "error looking up user %s", user)
 	}
@@ -450,9 +426,9 @@ var userLoginTimeout = settings.RegisterDurationSetting(
 // GetAllRoles returns a "set" (map) of Roles -> true.
 func (p *planner) GetAllRoles(ctx context.Context) (map[username.SQLUsername]bool, error) {
 	query := `SELECT username FROM system.users`
-	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
+	it, err := p.InternalSQLTxn().QueryIteratorEx(
 		ctx, "read-users", p.txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		query)
 	if err != nil {
 		return nil, err
@@ -473,17 +449,15 @@ func (p *planner) GetAllRoles(ctx context.Context) (map[username.SQLUsername]boo
 
 // RoleExists returns true if the role exists.
 func (p *planner) RoleExists(ctx context.Context, role username.SQLUsername) (bool, error) {
-	return RoleExists(ctx, p.execCfg.InternalExecutor, p.Txn(), role)
+	return RoleExists(ctx, p.InternalSQLTxn(), role)
 }
 
 // RoleExists returns true if the role exists.
-func RoleExists(
-	ctx context.Context, ie sqlutil.InternalExecutor, txn *kv.Txn, role username.SQLUsername,
-) (bool, error) {
+func RoleExists(ctx context.Context, txn isql.Txn, role username.SQLUsername) (bool, error) {
 	query := `SELECT username FROM system.users WHERE username = $1`
-	row, err := ie.QueryRowEx(
-		ctx, "read-users", txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+	row, err := txn.QueryRowEx(
+		ctx, "read-users", txn.KV(),
+		sessiondata.RootUserSessionDataOverride,
 		query, role,
 	)
 	if err != nil {
@@ -564,7 +538,7 @@ func (p *planner) setRole(ctx context.Context, local bool, s username.SQLUsernam
 	sessionUser := p.SessionData().SessionUser()
 	becomeUser := sessionUser
 	// Check the role exists - if so, populate becomeUser.
-	if !s.IsNoneRole() {
+	if !s.IsNoneRole() && s != sessionUser {
 		becomeUser = s
 
 		exists, err := p.RoleExists(ctx, becomeUser)
@@ -572,11 +546,7 @@ func (p *planner) setRole(ctx context.Context, local bool, s username.SQLUsernam
 			return err
 		}
 		if !exists {
-			return pgerror.Newf(
-				pgcode.InvalidParameterValue,
-				"role %s does not exist",
-				becomeUser.Normalized(),
-			)
+			return sqlerrors.NewUndefinedUserError(becomeUser)
 		}
 	}
 
@@ -599,8 +569,11 @@ func (p *planner) setRole(ctx context.Context, local bool, s username.SQLUsernam
 		ctx,
 		local,
 		func(m sessionDataMutator) error {
+			oldIsSuperuser := m.data.IsSuperuser
 			m.data.IsSuperuser = willBecomeAdmin
-			m.bufferParamStatusUpdate("is_superuser", updateStr)
+			if oldIsSuperuser != willBecomeAdmin {
+				m.bufferParamStatusUpdate("is_superuser", updateStr)
+			}
 
 			// The "none" user does resets the SessionUserProto in a SET ROLE.
 			if becomeUser.IsNoneRole() {
@@ -672,17 +645,18 @@ func (p *planner) checkCanBecomeUser(ctx context.Context, becomeUser username.SQ
 	return nil
 }
 
-// MaybeUpgradeStoredPasswordHash attempts to convert a stored hash
-// that was encoded using crdb-bcrypt, to the SCRAM-SHA-256 format.
+// MaybeConvertStoredPasswordHash attempts to convert a stored hash
+// to match the current server.user_login.password_encryption setting..
 //
 // This auto-conversion is a CockroachDB-specific feature, which
 // pushes clusters upgraded from a previous version into using
-// SCRAM-SHA-256.
+// SCRAM-SHA-256, and also allows easy downgrading from SCRAM-SHA-256
+// back to crdb-bcrypt.
 //
 // The caller is responsible for ensuring this function is only called
 // after a successful authentication, that is, the provided cleartext
 // password is known to match the previously-encoded prevHash.
-func MaybeUpgradeStoredPasswordHash(
+func MaybeConvertStoredPasswordHash(
 	ctx context.Context,
 	execCfg *ExecutorConfig,
 	userName username.SQLUsername,
@@ -693,11 +667,18 @@ func MaybeUpgradeStoredPasswordHash(
 	// configuration.
 
 	autoUpgradePasswordHashesBool := security.AutoUpgradePasswordHashes.Get(&execCfg.Settings.SV)
-	hashMethod := security.GetConfiguredPasswordHashMethod(ctx, &execCfg.Settings.SV)
+	autoDowngradePasswordHashesBool := security.AutoDowngradePasswordHashes.Get(&execCfg.Settings.SV)
+	autoRehashOnCostChangeBool := security.AutoRehashOnSCRAMCostChange.Get(&execCfg.Settings.SV)
+	configuredSCRAMCost := security.SCRAMCost.Get(&execCfg.Settings.SV)
+	configuredHashMethod := security.GetConfiguredPasswordHashMethod(&execCfg.Settings.SV)
 
-	converted, prevHash, newHash, newMethod, err := password.MaybeUpgradePasswordHash(ctx,
-		autoUpgradePasswordHashesBool, hashMethod, cleartext, currentHash,
-		security.GetExpensiveHashComputeSem(ctx), log.Infof)
+	converted, prevHash, newHash, newMethod, err := password.MaybeConvertPasswordHash(
+		ctx,
+		autoUpgradePasswordHashesBool, autoDowngradePasswordHashesBool, autoRehashOnCostChangeBool,
+		configuredHashMethod, configuredSCRAMCost, cleartext, currentHash,
+		security.GetExpensiveHashComputeSem(ctx),
+		log.Infof,
+	)
 	if err != nil {
 		// We're not returning an error: clients should not be refused a
 		// session just because a password conversion failed.
@@ -733,10 +714,10 @@ func updateUserPasswordHash(
 	userName username.SQLUsername,
 	prevHash, newHash []byte,
 ) error {
-	runFn := getUserInfoRunFn(execCfg, userName, "set-hash-timeout")
+	runFn := getUserInfoRunFn(execCfg, userName, "set-user-password-hash")
 
 	return runFn(ctx, func(ctx context.Context) error {
-		return DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, d *descs.Collection) error {
+		return DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, d *descs.Collection) error {
 			// NB: we cannot use ALTER USER ... WITH PASSWORD here,
 			// because it is not guaranteed to recognize the hash in the
 			// WITH PASSWORD clause.
@@ -760,10 +741,10 @@ func updateUserPasswordHash(
 			//   we'd be writing to system.users for all of them and queue
 			//   potentially many schema updates, creating a bottleneck.
 			//
-			rowsAffected, err := execCfg.InternalExecutor.Exec(
+			rowsAffected, err := txn.Exec(
 				ctx,
 				"set-password-hash",
-				txn,
+				txn.KV(),
 				`UPDATE system.users SET "hashedPassword" = $3 WHERE username = $1 AND "hashedPassword" = $2`,
 				userName.Normalized(),
 				prevHash,
@@ -773,14 +754,12 @@ func updateUserPasswordHash(
 				// Error, or no update took place.
 				return err
 			}
-			usersTable, err := d.GetMutableTableByID(
-				ctx, txn, keys.UsersTableID, tree.ObjectLookupFlagsWithRequired(),
-			)
+			usersTable, err := d.MutableByID(txn.KV()).Table(ctx, keys.UsersTableID)
 			if err != nil {
 				return err
 			}
 			// WriteDesc will internally bump the version.
-			return d.WriteDesc(ctx, false /* kvTrace */, usersTable, txn)
+			return d.WriteDesc(ctx, false /* kvTrace */, usersTable, txn.KV())
 		})
 	})
 }

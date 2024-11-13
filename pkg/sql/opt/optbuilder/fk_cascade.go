@@ -22,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -190,7 +190,6 @@ func tryNewOnDeleteFastCascadeBuilder(
 		if memo.CanBeCompositeSensitive(md, &sel.Filters) {
 			return nil, false
 		}
-		// TODO(mgartner): Disallow this fast path if there is a UDF invocation.
 		if sel.Relational().HasSubquery {
 			return nil, false
 		}
@@ -208,7 +207,7 @@ func tryNewOnDeleteFastCascadeBuilder(
 		return nil, false
 	}
 
-	var visited util.FastIntSet
+	var visited intsets.Fast
 	parentTabID := parentTab.ID()
 	childTabID := childTab.ID()
 

@@ -57,12 +57,15 @@ type FunctionReferenceResolver interface {
 	// there is no function with the same oid.
 	ResolveFunctionByOID(
 		ctx context.Context, oid oid.Oid,
-	) (string, *Overload, error)
+	) (*FunctionName, *Overload, error)
 }
 
 // ResolvableFunctionReference implements the editable reference call of a
 // FuncExpr.
 type ResolvableFunctionReference struct {
+	// ReferenceByName keeps track of the name that was used to resolve the
+	// function, if one was used. This is used for metadata dependency tracking.
+	ReferenceByName *UnresolvedObjectName
 	FunctionReference
 }
 
@@ -111,28 +114,27 @@ func (ref *ResolvableFunctionReference) Resolve(
 		if err != nil {
 			return nil, err
 		}
+		referenceByName, _ := t.ToUnresolvedObjectName(NoAnnotation)
+		ref.ReferenceByName = &referenceByName
+		ref.FunctionReference = fd
+		return fd, nil
+	case *FunctionOID:
+		if resolver == nil {
+			return GetBuiltinFunctionByOIDOrFail(t.OID)
+		}
+		fnName, o, err := resolver.ResolveFunctionByOID(ctx, t.OID)
+		if err != nil {
+			return nil, err
+		}
+		fd := &ResolvedFunctionDefinition{
+			Name:      fnName.Object(),
+			Overloads: []QualifiedOverload{{Schema: fnName.Schema(), Overload: o}},
+		}
 		ref.FunctionReference = fd
 		return fd, nil
 	default:
 		return nil, errors.AssertionFailedf("unknown resolvable function reference type %s", t)
 	}
-}
-
-// CustomBuiltinFunctionWrapper in an interface providing custom WrapFunction
-// functionality. This is hack only being used by CDC to inject CDC custom
-// builtin functions. It's not recommended to implement this interface for more
-// purpose and this interface could be deleted.
-//
-// TODO(Chengxiong): consider getting rid of this hack entirely and use function
-// resolver instead. Previously, CDC utilized search path as a interface hack to
-// do the same thing. This interface makes the concept not relevant to search
-// path anymore and also makes the purpose more specific on "Builtin" functions.
-// However, it's ideal to get rid of this hack and use function resolver
-// instead. One issue need to be addressed is that "WrapFunction" always look at
-// builtin functions. So, the FunctionReferenceResolver interface might need to
-// be extended to have a specific path for builtin functions.
-type CustomBuiltinFunctionWrapper interface {
-	WrapFunction(name string) (*ResolvedFunctionDefinition, error)
 }
 
 // WrapFunction creates a new ResolvableFunctionReference holding a pre-resolved
@@ -146,7 +148,7 @@ func WrapFunction(n string) ResolvableFunctionReference {
 	if !ok {
 		panic(errors.AssertionFailedf("function %s() not defined", redact.Safe(n)))
 	}
-	return ResolvableFunctionReference{fd}
+	return ResolvableFunctionReference{FunctionReference: fd}
 }
 
 // FunctionReference is the common interface to UnresolvedName and QualifiedFunctionName.
@@ -163,3 +165,16 @@ var _ FunctionReference = &ResolvedFunctionDefinition{}
 func (*UnresolvedName) functionReference()             {}
 func (*FunctionDefinition) functionReference()         {}
 func (*ResolvedFunctionDefinition) functionReference() {}
+func (*FunctionOID) functionReference()                {}
+
+type FunctionOID struct {
+	OID oid.Oid
+}
+
+func (o *FunctionOID) String() string {
+	return AsString(o)
+}
+
+func (o *FunctionOID) Format(ctx *FmtCtx) {
+	ctx.WriteString(fmt.Sprintf("[FUNCTION %d]", o.OID))
+}

@@ -17,13 +17,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
@@ -32,9 +36,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -50,27 +55,49 @@ const DebugRowFetch = false
 // part of the output.
 const noOutputColumn = -1
 
-// kvBatchFetcherResponse contains a response from the KVBatchFetcher.
-type kvBatchFetcherResponse struct {
-	// moreKVs indicates whether this response contains some keys from the
+// KVBatchFetcherResponse contains a response from the KVBatchFetcher.
+type KVBatchFetcherResponse struct {
+	// MoreKVs indicates whether this response contains some keys from the
 	// fetch.
 	//
 	// If true, then the fetch might (or might not) be complete at this point -
-	// another call to nextBatch() is needed to find out. If false, then the
+	// another call to NextBatch() is needed to find out. If false, then the
 	// fetch has already been completed and this response doesn't have any
 	// fetched data.
-	moreKVs bool
-	// Only one of kvs and batchResponse will be set. Which one is set depends
-	// on the server version. Both must be handled by calling code.
 	//
-	// kvs, if set, is a slice of roachpb.KeyValue, the deserialized kv pairs
+	// Note that it is possible that MoreKVs is true when neither KVs,
+	// BatchResponse, nor ColBatch is set. This can occur when there was nothing
+	// to fetch for a Scan or a ReverseScan request, so the caller should just
+	// skip over such a response.
+	MoreKVs bool
+	// Only one of KVs, BatchResponse, and ColBatch will be set. Which one is
+	// set depends on the request type (KVs is used for Gets and BatchResponse /
+	// ColBatch for Scans and ReverseScans). All must be handled by calling
+	// code.
+	//
+	// KVs, if set, is a slice of roachpb.KeyValue, the deserialized kv pairs
 	// that were fetched.
-	kvs []roachpb.KeyValue
-	// batchResponse, if set, is a packed byte slice containing the keys and
-	// values. An empty batchResponse indicates that nothing was fetched for the
+	KVs []roachpb.KeyValue
+	// BatchResponse, if set, is either a packed byte slice containing the keys
+	// and values (for BATCH_RESPONSE scan format) or serialized representation
+	// of a coldata.Batch (for COL_BATCH_RESPONSE scan format). An empty
+	// BatchResponse and nil ColBatch indicate that nothing was fetched for the
 	// corresponding ScanRequest, and the caller is expected to skip over the
 	// response.
-	batchResponse []byte
+	BatchResponse []byte
+	// ColBatch is used for COL_BATCH_RESPONSE scan format when the request was
+	// evaluated locally. An empty BatchResponse and nil ColBatch indicate that
+	// nothing was fetched for the corresponding ScanRequest, and the caller is
+	// expected to skip over the response.
+	//
+	// Note that this batch will be accounted for by the txnKVFetcher, and the
+	// memory reservation is only released when the fetcher performs another
+	// BatchRequest.
+	//
+	// Note that the datum-backed vectors in this batch are "incomplete" in a
+	// sense they are missing the eval.Context. It is the caller's
+	// responsibility to update all datum-backed vectors with the eval context.
+	ColBatch coldata.Batch
 	// spanID is the ID associated with the span that generated this response.
 	spanID int
 }
@@ -78,28 +105,48 @@ type kvBatchFetcherResponse struct {
 // KVBatchFetcher abstracts the logic of fetching KVs in batches.
 type KVBatchFetcher interface {
 	// SetupNextFetch prepares the fetch of the next set of spans.
+	//
+	// spansCanOverlap indicates whether spans might be unordered and
+	// overlapping. If true, then spanIDs must be non-nil.
+	//
+	// NOTE: if spansCanOverlap is true and a single span can touch multiple
+	// ranges, then fetched rows from different spans can be interspersed with
+	// one another. See the comment on txnKVFetcher.SetupNextFetch for more
+	// details.
 	SetupNextFetch(
 		ctx context.Context,
 		spans roachpb.Spans,
 		spanIDs []int,
 		batchBytesLimit rowinfra.BytesLimit,
 		firstBatchKeyLimit rowinfra.KeyLimit,
+		spansCanOverlap bool,
 	) error
 
-	// nextBatch returns the next batch of rows. See kvBatchFetcherResponse for
+	// NextBatch returns the next batch of rows. See KVBatchFetcherResponse for
 	// details on what is returned.
-	nextBatch(ctx context.Context) (kvBatchFetcherResponse, error)
+	NextBatch(ctx context.Context) (KVBatchFetcherResponse, error)
 
-	close(ctx context.Context)
+	// GetBytesRead returns the number of bytes read by this fetcher. It is safe
+	// for concurrent use and is able to handle a case of uninitialized fetcher.
+	GetBytesRead() int64
+
+	// GetBatchRequestsIssued returns the number of BatchRequests issued by this
+	// fetcher throughout its lifetime. It is safe for concurrent use and is
+	// able to handle a case of uninitialized fetcher.
+	GetBatchRequestsIssued() int64
+
+	// Close releases the resources of this KVBatchFetcher. Must be called once
+	// the fetcher is no longer in use.
+	Close(ctx context.Context)
 }
 
 type tableInfo struct {
 	// -- Fields initialized once --
-	spec descpb.IndexFetchSpec
+	spec fetchpb.IndexFetchSpec
 
 	// The set of indexes into spec.FetchedColumns that are required for columns
 	// in the value part.
-	neededValueColsByIdx util.FastIntSet
+	neededValueColsByIdx intsets.Fast
 
 	// The number of needed columns from the value part of the row. Once we've
 	// seen this number of value columns for a particular row, we can stop
@@ -137,7 +184,7 @@ type tableInfo struct {
 	// meaningful when kv deletion tombstones are returned by the KVBatchFetcher,
 	// which the one used by `StartScan` (the common case) doesnt. Notably,
 	// changefeeds use this by providing raw kvs with tombstones unfiltered via
-	// `StartScanFrom`.
+	// `ConsumeKVProvider`.
 	rowIsDeleted bool
 }
 
@@ -168,7 +215,7 @@ type Fetcher struct {
 
 	// mvccDecodeStrategy controls whether or not MVCC timestamps should
 	// be decoded from KV's fetched.
-	mvccDecodeStrategy MVCCDecodingStrategy
+	mvccDecodeStrategy storage.MVCCDecodingStrategy
 
 	// -- Fields updated during a scan --
 
@@ -224,12 +271,13 @@ type FetcherInitArgs struct {
 	// kvstreamer.Streamer API under the hood. The caller is then expected to
 	// use only StartScan() method.
 	StreamingKVFetcher *KVFetcher
-	// WillUseCustomKVBatchFetcher, if true, indicates that the caller will only
-	// use StartScanFrom() method and will be providing its own KVBatchFetcher.
-	WillUseCustomKVBatchFetcher bool
+	// WillUseKVProvider, if true, indicates that the caller will only use
+	// ConsumeKVProvider() method and will use its own KVBatchFetcher
+	// implementation.
+	WillUseKVProvider bool
 	// Txn is the txn for the fetch. It might be nil, and the caller is expected
-	// to either provide the txn later via SetTxn() or to only use StartScanFrom
-	// method.
+	// to either provide the txn later via SetTxn() or to only use
+	// ConsumeKVProvider method.
 	Txn *kv.Txn
 	// Reverse denotes whether or not the spans should be read in reverse or not
 	// when StartScan* methods are invoked.
@@ -247,7 +295,7 @@ type FetcherInitArgs struct {
 	// Alloc is used for buffered allocation of decoded datums.
 	Alloc      *tree.DatumAlloc
 	MemMonitor *mon.BytesMonitor
-	Spec       *descpb.IndexFetchSpec
+	Spec       *fetchpb.IndexFetchSpec
 	// TraceKV indicates whether or not session tracing is enabled.
 	TraceKV                    bool
 	ForceProductionKVBatchSize bool
@@ -261,7 +309,7 @@ type FetcherInitArgs struct {
 
 // Init sets up a Fetcher for a given table and index.
 func (rf *Fetcher) Init(ctx context.Context, args FetcherInitArgs) error {
-	if args.Spec.Version != descpb.IndexFetchSpecVersionInitial {
+	if args.Spec.Version != fetchpb.IndexFetchSpecVersionInitial {
 		return errors.Newf("unsupported IndexFetchSpec version %d", args.Spec.Version)
 	}
 
@@ -296,7 +344,7 @@ func (rf *Fetcher) Init(ctx context.Context, args FetcherInitArgs) error {
 			switch colinfo.GetSystemColumnKindFromColumnID(colID) {
 			case catpb.SystemColumnKind_MVCCTIMESTAMP:
 				table.timestampOutputIdx = idx
-				rf.mvccDecodeStrategy = MVCCDecodingRequired
+				rf.mvccDecodeStrategy = storage.MVCCDecodingRequired
 
 			case catpb.SystemColumnKind_TABLEOID:
 				table.oidOutputIdx = idx
@@ -368,28 +416,29 @@ func (rf *Fetcher) Init(ctx context.Context, args FetcherInitArgs) error {
 	}
 
 	if args.StreamingKVFetcher != nil {
-		if args.WillUseCustomKVBatchFetcher {
+		if args.WillUseKVProvider {
 			return errors.AssertionFailedf(
-				"StreamingKVFetcher is non-nil when WillUseCustomKVBatchFetcher is true",
+				"StreamingKVFetcher is non-nil when WillUseKVProvider is true",
 			)
 		}
 		rf.kvFetcher = args.StreamingKVFetcher
-	} else if !args.WillUseCustomKVBatchFetcher {
-		fetcherArgs := kvBatchFetcherArgs{
+	} else if !args.WillUseKVProvider {
+		var batchRequestsIssued int64
+		fetcherArgs := newTxnKVFetcherArgs{
 			reverse:                    args.Reverse,
 			lockStrength:               args.LockStrength,
 			lockWaitPolicy:             args.LockWaitPolicy,
 			lockTimeout:                args.LockTimeout,
 			acc:                        rf.kvFetcherMemAcc,
 			forceProductionKVBatchSize: args.ForceProductionKVBatchSize,
+			batchRequestsIssued:        &batchRequestsIssued,
 		}
-		var batchRequestsIssued int64
 		if args.Txn != nil {
-			fetcherArgs.sendFn = makeKVBatchFetcherDefaultSendFunc(args.Txn, &batchRequestsIssued)
+			fetcherArgs.sendFn = makeTxnKVFetcherDefaultSendFunc(args.Txn, &batchRequestsIssued)
 			fetcherArgs.requestAdmissionHeader = args.Txn.AdmissionHeader()
 			fetcherArgs.responseAdmissionQ = args.Txn.DB().SQLKVResponseAdmissionQ
 		}
-		rf.kvFetcher = newKVFetcher(newKVBatchFetcher(fetcherArgs), &batchRequestsIssued)
+		rf.kvFetcher = newKVFetcher(newTxnKVFetcherInternal(fetcherArgs))
 	}
 
 	return nil
@@ -404,8 +453,12 @@ func (rf *Fetcher) Init(ctx context.Context, args FetcherInitArgs) error {
 //   - allowing the caller to update the Fetcher to use the new txn. In this case,
 //     the caller should be careful since reads performed under different txns
 //     do not provide consistent view of the data.
+//
+// Note that this resets the number of batch requests issued by the Fetcher.
+// Consider using GetBatchRequestsIssued if that information is needed.
 func (rf *Fetcher) SetTxn(txn *kv.Txn) error {
-	sendFn := makeKVBatchFetcherDefaultSendFunc(txn, rf.kvFetcher.atomics.batchRequestsIssued)
+	var batchRequestsIssued int64
+	sendFn := makeTxnKVFetcherDefaultSendFunc(txn, &batchRequestsIssued)
 	return rf.setTxnAndSendFn(txn, sendFn)
 }
 
@@ -423,8 +476,7 @@ func (rf *Fetcher) setTxnAndSendFn(txn *kv.Txn, sendFn sendFunc) error {
 }
 
 // StartScan initializes and starts the key-value scan. Can be used multiple
-// times. Cannot be used if WillUseCustomKVBatchFetcher was set to true in
-// Init().
+// times. Cannot be used if WillUseKVProvider was set to true in Init().
 //
 // The fetcher takes ownership of the spans slice - it can modify the slice and
 // will perform the memory accounting accordingly (if Init() was called with
@@ -467,15 +519,15 @@ func (rf *Fetcher) StartScan(
 	batchBytesLimit rowinfra.BytesLimit,
 	rowLimitHint rowinfra.RowLimit,
 ) error {
-	if rf.args.WillUseCustomKVBatchFetcher {
-		return errors.AssertionFailedf("StartScan is called instead of StartScanFrom")
+	if rf.args.WillUseKVProvider {
+		return errors.AssertionFailedf("StartScan is called instead of ConsumeKVProvider")
 	}
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("no spans")
 	}
 
 	if err := rf.kvFetcher.SetupNextFetch(
-		ctx, spans, spanIDs, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint),
+		ctx, spans, spanIDs, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint), rf.args.SpansCanOverlap,
 	); err != nil {
 		return err
 	}
@@ -498,8 +550,8 @@ var TestingInconsistentScanSleep time.Duration
 // that has passed. See the documentation for TableReaderSpec for more
 // details.
 //
-// Can be used multiple times. Cannot be used if WillUseCustomKVBatchFetcher was
-// set to true in Init().
+// Can be used multiple times. Cannot be used if WillUseKVProvider was set to
+// true in Init().
 //
 // Batch limits can only be used if the spans are ordered.
 func (rf *Fetcher) StartInconsistentScan(
@@ -515,8 +567,8 @@ func (rf *Fetcher) StartInconsistentScan(
 	if rf.args.StreamingKVFetcher != nil {
 		return errors.AssertionFailedf("StartInconsistentScan is called instead of StartScan")
 	}
-	if rf.args.WillUseCustomKVBatchFetcher {
-		return errors.AssertionFailedf("StartInconsistentScan is called instead of StartScanFrom")
+	if rf.args.WillUseKVProvider {
+		return errors.AssertionFailedf("StartInconsistentScan is called instead of ConsumeKVProvider")
 	}
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("no spans")
@@ -538,7 +590,7 @@ func (rf *Fetcher) StartInconsistentScan(
 		log.Infof(ctx, "starting inconsistent scan at timestamp %v", txnTimestamp)
 	}
 
-	sendFn := func(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
+	sendFn := func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
 		if now := timeutil.Now(); now.Sub(txnTimestamp.GoTime()) >= maxTimestampAge {
 			// Time to bump the transaction. First commit the old one (should be a no-op).
 			if err := txn.Commit(ctx); err != nil {
@@ -575,7 +627,8 @@ func (rf *Fetcher) StartInconsistentScan(
 	}
 
 	if err := rf.kvFetcher.SetupNextFetch(
-		ctx, spans, nil /* spanIDs */, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint),
+		ctx, spans, nil, batchBytesLimit,
+		rf.rowLimitToKeyLimit(rowLimitHint), false, /* spansCanOverlap */
 	); err != nil {
 		return err
 	}
@@ -598,22 +651,17 @@ func (rf *Fetcher) rowLimitToKeyLimit(rowLimitHint rowinfra.RowLimit) rowinfra.K
 	return rowinfra.KeyLimit(int64(rowLimitHint)*int64(rf.table.spec.MaxKeysPerRow) + 1)
 }
 
-// StartScanFrom initializes and starts a scan from the given KVBatchFetcher.
-// Can be used multiple times. Cannot be used if WillUseCustomKVBatchFetcher was
-// set to false in Init().
-func (rf *Fetcher) StartScanFrom(ctx context.Context, f KVBatchFetcher) error {
-	if !rf.args.WillUseCustomKVBatchFetcher {
-		return errors.AssertionFailedf("StartScanFrom is called instead of StartScan")
+// ConsumeKVProvider initializes and starts a "scan" of the given KVProvider.
+// Can be used multiple times. Cannot be used if WillUseKVProvider was set to
+// false in Init().
+func (rf *Fetcher) ConsumeKVProvider(ctx context.Context, f *KVProvider) error {
+	if !rf.args.WillUseKVProvider {
+		return errors.AssertionFailedf("ConsumeKVProvider is called instead of StartScan")
 	}
-	var batchRequestsIssued *int64
 	if rf.kvFetcher != nil {
 		rf.kvFetcher.Close(ctx)
-		// Keep the same counter across different fetchers.
-		batchRequestsIssued = rf.kvFetcher.atomics.batchRequestsIssued
-	} else {
-		batchRequestsIssued = new(int64)
 	}
-	rf.kvFetcher = newKVFetcher(f, batchRequestsIssued)
+	rf.kvFetcher = newKVFetcher(f)
 	return rf.startScan(ctx)
 }
 
@@ -626,37 +674,14 @@ func (rf *Fetcher) startScan(ctx context.Context) error {
 	return err
 }
 
-// setNextKV sets the next KV to process to the input KV. needsCopy, if true,
-// causes the input kv to be deep copied. needsCopy should be set to true if
-// the input KV is pointing to the last KV of a batch, so that the batch can
-// be garbage collected before fetching the next one.
-// gcassert:inline
-func (rf *Fetcher) setNextKV(kv roachpb.KeyValue, needsCopy bool) {
-	if !needsCopy {
-		rf.kv = kv
-		return
-	}
-
-	// If we've made it to the very last key in the batch, copy out the key
-	// so that the GC can reclaim the large backing slice before we call
-	// NextKV() again.
-	kvCopy := roachpb.KeyValue{}
-	kvCopy.Key = make(roachpb.Key, len(kv.Key))
-	copy(kvCopy.Key, kv.Key)
-	kvCopy.Value.RawBytes = make([]byte, len(kv.Value.RawBytes))
-	copy(kvCopy.Value.RawBytes, kv.Value.RawBytes)
-	kvCopy.Value.Timestamp = kv.Value.Timestamp
-	rf.kv = kvCopy
-}
-
 // nextKey retrieves the next key/value and sets kv/kvEnd. Returns whether the
 // key indicates a new row (as opposed to another family for the current row).
 func (rf *Fetcher) nextKey(ctx context.Context) (newRow bool, spanID int, _ error) {
-	ok, kv, spanID, finalReferenceToBatch, err := rf.kvFetcher.NextKV(ctx, rf.mvccDecodeStrategy)
+	ok, kv, spanID, err := rf.kvFetcher.nextKV(ctx, rf.mvccDecodeStrategy)
 	if err != nil {
 		return false, 0, ConvertFetchError(&rf.table.spec, err)
 	}
-	rf.setNextKV(kv, finalReferenceToBatch)
+	rf.kv = kv
 
 	if !ok {
 		// No more keys in the scan.
@@ -732,7 +757,7 @@ func (rf *Fetcher) nextKey(ctx context.Context) (newRow bool, spanID int, _ erro
 }
 
 func (rf *Fetcher) prettyKeyDatums(
-	cols []descpb.IndexFetchSpec_KeyColumn, vals []rowenc.EncDatum,
+	cols []fetchpb.IndexFetchSpec_KeyColumn, vals []rowenc.EncDatum,
 ) string {
 	var buf strings.Builder
 	for i, v := range vals {
@@ -820,7 +845,7 @@ func (rf *Fetcher) processKV(
 	}
 
 	// For covering secondary indexes, allow for decoding as a primary key.
-	if table.spec.EncodingType == descpb.PrimaryIndexEncoding &&
+	if table.spec.EncodingType == catenumpb.PrimaryIndexEncoding &&
 		len(rf.keyRemainingBytes) > 0 {
 		// If familyID is 0, kv.Value contains values for composite key columns.
 		// These columns already have a table.row value assigned above, but that value
@@ -862,10 +887,14 @@ func (rf *Fetcher) processKV(
 					}
 				}
 				if defaultColumnID == 0 {
-					return "", "", errors.Errorf("single entry value with no default column id")
+					if kv.Value.GetTag() == roachpb.ValueType_UNKNOWN {
+						// Tombstone for a secondary column family, nothing needs to be done.
+					} else {
+						return "", "", errors.Errorf("single entry value with no default column id")
+					}
+				} else {
+					prettyKey, prettyValue, err = rf.processValueSingle(ctx, table, defaultColumnID, kv, prettyKey)
 				}
-
-				prettyKey, prettyValue, err = rf.processValueSingle(ctx, table, defaultColumnID, kv, prettyKey)
 			}
 		}
 		if err != nil {
@@ -1256,11 +1285,17 @@ func (rf *Fetcher) Key() roachpb.Key {
 
 // GetBytesRead returns total number of bytes read by the underlying KVFetcher.
 func (rf *Fetcher) GetBytesRead() int64 {
+	if rf == nil || rf.kvFetcher == nil {
+		return 0
+	}
 	return rf.kvFetcher.GetBytesRead()
 }
 
 // GetBatchRequestsIssued returns total number of BatchRequests issued by the
 // underlying KVFetcher.
 func (rf *Fetcher) GetBatchRequestsIssued() int64 {
+	if rf == nil || rf.kvFetcher == nil || rf.args.WillUseKVProvider {
+		return 0
+	}
 	return rf.kvFetcher.GetBatchRequestsIssued()
 }

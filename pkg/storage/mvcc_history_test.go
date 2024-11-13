@@ -8,9 +8,10 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package storage
+package storage_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -21,7 +22,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -29,8 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -52,8 +56,11 @@ var (
 		"mvcc-histories-clear-range-using-iterator", false)
 	cmdDeleteRangeTombstoneKnownStats = util.ConstantWithMetamorphicTestBool(
 		"mvcc-histories-deleterange-tombstome-known-stats", false)
-	iterReader = util.ConstantWithMetamorphicTestChoice("mvcc-histories-iter-reader",
+	mvccHistoriesReader = util.ConstantWithMetamorphicTestChoice("mvcc-histories-reader",
 		"engine", "readonly", "batch", "snapshot").(string)
+	mvccHistoriesUseBatch   = util.ConstantWithMetamorphicTestBool("mvcc-histories-use-batch", false)
+	mvccHistoriesPeekBounds = util.ConstantWithMetamorphicTestChoice("mvcc-histories-peek-bounds",
+		"none", "left", "right", "both").(string)
 	sstIterVerify           = util.ConstantWithMetamorphicTestBool("mvcc-histories-sst-iter-verify", false)
 	metamorphicIteratorSeed = util.ConstantWithMetamorphicTestRange("mvcc-metamorphic-iterator-seed", 0, 0, 100000) // 0 = disabled
 	separateEngineBlocks    = util.ConstantWithMetamorphicTestBool("mvcc-histories-separate-engine-blocks", false)
@@ -75,8 +82,8 @@ var (
 // txn_status     t=<name> status=<txnstatus>
 // txn_ignore_seqs t=<name> seqs=[<int>-<int>[,<int>-<int>...]]
 //
-// resolve_intent t=<name> k=<key> [status=<txnstatus>] [clockWhilePending=<int>[,<int>]]
-// resolve_intent_range t=<name> k=<key> end=<key> [status=<txnstatus>]
+// resolve_intent t=<name> k=<key> [status=<txnstatus>] [clockWhilePending=<int>[,<int>]] [targetBytes=<int>]
+// resolve_intent_range t=<name> k=<key> end=<key> [status=<txnstatus>] [maxKeys=<int>] [targetBytes=<int>]
 // check_intent   k=<key> [none]
 // add_lock       t=<name> k=<key>
 //
@@ -90,11 +97,11 @@ var (
 // merge          [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> v=<string> [raw]
 // put            [t=<name>] [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> v=<string> [raw]
 // put_rangekey   ts=<int>[,<int>] [localTs=<int>[,<int>]] k=<key> end=<key>
-// get            [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [inconsistent] [skipLocked] [tombstones] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]]
-// scan           [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [end=<key>] [inconsistent] [skipLocked] [tombstones] [reverse] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]] [max=<max>] [targetbytes=<target>] [allowEmpty]
-// export         [k=<key>] [end=<key>] [ts=<int>[,<int>]] [kTs=<int>[,<int>]] [startTs=<int>[,<int>]] [maxIntents=<int>] [allRevisions] [targetSize=<int>] [maxSize=<int>] [stopMidKey]
+// get            [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [inconsistent] [skipLocked] [tombstones] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]] [maxKeys=<int>] [targetBytes=<int>] [allowEmpty]
+// scan           [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [end=<key>] [inconsistent] [skipLocked] [tombstones] [reverse] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]] [max=<max>] [targetbytes=<target>] [wholeRows[=<int>]] [allowEmpty]
+// export         [k=<key>] [end=<key>] [ts=<int>[,<int>]] [kTs=<int>[,<int>]] [startTs=<int>[,<int>]] [maxIntents=<int>] [allRevisions] [targetSize=<int>] [maxSize=<int>] [stopMidKey] [fingerprint]
 //
-// iter_new       [k=<key>] [end=<key>] [prefix] [kind=key|keyAndIntents] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [pointSynthesis] [maskBelow=<int>[,<int>]]
+// iter_new       [k=<key>] [end=<key>] [prefix] [kind=key|keyAndIntents] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [maskBelow=<int>[,<int>]]
 // iter_new_incremental [k=<key>] [end=<key>] [startTs=<int>[,<int>]] [endTs=<int>[,<int>]] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [maskBelow=<int>[,<int>]] [intents=error|aggregate|emit]
 // iter_seek_ge   k=<key> [ts=<int>[,<int>]]
 // iter_seek_lt   k=<key> [ts=<int>[,<int>]]
@@ -114,6 +121,7 @@ var (
 // clear_time_range k=<key> end=<key> ts=<int>[,<int>] targetTs=<int>[,<int>] [clearRangeThreshold=<int>] [maxBatchSize=<int>] [maxBatchByteSize=<int>]
 //
 // gc_clear_range k=<key> end=<key> startTs=<int>[,<int>] ts=<int>[,<int>]
+// gc_points_clear_range k=<key> end=<key> startTs=<int>[,<int>] ts=<int>[,<int>]
 // replace_point_tombstones_with_range_tombstones k=<key> [end=<key>]
 //
 // sst_put            [ts=<int>[,<int>]] [localTs=<int>[,<int>]] k=<key> [v=<string>]
@@ -149,89 +157,94 @@ var (
 func TestMVCCHistories(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	DisableMetamorphicSimpleValueEncoding(t)
+	// TODO(storage-team): this prevents us from easily finding bugs which
+	// incorrectly assume simple value encoding. We only find bugs where we are
+	// explicitly using the extended encoding by setting a localTs. One way to
+	// handle the different test output with extended value encoding would be to
+	// duplicate each test file for the two cases.
+	storage.DisableMetamorphicSimpleValueEncoding(t)
 
 	ctx := context.Background()
 
-	// Everything reads/writes under the same prefix.
-	span := roachpb.Span{Key: keys.LocalMax, EndKey: roachpb.KeyMax}
+	// intentInterleavingIter doesn't allow iterating from the local to the global
+	// keyspace, so we have to process these key spans separately.
+	spans := []roachpb.Span{
+		{Key: keys.MinKey, EndKey: roachpb.LocalMax},
+		{Key: keys.LocalMax, EndKey: roachpb.KeyMax},
+	}
 
 	// Timestamp for MVCC stats calculations, in nanoseconds.
 	const statsTS = 100e9
 
-	datadriven.Walk(t, testutils.TestDataPath(t, "mvcc_histories"), func(t *testing.T, path string) {
-		engineOpts := []ConfigOption{CacheSize(1 << 20 /* 1 MiB */), ForTesting}
-		// If enabled by metamorphic parameter, use very small blocks to provoke TBI
-		// optimization. We'll also flush after each command.
-		if separateEngineBlocks {
-			engineOpts = append(engineOpts, func(cfg *engineConfig) error {
-				cfg.Opts.DisableAutomaticCompactions = true
-				for i := range cfg.Opts.Levels {
-					cfg.Opts.Levels[i].BlockSize = 1
-					cfg.Opts.Levels[i].IndexBlockSize = 1
-				}
-				return nil
-			})
-		}
-
-		// We start from a clean slate in every test file.
-		engine, err := Open(ctx, InMemory(), engineOpts...)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer engine.Close()
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "mvcc_histories"), func(t *testing.T, path string) {
+		st := cluster.MakeTestingClusterSettings()
 
 		if strings.Contains(path, "_norace") {
 			skip.UnderRace(t)
 		}
 
 		if strings.Contains(path, "_disable_local_timestamps") {
-			localTimestampsEnabled.Override(ctx, &engine.settings.SV, false)
+			storage.LocalTimestampsEnabled.Override(ctx, &st.SV, false)
 		}
+
+		disableSeparateEngineBlocks := strings.Contains(path, "_disable_separate_engine_blocks")
+
+		// We start from a clean slate in every test file.
+		engine, err := storage.Open(ctx, storage.InMemory(), st,
+			storage.CacheSize(1<<20 /* 1 MiB */),
+			storage.If(separateEngineBlocks && !disableSeparateEngineBlocks, storage.BlockSize(1)),
+		)
+		require.NoError(t, err)
+		defer engine.Close()
 
 		reportDataEntries := func(buf *redact.StringBuilder) error {
 			var hasData bool
 
-			err = engine.MVCCIterate(span.Key, span.EndKey, MVCCKeyAndIntentsIterKind, IterKeyTypeRangesOnly,
-				func(_ MVCCKeyValue, rangeKeys MVCCRangeKeyStack) error {
-					hasData = true
-					buf.Printf("rangekey: %s/[", rangeKeys.Bounds)
-					for i, version := range rangeKeys.Versions {
-						val, err := DecodeMVCCValue(version.Value)
-						require.NoError(t, err)
-						if i > 0 {
-							buf.Printf(" ")
+			for _, span := range spans {
+				err = engine.MVCCIterate(
+					span.Key, span.EndKey, storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypeRangesOnly,
+					func(_ storage.MVCCKeyValue, rangeKeys storage.MVCCRangeKeyStack) error {
+						hasData = true
+						buf.Printf("rangekey: %s/[", rangeKeys.Bounds)
+						for i, version := range rangeKeys.Versions {
+							val, err := storage.DecodeMVCCValue(version.Value)
+							require.NoError(t, err)
+							if i > 0 {
+								buf.Printf(" ")
+							}
+							buf.Printf("%s=%s", version.Timestamp, val)
 						}
-						buf.Printf("%s=%s", version.Timestamp, val)
-					}
-					buf.Printf("]\n")
-					return nil
-				})
-			if err != nil {
-				return err
+						buf.Printf("]\n")
+						return nil
+					})
+				if err != nil {
+					return err
+				}
+
+				err = engine.MVCCIterate(
+					span.Key, span.EndKey, storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
+					func(r storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
+						hasData = true
+						if r.Key.Timestamp.IsEmpty() {
+							// Meta is at timestamp zero.
+							meta := enginepb.MVCCMetadata{}
+							if err := protoutil.Unmarshal(r.Value, &meta); err != nil {
+								buf.Printf("meta: %v -> error decoding proto from %v: %v\n", r.Key, r.Value, err)
+							} else {
+								buf.Printf("meta: %v -> %+v\n", r.Key, &meta)
+							}
+						} else {
+							val, err := storage.DecodeMVCCValue(r.Value)
+							if err != nil {
+								buf.Printf("data: %v -> error decoding value %v: %v\n", r.Key, r.Value, err)
+							} else {
+								buf.Printf("data: %v -> %s\n", r.Key, val)
+							}
+						}
+						return nil
+					})
 			}
 
-			err = engine.MVCCIterate(span.Key, span.EndKey, MVCCKeyAndIntentsIterKind, IterKeyTypePointsOnly,
-				func(r MVCCKeyValue, _ MVCCRangeKeyStack) error {
-					hasData = true
-					if r.Key.Timestamp.IsEmpty() {
-						// Meta is at timestamp zero.
-						meta := enginepb.MVCCMetadata{}
-						if err := protoutil.Unmarshal(r.Value, &meta); err != nil {
-							buf.Printf("meta: %v -> error decoding proto from %v: %v\n", r.Key, r.Value, err)
-						} else {
-							buf.Printf("meta: %v -> %+v\n", r.Key, &meta)
-						}
-					} else {
-						val, err := DecodeMVCCValue(r.Value)
-						if err != nil {
-							buf.Printf("data: %v -> error decoding value %v: %v\n", r.Key, r.Value, err)
-						} else {
-							buf.Printf("data: %v -> %s\n", r.Key, val)
-						}
-					}
-					return nil
-				})
 			if !hasData {
 				buf.SafeString("<no data>\n")
 			}
@@ -242,7 +255,7 @@ func TestMVCCHistories(t *testing.T) {
 		// SST iterator in order to accurately represent the raw SST data.
 		reportSSTEntries := func(buf *redact.StringBuilder, name string, sst []byte) error {
 			r, err := sstable.NewMemReader(sst, sstable.ReaderOptions{
-				Comparer: EngineComparer,
+				Comparer: storage.EngineComparer,
 			})
 			if err != nil {
 				return err
@@ -255,15 +268,19 @@ func TestMVCCHistories(t *testing.T) {
 				return err
 			}
 			defer func() { _ = iter.Close() }()
-			for k, v := iter.SeekGE(nil, sstable.SeekGEFlags(0)); k != nil; k, v = iter.Next() {
+			for k, lv := iter.SeekGE(nil, sstable.SeekGEFlags(0)); k != nil; k, lv = iter.Next() {
 				if err := iter.Error(); err != nil {
 					return err
 				}
-				key, err := DecodeMVCCKey(k.UserKey)
+				key, err := storage.DecodeMVCCKey(k.UserKey)
 				if err != nil {
 					return err
 				}
-				value, err := DecodeMVCCValue(v)
+				v, _, err := lv.Value(nil)
+				if err != nil {
+					return err
+				}
+				value, err := storage.DecodeMVCCValue(v)
 				if err != nil {
 					return err
 				}
@@ -279,11 +296,11 @@ func TestMVCCHistories(t *testing.T) {
 					if err := rdIter.Error(); err != nil {
 						return err
 					}
-					start, err := DecodeMVCCKey(s.Start)
+					start, err := storage.DecodeMVCCKey(s.Start)
 					if err != nil {
 						return err
 					}
-					end, err := DecodeMVCCKey(s.End)
+					end, err := storage.DecodeMVCCKey(s.End)
 					if err != nil {
 						return err
 					}
@@ -303,11 +320,11 @@ func TestMVCCHistories(t *testing.T) {
 					if err := rkIter.Error(); err != nil {
 						return err
 					}
-					start, err := DecodeMVCCKey(s.Start)
+					start, err := storage.DecodeMVCCKey(s.Start)
 					if err != nil {
 						return err
 					}
-					end, err := DecodeMVCCKey(s.End)
+					end, err := storage.DecodeMVCCKey(s.End)
 					if err != nil {
 						return err
 					}
@@ -315,14 +332,14 @@ func TestMVCCHistories(t *testing.T) {
 						buf.Printf("%s: %s", strings.ToLower(k.Kind().String()),
 							roachpb.Span{Key: start.Key, EndKey: end.Key})
 						if k.Suffix != nil {
-							ts, err := DecodeMVCCTimestampSuffix(k.Suffix)
+							ts, err := storage.DecodeMVCCTimestampSuffix(k.Suffix)
 							if err != nil {
 								return err
 							}
 							buf.Printf("/%s", ts)
 						}
 						if k.Kind() == pebble.InternalKeyKindRangeKeySet {
-							value, err := DecodeMVCCValue(k.Value)
+							value, err := storage.DecodeMVCCValue(k.Value)
 							if err != nil {
 								return err
 							}
@@ -540,15 +557,18 @@ func TestMVCCHistories(t *testing.T) {
 					// that we can compare the deltas.
 					var msEngineBefore enginepb.MVCCStats
 					if stats {
-						msEngineBefore, err = ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
-						require.NoError(t, err)
+						for _, span := range spans {
+							ms, err := storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
+							require.NoError(t, err)
+							msEngineBefore.Add(ms)
+						}
 					}
 					msEvalBefore := *e.ms
 
 					// Run the command.
 					foundErr = cmd.fn(e)
 
-					if separateEngineBlocks && dataChange {
+					if separateEngineBlocks && !disableSeparateEngineBlocks && dataChange {
 						require.NoError(t, e.engine.Flush())
 					}
 
@@ -562,8 +582,12 @@ func TestMVCCHistories(t *testing.T) {
 					if stats && cmd.typ == typDataUpdate {
 						// If stats are enabled, emit evaluated stats returned by the
 						// command, and compare them with the real computed stats diff.
-						msEngineDiff, err := ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
-						require.NoError(t, err)
+						var msEngineDiff enginepb.MVCCStats
+						for _, span := range spans {
+							ms, err := storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
+							require.NoError(t, err)
+							msEngineDiff.Add(ms)
+						}
 						msEngineDiff.Subtract(msEngineBefore)
 
 						msEvalDiff := *e.ms
@@ -606,9 +630,13 @@ func TestMVCCHistories(t *testing.T) {
 
 				// Calculate and output final stats if requested and the data changed.
 				if stats && dataChange {
-					ms, err := ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
-					require.NoError(t, err)
-					buf.Printf("stats: %s\n", formatStats(ms, false))
+					var msFinal enginepb.MVCCStats
+					for _, span := range spans {
+						ms, err := storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
+						require.NoError(t, err)
+						msFinal.Add(ms)
+					}
+					buf.Printf("stats: %s\n", formatStats(msFinal, false))
 				}
 
 				signalError := e.t.Errorf
@@ -685,25 +713,26 @@ var commands = map[string]cmd{
 	"check_intent":         {typReadOnly, cmdCheckIntent},
 	"add_lock":             {typLocksUpdate, cmdAddLock},
 
-	"clear":            {typDataUpdate, cmdClear},
-	"clear_range":      {typDataUpdate, cmdClearRange},
-	"clear_rangekey":   {typDataUpdate, cmdClearRangeKey},
-	"clear_time_range": {typDataUpdate, cmdClearTimeRange},
-	"cput":             {typDataUpdate, cmdCPut},
-	"del":              {typDataUpdate, cmdDelete},
-	"del_range":        {typDataUpdate, cmdDeleteRange},
-	"del_range_ts":     {typDataUpdate, cmdDeleteRangeTombstone},
-	"del_range_pred":   {typDataUpdate, cmdDeleteRangePredicate},
-	"export":           {typReadOnly, cmdExport},
-	"get":              {typReadOnly, cmdGet},
-	"gc_clear_range":   {typDataUpdate, cmdGCClearRange},
-	"increment":        {typDataUpdate, cmdIncrement},
-	"initput":          {typDataUpdate, cmdInitPut},
-	"merge":            {typDataUpdate, cmdMerge},
-	"put":              {typDataUpdate, cmdPut},
-	"put_rangekey":     {typDataUpdate, cmdPutRangeKey},
-	"scan":             {typReadOnly, cmdScan},
-	"is_span_empty":    {typReadOnly, cmdIsSpanEmpty},
+	"clear":                 {typDataUpdate, cmdClear},
+	"clear_range":           {typDataUpdate, cmdClearRange},
+	"clear_rangekey":        {typDataUpdate, cmdClearRangeKey},
+	"clear_time_range":      {typDataUpdate, cmdClearTimeRange},
+	"cput":                  {typDataUpdate, cmdCPut},
+	"del":                   {typDataUpdate, cmdDelete},
+	"del_range":             {typDataUpdate, cmdDeleteRange},
+	"del_range_ts":          {typDataUpdate, cmdDeleteRangeTombstone},
+	"del_range_pred":        {typDataUpdate, cmdDeleteRangePredicate},
+	"export":                {typReadOnly, cmdExport},
+	"get":                   {typReadOnly, cmdGet},
+	"gc_clear_range":        {typDataUpdate, cmdGCClearRange},
+	"gc_points_clear_range": {typDataUpdate, cmdGCPointsClearRange},
+	"increment":             {typDataUpdate, cmdIncrement},
+	"initput":               {typDataUpdate, cmdInitPut},
+	"merge":                 {typDataUpdate, cmdMerge},
+	"put":                   {typDataUpdate, cmdPut},
+	"put_rangekey":          {typDataUpdate, cmdPutRangeKey},
+	"scan":                  {typReadOnly, cmdScan},
+	"is_span_empty":         {typReadOnly, cmdIsSpanEmpty},
 
 	"iter_new":                    {typReadOnly, cmdIterNew},
 	"iter_new_incremental":        {typReadOnly, cmdIterNewIncremental}, // MVCCIncrementalIterator
@@ -834,7 +863,7 @@ func cmdTxnUpdate(e *evalCtx) error {
 }
 
 type intentPrintingReadWriter struct {
-	ReadWriter
+	storage.ReadWriter
 	buf *redact.StringBuilder
 }
 
@@ -854,7 +883,7 @@ func (rw intentPrintingReadWriter) ClearIntent(
 	return rw.ReadWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID)
 }
 
-func (e *evalCtx) tryWrapForIntentPrinting(rw ReadWriter) ReadWriter {
+func (e *evalCtx) tryWrapForIntentPrinting(rw storage.ReadWriter) storage.ReadWriter {
 	if e.results.traceIntentWrites {
 		return intentPrintingReadWriter{ReadWriter: rw, buf: e.results.buf}
 	}
@@ -866,7 +895,13 @@ func cmdResolveIntent(e *evalCtx) error {
 	key := e.getKey()
 	status := e.getTxnStatus()
 	clockWhilePending := hlc.ClockTimestamp(e.getTsWithName("clockWhilePending"))
-	return e.resolveIntent(e.tryWrapForIntentPrinting(e.engine), key, txn, status, clockWhilePending)
+	var targetBytes int64
+	if e.hasArg("targetBytes") {
+		e.scanArg("targetBytes", &targetBytes)
+	}
+	return e.withWriter("resolve_intent", func(rw storage.ReadWriter) error {
+		return e.resolveIntent(rw, key, txn, status, clockWhilePending, targetBytes)
+	})
 }
 
 func cmdResolveIntentRange(e *evalCtx) error {
@@ -876,21 +911,36 @@ func cmdResolveIntentRange(e *evalCtx) error {
 
 	intent := roachpb.MakeLockUpdate(txn, roachpb.Span{Key: start, EndKey: end})
 	intent.Status = status
-	_, _, err := MVCCResolveWriteIntentRange(e.ctx, e.tryWrapForIntentPrinting(e.engine), e.ms, intent, 0)
-	return err
+
+	var maxKeys int64
+	if e.hasArg("maxKeys") {
+		e.scanArg("maxKeys", &maxKeys)
+	}
+	var targetBytes int64
+	if e.hasArg("targetBytes") {
+		e.scanArg("targetBytes", &targetBytes)
+	}
+
+	return e.withWriter("resolve_intent_range", func(rw storage.ReadWriter) error {
+		_, _, _, _, err := storage.MVCCResolveWriteIntentRange(e.ctx, rw, e.ms, intent,
+			storage.MVCCResolveWriteIntentRangeOptions{MaxKeys: maxKeys, TargetBytes: targetBytes})
+		return err
+	})
 }
 
 func (e *evalCtx) resolveIntent(
-	rw ReadWriter,
+	rw storage.ReadWriter,
 	key roachpb.Key,
 	txn *roachpb.Transaction,
 	resolveStatus roachpb.TransactionStatus,
 	clockWhilePending hlc.ClockTimestamp,
+	targetBytes int64,
 ) error {
 	intent := roachpb.MakeLockUpdate(txn, roachpb.Span{Key: key})
 	intent.Status = resolveStatus
 	intent.ClockWhilePending = roachpb.ObservedTimestamp{Timestamp: clockWhilePending}
-	_, err := MVCCResolveWriteIntent(e.ctx, rw, e.ms, intent)
+	_, _, _, err := storage.MVCCResolveWriteIntent(e.ctx, rw, e.ms, intent,
+		storage.MVCCResolveWriteIntentOptions{TargetBytes: targetBytes})
 	return err
 }
 
@@ -900,22 +950,33 @@ func cmdCheckIntent(e *evalCtx) error {
 	if e.hasArg("none") {
 		wantIntent = false
 	}
-	metaKey := mvccKey(key)
-	var meta enginepb.MVCCMetadata
-	ok, _, _, err := e.engine.MVCCGetProto(metaKey, &meta)
-	if err != nil {
-		return err
-	}
-	if !ok && wantIntent {
-		return errors.Newf("meta: %v -> expected intent, found none", key)
-	}
-	if ok {
-		e.results.buf.Printf("meta: %v -> %+v\n", key, &meta)
-		if !wantIntent {
-			return errors.Newf("meta: %v -> expected no intent, found one", key)
+
+	return e.withReader(func(r storage.Reader) error {
+		var meta enginepb.MVCCMetadata
+		iter := r.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{Prefix: true})
+		defer iter.Close()
+		iter.SeekGE(storage.MVCCKey{Key: key})
+		ok, err := iter.Valid()
+		if err != nil {
+			return err
 		}
-	}
-	return nil
+		ok = ok && iter.UnsafeKey().Timestamp.IsEmpty()
+		if ok {
+			if err = iter.ValueProto(&meta); err != nil {
+				return err
+			}
+		}
+		if !ok && wantIntent {
+			return errors.Newf("meta: %v -> expected intent, found none", key)
+		}
+		if ok {
+			e.results.buf.Printf("meta: %v -> %+v\n", key, &meta)
+			if !wantIntent {
+				return errors.Newf("meta: %v -> expected no intent, found one", key)
+			}
+		}
+		return nil
+	})
 }
 
 func cmdAddLock(e *evalCtx) error {
@@ -928,23 +989,29 @@ func cmdAddLock(e *evalCtx) error {
 func cmdClear(e *evalCtx) error {
 	key := e.getKey()
 	ts := e.getTs(nil)
-	return e.engine.ClearMVCC(MVCCKey{Key: key, Timestamp: ts})
+	return e.withWriter("clear", func(rw storage.ReadWriter) error {
+		return rw.ClearMVCC(storage.MVCCKey{Key: key, Timestamp: ts})
+	})
 }
 
 func cmdClearRange(e *evalCtx) error {
 	key, endKey := e.getKeyRange()
-	// NB: We can't test ClearRawRange or ClearRangeUsingHeuristic here, because
-	// it does not handle separated intents.
-	if clearRangeUsingIter {
-		return e.engine.ClearMVCCIteratorRange(key, endKey, true, true)
-	}
-	return e.engine.ClearMVCCRange(key, endKey, true, true)
+	return e.withWriter("clear_range", func(rw storage.ReadWriter) error {
+		// NB: We can't test ClearRawRange or ClearRangeUsingHeuristic here, because
+		// it does not handle separated intents.
+		if clearRangeUsingIter {
+			return rw.ClearMVCCIteratorRange(key, endKey, true, true)
+		}
+		return rw.ClearMVCCRange(key, endKey, true, true)
+	})
 }
 
 func cmdClearRangeKey(e *evalCtx) error {
 	key, endKey := e.getKeyRange()
 	ts := e.getTs(nil)
-	return e.engine.ClearMVCCRangeKey(MVCCRangeKey{StartKey: key, EndKey: endKey, Timestamp: ts})
+	return e.withWriter("clear_rangekey", func(rw storage.ReadWriter) error {
+		return rw.ClearMVCCRangeKey(storage.MVCCRangeKey{StartKey: key, EndKey: endKey, Timestamp: ts})
+	})
 }
 
 func cmdClearTimeRange(e *evalCtx) error {
@@ -962,11 +1029,13 @@ func cmdClearTimeRange(e *evalCtx) error {
 		e.scanArg("maxBatchByteSize", &maxBatchByteSize)
 	}
 
+	// NB: Must use a batch, since it requires consistent iterators.
 	batch := e.engine.NewBatch()
 	defer batch.Close()
 
-	resume, err := MVCCClearTimeRange(e.ctx, batch, e.ms, key, endKey, targetTs, ts,
-		nil, nil, clearRangeThreshold, int64(maxBatchSize), int64(maxBatchByteSize))
+	rw, leftPeekBound, rightPeekBound := e.metamorphicPeekBounds(batch, key, endKey)
+	resume, err := storage.MVCCClearTimeRange(e.ctx, rw, e.ms, key, endKey, targetTs, ts,
+		leftPeekBound, rightPeekBound, clearRangeThreshold, int64(maxBatchSize), int64(maxBatchByteSize))
 	if err != nil {
 		return err
 	}
@@ -982,10 +1051,19 @@ func cmdClearTimeRange(e *evalCtx) error {
 func cmdGCClearRange(e *evalCtx) error {
 	key, endKey := e.getKeyRange()
 	gcTs := e.getTs(nil)
-	return e.withWriter("gc_clear_range", func(rw ReadWriter) error {
-		cms, err := ComputeStats(rw, key, endKey, 100e9)
+	return e.withWriter("gc_clear_range", func(rw storage.ReadWriter) error {
+		cms, err := storage.ComputeStats(rw, key, endKey, 100e9)
 		require.NoError(e.t, err, "failed to compute range stats")
-		return MVCCGarbageCollectWholeRange(e.ctx, rw, e.ms, key, endKey, gcTs, cms)
+		return storage.MVCCGarbageCollectWholeRange(e.ctx, rw, e.ms, key, endKey, gcTs, cms)
+	})
+}
+
+func cmdGCPointsClearRange(e *evalCtx) error {
+	key, endKey := e.getKeyRange()
+	gcTs := e.getTs(nil)
+	startTs := e.getTsWithName("startTs")
+	return e.withWriter("gc_clear_range", func(rw storage.ReadWriter) error {
+		return storage.MVCCGarbageCollectPointsWithClearRange(e.ctx, rw, e.ms, key, endKey, startTs, gcTs)
 	})
 }
 
@@ -1002,18 +1080,18 @@ func cmdCPut(e *evalCtx) error {
 		rexpVal := e.getValInternal("cond")
 		expVal = rexpVal.TagAndDataBytes()
 	}
-	behavior := CPutFailIfMissing
+	behavior := storage.CPutFailIfMissing
 	if e.hasArg("allow_missing") {
-		behavior = CPutAllowIfMissing
+		behavior = storage.CPutAllowIfMissing
 	}
 	resolve, resolveStatus := e.getResolve()
 
-	return e.withWriter("cput", func(rw ReadWriter) error {
-		if err := MVCCConditionalPut(e.ctx, rw, e.ms, key, ts, localTs, val, expVal, behavior, txn); err != nil {
+	return e.withWriter("cput", func(rw storage.ReadWriter) error {
+		if err := storage.MVCCConditionalPut(e.ctx, rw, e.ms, key, ts, localTs, val, expVal, behavior, txn); err != nil {
 			return err
 		}
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{})
+			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
 		}
 		return nil
 	})
@@ -1029,12 +1107,12 @@ func cmdInitPut(e *evalCtx) error {
 	failOnTombstones := e.hasArg("failOnTombstones")
 	resolve, resolveStatus := e.getResolve()
 
-	return e.withWriter("initput", func(rw ReadWriter) error {
-		if err := MVCCInitPut(e.ctx, rw, e.ms, key, ts, localTs, val, failOnTombstones, txn); err != nil {
+	return e.withWriter("initput", func(rw storage.ReadWriter) error {
+		if err := storage.MVCCInitPut(e.ctx, rw, e.ms, key, ts, localTs, val, failOnTombstones, txn); err != nil {
 			return err
 		}
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{})
+			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
 		}
 		return nil
 	})
@@ -1046,14 +1124,18 @@ func cmdDelete(e *evalCtx) error {
 	ts := e.getTs(txn)
 	localTs := hlc.ClockTimestamp(e.getTsWithName("localTs"))
 	resolve, resolveStatus := e.getResolve()
-	return e.withWriter("del", func(rw ReadWriter) error {
-		deletedKey, err := MVCCDelete(e.ctx, rw, e.ms, key, ts, localTs, txn)
+	return e.withWriter("del", func(rw storage.ReadWriter) error {
+		foundKey, err := storage.MVCCDelete(e.ctx, rw, e.ms, key, ts, localTs, txn)
+		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
+			// We want to output foundKey even if a WriteTooOldError is returned,
+			// since the error may be swallowed/deferred during evaluation.
+			e.results.buf.Printf("del: %v: found key %v\n", key, foundKey)
+		}
 		if err != nil {
 			return err
 		}
-		e.results.buf.Printf("del: %v: found key %v\n", key, deletedKey)
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{})
+			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
 		}
 		return nil
 	})
@@ -1071,8 +1153,8 @@ func cmdDeleteRange(e *evalCtx) error {
 	}
 
 	resolve, resolveStatus := e.getResolve()
-	return e.withWriter("del_range", func(rw ReadWriter) error {
-		deleted, resumeSpan, num, err := MVCCDeleteRange(
+	return e.withWriter("del_range", func(rw storage.ReadWriter) error {
+		deleted, resumeSpan, num, err := storage.MVCCDeleteRange(
 			e.ctx, rw, e.ms, key, endKey, int64(max), ts, localTs, txn, returnKeys)
 		if err != nil {
 			return err
@@ -1086,7 +1168,7 @@ func cmdDeleteRange(e *evalCtx) error {
 		}
 
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{})
+			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
 		}
 		return nil
 	})
@@ -1104,7 +1186,7 @@ func cmdDeleteRangeTombstone(e *evalCtx) error {
 		// before the start key -- don't attempt to compute covered stats for these
 		// to avoid iterator panics.
 		if key.Compare(endKey) < 0 && key.Compare(keys.LocalMax) >= 0 {
-			ms, err := ComputeStats(e.engine, key, endKey, ts.WallTime)
+			ms, err := storage.ComputeStats(e.engine, key, endKey, ts.WallTime)
 			if err != nil {
 				return err
 			}
@@ -1112,8 +1194,10 @@ func cmdDeleteRangeTombstone(e *evalCtx) error {
 		}
 	}
 
-	return e.withWriter("del_range_ts", func(rw ReadWriter) error {
-		return MVCCDeleteRangeUsingTombstone(e.ctx, rw, e.ms, key, endKey, ts, localTs, nil, nil, idempotent, 0, msCovered)
+	return e.withWriter("del_range_ts", func(rw storage.ReadWriter) error {
+		rw, leftPeekBound, rightPeekBound := e.metamorphicPeekBounds(rw, key, endKey)
+		return storage.MVCCDeleteRangeUsingTombstone(e.ctx, rw, e.ms, key, endKey, ts, localTs,
+			leftPeekBound, rightPeekBound, idempotent, 0, msCovered)
 	})
 }
 
@@ -1131,16 +1215,17 @@ func cmdDeleteRangePredicate(e *evalCtx) error {
 	if e.hasArg("maxBytes") {
 		e.scanArg("maxBytes", &maxBytes)
 	}
-	predicates := roachpb.DeleteRangePredicates{
+	predicates := kvpb.DeleteRangePredicates{
 		StartTime: e.getTsWithName("startTime"),
 	}
 	rangeThreshold := 64
 	if e.hasArg("rangeThreshold") {
 		e.scanArg("rangeThreshold", &rangeThreshold)
 	}
-	return e.withWriter("del_range_pred", func(rw ReadWriter) error {
-		resumeSpan, err := MVCCPredicateDeleteRange(e.ctx, rw, e.ms, key, endKey, ts,
-			localTs, nil, nil, predicates, int64(max), int64(maxBytes), int64(rangeThreshold), 0)
+	return e.withWriter("del_range_pred", func(rw storage.ReadWriter) error {
+		rw, leftPeekBound, rightPeekBound := e.metamorphicPeekBounds(rw, key, endKey)
+		resumeSpan, err := storage.MVCCPredicateDeleteRange(e.ctx, rw, e.ms, key, endKey, ts, localTs,
+			leftPeekBound, rightPeekBound, predicates, int64(max), int64(maxBytes), int64(rangeThreshold), 0)
 
 		if resumeSpan != nil {
 			e.results.buf.Printf("del_range_pred: resume span [%s,%s)\n", resumeSpan.Key,
@@ -1155,7 +1240,7 @@ func cmdGet(e *evalCtx) error {
 	txn := e.getTxn(optional)
 	key := e.getKey()
 	ts := e.getTs(txn)
-	opts := MVCCGetOptions{Txn: txn}
+	opts := storage.MVCCGetOptions{Txn: txn}
 	if e.hasArg("inconsistent") {
 		opts.Inconsistent = true
 		opts.Txn = nil
@@ -1180,19 +1265,31 @@ func cmdGet(e *evalCtx) error {
 		}
 		opts.Uncertainty.GlobalLimit = txn.GlobalUncertaintyLimit
 	}
-	val, intent, err := MVCCGet(e.ctx, e.engine, key, ts, opts)
-	// NB: the error is returned below. This ensures the test can
-	// ascertain no result is populated in the intent when an error
-	// occurs.
-	if intent != nil {
-		e.results.buf.Printf("get: %v -> intent {%s}\n", key, intent.Txn)
+	if e.hasArg("maxKeys") {
+		e.scanArg("maxKeys", &opts.MaxKeys)
 	}
-	if val != nil {
-		e.results.buf.Printf("get: %v -> %v @%v\n", key, val.PrettyPrint(), val.Timestamp)
-	} else {
-		e.results.buf.Printf("get: %v -> <no data>\n", key)
+	if e.hasArg("targetBytes") {
+		e.scanArg("targetBytes", &opts.TargetBytes)
 	}
-	return err
+	if e.hasArg("allowEmpty") {
+		opts.AllowEmpty = true
+	}
+
+	return e.withReader(func(r storage.Reader) error {
+		res, err := storage.MVCCGet(e.ctx, r, key, ts, opts)
+		// NB: the error is returned below. This ensures the test can
+		// ascertain no result is populated in the intent when an error
+		// occurs.
+		if res.Intent != nil {
+			e.results.buf.Printf("get: %v -> intent {%s}\n", key, res.Intent.Txn)
+		}
+		if res.Value != nil {
+			e.results.buf.Printf("get: %v -> %v @%v\n", key, res.Value.PrettyPrint(), res.Value.Timestamp)
+		} else {
+			e.results.buf.Printf("get: %v -> <no data>\n", key)
+		}
+		return err
+	})
 }
 
 func cmdIncrement(e *evalCtx) error {
@@ -1210,14 +1307,14 @@ func cmdIncrement(e *evalCtx) error {
 
 	resolve, resolveStatus := e.getResolve()
 
-	return e.withWriter("increment", func(rw ReadWriter) error {
-		curVal, err := MVCCIncrement(e.ctx, rw, e.ms, key, ts, localTs, txn, inc)
+	return e.withWriter("increment", func(rw storage.ReadWriter) error {
+		curVal, err := storage.MVCCIncrement(e.ctx, rw, e.ms, key, ts, localTs, txn, inc)
 		if err != nil {
 			return err
 		}
 		e.results.buf.Printf("inc: current value = %d\n", curVal)
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{})
+			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
 		}
 		return nil
 	})
@@ -1227,8 +1324,8 @@ func cmdMerge(e *evalCtx) error {
 	key := e.getKey()
 	val := e.getVal()
 	ts := e.getTs(nil)
-	return e.withWriter("merge", func(rw ReadWriter) error {
-		return MVCCMerge(e.ctx, rw, e.ms, key, ts, val)
+	return e.withWriter("merge", func(rw storage.ReadWriter) error {
+		return storage.MVCCMerge(e.ctx, rw, e.ms, key, ts, val)
 	})
 }
 
@@ -1240,43 +1337,54 @@ func cmdPut(e *evalCtx) error {
 	key := e.getKey()
 	val := e.getVal()
 
+	if e.hasArg("init-checksum") {
+		val.InitChecksum(key)
+	}
+
 	resolve, resolveStatus := e.getResolve()
 
-	return e.withWriter("put", func(rw ReadWriter) error {
-		if err := MVCCPut(e.ctx, rw, e.ms, key, ts, localTs, val, txn); err != nil {
+	return e.withWriter("put", func(rw storage.ReadWriter) error {
+		if err := storage.MVCCPut(e.ctx, rw, e.ms, key, ts, localTs, val, txn); err != nil {
 			return err
 		}
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{})
+			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
 		}
 		return nil
 	})
 }
 
 func cmdIsSpanEmpty(e *evalCtx) error {
-	key, endKey := e.getKeyRange()
-	isEmpty, err := MVCCIsSpanEmpty(e.ctx, e.engine, MVCCIsSpanEmptyOptions{
-		StartKey: key,
-		EndKey:   endKey,
-		StartTS:  e.getTsWithName("startTs"),
-		EndTS:    e.getTs(nil),
+	return e.withReader(func(r storage.Reader) error {
+		key, endKey := e.getKeyRange()
+		isEmpty, err := storage.MVCCIsSpanEmpty(e.ctx, r, storage.MVCCIsSpanEmptyOptions{
+			StartKey: key,
+			EndKey:   endKey,
+			StartTS:  e.getTsWithName("startTs"),
+			EndTS:    e.getTs(nil),
+		})
+		if err != nil {
+			return err
+		}
+		e.results.buf.Printf("%t\n", isEmpty)
+		return nil
 	})
-	if err != nil {
-		return err
-	}
-	e.results.buf.Print(isEmpty)
-	return nil
 }
 
 func cmdExport(e *evalCtx) error {
 	key, endKey := e.getKeyRange()
-	opts := MVCCExportOptions{
-		StartKey:           MVCCKey{Key: key, Timestamp: e.getTsWithName("kTs")},
+	opts := storage.MVCCExportOptions{
+		StartKey:           storage.MVCCKey{Key: key, Timestamp: e.getTsWithName("kTs")},
 		EndKey:             endKey,
 		StartTS:            e.getTsWithName("startTs"),
 		EndTS:              e.getTs(nil),
 		ExportAllRevisions: e.hasArg("allRevisions"),
 		StopMidKey:         e.hasArg("stopMidKey"),
+		FingerprintOptions: storage.MVCCExportFingerprintOptions{
+			StripTenantPrefix:            e.hasArg("stripTenantPrefix"),
+			StripValueChecksum:           e.hasArg("stripValueChecksum"),
+			StripIndexPrefixAndTimestamp: e.hasArg("stripped"),
+		},
 	}
 	if e.hasArg("maxIntents") {
 		e.scanArg("maxIntents", &opts.MaxIntents)
@@ -1287,21 +1395,65 @@ func cmdExport(e *evalCtx) error {
 	if e.hasArg("maxSize") {
 		e.scanArg("maxSize", &opts.MaxSize)
 	}
-
-	sstFile := &MemFile{}
-	summary, resume, err := MVCCExportToSST(e.ctx, e.st, e.engine, opts, sstFile)
-	if err != nil {
-		return err
+	var shouldFingerprint bool
+	if e.hasArg("fingerprint") {
+		shouldFingerprint = true
 	}
 
-	e.results.buf.Printf("export: %s", &summary)
-	if resume.Key != nil {
-		e.results.buf.Printf(" resume=%s", resume)
+	r := e.newReader()
+	defer r.Close()
+
+	var sstFile bytes.Buffer
+
+	var summary kvpb.BulkOpSummary
+	var resumeInfo storage.ExportRequestResumeInfo
+	var fingerprint uint64
+	var hasRangeKeys bool
+	var err error
+	if shouldFingerprint {
+		summary, resumeInfo, fingerprint, hasRangeKeys, err = storage.MVCCExportFingerprint(e.ctx, e.st, r,
+			opts, &sstFile)
+		if err != nil {
+			return err
+		}
+		if !hasRangeKeys {
+			sstFile.Reset()
+		}
+		e.results.buf.Printf("export: %s", &summary)
+		e.results.buf.Print(" fingerprint=true")
+	} else {
+		summary, resumeInfo, err = storage.MVCCExportToSST(e.ctx, e.st, r, opts, &sstFile)
+		if err != nil {
+			return err
+		}
+		e.results.buf.Printf("export: %s", &summary)
+	}
+
+	if resumeInfo.ResumeKey.Key != nil {
+		e.results.buf.Printf(" resume=%s", resumeInfo.ResumeKey)
 	}
 	e.results.buf.Printf("\n")
 
-	iter, err := NewPebbleMemSSTIterator(sstFile.Bytes(), false /* verify */, IterOptions{
-		KeyTypes:   IterKeyTypePointsAndRanges,
+	if shouldFingerprint {
+		var ssts [][]byte
+		if sstFile.Len() != 0 {
+			ssts = append(ssts, sstFile.Bytes())
+		}
+		// Fingerprint the rangekeys returned as a pebble SST.
+		rangekeyFingerprint, err := storage.FingerprintRangekeys(e.ctx, e.st, opts.FingerprintOptions, ssts)
+		if err != nil {
+			return err
+		}
+		fingerprint = fingerprint ^ rangekeyFingerprint
+		e.results.buf.Printf("fingerprint: %d\n", fingerprint)
+
+		// Return early, we don't need to print the point and rangekeys if we are
+		// fingerprinting.
+		return nil
+	}
+
+	iter, err := storage.NewMemSSTIterator(sstFile.Bytes(), false /* verify */, storage.IterOptions{
+		KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		UpperBound: keys.MaxKey,
 	})
 	if err != nil {
@@ -1310,7 +1462,7 @@ func cmdExport(e *evalCtx) error {
 	defer iter.Close()
 
 	var rangeStart roachpb.Key
-	for iter.SeekGE(NilKey); ; iter.Next() {
+	for iter.SeekGE(storage.NilKey); ; iter.Next() {
 		if ok, err := iter.Valid(); err != nil {
 			return err
 		} else if !ok {
@@ -1322,7 +1474,7 @@ func cmdExport(e *evalCtx) error {
 				rangeStart = append(rangeStart[:0], rangeBounds.Key...)
 				e.results.buf.Printf("export: %s/[", rangeBounds)
 				for i, version := range iter.RangeKeys().Versions {
-					val, err := DecodeMVCCValue(version.Value)
+					val, err := storage.DecodeMVCCValue(version.Value)
 					if err != nil {
 						return err
 					}
@@ -1336,8 +1488,11 @@ func cmdExport(e *evalCtx) error {
 		}
 		if hasPoint {
 			key := iter.UnsafeKey()
-			value := iter.UnsafeValue()
-			mvccValue, err := DecodeMVCCValue(value)
+			value, err := iter.UnsafeValue()
+			if err != nil {
+				return err
+			}
+			mvccValue, err := storage.DecodeMVCCValue(value)
 			if err != nil {
 				return err
 			}
@@ -1352,7 +1507,7 @@ func cmdScan(e *evalCtx) error {
 	txn := e.getTxn(optional)
 	key, endKey := e.getKeyRange()
 	ts := e.getTs(txn)
-	opts := MVCCScanOptions{Txn: txn}
+	opts := storage.MVCCScanOptions{Txn: txn}
 	if e.hasArg("inconsistent") {
 		opts.Inconsistent = true
 		opts.Txn = nil
@@ -1394,44 +1549,65 @@ func cmdScan(e *evalCtx) error {
 		opts.AllowEmpty = true
 	}
 	if e.hasArg("wholeRows") {
-		opts.WholeRowsOfSize = 10 // arbitrary, must be greater than largest column family in tests
+		for _, c := range e.td.CmdArgs {
+			if c.Key == "wholeRows" {
+				// If we have a custom value for wholeRows key, then use it,
+				// otherwise, pick an arbitrary value greater than the largest
+				// column family in tests.
+				if len(c.Vals) > 0 {
+					wholeRowsOfSize, err := strconv.ParseInt(c.Vals[0], 10, 64)
+					if err != nil {
+						return err
+					}
+					if wholeRowsOfSize < 2 {
+						return errors.Newf("wholeRowOfSize value must be at least 2, got %d", wholeRowsOfSize)
+					}
+					opts.WholeRowsOfSize = int32(wholeRowsOfSize)
+				} else {
+					opts.WholeRowsOfSize = 10
+				}
+				break
+			}
+		}
 	}
-	res, err := MVCCScan(e.ctx, e.engine, key, endKey, ts, opts)
-	// NB: the error is returned below. This ensures the test can
-	// ascertain no result is populated in the intents when an error
-	// occurs.
-	for _, intent := range res.Intents {
-		e.results.buf.Printf("scan: intent %v {%s}\n", intent.Intent_SingleKeySpan.Key, intent.Txn)
-	}
-	for _, val := range res.KVs {
-		e.results.buf.Printf("scan: %v -> %v @%v\n", val.Key, val.Value.PrettyPrint(), val.Value.Timestamp)
-	}
-	if res.ResumeSpan != nil {
-		e.results.buf.Printf("scan: resume span [%s,%s) %s nextBytes=%d\n", res.ResumeSpan.Key, res.ResumeSpan.EndKey, res.ResumeReason, res.ResumeNextBytes)
-	}
-	if opts.TargetBytes > 0 {
-		e.results.buf.Printf("scan: %d bytes (target %d)\n", res.NumBytes, opts.TargetBytes)
-	}
-	if len(res.KVs) == 0 {
-		e.results.buf.Printf("scan: %v-%v -> <no data>\n", key, endKey)
-	}
-	return err
+	return e.withReader(func(r storage.Reader) error {
+		res, err := storage.MVCCScan(e.ctx, r, key, endKey, ts, opts)
+		// NB: the error is returned below. This ensures the test can
+		// ascertain no result is populated in the intents when an error
+		// occurs.
+		for _, intent := range res.Intents {
+			e.results.buf.Printf("scan: intent %v {%s}\n", intent.Intent_SingleKeySpan.Key, intent.Txn)
+		}
+		for _, val := range res.KVs {
+			e.results.buf.Printf("scan: %v -> %v @%v\n", val.Key, val.Value.PrettyPrint(), val.Value.Timestamp)
+		}
+		if res.ResumeSpan != nil {
+			e.results.buf.Printf("scan: resume span [%s,%s) %s nextBytes=%d\n", res.ResumeSpan.Key, res.ResumeSpan.EndKey, res.ResumeReason, res.ResumeNextBytes)
+		}
+		if opts.TargetBytes > 0 {
+			e.results.buf.Printf("scan: %d bytes (target %d)\n", res.NumBytes, opts.TargetBytes)
+		}
+		if len(res.KVs) == 0 {
+			e.results.buf.Printf("scan: %v-%v -> <no data>\n", key, endKey)
+		}
+		return err
+	})
 }
 
 func cmdPutRangeKey(e *evalCtx) error {
-	var rangeKey MVCCRangeKey
+	var rangeKey storage.MVCCRangeKey
 	rangeKey.StartKey, rangeKey.EndKey = e.getKeyRange()
 	rangeKey.Timestamp = e.getTs(nil)
-	var value MVCCValue
+	var value storage.MVCCValue
 	value.MVCCValueHeader.LocalTimestamp = hlc.ClockTimestamp(e.getTsWithName("localTs"))
 
-	return e.withWriter("put_rangekey", func(rw ReadWriter) error {
+	return e.withWriter("put_rangekey", func(rw storage.ReadWriter) error {
 		return rw.PutMVCCRangeKey(rangeKey, value)
 	})
 }
 
 func cmdIterNew(e *evalCtx) error {
-	var opts IterOptions
+	var opts storage.IterOptions
 	opts.Prefix = e.hasArg("prefix")
 	if e.hasArg("k") {
 		opts.LowerBound, opts.UpperBound = e.getKeyRange()
@@ -1439,15 +1615,15 @@ func cmdIterNew(e *evalCtx) error {
 	if len(opts.UpperBound) == 0 {
 		opts.UpperBound = keys.MaxKey
 	}
-	kind := MVCCKeyAndIntentsIterKind
+	kind := storage.MVCCKeyAndIntentsIterKind
 	if e.hasArg("kind") {
 		var arg string
 		e.scanArg("kind", &arg)
 		switch arg {
 		case "keys":
-			kind = MVCCKeyIterKind
+			kind = storage.MVCCKeyIterKind
 		case "keysAndIntents":
-			kind = MVCCKeyAndIntentsIterKind
+			kind = storage.MVCCKeyAndIntentsIterKind
 		default:
 			return errors.Errorf("unknown iterator kind %s", arg)
 		}
@@ -1457,11 +1633,11 @@ func cmdIterNew(e *evalCtx) error {
 		e.scanArg("types", &arg)
 		switch arg {
 		case "pointsOnly":
-			opts.KeyTypes = IterKeyTypePointsOnly
+			opts.KeyTypes = storage.IterKeyTypePointsOnly
 		case "pointsAndRanges":
-			opts.KeyTypes = IterKeyTypePointsAndRanges
+			opts.KeyTypes = storage.IterKeyTypePointsAndRanges
 		case "rangesOnly":
-			opts.KeyTypes = IterKeyTypeRangesOnly
+			opts.KeyTypes = storage.IterKeyTypeRangesOnly
 		default:
 			return errors.Errorf("unknown key type %s", arg)
 		}
@@ -1474,23 +1650,20 @@ func cmdIterNew(e *evalCtx) error {
 		e.iter.Close()
 	}
 
-	r, closer := metamorphicReader(e)
+	r := e.newReader()
 	iter := r.NewMVCCIterator(kind, opts)
-	if e.hasArg("pointSynthesis") {
-		iter = newPointSynthesizingIter(iter)
-	}
-	iter = newMetamorphicIterator(e.t, e.metamorphicIterSeed(), iter).(MVCCIterator)
+	iter = newMetamorphicIterator(e.t, e.metamorphicIterSeed(), iter).(storage.MVCCIterator)
 	if opts.Prefix != iter.IsPrefix() {
 		return errors.Errorf("prefix iterator returned IsPrefix=false")
 	}
 
-	e.iter = &iterWithCloser{iter, closer}
+	e.iter = &iterWithCloser{iter, r.Close}
 	e.iterRangeKeys.Clear()
 	return nil
 }
 
 func cmdIterNewIncremental(e *evalCtx) error {
-	var opts MVCCIncrementalIterOptions
+	var opts storage.MVCCIncrementalIterOptions
 	if e.hasArg("k") {
 		opts.StartKey, opts.EndKey = e.getKeyRange()
 	}
@@ -1509,11 +1682,11 @@ func cmdIterNewIncremental(e *evalCtx) error {
 		e.scanArg("types", &arg)
 		switch arg {
 		case "pointsOnly":
-			opts.KeyTypes = IterKeyTypePointsOnly
+			opts.KeyTypes = storage.IterKeyTypePointsOnly
 		case "pointsAndRanges":
-			opts.KeyTypes = IterKeyTypePointsAndRanges
+			opts.KeyTypes = storage.IterKeyTypePointsAndRanges
 		case "rangesOnly":
-			opts.KeyTypes = IterKeyTypeRangesOnly
+			opts.KeyTypes = storage.IterKeyTypeRangesOnly
 		default:
 			return errors.Errorf("unknown key type %s", arg)
 		}
@@ -1527,11 +1700,11 @@ func cmdIterNewIncremental(e *evalCtx) error {
 		e.scanArg("intents", &arg)
 		switch arg {
 		case "error":
-			opts.IntentPolicy = MVCCIncrementalIterIntentPolicyError
+			opts.IntentPolicy = storage.MVCCIncrementalIterIntentPolicyError
 		case "emit":
-			opts.IntentPolicy = MVCCIncrementalIterIntentPolicyEmit
+			opts.IntentPolicy = storage.MVCCIncrementalIterIntentPolicyEmit
 		case "aggregate":
-			opts.IntentPolicy = MVCCIncrementalIterIntentPolicyAggregate
+			opts.IntentPolicy = storage.MVCCIncrementalIterIntentPolicyAggregate
 		default:
 			return errors.Errorf("unknown intent policy %s", arg)
 		}
@@ -1541,14 +1714,14 @@ func cmdIterNewIncremental(e *evalCtx) error {
 		e.iter.Close()
 	}
 
-	r, closer := metamorphicReader(e)
-	it := SimpleMVCCIterator(NewMVCCIncrementalIterator(r, opts))
+	r := e.newReader()
+	it := storage.SimpleMVCCIterator(storage.NewMVCCIncrementalIterator(r, opts))
 	// Can't metamorphically move the iterator around since when intents get aggregated
 	// or emitted we can't undo that later at the level of the metamorphic iterator.
-	if opts.IntentPolicy == MVCCIncrementalIterIntentPolicyError {
+	if opts.IntentPolicy == storage.MVCCIncrementalIterIntentPolicyError {
 		it = newMetamorphicIterator(e.t, e.metamorphicIterSeed(), it)
 	}
-	e.iter = &iterWithCloser{it, closer}
+	e.iter = &iterWithCloser{it, r.Close}
 	e.iterRangeKeys.Clear()
 	return nil
 }
@@ -1561,8 +1734,8 @@ func cmdIterNewReadAsOf(e *evalCtx) error {
 	if e.hasArg("asOfTs") {
 		asOf = e.getTsWithName("asOfTs")
 	}
-	opts := IterOptions{
-		KeyTypes:             IterKeyTypePointsAndRanges,
+	opts := storage.IterOptions{
+		KeyTypes:             storage.IterKeyTypePointsAndRanges,
 		RangeKeyMaskingBelow: asOf}
 	if e.hasArg("k") {
 		opts.LowerBound, opts.UpperBound = e.getKeyRange()
@@ -1570,10 +1743,10 @@ func cmdIterNewReadAsOf(e *evalCtx) error {
 	if len(opts.UpperBound) == 0 {
 		opts.UpperBound = keys.MaxKey
 	}
-	r, closer := metamorphicReader(e)
-	innerIter := newMetamorphicIterator(e.t, e.metamorphicIterSeed(), r.NewMVCCIterator(MVCCKeyIterKind, opts))
-	iter := &iterWithCloser{innerIter, closer}
-	e.iter = NewReadAsOfIterator(iter, asOf)
+	r := e.newReader()
+	innerIter := newMetamorphicIterator(e.t, e.metamorphicIterSeed(), r.NewMVCCIterator(storage.MVCCKeyIterKind, opts))
+	iter := &iterWithCloser{innerIter, r.Close}
+	e.iter = storage.NewReadAsOfIterator(iter, asOf)
 	e.iterRangeKeys.Clear()
 	return nil
 }
@@ -1581,7 +1754,7 @@ func cmdIterNewReadAsOf(e *evalCtx) error {
 func cmdIterSeekGE(e *evalCtx) error {
 	key := e.getKey()
 	ts := e.getTs(nil)
-	e.iter.SeekGE(MVCCKey{Key: key, Timestamp: ts})
+	e.iter.SeekGE(storage.MVCCKey{Key: key, Timestamp: ts})
 	printIter(e)
 	return nil
 }
@@ -1599,7 +1772,7 @@ func cmdIterSeekIntentGE(e *evalCtx) error {
 func cmdIterSeekLT(e *evalCtx) error {
 	key := e.getKey()
 	ts := e.getTs(nil)
-	e.mvccIter().SeekLT(MVCCKey{Key: key, Timestamp: ts})
+	e.mvccIter().SeekLT(storage.MVCCKey{Key: key, Timestamp: ts})
 	printIter(e)
 	return nil
 }
@@ -1644,10 +1817,10 @@ func cmdIterScan(e *evalCtx) error {
 	// we're fudging e.rangeKeys.
 	if e.iter.RangeKeyChanged() {
 		if e.iterRangeKeys.IsEmpty() {
-			e.iterRangeKeys = MVCCRangeKeyStack{
+			e.iterRangeKeys = storage.MVCCRangeKeyStack{
 				// NB: Clone MinKey/MaxKey, since we write into these byte slices later.
 				Bounds:   roachpb.Span{Key: keys.MinKey.Next().Clone(), EndKey: keys.MaxKey.Clone()},
-				Versions: MVCCRangeKeyVersions{{Timestamp: hlc.MinTimestamp}},
+				Versions: storage.MVCCRangeKeyVersions{{Timestamp: hlc.MinTimestamp}},
 			}
 		} else {
 			e.iterRangeKeys.Clear()
@@ -1676,14 +1849,14 @@ func cmdSSTPut(e *evalCtx) error {
 	if e.hasArg("v") {
 		val = e.getVal()
 	}
-	return e.sst().PutMVCC(MVCCKey{Key: key, Timestamp: ts}, MVCCValue{Value: val})
+	return e.sst().PutMVCC(storage.MVCCKey{Key: key, Timestamp: ts}, storage.MVCCValue{Value: val})
 }
 
 func cmdSSTPutRangeKey(e *evalCtx) error {
-	var rangeKey MVCCRangeKey
+	var rangeKey storage.MVCCRangeKey
 	rangeKey.StartKey, rangeKey.EndKey = e.getKeyRange()
 	rangeKey.Timestamp = e.getTs(nil)
-	var value MVCCValue
+	var value storage.MVCCValue
 	value.MVCCValueHeader.LocalTimestamp = hlc.ClockTimestamp(e.getTsWithName("localTs"))
 
 	return e.sst().PutMVCCRangeKey(rangeKey, value)
@@ -1695,7 +1868,7 @@ func cmdSSTClearRange(e *evalCtx) error {
 }
 
 func cmdSSTClearRangeKey(e *evalCtx) error {
-	var rangeKey MVCCRangeKey
+	var rangeKey storage.MVCCRangeKey
 	rangeKey.StartKey, rangeKey.EndKey = e.getKeyRange()
 	rangeKey.Timestamp = e.getTs(nil)
 
@@ -1724,8 +1897,8 @@ func cmdSSTIterNew(e *evalCtx) error {
 	for i, sst := range e.ssts {
 		ssts[len(ssts)-i-1] = sst
 	}
-	iter, err := NewPebbleMultiMemSSTIterator(ssts, sstIterVerify, IterOptions{
-		KeyTypes:   IterKeyTypePointsAndRanges,
+	iter, err := storage.NewMultiMemSSTIterator(ssts, sstIterVerify, storage.IterOptions{
+		KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		UpperBound: keys.MaxKey,
 	})
 	if err != nil {
@@ -1738,7 +1911,7 @@ func cmdSSTIterNew(e *evalCtx) error {
 
 func cmdReplacePointTombstonesWithRangeTombstones(e *evalCtx) error {
 	start, end := e.getKeyRange()
-	return ReplacePointTombstonesWithRangeTombstones(e.ctx, e.engine, e.ms, start, end)
+	return storage.ReplacePointTombstonesWithRangeTombstones(e.ctx, e.engine, e.ms, start, end)
 }
 
 func printIter(e *evalCtx) {
@@ -1763,15 +1936,21 @@ func printIter(e *evalCtx) {
 		e.t.Fatalf("valid iterator at %s without point nor range keys", e.iter.UnsafeKey())
 	}
 
+	checkValErr := func(v []byte, err error) []byte {
+		if err != nil {
+			e.Fatalf("%v", err)
+		}
+		return v
+	}
 	if hasPoint {
 		if !e.iter.UnsafeKey().IsValue() {
 			meta := enginepb.MVCCMetadata{}
-			if err := protoutil.Unmarshal(e.iter.UnsafeValue(), &meta); err != nil {
+			if err := protoutil.Unmarshal(checkValErr(e.iter.UnsafeValue()), &meta); err != nil {
 				e.Fatalf("%v", err)
 			}
 			e.results.buf.Printf(" %s=%+v", e.iter.UnsafeKey(), &meta)
 		} else {
-			value, err := DecodeMVCCValue(e.iter.UnsafeValue())
+			value, err := storage.DecodeMVCCValue(checkValErr(e.iter.UnsafeValue()))
 			if err != nil {
 				e.Fatalf("%v", err)
 			}
@@ -1783,7 +1962,7 @@ func printIter(e *evalCtx) {
 		rangeKeys := e.iter.RangeKeys()
 		e.results.buf.Printf(" %s/[", rangeKeys.Bounds)
 		for i, version := range rangeKeys.Versions {
-			value, err := DecodeMVCCValue(version.Value)
+			value, err := storage.DecodeMVCCValue(version.Value)
 			if err != nil {
 				e.Fatalf("%v", err)
 			}
@@ -1795,14 +1974,14 @@ func printIter(e *evalCtx) {
 		e.results.buf.Printf("]")
 	}
 
-	var rangeKeysIgnoringTime MVCCRangeKeyStack
+	var rangeKeysIgnoringTime storage.MVCCRangeKeyStack
 	if maybeIIT != nil {
 		rangeKeysIgnoringTime = maybeIIT.RangeKeysIgnoringTime()
 	}
 	if ignoringTime && !rangeKeysIgnoringTime.IsEmpty() && !rangeKeysIgnoringTime.Equal(e.iter.RangeKeys()) {
 		e.results.buf.Printf(" (+%s/[", rangeKeysIgnoringTime.Bounds)
 		for i, version := range rangeKeysIgnoringTime.Versions {
-			value, err := DecodeMVCCValue(version.Value)
+			value, err := storage.DecodeMVCCValue(version.Value)
 			if err != nil {
 				e.Fatalf("%v", err)
 			}
@@ -1823,9 +2002,18 @@ func printIter(e *evalCtx) {
 	}
 }
 
+func rangeKeysIfExist(it storage.SimpleMVCCIterator) storage.MVCCRangeKeyStack {
+	if valid, err := it.Valid(); !valid || err != nil {
+		return storage.MVCCRangeKeyStack{}
+	} else if _, hasRange := it.HasPointAndRange(); !hasRange {
+		return storage.MVCCRangeKeyStack{}
+	}
+	return it.RangeKeys()
+}
+
 func checkAndUpdateRangeKeyChanged(e *evalCtx) bool {
 	rangeKeyChanged := e.iter.RangeKeyChanged()
-	rangeKeys := e.iter.RangeKeys()
+	rangeKeys := rangeKeysIfExist(e.iter)
 
 	if incrIter := e.tryMVCCIncrementalIter(); incrIter != nil {
 		// For MVCCIncrementalIterator, make sure RangeKeyChangedIgnoringTime() fires
@@ -1909,22 +2097,22 @@ type evalCtx struct {
 	}
 	ctx               context.Context
 	st                *cluster.Settings
-	engine            Engine
+	engine            storage.Engine
 	noMetamorphicIter bool // never instantiate metamorphicIterator
-	iter              SimpleMVCCIterator
-	iterRangeKeys     MVCCRangeKeyStack
+	iter              storage.SimpleMVCCIterator
+	iterRangeKeys     storage.MVCCRangeKeyStack
 	t                 *testing.T
 	td                *datadriven.TestData
 	txns              map[string]*roachpb.Transaction
 	txnCounter        uint128.Uint128
 	locks             map[string]*roachpb.Transaction
 	ms                *enginepb.MVCCStats
-	sstWriter         *SSTWriter
-	sstFile           *MemFile
+	sstWriter         *storage.SSTWriter
+	sstFile           *storage.MemObject
 	ssts              [][]byte
 }
 
-func newEvalCtx(ctx context.Context, engine Engine) *evalCtx {
+func newEvalCtx(ctx context.Context, engine storage.Engine) *evalCtx {
 	return &evalCtx{
 		ctx:        ctx,
 		st:         cluster.MakeTestingClusterSettings(),
@@ -2046,31 +2234,62 @@ func (e *evalCtx) getTxn(opt optArg) *roachpb.Transaction {
 	return txn
 }
 
-func (e *evalCtx) withWriter(cmd string, fn func(_ ReadWriter) error) error {
-	var rw ReadWriter
+// newReader returns a new (metamorphic) reader for use by a single command. The
+// caller must call Close on the reader when done.
+func (e *evalCtx) newReader() storage.Reader {
+	switch mvccHistoriesReader {
+	case "engine":
+		return noopCloseReader{e.engine}
+	case "readonly":
+		return e.engine.NewReadOnly(storage.StandardDurability)
+	case "batch":
+		return e.engine.NewBatch()
+	case "snapshot":
+		return e.engine.NewSnapshot()
+	default:
+		e.t.Fatalf("unknown reader type %q", mvccHistoriesReader)
+		return nil
+	}
+}
+
+// withReader calls the given closure with a new reader, closing it when done.
+func (e *evalCtx) withReader(fn func(storage.Reader) error) error {
+	r := e.newReader()
+	defer r.Close()
+	return fn(r)
+}
+
+// withWriter calls the given closure with a writer. The writer is
+// metamorphically chosen to be a batch, which will be committed and closed when
+// done.
+func (e *evalCtx) withWriter(cmd string, fn func(_ storage.ReadWriter) error) error {
+	var rw storage.ReadWriter
 	rw = e.engine
-	var batch Batch
-	if e.hasArg("batched") {
+	var batch storage.Batch
+	if e.hasArg("batched") || mvccHistoriesUseBatch {
 		batch = e.engine.NewBatch()
 		defer batch.Close()
 		rw = batch
 	}
 	rw = e.tryWrapForIntentPrinting(rw)
-	origErr := fn(rw)
-	if batch != nil {
+	err := fn(rw)
+	if e.hasArg("batched") {
 		batchStatus := "non-empty"
 		if batch.Empty() {
 			batchStatus = "empty"
 		}
 		e.results.buf.Printf("%s: batch after write is %s\n", cmd, batchStatus)
 	}
-	if origErr != nil {
-		return origErr
-	}
 	if batch != nil {
-		return batch.Commit(true)
+		// WriteTooOldError is sometimes expected to leave behind a provisional
+		// value at a higher timestamp. We commit this for parity with the engine.
+		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
+			if err := batch.Commit(true); err != nil {
+				return err
+			}
+		}
 	}
-	return nil
+	return err
 }
 
 func (e *evalCtx) getVal() roachpb.Value { return e.getValInternal("v") }
@@ -2090,21 +2309,31 @@ func (e *evalCtx) getKey() roachpb.Key {
 	e.t.Helper()
 	var keyS string
 	e.scanArg("k", &keyS)
-	return toKey(keyS)
+	return toKey(keyS, e.getTenantCodec())
 }
 
 func (e *evalCtx) getKeyRange() (sk, ek roachpb.Key) {
 	e.t.Helper()
 	var keyS string
 	e.scanArg("k", &keyS)
-	sk = toKey(keyS)
+	codec := e.getTenantCodec()
+	sk = toKey(keyS, codec)
 	ek = sk.Next()
 	if e.hasArg("end") {
 		var endKeyS string
 		e.scanArg("end", &endKeyS)
-		ek = toKey(endKeyS)
+		ek = toKey(endKeyS, codec)
 	}
 	return sk, ek
+}
+
+func (e *evalCtx) getTenantCodec() keys.SQLCodec {
+	if e.hasArg("tenant-prefix") {
+		var tenantID int
+		e.scanArg("tenant-prefix", &tenantID)
+		return keys.MakeSQLCodec(roachpb.TenantID{InternalValue: uint64(tenantID)})
+	}
+	return keys.SystemSQLCodec
 }
 
 func (e *evalCtx) newTxn(
@@ -2130,10 +2359,10 @@ func (e *evalCtx) newTxn(
 	return txn, nil
 }
 
-func (e *evalCtx) sst() *SSTWriter {
+func (e *evalCtx) sst() *storage.SSTWriter {
 	if e.sstWriter == nil {
-		e.sstFile = &MemFile{}
-		w := MakeIngestionSSTWriter(e.ctx, e.st, e.sstFile)
+		e.sstFile = &storage.MemObject{}
+		w := storage.MakeIngestionSSTWriter(e.ctx, e.st, e.sstFile)
 		e.sstWriter = &w
 	}
 	return e.sstWriter
@@ -2169,7 +2398,9 @@ func (e *evalCtx) lookupTxn(txnName string) (*roachpb.Transaction, error) {
 	return txn, nil
 }
 
-func (e *evalCtx) newLockTableView(txn *roachpb.Transaction, ts hlc.Timestamp) LockTableView {
+func (e *evalCtx) newLockTableView(
+	txn *roachpb.Transaction, ts hlc.Timestamp,
+) storage.LockTableView {
 	return &mockLockTableView{locks: e.locks, txn: txn, ts: ts}
 }
 
@@ -2196,7 +2427,7 @@ func (lt *mockLockTableView) IsKeyLockedByConflictingTxn(
 	return true, &holder.TxnMeta
 }
 
-func (e *evalCtx) visitWrappedIters(fn func(it SimpleMVCCIterator) (done bool)) {
+func (e *evalCtx) visitWrappedIters(fn func(it storage.SimpleMVCCIterator) (done bool)) {
 	iter := e.iter
 	if iter == nil {
 		return
@@ -2225,10 +2456,10 @@ func (e *evalCtx) visitWrappedIters(fn func(it SimpleMVCCIterator) (done bool)) 
 	}
 }
 
-func (e *evalCtx) mvccIter() MVCCIterator {
-	var iter MVCCIterator
-	e.visitWrappedIters(func(it SimpleMVCCIterator) (done bool) {
-		iter, done = it.(MVCCIterator)
+func (e *evalCtx) mvccIter() storage.MVCCIterator {
+	var iter storage.MVCCIterator
+	e.visitWrappedIters(func(it storage.SimpleMVCCIterator) (done bool) {
+		iter, done = it.(storage.MVCCIterator)
 		return done
 	})
 	require.NotNil(e.t, iter, "need an MVCC iterator")
@@ -2242,15 +2473,15 @@ func (e *evalCtx) mvccIncrementalIter() mvccIncrementalIteratorI {
 }
 
 type mvccIncrementalIteratorI interface {
-	SimpleMVCCIterator
-	RangeKeysIgnoringTime() MVCCRangeKeyStack
+	storage.SimpleMVCCIterator
+	RangeKeysIgnoringTime() storage.MVCCRangeKeyStack
 	RangeKeyChangedIgnoringTime() bool
 	NextIgnoringTime()
 	NextKeyIgnoringTime()
 	TryGetIntentError() error
 }
 
-var _ mvccIncrementalIteratorI = (*MVCCIncrementalIterator)(nil)
+var _ mvccIncrementalIteratorI = (*storage.MVCCIncrementalIterator)(nil)
 
 // tryMVCCIncrementalIter unwraps an MVCCIncrementalIterator, if there is one.
 // This does not return the verbatim *MVCCIncrementalIterator but an interface,
@@ -2258,7 +2489,7 @@ var _ mvccIncrementalIteratorI = (*MVCCIncrementalIterator)(nil)
 // movement and thus needs to mask RangeKeyChanged{,IgnoringTime}.
 func (e *evalCtx) tryMVCCIncrementalIter() mvccIncrementalIteratorI {
 	var iter mvccIncrementalIteratorI
-	e.visitWrappedIters(func(it SimpleMVCCIterator) (done bool) {
+	e.visitWrappedIters(func(it storage.SimpleMVCCIterator) (done bool) {
 		iter, done = it.(mvccIncrementalIteratorI)
 		return done
 	})
@@ -2280,7 +2511,47 @@ func (e *evalCtx) iterErr() error {
 	return nil
 }
 
-func toKey(s string) roachpb.Key {
+// metamorphicPeekBounds generates MVCC range key peek bounds for a command
+// based on its keyspan, and enables spanset assertions for the ReadWriter.
+func (e *evalCtx) metamorphicPeekBounds(
+	rw storage.ReadWriter, start, end roachpb.Key,
+) (storage.ReadWriter, roachpb.Key, roachpb.Key) {
+	leftPeekBound, rightPeekBound := start.Prevish(8), end.Next()
+	if end == nil {
+		rightPeekBound = nil
+	}
+
+	switch mvccHistoriesPeekBounds {
+	case "none":
+		leftPeekBound, rightPeekBound = nil, nil
+	case "left":
+		rightPeekBound = nil
+	case "right":
+		leftPeekBound = nil
+	case "both":
+	default:
+		e.t.Fatalf("invalid peek bound kind %q", mvccHistoriesPeekBounds)
+		return nil, nil, nil
+	}
+
+	if leftPeekBound != nil || rightPeekBound != nil {
+		ss := &spanset.SpanSet{}
+		ss.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: start, EndKey: end})
+		peekSpan := roachpb.Span{Key: leftPeekBound, EndKey: rightPeekBound}
+		if peekSpan.Key == nil {
+			peekSpan.Key = keys.LocalMax
+		}
+		if peekSpan.EndKey == nil {
+			peekSpan.EndKey = keys.MaxKey
+		}
+		ss.AddNonMVCC(spanset.SpanReadOnly, peekSpan)
+		rw = spanset.NewReadWriterAt(rw, ss, hlc.Timestamp{})
+	}
+
+	return rw, leftPeekBound, rightPeekBound
+}
+
+func toKey(s string, sqlCodec keys.SQLCodec) roachpb.Key {
 	if len(s) == 0 {
 		return roachpb.Key(s)
 	}
@@ -2312,7 +2583,7 @@ func toKey(s string) roachpb.Key {
 
 		var colMap catalog.TableColMap
 		colMap.Set(0, 0)
-		key := keys.SystemSQLCodec.IndexPrefix(1, 1)
+		key := sqlCodec.IndexPrefix(1, 1)
 		key, _, err = rowenc.EncodeColumns([]descpb.ColumnID{0}, nil /* directions */, colMap, []tree.Datum{tree.NewDString(pk)}, key)
 		if err != nil {
 			panic(err)
@@ -2324,31 +2595,10 @@ func toKey(s string) roachpb.Key {
 	}
 }
 
-// metamorphicReader returns a random storage.Reader for the Engine, and a
-// closer function if the reader must be closed when done (nil otherwise).
-func metamorphicReader(e *evalCtx) (r Reader, closer func()) {
-	switch iterReader {
-	case "engine":
-		return e.engine, nil
-	case "readonly":
-		readOnly := e.engine.NewReadOnly(StandardDurability)
-		return readOnly, readOnly.Close
-	case "batch":
-		batch := e.engine.NewBatch()
-		return batch, batch.Close
-	case "snapshot":
-		snapshot := e.engine.NewSnapshot()
-		return snapshot, snapshot.Close
-	default:
-		e.t.Fatalf("unknown reader type %q", iterReader)
-	}
-	return nil, nil
-}
-
 // iterWithCloser will call the given closer when the iterator
 // is closed.
 type iterWithCloser struct {
-	SimpleMVCCIterator
+	storage.SimpleMVCCIterator
 	closer func()
 }
 
@@ -2358,3 +2608,10 @@ func (i *iterWithCloser) Close() {
 		i.closer()
 	}
 }
+
+// noopCloseReader overrides Reader.Close() with a noop.
+type noopCloseReader struct {
+	storage.Reader
+}
+
+func (noopCloseReader) Close() {}

@@ -17,18 +17,24 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/deprecatedshowranges"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -37,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 )
@@ -87,13 +94,13 @@ type virtualIndex struct {
 		addRow func(...tree.Datum) error,
 	) (matched bool, err error)
 
-	// partial is true if the virtual index isn't able to satisfy all constraints.
+	// incomplete is true if the virtual index isn't able to satisfy all constraints.
 	// For example, the pg_class table contains both indexes and tables. Tables
 	// can be looked up via a virtual index, since we can look up their descriptor
 	// by their ID directly. But indexes can't - they're hashed identifiers with
-	// no actual index. So we mark this index as partial, and if we get no match
+	// no actual index. So we mark this index as incomplete, and if we get no match
 	// during populate, we'll fall back on populating the entire table.
-	partial bool
+	incomplete bool
 }
 
 // virtualSchemaTable represents a table within a virtualSchema.
@@ -126,12 +133,19 @@ type virtualSchemaTable struct {
 	// will be queryable but return no rows. Otherwise querying the table will
 	// return an unimplemented error.
 	unimplemented bool
+
+	// resultColumns is optional; if present, it will be checked for coherency
+	// with schema.
+	resultColumns colinfo.ResultColumns
 }
 
 // virtualSchemaView represents a view within a virtualSchema
 type virtualSchemaView struct {
 	schema        string
 	resultColumns colinfo.ResultColumns
+
+	// comment represents comment of virtual schema view.
+	comment string
 }
 
 // getSchema is part of the virtualSchemaDef interface.
@@ -173,6 +187,7 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 
 	// Virtual tables never use SERIAL so we need not process SERIAL
 	// types here.
+	semaCtx := tree.MakeSemaContext()
 	mutDesc, err := NewTableDesc(
 		ctx,
 		nil, /* txn */
@@ -184,17 +199,57 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 		id,
 		nil,       /* regionConfig */
 		startTime, /* creationTime */
-		nil,
-		nil,                        /* affected */
-		nil,                        /* semaCtx */
-		nil,                        /* evalCtx */
-		&sessiondata.SessionData{}, /* sessionData */
+		catpb.NewPrivilegeDescriptor(
+			username.PublicRoleName(),
+			privilege.List{privilege.SELECT},
+			privilege.List{},
+			username.NodeUserName(),
+		),
+		nil,      /* affected */
+		&semaCtx, /* semaCtx */
+		// We explicitly pass in a half-baked EvalContext because we don't need to
+		// evaluate any expressions to initialize virtual tables. We do need to
+		// pass in the cluster settings to make sure that functions can properly
+		// evaluate version gates, though.
+		&eval.Context{Settings: st}, /* evalCtx */
+		&sessiondata.SessionData{},  /* sessionData */
 		tree.PersistencePermanent,
 	)
 	if err != nil {
 		err = errors.Wrapf(err, "initVirtualDesc problem with schema: \n%s", t.schema)
 		return descpb.TableDescriptor{}, err
 	}
+
+	if t.resultColumns != nil {
+		if len(mutDesc.Columns) != len(t.resultColumns) {
+			return descpb.TableDescriptor{}, errors.AssertionFailedf(
+				"virtual table %s.%s declares incorrect number of columns: %d vs %d",
+				sc.GetName(), mutDesc.GetName(),
+				len(mutDesc.Columns), len(t.resultColumns))
+		}
+		for i := range mutDesc.Columns {
+			if mutDesc.Columns[i].Name != t.resultColumns[i].Name ||
+				mutDesc.Columns[i].Hidden != t.resultColumns[i].Hidden ||
+				mutDesc.Columns[i].Type.String() != t.resultColumns[i].Typ.String() {
+				return descpb.TableDescriptor{}, errors.AssertionFailedf(
+					"virtual table %s.%s declares incorrect column metadata: %#v vs %#v",
+					sc.GetName(), mutDesc.GetName(),
+					mutDesc.Columns[i], t.resultColumns[i])
+			}
+		}
+	}
+
+	if t.generator != nil {
+		for _, idx := range t.indexes {
+			if idx.incomplete {
+				return descpb.TableDescriptor{}, errors.AssertionFailedf(
+					"virtual table %s.%s contains an incomplete index and a generator will"+
+						" never use the index", sc.GetName(), mutDesc.GetName(),
+				)
+			}
+		}
+	}
+
 	for _, index := range mutDesc.PublicNonPrimaryIndexes() {
 		if index.NumKeyColumns() > 1 {
 			panic("we don't know how to deal with virtual composite indexes yet")
@@ -250,7 +305,7 @@ func (t virtualSchemaTable) preferIndexOverGenerator(
 	}
 
 	virtualIdx := t.getIndex(index.GetID())
-	if virtualIdx.partial {
+	if virtualIdx.incomplete {
 		return false
 	}
 
@@ -293,9 +348,18 @@ func (v virtualSchemaView) initVirtualTableDesc(
 		id,
 		columns,
 		startTime,
-		nil,
+		catpb.NewPrivilegeDescriptor(
+			username.PublicRoleName(),
+			privilege.List{privilege.SELECT},
+			privilege.List{},
+			username.NodeUserName(),
+		),
 		nil, // semaCtx
-		nil, // evalCtx
+		// We explicitly pass in a half-baked EvalContext because we don't need to
+		// evaluate any expressions to initialize virtual tables. We do need to
+		// pass in the cluster settings to make sure that functions can properly
+		// evaluate version gates, though.
+		&eval.Context{Settings: st}, /* evalCtx */
 		st,
 		tree.PersistencePermanent,
 		false, // isMultiRegion
@@ -306,7 +370,7 @@ func (v virtualSchemaView) initVirtualTableDesc(
 
 // getComment is part of the virtualSchemaDef interface.
 func (v virtualSchemaView) getComment() string {
-	return ""
+	return v.comment
 }
 
 // isUnimplemented is part of the virtualSchemaDef interface.
@@ -344,6 +408,10 @@ type VirtualSchemaHolder struct {
 	schemasByID   map[descpb.ID]*virtualSchemaEntry
 	defsByID      map[descpb.ID]*virtualDefEntry
 	orderedNames  []string
+
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	st *cluster.Settings
 }
 
 var _ VirtualTabler = (*VirtualSchemaHolder)(nil)
@@ -366,7 +434,38 @@ func (vs *VirtualSchemaHolder) GetVirtualObjectByID(id descpb.ID) (catalog.Virtu
 	if !ok {
 		return nil, false
 	}
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	switch {
+	// We only check the Enable condition after we know we're
+	// looking at the "interesting" ID because the Enable condition
+	// has side effects.
+	case id == catconstants.CrdbInternalRangesViewID && deprecatedshowranges.EnableDeprecatedBehavior(context.TODO(), vs.st, nil):
+		entry = vs.schemasByID[catconstants.CrdbInternalID].deprecatedRangesDef
+	case id == catconstants.CrdbInternalRangesNoLeasesTableID && deprecatedshowranges.EnableDeprecatedBehavior(context.TODO(), vs.st, nil):
+		entry = vs.schemasByID[catconstants.CrdbInternalID].deprecatedRangesNoLeasesDef
+	}
+
 	return entry, true
+}
+
+// Visit makes VirtualSchemaHolder implement catalog.VirtualSchemas.
+func (vs *VirtualSchemaHolder) Visit(fn func(desc catalog.Descriptor, comment string) error) error {
+	for _, sc := range vs.schemasByID {
+		if err := fn(sc.desc, "" /* comment */); err != nil {
+			return iterutil.Map(err)
+		}
+		for _, def := range sc.defs {
+			// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+			// Remove in v23.2.
+			def = sc.compatSubstDef(def, nil /* ClientNoticeSender */)
+
+			if err := fn(def.desc, def.comment); err != nil {
+				return iterutil.Map(err)
+			}
+		}
+	}
+	return nil
 }
 
 var _ catalog.VirtualSchemas = (*VirtualSchemaHolder)(nil)
@@ -377,6 +476,12 @@ type virtualSchemaEntry struct {
 	orderedDefNames []string
 	undefinedTables map[string]struct{}
 	containsTypes   bool
+
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	st                          *cluster.Settings
+	deprecatedRangesDef         *virtualDefEntry
+	deprecatedRangesNoLeasesDef *virtualDefEntry
 }
 
 func (v *virtualSchemaEntry) Desc() catalog.SchemaDescriptor {
@@ -389,57 +494,59 @@ func (v *virtualSchemaEntry) NumTables() int {
 
 func (v *virtualSchemaEntry) VisitTables(f func(object catalog.VirtualObject)) {
 	for _, name := range v.orderedDefNames {
-		f(v.defs[name])
+		def := v.defs[name]
+		// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+		// Remove in v23.2.
+		def = v.compatSubstDef(def, nil /* ClientNoticeSender */)
+
+		f(def)
 	}
 }
 
 func (v *virtualSchemaEntry) GetObjectByName(
-	name string, flags tree.ObjectLookupFlags,
+	name string, kind tree.DesiredObjectKind,
 ) (catalog.VirtualObject, error) {
-	switch flags.DesiredObjectKind {
-	case tree.TableObject:
-		if def, ok := v.defs[name]; ok {
-			if flags.RequireMutable {
-				return &mutableVirtualDefEntry{
-					desc: tabledesc.NewBuilder(def.desc.TableDesc()).BuildExistingMutableTable(),
+	switch kind {
+	case tree.TypeObject:
+		// Currently, we don't allow creation of types in virtual schemas, so
+		// the only types present in the virtual schemas that have types (i.e.
+		// pg_catalog) are types that are known at parse time or implicit record
+		// types for each table. So, first attempt to
+		// parse the input object as a statically known type. Note that an
+		// invalid input type like "notatype" will be parsed successfully as
+		// a ResolvableTypeReference, so the error here does not need to be
+		// intercepted and inspected.
+		if v.containsTypes {
+			typRef, err := parser.GetTypeReferenceFromName(tree.Name(name))
+			if err != nil {
+				return nil, err
+			}
+			// If the parsed reference is actually a statically known type, then
+			// we can return it. We return a simple wrapping of this type as
+			// TypeDescriptor that represents an alias of the result type.
+			typ, ok := tree.GetStaticallyKnownType(typRef)
+			if ok {
+				return &virtualTypeEntry{
+					desc: typedesc.MakeSimpleAlias(typ, catconstants.PgCatalogID),
 				}, nil
 			}
+		}
+		// If the type could not be found statically, then search for a table with
+		// this name so the implicit record type can be used.
+		fallthrough
+	case tree.TableObject:
+		if def, ok := v.defs[name]; ok {
+			// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+			// Remove in v23.2.
+			def = v.compatSubstDef(def, nil /* ClientNoticeSender */)
+
 			return def, nil
 		}
 		if _, ok := v.undefinedTables[name]; ok {
 			return nil, newUnimplementedVirtualTableError(v.desc.GetName(), name)
 		}
-		return nil, nil
-	case tree.TypeObject:
-		if !v.containsTypes {
-			return nil, nil
-		}
-		// Currently, we don't allow creation of types in virtual schemas, so
-		// the only types present in the virtual schemas that have types (i.e.
-		// pg_catalog) are types that are known at parse time. So, attempt to
-		// parse the input object as a statically known type. Note that an
-		// invalid input type like "notatype" will be parsed successfully as
-		// a ResolvableTypeReference, so the error here does not need to be
-		// intercepted and inspected.
-		typRef, err := parser.GetTypeReferenceFromName(tree.Name(name))
-		if err != nil {
-			return nil, err
-		}
-		// If the parsed reference is actually a statically known type, then
-		// we can return it. We return a simple wrapping of this type as
-		// TypeDescriptor that represents an alias of the result type.
-		typ, ok := tree.GetStaticallyKnownType(typRef)
-		if !ok {
-			return nil, nil
-		}
-
-		return &virtualTypeEntry{
-			desc:    typedesc.MakeSimpleAlias(typ, catconstants.PgCatalogID),
-			mutable: flags.RequireMutable,
-		}, nil
-	default:
-		return nil, errors.AssertionFailedf("unknown desired object kind %d", flags.DesiredObjectKind)
 	}
+	return nil, nil
 }
 
 type virtualDefEntry struct {
@@ -461,22 +568,11 @@ func canQueryVirtualTable(evalCtx *eval.Context, e *virtualDefEntry) bool {
 		evalCtx.SessionData().StubCatalogTablesEnabled
 }
 
-type mutableVirtualDefEntry struct {
-	desc *tabledesc.Mutable
-}
-
-func (e *mutableVirtualDefEntry) Desc() catalog.Descriptor {
-	return e.desc
-}
-
 type virtualTypeEntry struct {
-	desc    catalog.TypeDescriptor
-	mutable bool
+	desc catalog.TypeDescriptor
 }
 
 func (e *virtualTypeEntry) Desc() catalog.Descriptor {
-	// TODO(ajwerner): Should this be allowed? I think no. Let's just store an
-	// ImmutableTypeDesc off of this thing.
 	return e.desc
 }
 
@@ -539,10 +635,7 @@ func (e *virtualDefEntry) getPlanInfo(
 		var dbDesc catalog.DatabaseDescriptor
 		var err error
 		if dbName != "" {
-			dbDesc, err = p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
-				dbName, tree.DatabaseLookupFlags{
-					Required: true, AvoidLeased: p.skipDescriptorCache,
-				})
+			dbDesc, err = p.byNameGetterBuilder().Get().Database(ctx, dbName)
 			if err != nil {
 				return nil, err
 			}
@@ -563,15 +656,33 @@ func (e *virtualDefEntry) getPlanInfo(
 				if err != nil {
 					return nil, err
 				}
+				if index != nil && index.IsPartial() {
+					if next, err = e.wrapVirtualTableGeneratorWithPartialIndexPredicate(
+						ctx, p, index, next,
+					); err != nil {
+						return nil, err
+					}
+				}
 				return p.newVirtualTableNode(columns, next, cleanup), nil
 			}
 
 			constrainedScan := idxConstraint != nil && !idxConstraint.IsUnconstrained()
 			if !constrainedScan {
+				var filter func(tree.Datums) (bool, error)
+				if index != nil && index.IsPartial() {
+					if filter, err = e.getIndexPredicateFilter(ctx, p, index); err != nil {
+						return nil, err
+					}
+				}
 				generator, cleanup, setupError := setupGenerator(ctx, func(ctx context.Context, pusher rowPusher) error {
 					return def.populate(ctx, p, dbDesc, func(row ...tree.Datum) error {
 						if err := e.validateRow(row, columns); err != nil {
 							return err
+						}
+						if filter != nil {
+							if matched, err := filter(row); err != nil || !matched {
+								return err
+							}
 						}
 						return pusher.pushRow(row...)
 					})
@@ -583,7 +694,6 @@ func (e *virtualDefEntry) getPlanInfo(
 			}
 
 			// We are now dealing with a constrained virtual index scan.
-
 			if index.GetID() == 1 {
 				return nil, errors.AssertionFailedf(
 					"programming error: can't constrain scan on primary virtual index of table %s", e.desc.GetName())
@@ -608,6 +718,36 @@ func (e *virtualDefEntry) getPlanInfo(
 	return columns, constructor
 }
 
+// wrapVirtualTableGeneratorWithPartialIndexPredicate will filter the
+// virtualTableGenerator rows which do not match the partial index predicate.
+// The passed index must exist and be partial.
+func (e *virtualDefEntry) wrapVirtualTableGeneratorWithPartialIndexPredicate(
+	ctx context.Context, p *planner, index catalog.Index, src virtualTableGenerator,
+) (virtualTableGenerator, error) {
+	partialFilter, err := e.getIndexPredicateFilter(ctx, p, index)
+	if err != nil {
+		return nil, err
+	}
+	return func() (tree.Datums, error) {
+		for {
+			datums, err := src()
+			if err != nil {
+				return nil, err
+			}
+			if datums == nil {
+				return nil, nil
+			}
+			matched, err := partialFilter(datums)
+			if err != nil {
+				return nil, err
+			}
+			if matched {
+				return datums, nil
+			}
+		}
+	}, nil
+}
+
 // makeConstrainedRowsGenerator returns a generator function that can be invoked
 // to push all rows from this virtual table that satisfy the input index
 // constraint to a row pusher that's supplied to the generator function.
@@ -623,6 +763,7 @@ func (e *virtualDefEntry) makeConstrainedRowsGenerator(
 	def := e.virtualDef.(virtualSchemaTable)
 	return func(ctx context.Context, pusher rowPusher) error {
 		var span constraint.Span
+		var partialIndexPredicate func(datums tree.Datums) (matched bool, _ error)
 		addRowIfPassesFilter := func(idxConstraint *constraint.Constraint) func(datums ...tree.Datum) error {
 			return func(datums ...tree.Datum) error {
 				for i := 0; i < index.NumKeyColumns(); i++ {
@@ -635,14 +776,22 @@ func (e *virtualDefEntry) makeConstrainedRowsGenerator(
 				// will tell us whether or not to let the current row pass the filter.
 				key := constraint.MakeCompositeKey(indexKeyDatums...)
 				span.Init(key, constraint.IncludeBoundary, key, constraint.IncludeBoundary)
-				var err error
-				if idxConstraint.ContainsSpan(p.EvalContext(), &span) {
-					if err := e.validateRow(datums, columns); err != nil {
+				if !idxConstraint.ContainsSpan(p.EvalContext(), &span) {
+					return nil
+				}
+				if err := e.validateRow(datums, columns); err != nil {
+					return err
+				}
+				if partialIndexPredicate != nil {
+					matched, err := partialIndexPredicate(datums)
+					if err != nil {
 						return err
 					}
-					return pusher.pushRow(datums...)
+					if !matched {
+						return nil
+					}
 				}
-				return err
+				return pusher.pushRow(datums...)
 			}
 		}
 
@@ -663,7 +812,7 @@ func (e *virtualDefEntry) makeConstrainedRowsGenerator(
 				break
 			}
 			constraintDatum := span.StartKey().Value(0)
-			unwrappedConstraint := eval.UnwrapDatum(p.EvalContext(), constraintDatum)
+			unwrappedConstraint := eval.UnwrapDatum(ctx, p.EvalContext(), constraintDatum)
 			virtualIndex := def.getIndex(index.GetID())
 			// NULL constraint will not match any row.
 			matched := unwrappedConstraint != tree.DNull
@@ -677,8 +826,8 @@ func (e *virtualDefEntry) makeConstrainedRowsGenerator(
 					return err
 				}
 			}
-			if !matched && virtualIndex.partial {
-				// If no row was matched, and the index was partial, we have no choice
+			if !matched && virtualIndex.incomplete {
+				// If no row was matched, and the index was incomplete, we have no choice
 				// but to populate the entire table and search through it.
 				break
 			}
@@ -698,14 +847,64 @@ func (e *virtualDefEntry) makeConstrainedRowsGenerator(
 			newConstraint.Spans.Append(idxConstraint.Spans.Get(currentSpan))
 		}
 
+		// If the index that was chosen but not used was a partial index, we need
+		// to make sure we apply the same predicate to all rows of the primary
+		// index.
+		if index != nil && index.IsPartial() {
+			var err error
+			partialIndexPredicate, err = e.getIndexPredicateFilter(ctx, p, index)
+			if err != nil {
+				return err
+			}
+		}
+
 		// NB: If we allow virtualSchemaTables with generator to perform a constrained scan,
 		// we then need to ensure that we don't call populate without checking, as it may be nil.
 		if def.populate == nil {
 			return errors.AssertionFailedf(
 				"programming error: can't fall back to unconstrained scan on generated vtables")
 		}
+
 		return def.populate(ctx, p, dbDesc, addRowIfPassesFilter(&newConstraint))
 	}
+}
+
+// getIndexPredicateFilter returns a function which can be used to filter
+// rows of a virtual table which do not match the corresponding index predicate.
+// The index must be non-nil and partial. We need this because there are cases
+// the optimizer will choose to scan a virtual index but the index cannot be
+// used to serve the query. Instead, we need to scan the primary index and then
+// constrain it as though the partial index were scanned.
+func (e *virtualDefEntry) getIndexPredicateFilter(
+	ctx context.Context, p *planner, index catalog.Index,
+) (func(datums tree.Datums) (matched bool, _ error), error) {
+	if index == nil || !index.IsPartial() {
+		return nil, errors.AssertionFailedf("cannot construct filter for a non-partial index %v", index)
+	}
+	expr, err := schemaexpr.MakePartialIndexExpr(ctx, e.desc, index, p.EvalContext(), p.SemaCtx())
+	if err != nil {
+		return nil, errors.NewAssertionErrorWithWrappedErrf(err, "failed to construct partial index constraints")
+	}
+	publicColumns := e.desc.PublicColumns()
+	r := schemaexpr.RowIndexedVarContainer{
+		Cols: publicColumns,
+	}
+	for i, c := range publicColumns {
+		r.Mapping.Set(c.GetID(), i)
+	}
+	return func(datums tree.Datums) (matched bool, _ error) {
+		r.CurSourceRow = datums
+		p.EvalContext().PushIVarContainer(&r)
+		defer p.EvalContext().PopIVarContainer()
+		got, err := eval.Expr(ctx, p.EvalContext(), expr)
+		if err != nil {
+			return false, err
+		}
+		if got == tree.DNull {
+			return false, nil
+		}
+		return bool(tree.MustBeDBool(got)), nil
+	}, nil
 }
 
 // NewVirtualSchemaHolder creates a new VirtualSchemaHolder.
@@ -717,6 +916,10 @@ func NewVirtualSchemaHolder(
 		schemasByID:   make(map[descpb.ID]*virtualSchemaEntry, len(virtualSchemas)),
 		orderedNames:  make([]string, len(virtualSchemas)),
 		defsByID:      make(map[descpb.ID]*virtualDefEntry, math.MaxUint32-catconstants.MinVirtualID),
+
+		// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+		// Remove in v23.2.
+		st: st,
 	}
 
 	order := 0
@@ -732,23 +935,29 @@ func NewVirtualSchemaHolder(
 		defs := make(map[string]*virtualDefEntry, len(schema.tableDefs))
 		orderedDefNames := make([]string, 0, len(schema.tableDefs))
 
-		for id, def := range schema.tableDefs {
+		doTheWork := func(id descpb.ID, def virtualSchemaDef, bumpVersion bool) (tb descpb.TableDescriptor, de *virtualDefEntry, err error) {
 			tableDesc, err := def.initVirtualTableDesc(ctx, st, scDesc, id)
-
 			if err != nil {
-				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+				return tb, nil, errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to initialize %s", errors.Safe(def.getSchema()))
+			}
+
+			// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+			// Remove in v23.2.
+			if bumpVersion {
+				tableDesc.Version++
 			}
 
 			if schema.tableValidator != nil {
 				if err := schema.tableValidator(&tableDesc); err != nil {
-					return nil, errors.NewAssertionErrorWithWrappedErrf(err, "programmer error")
+					return tb, nil, errors.NewAssertionErrorWithWrappedErrf(err, "programmer error")
 				}
 			}
 			td := tabledesc.NewBuilder(&tableDesc).BuildImmutableTable()
 			version := st.Version.ActiveVersionOrEmpty(ctx)
-			if err := descbuilder.ValidateSelf(td, version); err != nil {
-				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+			dvmp := catsessiondata.NewDescriptorSessionDataProvider(nil /* sd */)
+			if err := descs.ValidateSelf(td, version, dvmp); err != nil {
+				return tb, nil, errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to validate virtual table %s: programmer error", errors.Safe(td.GetName()))
 			}
 
@@ -759,6 +968,14 @@ func NewVirtualSchemaHolder(
 				comment:                    def.getComment(),
 				unimplemented:              def.isUnimplemented(),
 			}
+			return tableDesc, entry, nil
+		}
+
+		for id, def := range schema.tableDefs {
+			tableDesc, entry, err := doTheWork(id, def, false /* bumpVersion */)
+			if err != nil {
+				return nil, err
+			}
 			defs[tableDesc.Name] = entry
 			vs.defsByID[tableDesc.ID] = entry
 			orderedDefNames = append(orderedDefNames, tableDesc.Name)
@@ -766,12 +983,27 @@ func NewVirtualSchemaHolder(
 
 		sort.Strings(orderedDefNames)
 
+		_, extra1, err := doTheWork(catconstants.CrdbInternalRangesViewID, crdbInternalRangesViewDEPRECATED, true /* bumpVersion */)
+		if err != nil {
+			return nil, err
+		}
+		_, extra2, err := doTheWork(catconstants.CrdbInternalRangesNoLeasesTableID, crdbInternalRangesNoLeasesTableDEPRECATED, true /* bumpVersion */)
+		if err != nil {
+			return nil, err
+		}
+
 		vse := &virtualSchemaEntry{
 			desc:            scDesc,
 			defs:            defs,
 			orderedDefNames: orderedDefNames,
 			undefinedTables: schema.undefinedTables,
 			containsTypes:   schema.containsTypes,
+
+			// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+			// Remove in v23.2.
+			st:                          st,
+			deprecatedRangesDef:         extra1,
+			deprecatedRangesNoLeasesDef: extra2,
 		}
 		vs.schemasByName[scDesc.GetName()] = vse
 		vs.schemasByID[scDesc.GetID()] = vse
@@ -808,15 +1040,39 @@ func (vs *VirtualSchemaHolder) getVirtualSchemaEntry(name string) (*virtualSchem
 	return e, ok
 }
 
+// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+// Remove in v23.2.
+func (v *virtualSchemaEntry) compatSubstDef(
+	t *virtualDefEntry, ns eval.ClientNoticeSender,
+) *virtualDefEntry {
+	switch {
+	// We only check the Enable condition after we know we're
+	// looking at the "interesting" ID because the Enable condition
+	// has side effects.
+	case t.desc.GetID() == catconstants.CrdbInternalRangesViewID && deprecatedshowranges.EnableDeprecatedBehavior(context.TODO(), v.st, ns):
+		t = v.deprecatedRangesDef
+
+	case t.desc.GetID() == catconstants.CrdbInternalRangesNoLeasesTableID && deprecatedshowranges.EnableDeprecatedBehavior(context.TODO(), v.st, ns):
+		t = v.deprecatedRangesNoLeasesDef
+	}
+	return t
+}
+
 // getVirtualTableEntry checks if the provided name matches a virtual database/table
 // pair. The function will return the table's virtual table entry if the name matches
 // a specific table. It will return an error if the name references a virtual database
 // but the table is non-existent.
 // getVirtualTableEntry is part of the VirtualTabler interface.
-func (vs *VirtualSchemaHolder) getVirtualTableEntry(tn *tree.TableName) (*virtualDefEntry, error) {
+func (vs *VirtualSchemaHolder) getVirtualTableEntry(
+	tn *tree.TableName, ns eval.ClientNoticeSender,
+) (*virtualDefEntry, error) {
 	if db, ok := vs.getVirtualSchemaEntry(tn.Schema()); ok {
 		tableName := tn.Table()
 		if t, ok := db.defs[tableName]; ok {
+			// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+			// Remove in v23.2.
+			t = db.compatSubstDef(t, ns)
+
 			sqltelemetry.IncrementGetVirtualTableEntry(tn.Schema(), tableName)
 			return t, nil
 		}
@@ -836,8 +1092,8 @@ func (vs *VirtualSchemaHolder) getVirtualTableEntry(tn *tree.TableName) (*virtua
 
 // VirtualTabler is used to fetch descriptors for virtual tables and databases.
 type VirtualTabler interface {
-	getVirtualTableDesc(tn *tree.TableName) (catalog.TableDescriptor, error)
-	getVirtualTableEntry(tn *tree.TableName) (*virtualDefEntry, error)
+	getVirtualTableDesc(tn *tree.TableName, ns eval.ClientNoticeSender) (catalog.TableDescriptor, error)
+	getVirtualTableEntry(tn *tree.TableName, ns eval.ClientNoticeSender) (*virtualDefEntry, error)
 	getSchemas() map[string]*virtualSchemaEntry
 	getSchemaNames() []string
 }
@@ -846,9 +1102,9 @@ type VirtualTabler interface {
 // pair, and returns its descriptor if it does.
 // getVirtualTableDesc is part of the VirtualTabler interface.
 func (vs *VirtualSchemaHolder) getVirtualTableDesc(
-	tn *tree.TableName,
+	tn *tree.TableName, ns eval.ClientNoticeSender,
 ) (catalog.TableDescriptor, error) {
-	t, err := vs.getVirtualTableEntry(tn)
+	t, err := vs.getVirtualTableEntry(tn, ns)
 	if err != nil || t == nil {
 		return nil, err
 	}

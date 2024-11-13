@@ -52,7 +52,7 @@ func TestOnlyValidAndHealthyDisk(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
-		valid, invalid, full, readAmpHigh int
+		valid, invalid, full, ioOverloaded int
 	}{
 		{0, 0, 0, 0},
 		{1, 0, 0, 0},
@@ -80,8 +80,8 @@ func TestOnlyValidAndHealthyDisk(t *testing.T) {
 			for i := 0; i < tc.full; i++ {
 				cl = append(cl, candidate{fullDisk: true})
 			}
-			for i := 0; i < tc.readAmpHigh; i++ {
-				cl = append(cl, candidate{highReadAmp: true})
+			for i := 0; i < tc.ioOverloaded; i++ {
+				cl = append(cl, candidate{ioOverloaded: true})
 			}
 			sort.Sort(sort.Reverse(byScore(cl)))
 
@@ -89,7 +89,7 @@ func TestOnlyValidAndHealthyDisk(t *testing.T) {
 			if a, e := len(valid), tc.valid; a != e {
 				t.Errorf("expected %d valid, actual %d", e, a)
 			}
-			if a, e := len(cl)-len(valid), tc.invalid+tc.full+tc.readAmpHigh; a != e {
+			if a, e := len(cl)-len(valid), tc.invalid+tc.full+tc.ioOverloaded; a != e {
 				t.Errorf("expected %d invalid, actual %d", e, a)
 			}
 		})
@@ -583,7 +583,13 @@ var (
 	}
 )
 
-func getTestStoreDesc(storeID roachpb.StoreID) (roachpb.StoreDescriptor, bool) {
+type mockStoreResolver struct{}
+
+var _ constraint.StoreResolver = mockStoreResolver{}
+
+func (m mockStoreResolver) GetStoreDescriptor(
+	storeID roachpb.StoreID,
+) (roachpb.StoreDescriptor, bool) {
 	desc, ok := testStores[storeID]
 	return desc, ok
 }
@@ -936,9 +942,7 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 				Constraints: tc.constraints,
 				NumReplicas: tc.numReplicas,
 			}
-			analyzed := constraint.AnalyzeConstraints(
-				context.Background(), getTestStoreDesc, testStoreReplicas(tc.existing),
-				conf.NumReplicas, conf.Constraints)
+			analyzed := constraint.AnalyzeConstraints(mockStoreResolver{}, testStoreReplicas(tc.existing), conf.NumReplicas, conf.Constraints)
 			for _, s := range testStores {
 				valid, necessary := allocateConstraintsCheck(s, analyzed)
 				if e, a := tc.expectedValid[s.StoreID], valid; e != a {
@@ -1071,8 +1075,7 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 				Constraints: tc.constraints,
 				NumReplicas: tc.numReplicas,
 			}
-			analyzed := constraint.AnalyzeConstraints(
-				context.Background(), getTestStoreDesc, existing, conf.NumReplicas, conf.Constraints)
+			analyzed := constraint.AnalyzeConstraints(mockStoreResolver{}, existing, conf.NumReplicas, conf.Constraints)
 			for storeID, expected := range tc.expected {
 				valid, necessary := removeConstraintsCheck(testStores[storeID], analyzed)
 				if e, a := expected.valid, valid; e != a {
@@ -1093,7 +1096,9 @@ func TestShouldRebalanceDiversity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	options := &RangeCountScorerOptions{StoreHealthOptions: StoreHealthOptions{EnforcementLevel: StoreHealthNoAction}}
+	options := &RangeCountScorerOptions{
+		DiskCapacityOptions: defaultDiskCapacityOptions(),
+	}
 	newStore := func(id int, locality roachpb.Locality) roachpb.StoreDescriptor {
 		return roachpb.StoreDescriptor{
 			StoreID: roachpb.StoreID(id),
@@ -1525,6 +1530,7 @@ func TestBalanceScoreByRangeCount(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	options := RangeCountScorerOptions{
+		DiskCapacityOptions:     defaultDiskCapacityOptions(),
 		rangeRebalanceThreshold: 0.1,
 	}
 	storeList := storepool.StoreList{
@@ -1559,9 +1565,7 @@ func TestRebalanceBalanceScoreOnQPS(t *testing.T) {
 	storeList := storepool.StoreList{
 		CandidateQueriesPerSecond: storepool.Stat{Mean: 1000},
 	}
-	options := QPSScorerOptions{
-		QPSRebalanceThreshold: 0.1,
-	}
+	options := TestingQPSLoadScorerOptions(0, 0.1)
 
 	testCases := []struct {
 		QPS             float64
@@ -1611,7 +1615,9 @@ func TestRebalanceConvergesRangeCountOnMean(t *testing.T) {
 		{2000, false, true},
 	}
 
-	options := RangeCountScorerOptions{}
+	options := RangeCountScorerOptions{
+		DiskCapacityOptions: defaultDiskCapacityOptions(),
+	}
 	eqClass := equivalenceClass{
 		candidateSL: storeList,
 	}
@@ -1645,8 +1651,13 @@ func TestMaxCapacity(t *testing.T) {
 		testStoreEurope: true,
 	}
 
+	do := DiskCapacityOptions{
+		RebalanceToThreshold:     0.925,
+		ShedAndBlockAllThreshold: 0.95,
+	}
+
 	for _, s := range testStores {
-		if e, a := expectedCheck[s.StoreID], allocator.MaxCapacityCheck(s); e != a {
+		if e, a := expectedCheck[s.StoreID], do.maxCapacityCheck(s); e != a {
 			t.Errorf("store %d expected max capacity check: %t, actual %t", s.StoreID, e, a)
 		}
 	}

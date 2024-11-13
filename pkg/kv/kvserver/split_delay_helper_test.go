@@ -19,8 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/assert"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 type testSplitDelayHelper struct {
@@ -30,18 +30,15 @@ type testSplitDelayHelper struct {
 	raftStatus *raft.Status
 	sleep      func()
 
-	slept         time.Duration
-	emptyProposed int
+	slept time.Duration
 }
 
 func (h *testSplitDelayHelper) RaftStatus(context.Context) (roachpb.RangeID, *raft.Status) {
 	return h.rangeID, h.raftStatus
 }
-func (h *testSplitDelayHelper) ProposeEmptyCommand(ctx context.Context) {
-	h.emptyProposed++
-}
-func (h *testSplitDelayHelper) MaxTicks() int {
-	return h.numAttempts
+
+func (h *testSplitDelayHelper) MaxDelay() time.Duration {
+	return time.Duration(h.numAttempts) * h.TickDuration()
 }
 
 func (h *testSplitDelayHelper) TickDuration() time.Duration {
@@ -135,7 +132,6 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 		// We try to wake up the follower once, but then give up on it.
 		assert.Equal(t, "; delayed by 1.3s to resolve: r1/2 inactive", s)
 		assert.Less(t, int64(h.slept), int64(2*h.TickDuration()))
-		assert.Equal(t, 1, h.emptyProposed)
 	})
 
 	for _, state := range []tracker.StateType{tracker.StateProbe, tracker.StateSnapshot} {
@@ -143,10 +139,10 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 			st := statusWithState(raft.StateLeader)
 			st.Progress = map[uint64]tracker.Progress{
 				2: {
-					State:        state,
-					RecentActive: true,
-					ProbeSent:    true, // Unifies string output below.
-					Inflights:    &tracker.Inflights{},
+					State:            state,
+					RecentActive:     true,
+					MsgAppFlowPaused: true, // Unifies string output below.
+					Inflights:        &tracker.Inflights{},
 				},
 				// Healthy follower just for kicks.
 				3: {State: tracker.StateReplicate},
@@ -159,7 +155,6 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 			s := maybeDelaySplitToAvoidSnapshot(ctx, h)
 			assert.Equal(t, "; delayed by 5.5s to resolve: replica r1/2 not caught up: "+
 				state.String()+" match=0 next=0 paused (without success)", s)
-			assert.Equal(t, 0, h.emptyProposed)
 		})
 	}
 
@@ -176,7 +171,6 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 		s := maybeDelaySplitToAvoidSnapshot(ctx, h)
 		assert.Equal(t, "", s)
 		assert.EqualValues(t, 0, h.slept)
-		assert.Equal(t, 0, h.emptyProposed)
 	})
 
 	t.Run("becomes-replicating", func(t *testing.T) {
@@ -199,6 +193,5 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 		}
 		s := maybeDelaySplitToAvoidSnapshot(ctx, h)
 		assert.Equal(t, "; delayed by 2.5s to resolve: replica r1/2 not caught up: StateProbe match=0 next=0", s)
-		assert.EqualValues(t, 0, h.emptyProposed)
 	})
 }

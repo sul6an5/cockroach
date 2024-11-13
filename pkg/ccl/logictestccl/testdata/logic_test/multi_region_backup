@@ -1,4 +1,4 @@
-# tenant-cluster-setting-override-opt: allow-zone-configs-for-secondary-tenants allow-multi-region-abstractions-for-secondary-tenants
+# tenant-cluster-setting-override-opt: sql.zone_configs.allow_for_secondary_tenant.enabled=true sql.multi_region.allow_abstractions_for_secondary_tenants.enabled=true
 # LogicTest: multiregion-9node-3region-3azs multiregion-9node-3region-3azs-no-los
 
 # Tests in this file assume no multi-region tenant setup as tenants have no
@@ -57,15 +57,15 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE global_table
 ----
 TABLE global_table  ALTER TABLE global_table CONFIGURE ZONE USING
-                    range_min_bytes = 134217728,
-                    range_max_bytes = 536870912,
-                    gc.ttlseconds = 90000,
-                    global_reads = true,
-                    num_replicas = 5,
-                    num_voters = 3,
-                    constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                    voter_constraints = '[+region=ca-central-1]',
-                    lease_preferences = '[[+region=ca-central-1]]'
+                      range_min_bytes = 134217728,
+                      range_max_bytes = 536870912,
+                      gc.ttlseconds = 14400,
+                      global_reads = true,
+                      num_replicas = 5,
+                      num_voters = 3,
+                      constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                      voter_constraints = '[+region=ca-central-1]',
+                      lease_preferences = '[[+region=ca-central-1]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_row_table]
@@ -112,31 +112,31 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_row_table
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 query TT
 SHOW CREATE TABLE regional_by_row_table
 ----
-regional_by_row_table       CREATE TABLE public.regional_by_row_table (
-                            pk INT8 NOT NULL,
-                            pk2 INT8 NOT NULL,
-                            a INT8 NOT NULL,
-                            b INT8 NOT NULL,
-                            j JSONB NULL,
-                            crdb_region mr-backup-1.public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::mr-backup-1.public.crdb_internal_region,
-                            CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
-                            INDEX regional_by_row_table_a_idx (a ASC),
-                            UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-                            INVERTED INDEX regional_by_row_table_j_idx (j),
-                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
-) LOCALITY REGIONAL BY ROW
+regional_by_row_table  CREATE TABLE public.regional_by_row_table (
+                         pk INT8 NOT NULL,
+                         pk2 INT8 NOT NULL,
+                         a INT8 NOT NULL,
+                         b INT8 NOT NULL,
+                         j JSONB NULL,
+                         crdb_region "mr-backup-1".public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::"mr-backup-1".public.crdb_internal_region,
+                         CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
+                         INDEX regional_by_row_table_a_idx (a ASC),
+                         UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                         INVERTED INDEX regional_by_row_table_j_idx (j),
+                         FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
+                       ) LOCALITY REGIONAL BY ROW
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_primary_region]
@@ -147,14 +147,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_primary_region
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_ca_central_1]
@@ -165,14 +165,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_ca_central_1
 ----
 TABLE regional_by_table_in_ca_central_1  ALTER TABLE regional_by_table_in_ca_central_1 CONFIGURE ZONE USING
-                                         range_min_bytes = 134217728,
-                                         range_max_bytes = 536870912,
-                                         gc.ttlseconds = 90000,
-                                         num_replicas = 5,
-                                         num_voters = 3,
-                                         constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                                         voter_constraints = '[+region=ca-central-1]',
-                                         lease_preferences = '[[+region=ca-central-1]]'
+                                           range_min_bytes = 134217728,
+                                           range_max_bytes = 536870912,
+                                           gc.ttlseconds = 14400,
+                                           num_replicas = 5,
+                                           num_voters = 3,
+                                           constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                                           voter_constraints = '[+region=ca-central-1]',
+                                           lease_preferences = '[[+region=ca-central-1]]'
 
 statement ok
 CREATE DATABASE "mr-backup-2" primary region "ap-southeast-2" regions "ca-central-1", "us-east-1"
@@ -227,15 +227,15 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE global_table
 ----
 TABLE global_table  ALTER TABLE global_table CONFIGURE ZONE USING
-                    range_min_bytes = 134217728,
-                    range_max_bytes = 536870912,
-                    gc.ttlseconds = 90000,
-                    global_reads = true,
-                    num_replicas = 5,
-                    num_voters = 3,
-                    constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                    voter_constraints = '[+region=ap-southeast-2]',
-                    lease_preferences = '[[+region=ap-southeast-2]]'
+                      range_min_bytes = 134217728,
+                      range_max_bytes = 536870912,
+                      gc.ttlseconds = 14400,
+                      global_reads = true,
+                      num_replicas = 5,
+                      num_voters = 3,
+                      constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                      voter_constraints = '[+region=ap-southeast-2]',
+                      lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_row_table]
@@ -282,31 +282,31 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_row_table
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TT
 SHOW CREATE TABLE regional_by_row_table
 ----
-regional_by_row_table       CREATE TABLE public.regional_by_row_table (
-                            pk INT8 NOT NULL,
-                            pk2 INT8 NOT NULL,
-                            a INT8 NOT NULL,
-                            b INT8 NOT NULL,
-                            j JSONB NULL,
-                            crdb_region mr-backup-2.public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::mr-backup-2.public.crdb_internal_region,
-                            CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
-                            INDEX regional_by_row_table_a_idx (a ASC),
-                            UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-                            INVERTED INDEX regional_by_row_table_j_idx (j),
-                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
-) LOCALITY REGIONAL BY ROW
+regional_by_row_table  CREATE TABLE public.regional_by_row_table (
+                         pk INT8 NOT NULL,
+                         pk2 INT8 NOT NULL,
+                         a INT8 NOT NULL,
+                         b INT8 NOT NULL,
+                         j JSONB NULL,
+                         crdb_region "mr-backup-2".public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::"mr-backup-2".public.crdb_internal_region,
+                         CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
+                         INDEX regional_by_row_table_a_idx (a ASC),
+                         UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                         INVERTED INDEX regional_by_row_table_j_idx (j),
+                         FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
+                       ) LOCALITY REGIONAL BY ROW
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_primary_region]
@@ -317,14 +317,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_primary_region
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_ca_central_1]
@@ -335,54 +335,54 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_ca_central_1
 ----
 TABLE regional_by_table_in_ca_central_1  ALTER TABLE regional_by_table_in_ca_central_1 CONFIGURE ZONE USING
-                                         range_min_bytes = 134217728,
-                                         range_max_bytes = 536870912,
-                                         gc.ttlseconds = 90000,
-                                         num_replicas = 5,
-                                         num_voters = 3,
-                                         constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                                         voter_constraints = '[+region=ca-central-1]',
-                                         lease_preferences = '[[+region=ca-central-1]]'
+                                           range_min_bytes = 134217728,
+                                           range_max_bytes = 536870912,
+                                           gc.ttlseconds = 14400,
+                                           num_replicas = 5,
+                                           num_voters = 3,
+                                           constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                                           voter_constraints = '[+region=ca-central-1]',
+                                           lease_preferences = '[[+region=ca-central-1]]'
 
 query TT
 SHOW ZONE CONFIGURATION FOR DATABASE "mr-backup-1"
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 
 query TT
 SHOW ZONE CONFIGURATION FOR DATABASE "mr-backup-2"
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 statement ok
 ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING gc.ttlseconds = 1;
 ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING gc.ttlseconds = 1
 
 statement ok
-BACKUP DATABASE "mr-backup-1" TO 'nodelocal://0/mr-backup-1/';
+BACKUP DATABASE "mr-backup-1" TO 'nodelocal://1/mr-backup-1/';
 
 statement ok
-BACKUP DATABASE "mr-backup-2" TO 'nodelocal://0/mr-backup-2/';
+BACKUP DATABASE "mr-backup-2" TO 'nodelocal://1/mr-backup-2/';
 
 statement ok
-BACKUP DATABASE "mr-backup-1", "mr-backup-2" TO 'nodelocal://0/mr-backup-combined/'
+BACKUP DATABASE "mr-backup-1", "mr-backup-2" TO 'nodelocal://1/mr-backup-combined/'
 
 query T
 select database_name from [show databases]
@@ -409,7 +409,7 @@ system
 test
 
 statement ok
-RESTORE DATABASE "mr-backup-1" FROM 'nodelocal://0/mr-backup-1/'
+RESTORE DATABASE "mr-backup-1" FROM 'nodelocal://1/mr-backup-1/'
 
 query T
 select database_name from [show databases]
@@ -424,14 +424,14 @@ query TT
 SHOW ZONE CONFIGURATION FOR DATABASE "mr-backup-1"
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 statement ok
 use "mr-backup-1"
@@ -445,15 +445,15 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE global_table
 ----
 TABLE global_table  ALTER TABLE global_table CONFIGURE ZONE USING
-                    range_min_bytes = 134217728,
-                    range_max_bytes = 536870912,
-                    gc.ttlseconds = 90000,
-                    global_reads = true,
-                    num_replicas = 5,
-                    num_voters = 3,
-                    constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                    voter_constraints = '[+region=ca-central-1]',
-                    lease_preferences = '[[+region=ca-central-1]]'
+                      range_min_bytes = 134217728,
+                      range_max_bytes = 536870912,
+                      gc.ttlseconds = 14400,
+                      global_reads = true,
+                      num_replicas = 5,
+                      num_voters = 3,
+                      constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                      voter_constraints = '[+region=ca-central-1]',
+                      lease_preferences = '[[+region=ca-central-1]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_row_table]
@@ -500,31 +500,31 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_row_table
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 query TT
 SHOW CREATE TABLE regional_by_row_table
 ----
-regional_by_row_table       CREATE TABLE public.regional_by_row_table (
-                            pk INT8 NOT NULL,
-                            pk2 INT8 NOT NULL,
-                            a INT8 NOT NULL,
-                            b INT8 NOT NULL,
-                            j JSONB NULL,
-                            crdb_region mr-backup-1.public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::mr-backup-1.public.crdb_internal_region,
-                            CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
-                            INDEX regional_by_row_table_a_idx (a ASC),
-                            UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-                            INVERTED INDEX regional_by_row_table_j_idx (j),
-                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
-) LOCALITY REGIONAL BY ROW
+regional_by_row_table  CREATE TABLE public.regional_by_row_table (
+                         pk INT8 NOT NULL,
+                         pk2 INT8 NOT NULL,
+                         a INT8 NOT NULL,
+                         b INT8 NOT NULL,
+                         j JSONB NULL,
+                         crdb_region "mr-backup-1".public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::"mr-backup-1".public.crdb_internal_region,
+                         CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
+                         INDEX regional_by_row_table_a_idx (a ASC),
+                         UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                         INVERTED INDEX regional_by_row_table_j_idx (j),
+                         FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
+                       ) LOCALITY REGIONAL BY ROW
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_primary_region]
@@ -535,14 +535,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_primary_region
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_ca_central_1]
@@ -553,17 +553,17 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_ca_central_1
 ----
 TABLE regional_by_table_in_ca_central_1  ALTER TABLE regional_by_table_in_ca_central_1 CONFIGURE ZONE USING
-                                         range_min_bytes = 134217728,
-                                         range_max_bytes = 536870912,
-                                         gc.ttlseconds = 90000,
-                                         num_replicas = 5,
-                                         num_voters = 3,
-                                         constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                                         voter_constraints = '[+region=ca-central-1]',
-                                         lease_preferences = '[[+region=ca-central-1]]'
+                                           range_min_bytes = 134217728,
+                                           range_max_bytes = 536870912,
+                                           gc.ttlseconds = 14400,
+                                           num_replicas = 5,
+                                           num_voters = 3,
+                                           constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                                           voter_constraints = '[+region=ca-central-1]',
+                                           lease_preferences = '[[+region=ca-central-1]]'
 
 statement ok
-RESTORE DATABASE "mr-backup-2" FROM 'nodelocal://0/mr-backup-2/'
+RESTORE DATABASE "mr-backup-2" FROM 'nodelocal://1/mr-backup-2/'
 
 query T
 select database_name from [show databases]
@@ -579,14 +579,14 @@ query TT
 SHOW ZONE CONFIGURATION FOR DATABASE "mr-backup-2"
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 statement ok
 use "mr-backup-2"
@@ -600,15 +600,15 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE global_table
 ----
 TABLE global_table  ALTER TABLE global_table CONFIGURE ZONE USING
-                    range_min_bytes = 134217728,
-                    range_max_bytes = 536870912,
-                    gc.ttlseconds = 90000,
-                    global_reads = true,
-                    num_replicas = 5,
-                    num_voters = 3,
-                    constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                    voter_constraints = '[+region=ap-southeast-2]',
-                    lease_preferences = '[[+region=ap-southeast-2]]'
+                      range_min_bytes = 134217728,
+                      range_max_bytes = 536870912,
+                      gc.ttlseconds = 14400,
+                      global_reads = true,
+                      num_replicas = 5,
+                      num_voters = 3,
+                      constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                      voter_constraints = '[+region=ap-southeast-2]',
+                      lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_row_table]
@@ -655,31 +655,31 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_row_table
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TT
 SHOW CREATE TABLE regional_by_row_table
 ----
-regional_by_row_table       CREATE TABLE public.regional_by_row_table (
-                            pk INT8 NOT NULL,
-                            pk2 INT8 NOT NULL,
-                            a INT8 NOT NULL,
-                            b INT8 NOT NULL,
-                            j JSONB NULL,
-                            crdb_region mr-backup-2.public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::mr-backup-2.public.crdb_internal_region,
-                            CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
-                            INDEX regional_by_row_table_a_idx (a ASC),
-                            UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-                            INVERTED INDEX regional_by_row_table_j_idx (j),
-                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
-) LOCALITY REGIONAL BY ROW
+regional_by_row_table  CREATE TABLE public.regional_by_row_table (
+                         pk INT8 NOT NULL,
+                         pk2 INT8 NOT NULL,
+                         a INT8 NOT NULL,
+                         b INT8 NOT NULL,
+                         j JSONB NULL,
+                         crdb_region "mr-backup-2".public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::"mr-backup-2".public.crdb_internal_region,
+                         CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
+                         INDEX regional_by_row_table_a_idx (a ASC),
+                         UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                         INVERTED INDEX regional_by_row_table_j_idx (j),
+                         FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
+                       ) LOCALITY REGIONAL BY ROW
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_primary_region]
@@ -690,14 +690,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_primary_region
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_ca_central_1]
@@ -708,14 +708,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_ca_central_1
 ----
 TABLE regional_by_table_in_ca_central_1  ALTER TABLE regional_by_table_in_ca_central_1 CONFIGURE ZONE USING
-                                         range_min_bytes = 134217728,
-                                         range_max_bytes = 536870912,
-                                         gc.ttlseconds = 90000,
-                                         num_replicas = 5,
-                                         num_voters = 3,
-                                         constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                                         voter_constraints = '[+region=ca-central-1]',
-                                         lease_preferences = '[[+region=ca-central-1]]'
+                                           range_min_bytes = 134217728,
+                                           range_max_bytes = 536870912,
+                                           gc.ttlseconds = 14400,
+                                           num_replicas = 5,
+                                           num_voters = 3,
+                                           constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                                           voter_constraints = '[+region=ca-central-1]',
+                                           lease_preferences = '[[+region=ca-central-1]]'
 
 statement ok
 DROP DATABASE "mr-backup-1";
@@ -732,7 +732,7 @@ system
 test
 
 statement ok
-RESTORE DATABASE "mr-backup-1", "mr-backup-2" FROM 'nodelocal://0/mr-backup-combined/'
+RESTORE DATABASE "mr-backup-1", "mr-backup-2" FROM 'nodelocal://1/mr-backup-combined/'
 
 query T
 select database_name from [show databases]
@@ -748,27 +748,27 @@ query TT
 SHOW ZONE CONFIGURATION FOR DATABASE "mr-backup-1"
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 query TT
 SHOW ZONE CONFIGURATION FOR DATABASE "mr-backup-2"
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 statement ok
 use "mr-backup-1"
@@ -782,15 +782,15 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE global_table
 ----
 TABLE global_table  ALTER TABLE global_table CONFIGURE ZONE USING
-                    range_min_bytes = 134217728,
-                    range_max_bytes = 536870912,
-                    gc.ttlseconds = 90000,
-                    global_reads = true,
-                    num_replicas = 5,
-                    num_voters = 3,
-                    constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                    voter_constraints = '[+region=ca-central-1]',
-                    lease_preferences = '[[+region=ca-central-1]]'
+                      range_min_bytes = 134217728,
+                      range_max_bytes = 536870912,
+                      gc.ttlseconds = 14400,
+                      global_reads = true,
+                      num_replicas = 5,
+                      num_voters = 3,
+                      constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                      voter_constraints = '[+region=ca-central-1]',
+                      lease_preferences = '[[+region=ca-central-1]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_row_table]
@@ -837,31 +837,31 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_row_table
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 query TT
 SHOW CREATE TABLE regional_by_row_table
 ----
-regional_by_row_table       CREATE TABLE public.regional_by_row_table (
-                            pk INT8 NOT NULL,
-                            pk2 INT8 NOT NULL,
-                            a INT8 NOT NULL,
-                            b INT8 NOT NULL,
-                            j JSONB NULL,
-                            crdb_region mr-backup-1.public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::mr-backup-1.public.crdb_internal_region,
-                            CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
-                            INDEX regional_by_row_table_a_idx (a ASC),
-                            UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-                            INVERTED INDEX regional_by_row_table_j_idx (j),
-                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
-) LOCALITY REGIONAL BY ROW
+regional_by_row_table  CREATE TABLE public.regional_by_row_table (
+                         pk INT8 NOT NULL,
+                         pk2 INT8 NOT NULL,
+                         a INT8 NOT NULL,
+                         b INT8 NOT NULL,
+                         j JSONB NULL,
+                         crdb_region "mr-backup-1".public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::"mr-backup-1".public.crdb_internal_region,
+                         CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
+                         INDEX regional_by_row_table_a_idx (a ASC),
+                         UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                         INVERTED INDEX regional_by_row_table_j_idx (j),
+                         FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
+                       ) LOCALITY REGIONAL BY ROW
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_primary_region]
@@ -872,14 +872,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_primary_region
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ca-central-1]',
-                        lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_ca_central_1]
@@ -890,14 +890,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_ca_central_1
 ----
 TABLE regional_by_table_in_ca_central_1  ALTER TABLE regional_by_table_in_ca_central_1 CONFIGURE ZONE USING
-                                         range_min_bytes = 134217728,
-                                         range_max_bytes = 536870912,
-                                         gc.ttlseconds = 90000,
-                                         num_replicas = 5,
-                                         num_voters = 3,
-                                         constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                                         voter_constraints = '[+region=ca-central-1]',
-                                         lease_preferences = '[[+region=ca-central-1]]'
+                                           range_min_bytes = 134217728,
+                                           range_max_bytes = 536870912,
+                                           gc.ttlseconds = 14400,
+                                           num_replicas = 5,
+                                           num_voters = 3,
+                                           constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                                           voter_constraints = '[+region=ca-central-1]',
+                                           lease_preferences = '[[+region=ca-central-1]]'
 
 statement ok
 use "mr-backup-2"
@@ -911,15 +911,15 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE global_table
 ----
 TABLE global_table  ALTER TABLE global_table CONFIGURE ZONE USING
-                    range_min_bytes = 134217728,
-                    range_max_bytes = 536870912,
-                    gc.ttlseconds = 90000,
-                    global_reads = true,
-                    num_replicas = 5,
-                    num_voters = 3,
-                    constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                    voter_constraints = '[+region=ap-southeast-2]',
-                    lease_preferences = '[[+region=ap-southeast-2]]'
+                      range_min_bytes = 134217728,
+                      range_max_bytes = 536870912,
+                      gc.ttlseconds = 14400,
+                      global_reads = true,
+                      num_replicas = 5,
+                      num_voters = 3,
+                      constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                      voter_constraints = '[+region=ap-southeast-2]',
+                      lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_row_table]
@@ -966,31 +966,31 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_row_table
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TT
 SHOW CREATE TABLE regional_by_row_table
 ----
-regional_by_row_table       CREATE TABLE public.regional_by_row_table (
-                            pk INT8 NOT NULL,
-                            pk2 INT8 NOT NULL,
-                            a INT8 NOT NULL,
-                            b INT8 NOT NULL,
-                            j JSONB NULL,
-                            crdb_region mr-backup-2.public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::mr-backup-2.public.crdb_internal_region,
-                            CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
-                            INDEX regional_by_row_table_a_idx (a ASC),
-                            UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-                            INVERTED INDEX regional_by_row_table_j_idx (j),
-                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
-) LOCALITY REGIONAL BY ROW
+regional_by_row_table  CREATE TABLE public.regional_by_row_table (
+                         pk INT8 NOT NULL,
+                         pk2 INT8 NOT NULL,
+                         a INT8 NOT NULL,
+                         b INT8 NOT NULL,
+                         j JSONB NULL,
+                         crdb_region "mr-backup-2".public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::"mr-backup-2".public.crdb_internal_region,
+                         CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
+                         INDEX regional_by_row_table_a_idx (a ASC),
+                         UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                         INVERTED INDEX regional_by_row_table_j_idx (j),
+                         FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
+                       ) LOCALITY REGIONAL BY ROW
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_primary_region]
@@ -1001,14 +1001,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_primary_region
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_ca_central_1]
@@ -1019,29 +1019,29 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_ca_central_1
 ----
 TABLE regional_by_table_in_ca_central_1  ALTER TABLE regional_by_table_in_ca_central_1 CONFIGURE ZONE USING
-                                         range_min_bytes = 134217728,
-                                         range_max_bytes = 536870912,
-                                         gc.ttlseconds = 90000,
-                                         num_replicas = 5,
-                                         num_voters = 3,
-                                         constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                                         voter_constraints = '[+region=ca-central-1]',
-                                         lease_preferences = '[[+region=ca-central-1]]'
+                                           range_min_bytes = 134217728,
+                                           range_max_bytes = 536870912,
+                                           gc.ttlseconds = 14400,
+                                           num_replicas = 5,
+                                           num_voters = 3,
+                                           constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                                           voter_constraints = '[+region=ca-central-1]',
+                                           lease_preferences = '[[+region=ca-central-1]]'
 
 # Backup and restore individual multi-region tables.
 subtest multiregion_table_backup_and_restore
 
 statement ok
-BACKUP TABLE regional_by_row_table TO 'nodelocal://0/rbr_table/';
+BACKUP TABLE regional_by_row_table TO 'nodelocal://1/rbr_table/';
 
 statement ok
-BACKUP TABLE regional_by_table_in_primary_region TO 'nodelocal://0/rbt_table_in_primary_region/';
+BACKUP TABLE regional_by_table_in_primary_region TO 'nodelocal://1/rbt_table_in_primary_region/';
 
 statement ok
-BACKUP TABLE regional_by_table_in_ca_central_1 TO 'nodelocal://0/rbt_table_in_ca_central_1/';
+BACKUP TABLE regional_by_table_in_ca_central_1 TO 'nodelocal://1/rbt_table_in_ca_central_1/';
 
 statement ok
-BACKUP TABLE global_table TO 'nodelocal://0/global_table/';
+BACKUP TABLE global_table TO 'nodelocal://1/global_table/';
 
 statement ok
 DROP TABLE regional_by_row_table;
@@ -1050,16 +1050,16 @@ DROP TABLE regional_by_table_in_ca_central_1;
 DROP TABLE global_table;
 
 statement ok
-RESTORE TABLE regional_by_row_table FROM 'nodelocal://0/rbr_table/';
+RESTORE TABLE regional_by_row_table FROM 'nodelocal://1/rbr_table/';
 
 statement ok
-RESTORE TABLE regional_by_table_in_primary_region FROM 'nodelocal://0/rbt_table_in_primary_region/';
+RESTORE TABLE regional_by_table_in_primary_region FROM 'nodelocal://1/rbt_table_in_primary_region/';
 
 statement ok
-RESTORE TABLE regional_by_table_in_ca_central_1 FROM 'nodelocal://0/rbt_table_in_ca_central_1/';
+RESTORE TABLE regional_by_table_in_ca_central_1 FROM 'nodelocal://1/rbt_table_in_ca_central_1/';
 
 statement ok
-RESTORE TABLE global_table FROM 'nodelocal://0/global_table/';
+RESTORE TABLE global_table FROM 'nodelocal://1/global_table/';
 
 query IIIIT
 SELECT * FROM regional_by_row_table;
@@ -1111,19 +1111,19 @@ lease_preferences = '[[+region=us-east-1]]'
 query TT
 SHOW CREATE TABLE regional_by_row_table
 ----
-regional_by_row_table       CREATE TABLE public.regional_by_row_table (
-                            pk INT8 NOT NULL,
-                            pk2 INT8 NOT NULL,
-                            a INT8 NOT NULL,
-                            b INT8 NOT NULL,
-                            j JSONB NULL,
-                            crdb_region mr-backup-2.public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::mr-backup-2.public.crdb_internal_region,
-                            CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
-                            INDEX regional_by_row_table_a_idx (a ASC),
-                            UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-                            INVERTED INDEX regional_by_row_table_j_idx (j),
-                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
-) LOCALITY REGIONAL BY ROW
+regional_by_row_table  CREATE TABLE public.regional_by_row_table (
+                         pk INT8 NOT NULL,
+                         pk2 INT8 NOT NULL,
+                         a INT8 NOT NULL,
+                         b INT8 NOT NULL,
+                         j JSONB NULL,
+                         crdb_region "mr-backup-2".public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::"mr-backup-2".public.crdb_internal_region,
+                         CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
+                         INDEX regional_by_row_table_a_idx (a ASC),
+                         UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                         INVERTED INDEX regional_by_row_table_j_idx (j),
+                         FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
+                       ) LOCALITY REGIONAL BY ROW
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_primary_region]
@@ -1134,14 +1134,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_primary_region
 ----
 DATABASE "mr-backup-2"  ALTER DATABASE "mr-backup-2" CONFIGURE ZONE USING
-                        range_min_bytes = 134217728,
-                        range_max_bytes = 536870912,
-                        gc.ttlseconds = 90000,
-                        num_replicas = 5,
-                        num_voters = 3,
-                        constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                        voter_constraints = '[+region=ap-southeast-2]',
-                        lease_preferences = '[[+region=ap-southeast-2]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ap-southeast-2]',
+                          lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE regional_by_table_in_ca_central_1]
@@ -1152,14 +1152,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_ca_central_1
 ----
 TABLE regional_by_table_in_ca_central_1  ALTER TABLE regional_by_table_in_ca_central_1 CONFIGURE ZONE USING
-                                         range_min_bytes = 134217728,
-                                         range_max_bytes = 536870912,
-                                         gc.ttlseconds = 90000,
-                                         num_replicas = 5,
-                                         num_voters = 3,
-                                         constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                                         voter_constraints = '[+region=ca-central-1]',
-                                         lease_preferences = '[[+region=ca-central-1]]'
+                                           range_min_bytes = 134217728,
+                                           range_max_bytes = 536870912,
+                                           gc.ttlseconds = 14400,
+                                           num_replicas = 5,
+                                           num_voters = 3,
+                                           constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                                           voter_constraints = '[+region=ca-central-1]',
+                                           lease_preferences = '[[+region=ca-central-1]]'
 
 query TTT
 SELECT partition_name, index_name, zone_config FROM [SHOW PARTITIONS FROM TABLE global_table]
@@ -1170,15 +1170,15 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE global_table
 ----
 TABLE global_table  ALTER TABLE global_table CONFIGURE ZONE USING
-                    range_min_bytes = 134217728,
-                    range_max_bytes = 536870912,
-                    gc.ttlseconds = 90000,
-                    global_reads = true,
-                    num_replicas = 5,
-                    num_voters = 3,
-                    constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                    voter_constraints = '[+region=ap-southeast-2]',
-                    lease_preferences = '[[+region=ap-southeast-2]]'
+                      range_min_bytes = 134217728,
+                      range_max_bytes = 536870912,
+                      gc.ttlseconds = 14400,
+                      global_reads = true,
+                      num_replicas = 5,
+                      num_voters = 3,
+                      constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                      voter_constraints = '[+region=ap-southeast-2]',
+                      lease_preferences = '[[+region=ap-southeast-2]]'
 
 
 statement ok
@@ -1195,39 +1195,39 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE non_mr_table
 ----
 RANGE default  ALTER RANGE default CONFIGURE ZONE USING
-                           range_min_bytes = 134217728,
-                           range_max_bytes = 536870912,
-                           gc.ttlseconds = 90000,
-                           num_replicas = 3,
-                           constraints = '[]',
-                           lease_preferences = '[]'
+                 range_min_bytes = 134217728,
+                 range_max_bytes = 536870912,
+                 gc.ttlseconds = 14400,
+                 num_replicas = 3,
+                 constraints = '[]',
+                 lease_preferences = '[]'
 
 statement ok
-BACKUP TABLE non_mr_table TO 'nodelocal://0/non_mr_table/'
+BACKUP TABLE non_mr_table TO 'nodelocal://1/non_mr_table/'
 
 statement ok
 DROP TABLE non_mr_table
 
 statement ok
-RESTORE TABLE non_mr_table FROM 'nodelocal://0/non_mr_table/'
+RESTORE TABLE non_mr_table FROM 'nodelocal://1/non_mr_table/'
 
 query TT
 SHOW ZONE CONFIGURATION FROM TABLE non_mr_table
 ----
 RANGE default  ALTER RANGE default CONFIGURE ZONE USING
-                           range_min_bytes = 134217728,
-                           range_max_bytes = 536870912,
-                           gc.ttlseconds = 90000,
-                           num_replicas = 3,
-                           constraints = '[]',
-                           lease_preferences = '[]'
+                 range_min_bytes = 134217728,
+                 range_max_bytes = 536870912,
+                 gc.ttlseconds = 14400,
+                 num_replicas = 3,
+                 constraints = '[]',
+                 lease_preferences = '[]'
 
 statement ok
-RESTORE TABLE non_mr_table FROM 'nodelocal://0/non_mr_table/' WITH into_db = 'mr-backup-1'
+RESTORE TABLE non_mr_table FROM 'nodelocal://1/non_mr_table/' WITH into_db = 'mr-backup-1'
 
 # Verify that an MR table cannot be restored in a non-MR database.
 statement error cannot restore descriptor for multi-region table regional_by_row_table into non-multi-region database non_mr_backup
-RESTORE TABLE "mr-backup-2".regional_by_row_table FROM 'nodelocal://0/mr-backup-2/' WITH into_db = 'non_mr_backup'
+RESTORE TABLE "mr-backup-2".regional_by_row_table FROM 'nodelocal://1/mr-backup-2/' WITH into_db = 'non_mr_backup'
 
 statement ok
 USE 'mr-backup-1'
@@ -1237,14 +1237,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE non_mr_table
 ----
 DATABASE "mr-backup-1"  ALTER DATABASE "mr-backup-1" CONFIGURE ZONE USING
-                                    range_min_bytes = 134217728,
-                                    range_max_bytes = 536870912,
-                                    gc.ttlseconds = 90000,
-                                    num_replicas = 5,
-                                    num_voters = 3,
-                                    constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
-                                    voter_constraints = '[+region=ca-central-1]',
-                                    lease_preferences = '[[+region=ca-central-1]]'
+                          range_min_bytes = 134217728,
+                          range_max_bytes = 536870912,
+                          gc.ttlseconds = 14400,
+                          num_replicas = 5,
+                          num_voters = 3,
+                          constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
+                          voter_constraints = '[+region=ca-central-1]',
+                          lease_preferences = '[[+region=ca-central-1]]'
 
 query TT
 SHOW CREATE TABLE non_mr_table
@@ -1269,27 +1269,27 @@ DROP TABLE global_table;
 subtest restore_tables_into_database_with_same_regions
 
 statement ok
-RESTORE TABLE regional_by_row_table FROM 'nodelocal://0/mr-backup-2/'
+RESTORE TABLE regional_by_row_table FROM 'nodelocal://1/mr-backup-2/'
 
 query TT
 SHOW CREATE TABLE regional_by_row_table
 ----
-regional_by_row_table       CREATE TABLE public.regional_by_row_table (
-                            pk INT8 NOT NULL,
-                            pk2 INT8 NOT NULL,
-                            a INT8 NOT NULL,
-                            b INT8 NOT NULL,
-                            j JSONB NULL,
-                            crdb_region mr-backup-2.public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::mr-backup-2.public.crdb_internal_region,
-                            CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
-                            INDEX regional_by_row_table_a_idx (a ASC),
-                            UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-                            INVERTED INDEX regional_by_row_table_j_idx (j),
-                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
-) LOCALITY REGIONAL BY ROW
+regional_by_row_table  CREATE TABLE public.regional_by_row_table (
+                         pk INT8 NOT NULL,
+                         pk2 INT8 NOT NULL,
+                         a INT8 NOT NULL,
+                         b INT8 NOT NULL,
+                         j JSONB NULL,
+                         crdb_region "mr-backup-2".public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::"mr-backup-2".public.crdb_internal_region,
+                         CONSTRAINT regional_by_row_table_pkey PRIMARY KEY (pk ASC),
+                         INDEX regional_by_row_table_a_idx (a ASC),
+                         UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                         INVERTED INDEX regional_by_row_table_j_idx (j),
+                         FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
+                       ) LOCALITY REGIONAL BY ROW
 
 statement ok
-RESTORE TABLE regional_by_table_in_primary_region FROM 'nodelocal://0/mr-backup-2/'
+RESTORE TABLE regional_by_table_in_primary_region FROM 'nodelocal://1/mr-backup-2/'
 
 query TT
 SHOW CREATE TABLE regional_by_table_in_primary_region
@@ -1303,7 +1303,7 @@ regional_by_table_in_primary_region             CREATE TABLE public.regional_by_
 
 
 statement ok
-RESTORE TABLE regional_by_table_in_ca_central_1 FROM 'nodelocal://0/mr-backup-2/'
+RESTORE TABLE regional_by_table_in_ca_central_1 FROM 'nodelocal://1/mr-backup-2/'
 
 # REGIONAL BY TABLE tables with a specific region are permitted if that region
 # exists in the database.
@@ -1318,7 +1318,7 @@ regional_by_table_in_ca_central_1               CREATE TABLE public.regional_by_
 ) LOCALITY REGIONAL BY TABLE IN "ca-central-1"
 
 statement ok
-RESTORE TABLE global_table FROM 'nodelocal://0/mr-backup-2/'
+RESTORE TABLE global_table FROM 'nodelocal://1/mr-backup-2/'
 
 query TT
 SHOW CREATE TABLE global_table
@@ -1338,7 +1338,7 @@ statement ok
 CREATE DATABASE "mr-restore-1" primary region "ap-southeast-2" regions "us-east-1"
 
 statement ok
-RESTORE TABLE "mr-backup-2".global_table FROM 'nodelocal://0/mr-backup-2/' WITH into_db='mr-restore-1';
+RESTORE TABLE "mr-backup-2".global_table FROM 'nodelocal://1/mr-backup-2/' WITH into_db='mr-restore-1';
 
 statement ok
 USE "mr-restore-1";
@@ -1357,19 +1357,19 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE global_table
 ----
 TABLE global_table  ALTER TABLE global_table CONFIGURE ZONE USING
-                    range_min_bytes = 134217728,
-                    range_max_bytes = 536870912,
-                    gc.ttlseconds = 90000,
-                    global_reads = true,
-                    num_replicas = 4,
-                    num_voters = 3,
-                    constraints = '{+region=ap-southeast-2: 1, +region=us-east-1: 1}',
-                    voter_constraints = '[+region=ap-southeast-2]',
-                    lease_preferences = '[[+region=ap-southeast-2]]'
+                      range_min_bytes = 134217728,
+                      range_max_bytes = 536870912,
+                      gc.ttlseconds = 14400,
+                      global_reads = true,
+                      num_replicas = 4,
+                      num_voters = 3,
+                      constraints = '{+region=ap-southeast-2: 1, +region=us-east-1: 1}',
+                      voter_constraints = '[+region=ap-southeast-2]',
+                      lease_preferences = '[[+region=ap-southeast-2]]'
 
 
 statement ok
-RESTORE TABLE "mr-backup-2".regional_by_table_in_primary_region FROM 'nodelocal://0/mr-backup-2/' WITH into_db='mr-restore-1';
+RESTORE TABLE "mr-backup-2".regional_by_table_in_primary_region FROM 'nodelocal://1/mr-backup-2/' WITH into_db='mr-restore-1';
 
 query TT
 SHOW CREATE TABLE regional_by_table_in_primary_region
@@ -1385,14 +1385,14 @@ query TT
 SHOW ZONE CONFIGURATION FROM TABLE regional_by_table_in_primary_region
 ----
 DATABASE "mr-restore-1"  ALTER DATABASE "mr-restore-1" CONFIGURE ZONE USING
-                         range_min_bytes = 134217728,
-                         range_max_bytes = 536870912,
-                         gc.ttlseconds = 90000,
-                         num_replicas = 4,
-                         num_voters = 3,
-                         constraints = '{+region=ap-southeast-2: 1, +region=us-east-1: 1}',
-                         voter_constraints = '[+region=ap-southeast-2]',
-                         lease_preferences = '[[+region=ap-southeast-2]]'
+                           range_min_bytes = 134217728,
+                           range_max_bytes = 536870912,
+                           gc.ttlseconds = 14400,
+                           num_replicas = 4,
+                           num_voters = 3,
+                           constraints = '{+region=ap-southeast-2: 1, +region=us-east-1: 1}',
+                           voter_constraints = '[+region=ap-southeast-2]',
+                           lease_preferences = '[[+region=ap-southeast-2]]'
 
 query TTTTT colnames
 SHOW REGIONS
@@ -1403,11 +1403,11 @@ ca-central-1    {ca-az1,ca-az2,ca-az3}  {mr-backup-1,mr-backup-2}               
 us-east-1       {us-az1,us-az2,us-az3}  {mr-backup-1,mr-backup-2,mr-restore-1}  {}                          {}
 
 statement error "crdb_internal_region" is not compatible with type "crdb_internal_region" existing in cluster: could not find enum value "ca-central-1" in "crdb_internal_region"
-RESTORE TABLE "mr-backup-2".regional_by_table_in_ap_southeast_2 FROM 'nodelocal://0/mr-backup-2/' WITH into_db='mr-restore-1';
+RESTORE TABLE "mr-backup-2".regional_by_table_in_ap_southeast_2 FROM 'nodelocal://1/mr-backup-2/' WITH into_db='mr-restore-1';
 
 # Cannot restore a REGIONAL BY TABLE table that has different regions.
 statement error cannot restore REGIONAL BY TABLE regional_by_table_in_ca_central_1 IN REGION "ca-central-1" \(table ID: [0-9]+\) into database "mr-restore-1"; region "ca-central-1" not found in database regions "ap-southeast-2", "us-east-1"
-RESTORE TABLE "mr-backup-2".regional_by_table_in_ca_central_1 FROM 'nodelocal://0/mr-backup-2/' WITH into_db='mr-restore-1'
+RESTORE TABLE "mr-backup-2".regional_by_table_in_ca_central_1 FROM 'nodelocal://1/mr-backup-2/' WITH into_db='mr-restore-1'
 
 statement error "crdb_internal_region" is not compatible with type "crdb_internal_region" existing in cluster: could not find enum value "ca-central-1" in "crdb_internal_region"
-RESTORE TABLE "mr-backup-2".regional_by_row_table FROM 'nodelocal://0/mr-backup-2/' WITH into_db='mr-restore-1'
+RESTORE TABLE "mr-backup-2".regional_by_row_table FROM 'nodelocal://1/mr-backup-2/' WITH into_db='mr-restore-1'

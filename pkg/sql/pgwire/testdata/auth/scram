@@ -1,9 +1,19 @@
 config secure
 ----
 
+# Prevent auto-converting passwords, so that each sub-test exercises its own hash method.
 sql
--- prevent auto-converting passwords, so that each sub-test exercises its own hash method.
 SET CLUSTER SETTING server.user_login.upgrade_bcrypt_stored_passwords_to_scram.enabled = false;
+----
+ok
+
+sql
+SET CLUSTER SETTING server.user_login.downgrade_scram_stored_passwords_to_bcrypt.enabled = false;
+----
+ok
+
+sql
+SET CLUSTER SETTING server.user_login.rehash_scram_stored_passwords_on_cost_change.enabled = false;
 ----
 ok
 
@@ -46,15 +56,17 @@ host all abc2 all password
 ----
 # Active authentication configuration on this node:
 # Original configuration:
+# loopback all all all trust       # built-in CockroachDB default
 # host  all root all cert-password # CockroachDB mandatory rule
 # host all abc all password
 # host all abc2 all password
 #
 # Interpreted configuration:
-# TYPE DATABASE USER ADDRESS METHOD        OPTIONS
-host   all      root all     cert-password
-host   all      abc  all     password
-host   all      abc2 all     password
+# TYPE   DATABASE USER ADDRESS METHOD        OPTIONS
+loopback all      all  all     trust
+host     all      root all     cert-password
+host     all      abc  all     password
+host     all      abc2 all     password
 
 # User abc has SCRAM credentials, but 'mistake' is not its password.
 # Expect authn error.
@@ -108,17 +120,19 @@ host all abc2 all scram-sha-256
 ----
 # Active authentication configuration on this node:
 # Original configuration:
+# loopback all all all trust       # built-in CockroachDB default
 # host  all root all cert-password # CockroachDB mandatory rule
 # host all foo all scram-sha-256
 # host all abc all scram-sha-256
 # host all abc2 all scram-sha-256
 #
 # Interpreted configuration:
-# TYPE DATABASE USER ADDRESS METHOD        OPTIONS
-host   all      root all     cert-password
-host   all      foo  all     scram-sha-256
-host   all      abc  all     scram-sha-256
-host   all      abc2 all     scram-sha-256
+# TYPE   DATABASE USER ADDRESS METHOD        OPTIONS
+loopback all      all  all     trust
+host     all      root all     cert-password
+host     all      foo  all     scram-sha-256
+host     all      abc  all     scram-sha-256
+host     all      abc2 all     scram-sha-256
 
 subtest only_scram/conn_scram
 
@@ -193,13 +207,15 @@ host all all all cert-scram-sha-256
 ----
 # Active authentication configuration on this node:
 # Original configuration:
+# loopback all all all trust       # built-in CockroachDB default
 # host  all root all cert-password # CockroachDB mandatory rule
 # host all all all cert-scram-sha-256
 #
 # Interpreted configuration:
-# TYPE DATABASE USER ADDRESS METHOD             OPTIONS
-host   all      root all     cert-password
-host   all      all  all     cert-scram-sha-256
+# TYPE   DATABASE USER ADDRESS METHOD             OPTIONS
+loopback all      all  all     trust
+host     all      root all     cert-password
+host     all      all  all     cert-scram-sha-256
 
 subtest scram_cert/cert
 
@@ -238,15 +254,17 @@ host all abc all cert-password
 ----
 # Active authentication configuration on this node:
 # Original configuration:
+# loopback all all all trust       # built-in CockroachDB default
 # host  all root all cert-password # CockroachDB mandatory rule
 # host all foo all cert-password
 # host all abc all cert-password
 #
 # Interpreted configuration:
-# TYPE DATABASE USER ADDRESS METHOD        OPTIONS
-host   all      root all     cert-password
-host   all      foo  all     cert-password
-host   all      abc  all     cert-password
+# TYPE   DATABASE USER ADDRESS METHOD        OPTIONS
+loopback all      all  all     trust
+host     all      root all     cert-password
+host     all      foo  all     cert-password
+host     all      abc  all     cert-password
 
 # Foo uses a bcrypt hash.
 connect user=foo password=abc
@@ -280,9 +298,14 @@ subtest end
 
 subtest hash_conversion
 
+# Enable auto-conversion of passwords.
 sql
--- enable auto-conversion of passwords.
 SET CLUSTER SETTING server.user_login.upgrade_bcrypt_stored_passwords_to_scram.enabled = true;
+----
+ok
+
+sql
+SET CLUSTER SETTING server.user_login.downgrade_scram_stored_passwords_to_bcrypt.enabled = true;
 ----
 ok
 
@@ -332,6 +355,103 @@ authlog 7
 95 {"Duration":"NNN","EventType":"client_session_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
 96 {"Duration":"NNN","EventType":"client_connection_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
 
+sql
+-- change back to bcrypt.
+SET CLUSTER SETTING server.user_login.password_encryption = 'crdb-bcrypt';
+----
+ok
 
+# The first time after conversion is enabled, a scram-using account still uses scram.
+connect user=foo password=abc
+----
+ok defaultdb
+
+# Assert the conn used a cleartext handshake, but with a SCRAM hash.
+authlog 7
+.*client_connection_end
+----
+97 {"EventType":"client_connection_start","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+98 {"EventType":"client_authentication_info","Info":"HBA rule: host all foo all cert-password","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl"}
+99 {"EventType":"client_authentication_info","Info":"client did not present TLS certificate","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl"}
+100 {"EventType":"client_authentication_info","Info":"found stored SCRAM-SHA-256 credentials but cluster is configured to downgrade to bcrypt; requesting cleartext password","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl","User":"foo"}
+101 {"EventType":"client_authentication_ok","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl","User":"foo"}
+102 {"Duration":"NNN","EventType":"client_session_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+103 {"Duration":"NNN","EventType":"client_connection_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+
+# Verify the stored hash has been converted to bcrypt now.
+sql
+SELECT crdb_internal.force_error('11111', substr(encode("hashedPassword",'escape'), 1, 4)) FROM system.users WHERE username='foo'
+----
+ERROR: $2a$ (SQLSTATE 11111)
+
+# So the next login uses bcrypt.
+connect user=foo password=abc
+----
+ok defaultdb
+
+# Assert the conn used bcrypt.
+authlog 7
+.*client_connection_end
+----
+104 {"EventType":"client_connection_start","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+105 {"EventType":"client_authentication_info","Info":"HBA rule: host all foo all cert-password","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl"}
+106 {"EventType":"client_authentication_info","Info":"client did not present TLS certificate","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl"}
+107 {"EventType":"client_authentication_info","Info":"found stored crdb-bcrypt credentials; requesting cleartext password","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl","User":"foo"}
+108 {"EventType":"client_authentication_ok","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl","User":"foo"}
+109 {"Duration":"NNN","EventType":"client_session_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+110 {"Duration":"NNN","EventType":"client_connection_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+
+sql
+-- change back to SCRAM for future tests, and connect again to cause the upgrade.
+SET CLUSTER SETTING server.user_login.password_encryption = 'scram-sha-256';
+----
+ok
+
+connect user=foo password=abc
+----
+ok defaultdb
+
+# Assert the conn is using SCRAM.
+authlog 7
+.*client_connection_end
+----
+111 {"EventType":"client_connection_start","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+112 {"EventType":"client_authentication_info","Info":"HBA rule: host all foo all cert-password","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl"}
+113 {"EventType":"client_authentication_info","Info":"client did not present TLS certificate","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl"}
+114 {"EventType":"client_authentication_info","Info":"found stored crdb-bcrypt credentials; requesting cleartext password","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl","User":"foo"}
+115 {"EventType":"client_authentication_ok","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl","User":"foo"}
+116 {"Duration":"NNN","EventType":"client_session_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+117 {"Duration":"NNN","EventType":"client_connection_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+
+subtest end
+
+subtest hash_cost_change
+
+# Enable auto-conversion of SCRAM password costs.
+sql
+SET CLUSTER SETTING server.user_login.rehash_scram_stored_passwords_on_cost_change.enabled = true;
+----
+ok
+
+sql
+SET CLUSTER SETTING server.user_login.password_hashes.default_cost.scram_sha_256 = 5432;
+----
+ok
+
+connect user=foo password=abc
+----
+ok defaultdb
+
+# Assert the conn requested a cleartext password in order to re-hash.
+authlog 7
+.*client_connection_end
+----
+118 {"EventType":"client_connection_start","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+119 {"EventType":"client_authentication_info","Info":"HBA rule: host all foo all cert-password","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl"}
+120 {"EventType":"client_authentication_info","Info":"client did not present TLS certificate","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl"}
+121 {"EventType":"client_authentication_info","Info":"found stored SCRAM-SHA-256 credentials but cluster is configured to re-hash after SCRAM cost change; requesting cleartext password","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl","User":"foo"}
+122 {"EventType":"client_authentication_ok","InstanceID":1,"Method":"cert-password","Network":"tcp","RemoteAddress":"XXX","SystemIdentity":"foo","Timestamp":"XXX","Transport":"hostssl","User":"foo"}
+123 {"Duration":"NNN","EventType":"client_session_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
+124 {"Duration":"NNN","EventType":"client_connection_end","InstanceID":1,"Network":"tcp","RemoteAddress":"XXX","Timestamp":"XXX"}
 
 subtest end

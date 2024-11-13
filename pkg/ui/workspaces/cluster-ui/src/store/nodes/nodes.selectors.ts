@@ -13,12 +13,12 @@ import _ from "lodash";
 import { AppState } from "../reducers";
 import { getDisplayName } from "../../nodes";
 import { livenessStatusByNodeIDSelector } from "../liveness";
-import { accumulateMetrics } from "../../util";
+import { accumulateMetrics } from "src/util/proto";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 type ILocality = cockroach.roachpb.ILocality;
 
 export const nodeStatusesSelector = (state: AppState) =>
-  state.adminUI.nodes.data || [];
+  state.adminUI?.nodes.data || [];
 
 export const nodesSelector = createSelector(
   nodeStatusesSelector,

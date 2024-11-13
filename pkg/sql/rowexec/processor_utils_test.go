@@ -17,7 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -45,6 +45,7 @@ func DefaultProcessorTestConfig() ProcessorTestConfig {
 		FlowCtx: &execinfra.FlowCtx{
 			Cfg:     &execinfra.ServerConfig{Settings: st},
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 		},
 	}
 }
@@ -80,7 +81,7 @@ func toEncDatum(datumType *types.T, v interface{}) rowenc.EncDatum {
 	if err != nil {
 		panic(err)
 	}
-	encodedDatum := rowenc.EncDatumFromEncoded(descpb.DatumEncoding_ASCENDING_KEY, encoded)
+	encodedDatum := rowenc.EncDatumFromEncoded(catenumpb.DatumEncoding_ASCENDING_KEY, encoded)
 	encodedDatum.Datum = d
 	return encodedDatum
 }
@@ -160,7 +161,6 @@ func (p *ProcessorTest) RunTestCases(
 			&tc.ProcessorCore,
 			&tc.Post,
 			inputs,
-			[]execinfra.RowReceiver{output},
 			nil, /* localProcessors */
 		)
 		if err != nil {
@@ -172,7 +172,7 @@ func (p *ProcessorTest) RunTestCases(
 			p.config.BeforeTestCase(processor, inputs, output)
 		}
 
-		processor.Run(ctx)
+		processor.Run(ctx, output)
 
 		if p.config.AfterTestCase != nil {
 			p.config.AfterTestCase(processor, inputs, output)

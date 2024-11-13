@@ -10,6 +10,13 @@
 
 package catalog
 
+import (
+	"fmt"
+	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+)
+
 // chart_catalog.go represents a catalog of pre-defined DB Console charts
 // to aid users in debugging CockroachDB clusters. This file represents
 // a simplified structure of the catalog, meant to make it easier for
@@ -112,6 +119,7 @@ var charts = []sectionDescription{
 					"sys.cpu.sys.percent",
 					"sys.cpu.user.percent",
 					"sys.cpu.combined.percent-normalized",
+					"sys.cpu.host.combined.percent-normalized",
 				},
 			},
 			{
@@ -297,6 +305,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Restarted Ranges",
+				Metrics: []string{
+					"distsender.rangefeed.restart_ranges",
+				},
+			},
+			{
 				Title: "RPCs",
 				Metrics: []string{
 					"distsender.rpc.sent.local",
@@ -356,7 +370,6 @@ var charts = []sectionDescription{
 					"rpc.method.reversescan.recv",
 					"rpc.method.revertrange.recv",
 					"rpc.method.scan.recv",
-					"rpc.method.scaninterleavedintents.recv",
 					"rpc.method.subsume.recv",
 					"rpc.method.transferlease.recv",
 					"rpc.method.truncatelog.recv",
@@ -410,7 +423,6 @@ var charts = []sectionDescription{
 					"distsender.rpc.reversescan.sent",
 					"distsender.rpc.revertrange.sent",
 					"distsender.rpc.scan.sent",
-					"distsender.rpc.scaninterleavedintents.sent",
 					"distsender.rpc.subsume.sent",
 					"distsender.rpc.transferlease.sent",
 					"distsender.rpc.probe.sent",
@@ -477,9 +489,7 @@ var charts = []sectionDescription{
 			{
 				Title: "Overview",
 				Metrics: []string{
-					"rpc.heartbeats.initializing",
 					"rpc.heartbeats.nominal",
-					"rpc.heartbeats.failed",
 				},
 				AxisLabel: "Heartbeats",
 			},
@@ -600,6 +610,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Rangefeed Registrations",
+				Metrics: []string{
+					"kv.rangefeed.registrations",
+				},
+			},
+			{
 				Title: "Rangefeed Memory Allocations",
 				Metrics: []string{
 					"kv.rangefeed.budget_allocation_failed",
@@ -620,6 +636,10 @@ var charts = []sectionDescription{
 					"range.snapshots.applied-voter",
 					"range.snapshots.applied-initial",
 					"range.snapshots.applied-non-voter",
+					"range.snapshots.delegate.successes",
+					"range.snapshots.delegate.failures",
+					"range.snapshots.recv-failed",
+					"range.snapshots.recv-unusable",
 				},
 			},
 			{
@@ -631,6 +651,7 @@ var charts = []sectionDescription{
 					"range.snapshots.recv-in-progress",
 					"range.snapshots.send-total-in-progress",
 					"range.snapshots.recv-total-in-progress",
+					"range.snapshots.delegate.in-progress",
 				},
 			},
 			{
@@ -644,6 +665,7 @@ var charts = []sectionDescription{
 					"range.snapshots.rebalancing.sent-bytes",
 					"range.snapshots.unknown.rcvd-bytes",
 					"range.snapshots.unknown.sent-bytes",
+					"range.snapshots.delegate.sent-bytes",
 				},
 			},
 		},
@@ -678,6 +700,17 @@ var charts = []sectionDescription{
 		},
 		Charts: []chartDescription{
 			{
+				Title:   "Rebalancing Exhausted Options",
+				Metrics: []string{"rebalancing.state.imbalanced_overfull_options_exhausted"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{
+			{DistributionLayer, "Rebalancing"},
+		},
+		Charts: []chartDescription{
+			{
 				Title:   "QPS",
 				Metrics: []string{"rebalancing.queriespersecond"},
 			},
@@ -697,6 +730,18 @@ var charts = []sectionDescription{
 				Title:   "Bytes Written Per Second",
 				Metrics: []string{"rebalancing.writebytespersecond"},
 			},
+			{
+				Title:   "CPU Nanos Used Per Second",
+				Metrics: []string{"rebalancing.cpunanospersecond"},
+			},
+			{
+				Title:   "Replica CPU Nanos Used Per Second",
+				Metrics: []string{"rebalancing.replicas.cpunanospersecond"},
+			},
+			{
+				Title:   "Replica Queries Per Second",
+				Metrics: []string{"rebalancing.replicas.queriespersecond"},
+			},
 		},
 	},
 	{
@@ -708,6 +753,7 @@ var charts = []sectionDescription{
 			{
 				Title: "Allocator Load-Based Lease Transfer Decisions",
 				Metrics: []string{
+					"kv.allocator.load_based_lease_transfers.follow_the_workload",
 					"kv.allocator.load_based_lease_transfers.should_transfer",
 					"kv.allocator.load_based_lease_transfers.missing_stats_for_existing_stores",
 					"kv.allocator.load_based_lease_transfers.delta_not_significant",
@@ -731,6 +777,18 @@ var charts = []sectionDescription{
 					"kv.allocator.load_based_replica_rebalancing.delta_not_significant",
 					"kv.allocator.load_based_replica_rebalancing.existing_not_overfull",
 					"kv.allocator.load_based_replica_rebalancing.cannot_find_better_candidate",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{DistributionLayer, "Load", "Splitter"}},
+		Charts: []chartDescription{
+			{
+				Title: "Load Splitter",
+				Metrics: []string{
+					"kv.loadsplitter.popularkey",
+					"kv.loadsplitter.nosplitkey",
 				},
 			},
 		},
@@ -763,6 +821,18 @@ var charts = []sectionDescription{
 				Title:   "Time Spent",
 				Metrics: []string{"queue.split.processingnanos"},
 			},
+			{
+				Title:   "Sized Based Splits",
+				Metrics: []string{"queue.split.size_based"},
+			},
+			{
+				Title:   "Load Based Splits",
+				Metrics: []string{"queue.split.load_based"},
+			},
+			{
+				Title:   "Span Configuration Based Splits",
+				Metrics: []string{"queue.split.span_config_based"},
+			},
 		},
 	},
 	{
@@ -771,8 +841,17 @@ var charts = []sectionDescription{
 		},
 		Charts: []chartDescription{
 			{
-				Title:   "KVSubscriber",
-				Metrics: []string{"spanconfig.kvsubscriber.update_behind_nanos"},
+				Title: "KVSubscriber Lag Metrics",
+				Metrics: []string{
+					"spanconfig.kvsubscriber.oldest_protected_record_nanos",
+					"spanconfig.kvsubscriber.update_behind_nanos",
+				},
+			},
+			{
+				Title: "KVSubscriber Protected Record Count",
+				Metrics: []string{
+					"spanconfig.kvsubscriber.protected_record_count",
+				},
 			},
 		},
 	},
@@ -803,6 +882,12 @@ var charts = []sectionDescription{
 				Metrics: []string{
 					"kv.prober.read.latency",
 					"kv.prober.write.latency",
+				},
+			},
+			{
+				Title: "Duration",
+				Metrics: []string{
+					"kv.prober.write.quarantine.oldest_duration",
 				},
 			},
 		},
@@ -910,6 +995,12 @@ var charts = []sectionDescription{
 				Metrics: []string{
 					"queue.gc.info.clearrangesuccess",
 					"queue.gc.info.clearrangefailed",
+				},
+			},
+			{
+				Title: "GC Enqueue with High Priority",
+				Metrics: []string{
+					"queue.gc.info.enqueuehighpriority",
 				},
 			},
 		},
@@ -1366,6 +1457,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Filtered Messages",
+				Metrics: []string{
+					"changefeed.filtered_messages",
+				},
+			},
+			{
 				Title: "Entries",
 				Metrics: []string{
 					"changefeed.buffer_entries.in",
@@ -1386,6 +1483,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Size Based Flushes",
+				Metrics: []string{
+					"changefeed.size_based_flushes",
+				},
+			},
+			{
 				Title: "Max Behind Nanos",
 				Metrics: []string{
 					"changefeed.max_behind_nanos",
@@ -1400,7 +1503,13 @@ var charts = []sectionDescription{
 			{
 				Title: "Total Time Spent",
 				Metrics: []string{
-					"changefeed.table_metadata_nanos",
+					"changefeed.schemafeed.table_metadata_nanos",
+				},
+			},
+			{
+				Title: "Table History Scans",
+				Metrics: []string{
+					"changefeed.schemafeed.table_history_scans",
 				},
 			},
 			{
@@ -1427,6 +1536,24 @@ var charts = []sectionDescription{
 				Title: "Replan Count",
 				Metrics: []string{
 					"changefeed.replan_count",
+				},
+			},
+			{
+				Title: "Nprocs Consume Event Nanos",
+				Metrics: []string{
+					"changefeed.nprocs_consume_event_nanos",
+				},
+			},
+			{
+				Title: "Nprocs Flush Nanos",
+				Metrics: []string{
+					"changefeed.nprocs_flush_nanos",
+				},
+			},
+			{
+				Title: "Nprocs In Flight Count",
+				Metrics: []string{
+					"changefeed.nprocs_in_flight_count",
 				},
 			},
 			{
@@ -1459,6 +1586,7 @@ var charts = []sectionDescription{
 					"changefeed.checkpoint_hist_nanos",
 					"changefeed.flush_hist_nanos",
 					"changefeed.sink_batch_hist_nanos",
+					"changefeed.parallel_io_queue_nanos",
 				},
 			},
 			{
@@ -1484,6 +1612,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Sink IO",
+				Metrics: []string{
+					"changefeed.sink_io_inflight",
+				},
+			},
+			{
 				Title: "Batching",
 				Metrics: []string{
 					"changefeed.batch_reduction_count",
@@ -1495,6 +1629,18 @@ var charts = []sectionDescription{
 					"changefeed.internal_retry_message_count",
 				},
 			},
+			{
+				Title: "Schema Registry Retries",
+				Metrics: []string{
+					"changefeed.schema_registry.retry_count",
+				},
+			},
+			{
+				Title: "Schema Registry Registrations",
+				Metrics: []string{
+					"changefeed.schema_registry.registrations",
+				},
+			},
 		},
 	},
 	{
@@ -1502,64 +1648,78 @@ var charts = []sectionDescription{
 		Charts: []chartDescription{
 			{
 				Title:   "Currently Running",
-				Metrics: []string{"streaming.running"},
+				Metrics: []string{"replication.running"},
 			},
 			{
 				Title: "Event admission latency",
 				Metrics: []string{
-					"streaming.admit_latency",
+					"replication.admit_latency",
 				},
 			},
 			{
 				Title: "Commits Latency",
 				Metrics: []string{
-					"streaming.commit_latency",
+					"replication.commit_latency",
 				},
 			},
 			{
 				Title: "Time spent",
 				Metrics: []string{
-					"streaming.flush_hist_nanos",
+					"replication.flush_hist_nanos",
 				},
 			},
 			{
 				Title: "Ingested Events",
 				Metrics: []string{
-					"streaming.events_ingested",
-					"streaming.resolved_events_ingested",
+					"replication.events_ingested",
+					"replication.resolved_events_ingested",
 				},
 			},
 			{
 				Title: "Flushes",
 				Metrics: []string{
-					"streaming.flushes",
+					"replication.flushes",
 				},
 			},
 			{
-				Title: "Ingested Bytes",
+				Title: "Logical Bytes",
 				Metrics: []string{
-					"streaming.ingested_bytes",
+					"replication.logical_bytes",
+				},
+			},
+			{
+				Title: "SST Bytes",
+				Metrics: []string{
+					"replication.sst_bytes",
 				},
 			},
 			{
 				Title:   "Earliest Data Processor Checkpoint Span",
-				Metrics: []string{"streaming.earliest_data_checkpoint_span"},
+				Metrics: []string{"replication.earliest_data_checkpoint_span"},
 			},
 			{
 				Title:   "Latest Data Processor Checkpoint Span",
-				Metrics: []string{"streaming.latest_data_checkpoint_span"},
+				Metrics: []string{"replication.latest_data_checkpoint_span"},
 			},
 			{
 				Title:   "Data Checkpoint Span Count",
-				Metrics: []string{"streaming.data_checkpoint_span_count"},
+				Metrics: []string{"replication.data_checkpoint_span_count"},
 			},
 			{
 				Title:   "Frontier Checkpoint Span Count",
-				Metrics: []string{"streaming.frontier_checkpoint_span_count"},
+				Metrics: []string{"replication.frontier_checkpoint_span_count"},
+			},
+			{
+				Title:   "Frontier Lag",
+				Metrics: []string{"replication.frontier_lag_nanos"},
 			},
 			{
 				Title:   "Job Progress Updates",
-				Metrics: []string{"streaming.job_progress_updates"},
+				Metrics: []string{"replication.job_progress_updates"},
+			},
+			{
+				Title:   "Ranges To Revert",
+				Metrics: []string{"replication.cutover_progress"},
 			},
 		},
 	},
@@ -1614,6 +1774,10 @@ var charts = []sectionDescription{
 				Metrics: []string{"requests.slow.lease"},
 			},
 			{
+				Title:   "Lease Request Latency",
+				Metrics: []string{"leases.requests.latency"},
+			},
+			{
 				Title: "Succcess Rate",
 				Metrics: []string{
 					"leases.error",
@@ -1627,6 +1791,7 @@ var charts = []sectionDescription{
 					"leases.expiration",
 					"replicas.leaseholders",
 					"replicas.leaders_not_leaseholders",
+					"replicas.leaders_invalid_lease",
 				},
 			},
 			{
@@ -2118,20 +2283,8 @@ var charts = []sectionDescription{
 				Metrics: []string{"sql.distsql.flows.active"},
 			},
 			{
-				Title:   "Queue Wait",
-				Metrics: []string{"sql.distsql.flows.queue_wait"},
-			},
-			{
-				Title:   "Queued",
-				Metrics: []string{"sql.distsql.flows.queued"},
-			},
-			{
 				Title:   "Total",
 				Metrics: []string{"sql.distsql.flows.total"},
-			},
-			{
-				Title:   "Scheduled",
-				Metrics: []string{"sql.distsql.flows.scheduled"},
 			},
 		},
 	},
@@ -2158,6 +2311,8 @@ var charts = []sectionDescription{
 					"sql.hydrated_udf_cache.misses",
 					"sql.hydrated_schema_cache.hits",
 					"sql.hydrated_schema_cache.misses",
+					"sql.hydrated_type_cache.hits",
+					"sql.hydrated_type_cache.misses",
 				},
 			},
 		},
@@ -2457,6 +2612,14 @@ var charts = []sectionDescription{
 				Metrics: []string{"sql.mem.internal.session.current"},
 			},
 			{
+				Title:   "Prepared Statements All",
+				Metrics: []string{"sql.mem.internal.session.prepared.max"},
+			},
+			{
+				Title:   "Prepared Statements Current",
+				Metrics: []string{"sql.mem.internal.session.prepared.current"},
+			},
+			{
 				Title:   "Txn All",
 				Metrics: []string{"sql.mem.internal.txn.max"},
 			},
@@ -2476,6 +2639,14 @@ var charts = []sectionDescription{
 			{
 				Title:   "Max",
 				Metrics: []string{"sql.mem.sql.session.max"},
+			},
+			{
+				Title:   "Prepared Statements Current",
+				Metrics: []string{"sql.mem.sql.session.prepared.current"},
+			},
+			{
+				Title:   "Prepared Statements Max",
+				Metrics: []string{"sql.mem.sql.session.prepared.max"},
 			},
 		},
 	},
@@ -2518,6 +2689,43 @@ var charts = []sectionDescription{
 					"sql.temp_object_cleaner.schemas_to_delete",
 					"sql.temp_object_cleaner.schemas_deletion_success",
 					"sql.temp_object_cleaner.schemas_deletion_error",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "SQL, Prior to tenant selection"}},
+		Charts: []chartDescription{
+			{
+				Title: "New Connections",
+				Metrics: []string{
+					"sql.pre_serve.new_conns",
+				},
+			},
+			{
+				Title: "Connection Failures",
+				Metrics: []string{
+					"sql.pre_serve.conn.failures",
+				},
+				AxisLabel: "Failures",
+			},
+			{
+				Title: "Byte I/O",
+				Metrics: []string{
+					"sql.pre_serve.bytesin",
+					"sql.pre_serve.bytesout",
+				},
+			},
+			{
+				Title: "Memory usage, Current",
+				Metrics: []string{
+					"sql.pre_serve.mem.cur",
+				},
+			},
+			{
+				Title: "Memory usage, Max",
+				Metrics: []string{
+					"sql.pre_serve.mem.max",
 				},
 			},
 		},
@@ -2664,6 +2872,7 @@ var charts = []sectionDescription{
 					"sql.insert.count",
 					"sql.misc.count",
 					"sql.copy.count",
+					"sql.copy.nonatomic.count",
 					"sql.query.count",
 					"sql.select.count",
 					"sql.update.count",
@@ -2678,6 +2887,7 @@ var charts = []sectionDescription{
 					"sql.insert.started.count",
 					"sql.misc.started.count",
 					"sql.copy.started.count",
+					"sql.copy.nonatomic.started.count",
 					"sql.query.started.count",
 					"sql.select.started.count",
 					"sql.update.started.count",
@@ -2690,6 +2900,7 @@ var charts = []sectionDescription{
 					"sql.insert.count.internal",
 					"sql.misc.count.internal",
 					"sql.copy.count.internal",
+					"sql.copy.nonatomic.count.internal",
 					"sql.query.count.internal",
 					"sql.select.count.internal",
 					"sql.update.count.internal",
@@ -2703,6 +2914,7 @@ var charts = []sectionDescription{
 					"sql.insert.started.count.internal",
 					"sql.misc.started.count.internal",
 					"sql.copy.started.count.internal",
+					"sql.copy.nonatomic.started.count.internal",
 					"sql.query.started.count.internal",
 					"sql.select.started.count.internal",
 					"sql.update.started.count.internal",
@@ -2783,9 +2995,9 @@ var charts = []sectionDescription{
 		Organization: [][]string{{SQLLayer, "SQL", "Row Level TTL"}},
 		Charts: []chartDescription{
 			{
-				Title: "Active Range Deletes",
+				Title: "Active Span Deletes",
 				Metrics: []string{
-					"jobs.row_level_ttl.num_active_ranges",
+					"jobs.row_level_ttl.num_active_spans",
 				},
 				AxisLabel: "Num Running",
 			},
@@ -2808,7 +3020,7 @@ var charts = []sectionDescription{
 			{
 				Title: "Net Processing Latency",
 				Metrics: []string{
-					"jobs.row_level_ttl.range_total_duration",
+					"jobs.row_level_ttl.span_total_duration",
 				},
 				AxisLabel: "Latency (nanoseconds)",
 			},
@@ -2905,6 +3117,18 @@ var charts = []sectionDescription{
 				Title:   "Range Key Set Count",
 				Metrics: []string{"storage.keys.range-key-set.count"},
 			},
+			{
+				Title:   "Tombstone Count",
+				Metrics: []string{"storage.keys.tombstone.count"},
+			},
+			{
+				Title:   "Pinned Keys Written",
+				Metrics: []string{"storage.compactions.keys.pinned.count"},
+			},
+			{
+				Title:   "Pinned Key Bytes Written",
+				Metrics: []string{"storage.compactions.keys.pinned.bytes"},
+			},
 		},
 	},
 	{
@@ -2931,8 +3155,11 @@ var charts = []sectionDescription{
 				Metrics: []string{"rocksdb.compactions"},
 			},
 			{
-				Title:   "Flushes",
-				Metrics: []string{"rocksdb.flushes"},
+				Title: "Flushes",
+				Metrics: []string{
+					"rocksdb.flushes",
+					"storage.flush.ingest.count",
+				},
 			},
 			{
 				Title:   "Index & Filter Block Size",
@@ -2953,6 +3180,13 @@ var charts = []sectionDescription{
 			{
 				Title:   "L0 Sublevels",
 				Metrics: []string{"storage.l0-sublevels"},
+			},
+			{
+				Title: "Shared Storage Reads/Writes",
+				Metrics: []string{
+					"storage.shared-storage.read",
+					"storage.shared-storage.write",
+				},
 			},
 			{
 				Title: "L0 Files",
@@ -2986,8 +3220,15 @@ var charts = []sectionDescription{
 					"rocksdb.compacted-bytes-read",
 					"rocksdb.compacted-bytes-written",
 					"rocksdb.flushed-bytes",
+					"storage.flush.ingest.table.bytes",
 				},
 				AxisLabel: "Bytes",
+			},
+			{
+				Title: "Flushable Ingestions",
+				Metrics: []string{
+					"storage.flush.ingest.table.count",
+				},
 			},
 			{
 				Title:   "Stalls",
@@ -2997,6 +3238,67 @@ var charts = []sectionDescription{
 				Title:     "Stall Duration",
 				Metrics:   []string{"storage.write-stall-nanos"},
 				AxisLabel: "Duration (nanos)",
+			},
+			{
+				Title:     "Checkpoints",
+				Metrics:   []string{"storage.checkpoints"},
+				AxisLabel: "Directories",
+			},
+			{
+				Title: "Bytes Used Per Level",
+				Metrics: []string{
+					"storage.l0-level-size",
+					"storage.l1-level-size",
+					"storage.l2-level-size",
+					"storage.l3-level-size",
+					"storage.l4-level-size",
+					"storage.l5-level-size",
+					"storage.l6-level-size",
+				},
+				AxisLabel: "Bytes",
+			},
+			{
+				Title: "Compaction Score Per Level",
+				Metrics: []string{
+					"storage.l0-level-score",
+					"storage.l1-level-score",
+					"storage.l2-level-score",
+					"storage.l3-level-score",
+					"storage.l4-level-score",
+					"storage.l5-level-score",
+					"storage.l6-level-score",
+				},
+			},
+			{
+				Title:   "Flush Utilization",
+				Metrics: []string{"storage.flush.utilization"},
+			},
+			{
+				Title:   "WAL Fsync Latency",
+				Metrics: []string{"storage.wal.fsync.latency"},
+			},
+			{
+				Title: "Iterator Block Loads",
+				Metrics: []string{
+					"storage.iterator.block-load.bytes",
+					"storage.iterator.block-load.cached-bytes",
+				},
+				AxisLabel: "Bytes",
+			},
+			{
+				Title:     "Iterator I/O",
+				Metrics:   []string{"storage.iterator.block-load.read-duration"},
+				AxisLabel: "Duration (nanos)",
+			},
+			{
+				Title: "Iterator Operations",
+				Metrics: []string{
+					"storage.iterator.external.seeks",
+					"storage.iterator.external.steps",
+					"storage.iterator.internal.seeks",
+					"storage.iterator.internal.steps",
+				},
+				AxisLabel: "Ops",
 			},
 		},
 	},
@@ -3168,9 +3470,34 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "PTS Counts",
+				Metrics: []string{
+					"schedules.BACKUP.protected_record_count",
+				},
+			},
+			{
+				Title: "PTS Age",
+				Metrics: []string{
+					"schedules.BACKUP.protected_age_sec",
+				},
+			},
+			{
 				Title: "Last Completed Backups",
 				Metrics: []string{
 					"schedules.BACKUP.last-completed-time",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{Jobs, "Schedules", "Changefeed"}},
+		Charts: []chartDescription{
+			{
+				Title: "Counts",
+				Metrics: []string{
+					"schedules.CHANGEFEED.started",
+					"schedules.CHANGEFEED.succeeded",
+					"schedules.CHANGEFEED.failed",
 				},
 			},
 		},
@@ -3197,46 +3524,12 @@ var charts = []sectionDescription{
 					"jobs.running_non_idle",
 				},
 			},
-			{
-				Title: "Currently Running",
-				Metrics: []string{
-					"jobs.auto_create_stats.currently_running",
-					"jobs.backup.currently_running",
-					"jobs.changefeed.currently_running",
-					"jobs.create_stats.currently_running",
-					"jobs.import.currently_running",
-					"jobs.restore.currently_running",
-					"jobs.schema_change.currently_running",
-					"jobs.new_schema_change.currently_running",
-					"jobs.schema_change_gc.currently_running",
-					"jobs.typedesc_schema_change.currently_running",
-					"jobs.stream_ingestion.currently_running",
-					"jobs.migration.currently_running",
-					"jobs.auto_span_config_reconciliation.currently_running",
-					"jobs.auto_sql_stats_compaction.currently_running",
-					"jobs.stream_replication.currently_running",
-				},
-			},
-			{
-				Title: "Currently Idle",
-				Metrics: []string{
-					"jobs.auto_create_stats.currently_idle",
-					"jobs.auto_span_config_reconciliation.currently_idle",
-					"jobs.auto_sql_stats_compaction.currently_idle",
-					"jobs.backup.currently_idle",
-					"jobs.changefeed.currently_idle",
-					"jobs.create_stats.currently_idle",
-					"jobs.import.currently_idle",
-					"jobs.migration.currently_idle",
-					"jobs.new_schema_change.currently_idle",
-					"jobs.restore.currently_idle",
-					"jobs.schema_change.currently_idle",
-					"jobs.schema_change_gc.currently_idle",
-					"jobs.stream_ingestion.currently_idle",
-					"jobs.stream_replication.currently_idle",
-					"jobs.typedesc_schema_change.currently_idle",
-				},
-			},
+			jobTypeCharts("Currently Running", "currently_running"),
+			jobTypeCharts("Currently Idle", "currently_idle"),
+			jobTypeCharts("Currently Paused", "currently_paused"),
+			jobTypeCharts("PTS Age", "protected_age_sec"),
+			jobTypeCharts("PTS Record Count", "protected_record_count"),
+			jobTypeCharts("Expired PTS Records", "expired_pts_records"),
 			{
 				Title: "Auto Create Stats",
 				Metrics: []string{
@@ -3411,6 +3704,72 @@ var charts = []sectionDescription{
 					"jobs.auto_sql_stats_compaction.resume_retry_error",
 				},
 			},
+			{
+				Title: "Key Visualizer",
+				Metrics: []string{
+					"jobs.key_visualizer.fail_or_cancel_completed",
+					"jobs.key_visualizer.fail_or_cancel_failed",
+					"jobs.key_visualizer.fail_or_cancel_retry_error",
+					"jobs.key_visualizer.resume_completed",
+					"jobs.key_visualizer.resume_failed",
+					"jobs.key_visualizer.resume_retry_error",
+				},
+			},
+			{
+				Title: "SQL Activity Updater",
+				Metrics: []string{
+					"jobs.auto_update_sql_activity.fail_or_cancel_completed",
+					"jobs.auto_update_sql_activity.fail_or_cancel_failed",
+					"jobs.auto_update_sql_activity.fail_or_cancel_retry_error",
+					"jobs.auto_update_sql_activity.resume_completed",
+					"jobs.auto_update_sql_activity.resume_failed",
+					"jobs.auto_update_sql_activity.resume_retry_error",
+				},
+			},
+			{
+				Title: "Jobs Stats Polling Job",
+				Metrics: []string{
+					"jobs.poll_jobs_stats.fail_or_cancel_completed",
+					"jobs.poll_jobs_stats.fail_or_cancel_failed",
+					"jobs.poll_jobs_stats.fail_or_cancel_retry_error",
+					"jobs.poll_jobs_stats.resume_completed",
+					"jobs.poll_jobs_stats.resume_failed",
+					"jobs.poll_jobs_stats.resume_retry_error",
+				},
+			},
+			{
+				Title: "Auto Config Top-level Runner Job",
+				Metrics: []string{
+					"jobs.auto_config_runner.fail_or_cancel_completed",
+					"jobs.auto_config_runner.fail_or_cancel_failed",
+					"jobs.auto_config_runner.fail_or_cancel_retry_error",
+					"jobs.auto_config_runner.resume_completed",
+					"jobs.auto_config_runner.resume_failed",
+					"jobs.auto_config_runner.resume_retry_error",
+				},
+			},
+			{
+				Title: "Auto Config Per-environment Runner Jobs",
+				Metrics: []string{
+					"jobs.auto_config_env_runner.fail_or_cancel_completed",
+					"jobs.auto_config_env_runner.fail_or_cancel_failed",
+					"jobs.auto_config_env_runner.fail_or_cancel_retry_error",
+					"jobs.auto_config_env_runner.resume_completed",
+					"jobs.auto_config_env_runner.resume_failed",
+					"jobs.auto_config_env_runner.resume_retry_error",
+				},
+			},
+			{
+				Title: "Auto Config Tasks",
+				Metrics: []string{
+					"jobs.auto_config_task.fail_or_cancel_completed",
+					"jobs.auto_config_task.fail_or_cancel_failed",
+					"jobs.auto_config_task.fail_or_cancel_retry_error",
+					"jobs.auto_config_task.resume_completed",
+					"jobs.auto_config_task.resume_failed",
+					"jobs.auto_config_task.resume_retry_error",
+				},
+			},
 		},
 	},
 	{
@@ -3424,6 +3783,18 @@ var charts = []sectionDescription{
 					"jobs.resumed_claimed_jobs",
 				},
 				AxisLabel: "Count",
+			},
+		},
+	},
+	{
+		Organization: [][]string{{Jobs, "External Storage"}},
+		Charts: []chartDescription{
+			{
+				Title: "External Storage",
+				Metrics: []string{
+					"cloud.read_bytes",
+					"cloud.write_bytes",
+				},
 			},
 		},
 	},
@@ -3451,6 +3822,63 @@ var charts = []sectionDescription{
 					"admission.requested.sql-root-start",
 					"admission.admitted.sql-root-start",
 					"admission.errored.sql-root-start",
+					"admission.requested.elastic-cpu",
+					"admission.admitted.elastic-cpu",
+					"admission.errored.elastic-cpu",
+					"admission.admitted.elastic-cpu.normal-pri",
+					"admission.admitted.elastic-cpu.bulk-normal-pri",
+					"admission.admitted.kv-stores.bulk-normal-pri",
+					"admission.admitted.kv-stores.locking-pri",
+					"admission.admitted.kv-stores.ttl-low-pri",
+					"admission.admitted.kv-stores.normal-pri",
+					"admission.admitted.kv-stores.high-pri",
+					"admission.admitted.kv.locking-pri",
+					"admission.admitted.kv.normal-pri",
+					"admission.admitted.kv.high-pri",
+					"admission.admitted.sql-kv-response.locking-pri",
+					"admission.admitted.sql-kv-response.normal-pri",
+					"admission.admitted.sql-leaf-start.locking-pri",
+					"admission.admitted.sql-leaf-start.normal-pri",
+					"admission.admitted.sql-root-start.locking-pri",
+					"admission.admitted.sql-root-start.normal-pri",
+					"admission.admitted.sql-sql-response.locking-pri",
+					"admission.admitted.sql-sql-response.normal-pri",
+					"admission.errored.elastic-cpu.normal-pri",
+					"admission.errored.elastic-cpu.bulk-normal-pri",
+					"admission.errored.kv-stores.bulk-normal-pri",
+					"admission.errored.kv-stores.locking-pri",
+					"admission.errored.kv-stores.ttl-low-pri",
+					"admission.errored.kv-stores.normal-pri",
+					"admission.errored.kv-stores.high-pri",
+					"admission.errored.kv.locking-pri",
+					"admission.errored.kv.normal-pri",
+					"admission.errored.kv.high-pri",
+					"admission.errored.sql-kv-response.locking-pri",
+					"admission.errored.sql-kv-response.normal-pri",
+					"admission.errored.sql-leaf-start.locking-pri",
+					"admission.errored.sql-leaf-start.normal-pri",
+					"admission.errored.sql-root-start.locking-pri",
+					"admission.errored.sql-root-start.normal-pri",
+					"admission.errored.sql-sql-response.locking-pri",
+					"admission.errored.sql-sql-response.normal-pri",
+					"admission.requested.elastic-cpu.normal-pri",
+					"admission.requested.elastic-cpu.bulk-normal-pri",
+					"admission.requested.kv-stores.bulk-normal-pri",
+					"admission.requested.kv-stores.locking-pri",
+					"admission.requested.kv-stores.ttl-low-pri",
+					"admission.requested.kv-stores.normal-pri",
+					"admission.requested.kv-stores.high-pri",
+					"admission.requested.kv.locking-pri",
+					"admission.requested.kv.normal-pri",
+					"admission.requested.kv.high-pri",
+					"admission.requested.sql-kv-response.locking-pri",
+					"admission.requested.sql-kv-response.normal-pri",
+					"admission.requested.sql-leaf-start.locking-pri",
+					"admission.requested.sql-leaf-start.normal-pri",
+					"admission.requested.sql-root-start.locking-pri",
+					"admission.requested.sql-root-start.normal-pri",
+					"admission.requested.sql-sql-response.locking-pri",
+					"admission.requested.sql-sql-response.normal-pri",
 				},
 			},
 			{
@@ -3462,17 +3890,25 @@ var charts = []sectionDescription{
 					"admission.wait_queue_length.sql-sql-response",
 					"admission.wait_queue_length.sql-leaf-start",
 					"admission.wait_queue_length.sql-root-start",
-				},
-			},
-			{
-				Title: "Work Queue Admission Latency Sum",
-				Metrics: []string{
-					"admission.wait_sum.kv",
-					"admission.wait_sum.kv-stores",
-					"admission.wait_sum.sql-kv-response",
-					"admission.wait_sum.sql-sql-response",
-					"admission.wait_sum.sql-leaf-start",
-					"admission.wait_sum.sql-root-start",
+					"admission.wait_queue_length.elastic-cpu",
+					"admission.wait_queue_length.elastic-cpu.normal-pri",
+					"admission.wait_queue_length.elastic-cpu.bulk-normal-pri",
+					"admission.wait_queue_length.kv-stores.bulk-normal-pri",
+					"admission.wait_queue_length.kv-stores.locking-pri",
+					"admission.wait_queue_length.kv-stores.ttl-low-pri",
+					"admission.wait_queue_length.kv-stores.normal-pri",
+					"admission.wait_queue_length.kv-stores.high-pri",
+					"admission.wait_queue_length.kv.locking-pri",
+					"admission.wait_queue_length.kv.normal-pri",
+					"admission.wait_queue_length.kv.high-pri",
+					"admission.wait_queue_length.sql-kv-response.locking-pri",
+					"admission.wait_queue_length.sql-kv-response.normal-pri",
+					"admission.wait_queue_length.sql-leaf-start.locking-pri",
+					"admission.wait_queue_length.sql-leaf-start.normal-pri",
+					"admission.wait_queue_length.sql-root-start.locking-pri",
+					"admission.wait_queue_length.sql-root-start.normal-pri",
+					"admission.wait_queue_length.sql-sql-response.locking-pri",
+					"admission.wait_queue_length.sql-sql-response.normal-pri",
 				},
 			},
 			{
@@ -3484,6 +3920,25 @@ var charts = []sectionDescription{
 					"admission.wait_durations.sql-sql-response",
 					"admission.wait_durations.sql-leaf-start",
 					"admission.wait_durations.sql-root-start",
+					"admission.wait_durations.elastic-cpu",
+					"admission.wait_durations.elastic-cpu.normal-pri",
+					"admission.wait_durations.elastic-cpu.bulk-normal-pri",
+					"admission.wait_durations.kv-stores.bulk-normal-pri",
+					"admission.wait_durations.kv-stores.locking-pri",
+					"admission.wait_durations.kv-stores.ttl-low-pri",
+					"admission.wait_durations.kv-stores.normal-pri",
+					"admission.wait_durations.kv-stores.high-pri",
+					"admission.wait_durations.kv.locking-pri",
+					"admission.wait_durations.kv.normal-pri",
+					"admission.wait_durations.kv.high-pri",
+					"admission.wait_durations.sql-kv-response.locking-pri",
+					"admission.wait_durations.sql-kv-response.normal-pri",
+					"admission.wait_durations.sql-leaf-start.locking-pri",
+					"admission.wait_durations.sql-leaf-start.normal-pri",
+					"admission.wait_durations.sql-root-start.locking-pri",
+					"admission.wait_durations.sql-root-start.normal-pri",
+					"admission.wait_durations.sql-sql-response.locking-pri",
+					"admission.wait_durations.sql-sql-response.normal-pri",
 				},
 			},
 			{
@@ -3491,16 +3946,81 @@ var charts = []sectionDescription{
 				Metrics: []string{
 					"admission.granter.total_slots.kv",
 					"admission.granter.used_slots.kv",
-					"admission.granter.total_moderate_slots.kv",
-					"admission.granter.used_soft_slots.kv",
 					"admission.granter.used_slots.sql-leaf-start",
 					"admission.granter.used_slots.sql-root-start",
+				},
+			},
+			{
+				Title: "Granter Slot Counters",
+				Metrics: []string{
+					"admission.granter.slot_adjuster_increments.kv",
+					"admission.granter.slot_adjuster_decrements.kv",
+				},
+			},
+			{
+				Title: "Granter Slot Durations",
+				Metrics: []string{
+					"admission.granter.slots_exhausted_duration.kv",
+					"admission.granter.cpu_load_short_period_duration.kv",
+					"admission.granter.cpu_load_long_period_duration.kv",
+				},
+			},
+			{
+				Title: "Elastic CPU Utilization",
+				Metrics: []string{
+					"admission.elastic_cpu.utilization",
+					"admission.elastic_cpu.utilization_limit",
+				},
+			},
+			{
+				Title: "Scheduler Latency Listener",
+				Metrics: []string{
+					"admission.scheduler_latency_listener.p99_nanos",
+				},
+			},
+			{
+				Title: "Scheduler Latency",
+				Metrics: []string{
+					"go.scheduler_latency",
+				},
+			},
+			{
+				Title: "Elastic CPU Durations",
+				Metrics: []string{
+					"admission.elastic_cpu.acquired_nanos",
+					"admission.elastic_cpu.returned_nanos",
+					"admission.elastic_cpu.max_available_nanos",
+					"admission.elastic_cpu.pre_work_nanos",
+				},
+			},
+			{
+				Title: "Elastic CPU Available Tokens",
+				Metrics: []string{
+					"admission.elastic_cpu.available_nanos",
+				},
+			},
+			{
+				Title: "Elastic CPU Tokens Exhausted Duration Sum",
+				Metrics: []string{
+					"admission.elastic_cpu.nanos_exhausted_duration",
+				},
+			},
+			{
+				Title: "Elastic CPU Tokens Over Limit Duration",
+				Metrics: []string{
+					"admission.elastic_cpu.over_limit_durations",
 				},
 			},
 			{
 				Title: "IO Tokens Exhausted Duration Sum",
 				Metrics: []string{
 					"admission.granter.io_tokens_exhausted_duration.kv",
+				},
+			},
+			{
+				Title: "IO Overload - IOThreshold Score",
+				Metrics: []string{
+					"admission.io.overload",
 				},
 			},
 		},
@@ -3560,4 +4080,32 @@ var charts = []sectionDescription{
 			},
 		},
 	},
+	{
+		Organization: [][]string{{ReplicationLayer, "Batches"}},
+		Charts: []chartDescription{
+			{
+				Title: "Total number of attempts to evaluate read-only batches",
+				Metrics: []string{
+					"kv.replica_read_batch_evaluate.dropped_latches_before_eval",
+					"kv.replica_read_batch_evaluate.without_interleaving_iter",
+				},
+			},
+		},
+	},
+}
+
+func jobTypeCharts(title string, varName string) chartDescription {
+	var metrics []string
+	for i := 0; i < jobspb.NumJobTypes; i++ {
+		jt := jobspb.Type(i)
+		if jt == jobspb.TypeUnspecified {
+			continue
+		}
+		metrics = append(metrics,
+			fmt.Sprintf("jobs.%s.%s", strings.ToLower(jobspb.Type_name[int32(i)]), varName))
+	}
+	return chartDescription{
+		Title:   title,
+		Metrics: metrics,
+	}
 }

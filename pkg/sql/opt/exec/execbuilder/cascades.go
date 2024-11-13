@@ -241,7 +241,7 @@ func (cb *cascadeBuilder) planCascade(
 			Min: uint32(numBufferedRows),
 			Max: uint32(numBufferedRows),
 		}
-		bindingProps.Stats = props.Statistics{
+		*bindingProps.Statistics() = props.Statistics{
 			Available: true,
 			RowCount:  float64(numBufferedRows),
 		}
@@ -293,7 +293,8 @@ func (cb *cascadeBuilder) planCascade(
 	}
 
 	// 5. Execbuild the optimized expression.
-	eb := New(execFactory, &o, factory.Memo(), cb.b.catalog, optimizedExpr, evalCtx, allowAutoCommit)
+	eb := New(ctx, execFactory, &o, factory.Memo(), cb.b.catalog, optimizedExpr, evalCtx, allowAutoCommit,
+		evalCtx.Planner.IsANSIDML())
 	if bufferRef != nil {
 		// Set up the With binding.
 		eb.addBuiltWithExpr(cascadeInputWithID, bufferColMap, bufferRef)

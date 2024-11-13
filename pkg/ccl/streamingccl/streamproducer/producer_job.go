@@ -18,18 +18,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
 func makeTenantSpan(tenantID uint64) *roachpb.Span {
-	prefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(tenantID))
+	prefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenantID))
 	return &roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
@@ -47,6 +47,7 @@ func makeProducerJobRecord(
 		Details: jobspb.StreamReplicationDetails{
 			ProtectedTimestampRecordID: ptsID,
 			Spans:                      []*roachpb.Span{makeTenantSpan(tenantID)},
+			TenantID:                   roachpb.MustMakeTenantID(tenantID),
 		},
 		Progress: jobspb.StreamReplicationProgress{
 			Expiration: timeutil.Now().Add(timeout),
@@ -67,8 +68,8 @@ func (p *producerJobResumer) releaseProtectedTimestamp(
 	ctx context.Context, executorConfig *sql.ExecutorConfig,
 ) error {
 	ptr := p.job.Details().(jobspb.StreamReplicationDetails).ProtectedTimestampRecordID
-	return executorConfig.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		err := executorConfig.ProtectedTimestampProvider.Release(ctx, txn, ptr)
+	return executorConfig.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		err := executorConfig.ProtectedTimestampProvider.WithTxn(txn).Release(ctx, ptr)
 		// In case that a retry happens, the record might have been released.
 		if errors.Is(err, exec.ErrNotFound) {
 			return nil
@@ -101,7 +102,7 @@ func (p *producerJobResumer) Resume(ctx context.Context, execCtx interface{}) er
 			case jobspb.StreamReplicationProgress_FINISHED_SUCCESSFULLY:
 				return p.releaseProtectedTimestamp(ctx, execCfg)
 			case jobspb.StreamReplicationProgress_FINISHED_UNSUCCESSFULLY:
-				return j.Update(ctx, nil, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+				return j.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 					ju.UpdateStatus(jobs.StatusCancelRequested)
 					return nil
 				})

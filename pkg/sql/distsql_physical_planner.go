@@ -11,12 +11,14 @@
 package sql
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"reflect"
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -29,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
@@ -37,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -46,18 +50,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // DistSQLPlanner is used to generate distributed plans from logical
@@ -115,6 +121,10 @@ type DistSQLPlanner struct {
 	// additional goroutines that can be used to run concurrent TableReaders
 	// for the same stage of the fully local physical plans.
 	parallelLocalScansSem *quotapool.IntPool
+	// parallelChecksSem is a node-wide semaphore on the number of additional
+	// goroutines that can be used to run check postqueries (FK and UNIQUE
+	// constraint checks) in parallel.
+	parallelChecksSem *quotapool.IntPool
 
 	// distSender is used to construct the spanResolver upon SetSQLInstanceInfo.
 	distSender *kvcoord.DistSender
@@ -123,9 +133,9 @@ type DistSQLPlanner struct {
 	// rpcCtx is used to construct the spanResolver upon SetSQLInstanceInfo.
 	rpcCtx *rpc.Context
 
-	// sqlInstanceProvider has information about SQL instances in a non-system
+	// sqlAddressResolver has information about SQL instances in a non-system
 	// tenant environment.
-	sqlInstanceProvider sqlinstance.Provider
+	sqlAddressResolver sqlinstance.AddressResolver
 
 	// codec allows the DistSQLPlanner to determine whether it is creating plans
 	// for a system tenant or non-system tenant.
@@ -174,7 +184,7 @@ func NewDistSQLPlanner(
 	connHealthCheckerSystem func(roachpb.NodeID, rpc.ConnectionClass) error, // will only be used by the system tenant
 	podNodeDialer *nodedialer.Dialer,
 	codec keys.SQLCodec,
-	sqlInstanceProvider sqlinstance.Provider,
+	sqlAddressResolver sqlinstance.AddressResolver,
 	clock *hlc.Clock,
 ) *DistSQLPlanner {
 	dsp := &DistSQLPlanner{
@@ -190,12 +200,12 @@ func NewDistSQLPlanner(
 			connHealth:  connHealthCheckerSystem,
 			isAvailable: isAvailable,
 		},
-		distSender:          distSender,
-		nodeDescs:           nodeDescs,
-		rpcCtx:              rpcCtx,
-		sqlInstanceProvider: sqlInstanceProvider,
-		codec:               codec,
-		clock:               clock,
+		distSender:         distSender,
+		nodeDescs:          nodeDescs,
+		rpcCtx:             rpcCtx,
+		sqlAddressResolver: sqlAddressResolver,
+		codec:              codec,
+		clock:              clock,
 	}
 
 	dsp.parallelLocalScansSem = quotapool.NewIntPool("parallel local scans concurrency",
@@ -203,14 +213,42 @@ func NewDistSQLPlanner(
 	localScansConcurrencyLimit.SetOnChange(&st.SV, func(ctx context.Context) {
 		dsp.parallelLocalScansSem.UpdateCapacity(uint64(localScansConcurrencyLimit.Get(&st.SV)))
 	})
+	dsp.parallelChecksSem = quotapool.NewIntPool("parallel checks concurrency",
+		uint64(parallelChecksConcurrencyLimit.Get(&st.SV)))
+	parallelChecksConcurrencyLimit.SetOnChange(&st.SV, func(ctx context.Context) {
+		dsp.parallelChecksSem.UpdateCapacity(uint64(parallelChecksConcurrencyLimit.Get(&st.SV)))
+	})
 	if rpcCtx != nil {
 		// rpcCtx might be nil in some tests.
 		rpcCtx.Stopper.AddCloser(dsp.parallelLocalScansSem.Closer("stopper"))
+		rpcCtx.Stopper.AddCloser(dsp.parallelChecksSem.Closer("stopper"))
 	}
 
 	dsp.runnerCoordinator.init(ctx, stopper, &st.SV)
 	dsp.initCancelingWorkers(ctx)
 	return dsp
+}
+
+// GetAllInstancesByLocality lists all instances that match the passed locality
+// filters.
+func (dsp *DistSQLPlanner) GetAllInstancesByLocality(
+	ctx context.Context, filter roachpb.Locality,
+) ([]sqlinstance.InstanceInfo, error) {
+	all, err := dsp.sqlAddressResolver.GetAllInstances(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var pos int
+	for _, n := range all {
+		if ok, _ := n.Locality.Matches(filter); ok {
+			all[pos] = n
+			pos++
+		}
+	}
+	if pos == 0 {
+		return nil, errors.Newf("no instances found matching locality filter %s", filter.String())
+	}
+	return all[:pos], nil
 }
 
 // GetSQLInstanceInfo gets a node descriptor by node ID.
@@ -440,11 +478,9 @@ func mustWrapValuesNode(planCtx *PlanningCtx, specifiedInQuery bool) bool {
 	// If the plan is local, we also wrap the valuesNode to avoid pointless
 	// serialization of the values, and also to avoid situations in which
 	// expressions within the valuesNode were not distributable in the first
-	// place.
-	if !specifiedInQuery || planCtx.isLocal {
-		return true
-	}
-	return false
+	// place. Unless the plan is a vector insert where we are inserting a preformed
+	// coldata.Batch.
+	return !specifiedInQuery || (planCtx.isLocal && !planCtx.isVectorInsert)
 }
 
 // checkSupportForPlanNode returns a distRecommendation (as described above) or
@@ -544,6 +580,10 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		return checkSupportForPlanNode(n.plan)
 
 	case *lookupJoinNode:
+		if n.remoteLookupExpr != nil || n.remoteOnlyLookups {
+			// This is a locality optimized join.
+			return cannotDistribute, nil
+		}
 		if n.table.lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
 			// Lookup joins that are performing row-level locking cannot
 			// currently be distributed because their locks would not be
@@ -573,6 +613,11 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		return cannotDistribute, nil
 
 	case *projectSetNode:
+		for i := range n.exprs {
+			if err := checkExpr(n.exprs[i]); err != nil {
+				return cannotDistribute, err
+			}
+		}
 		return checkSupportForPlanNode(n.source)
 
 	case *renderNode:
@@ -686,6 +731,8 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 			return cannotDistribute, err
 		}
 		return shouldDistribute, nil
+	case *cdcValuesNode:
+		return cannotDistribute, nil
 
 	default:
 		return cannotDistribute, planNodeNotSupportedErr
@@ -744,22 +791,25 @@ const (
 // a single query.
 type PlanningCtx struct {
 	ExtendedEvalCtx *extendedEvalContext
-	spanIter        physicalplan.SpanResolverIterator
+
+	localityFilter roachpb.Locality
+
+	spanIter physicalplan.SpanResolverIterator
 	// nodeStatuses contains info for all SQLInstanceIDs that are referenced by
 	// any PhysicalPlan we generate with this context.
 	nodeStatuses map[base.SQLInstanceID]NodeStatus
 
-	infra physicalplan.PhysicalInfrastructure
+	infra *physicalplan.PhysicalInfrastructure
 
 	// isLocal is set to true if we're planning this query on a single node.
 	isLocal bool
 	planner *planner
-	// ignoreClose, when set to true, will prevent the closing of the planner's
-	// current plan. Only the top-level query needs to close it, but everything
-	// else (like sub- and postqueries, or EXPLAIN ANALYZE) should set this to
-	// true to avoid double closes of the planNode tree.
-	ignoreClose bool
-	stmtType    tree.StatementReturnType
+
+	// usePlannerDescriptorsForLocalFlow may be set to true to force
+	// planner.Descriptors() use for local flows.
+	usePlannerDescriptorsForLocalFlow bool
+
+	stmtType tree.StatementReturnType
 	// planDepth is set to the current depth of the planNode tree. It's used to
 	// keep track of whether it's valid to run a root node in a special fast path
 	// mode.
@@ -773,11 +823,11 @@ type PlanningCtx struct {
 
 	// If set, the flows for the physical plan will be passed to this function.
 	// The flows are not safe for use past the lifetime of the saveFlows function.
-	saveFlows func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execopnode.OpChains) error
+	saveFlows func(_ map[base.SQLInstanceID]*execinfrapb.FlowSpec, _ execopnode.OpChains, vectorized bool) error
 
 	// If set, we will record the mapping from planNode to tracing metadata to
 	// later allow associating statistics with the planNode.
-	traceMetadata execNodeTraceMetadata
+	associateNodeWithComponents func(exec.Node, execComponents)
 
 	// If set, statement execution stats should be collected.
 	collectExecStats bool
@@ -789,11 +839,24 @@ type PlanningCtx struct {
 	// are supported natively by the vectorized engine.
 	parallelizeScansIfLocal bool
 
+	// Set if this is either a subquery or a postquery (i.e. not the "main"
+	// query).
+	subOrPostQuery bool
+
+	// mustUseLeafTxn, if set, indicates that this PlanningCtx is used to handle
+	// one of the plans that will run in parallel with other plans. As such, the
+	// DistSQL planner will need to use the LeafTxn (even if it's not needed
+	// based on other "regular" factors).
+	mustUseLeafTxn bool
+
 	// onFlowCleanup contains non-nil functions that will be called after the
 	// local flow finished running and is being cleaned up. It allows us to
 	// release the resources that are acquired during the physical planning and
-	// are being hold onto throughout the whole flow lifecycle.
+	// are being held onto throughout the whole flow lifecycle.
 	onFlowCleanup []func()
+
+	// This is true if plan is a simple insert that can be vectorized.
+	isVectorInsert bool
 }
 
 var _ physicalplan.ExprContext = &PlanningCtx{}
@@ -805,7 +868,7 @@ var _ physicalplan.ExprContext = &PlanningCtx{}
 // they have to be part of the final plan.
 func (p *PlanningCtx) NewPhysicalPlan() *PhysicalPlan {
 	return &PhysicalPlan{
-		PhysicalPlan: physicalplan.MakePhysicalPlan(&p.infra),
+		PhysicalPlan: physicalplan.MakePhysicalPlan(p.infra),
 	}
 }
 
@@ -822,16 +885,22 @@ func (p *PlanningCtx) EvalContext() *eval.Context {
 func (p *PlanningCtx) IsLocal() bool {
 	return p.isLocal
 }
-// how many phsical plan
-func (p *PlanningCtx) CountofPL() int {
-	return p.planDepth
+
+// getPortalPauseInfo returns the portal pause info if the current planner is
+// for a pausable portal. Otherwise, returns nil.
+func (p *PlanningCtx) getPortalPauseInfo() *portalPauseInfo {
+	if p.planner != nil && p.planner.pausablePortal != nil && p.planner.pausablePortal.pauseInfo != nil {
+		return p.planner.pausablePortal.pauseInfo
+	}
+	return nil
 }
+
 // getDefaultSaveFlowsFunc returns the default function used to save physical
-// plans and their diagrams.
+// plans and their diagrams. The returned function is **not** concurrency-safe.
 func (p *PlanningCtx) getDefaultSaveFlowsFunc(
 	ctx context.Context, planner *planner, typ planComponentType,
-) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execopnode.OpChains) error {
-	return func(flows map[base.SQLInstanceID]*execinfrapb.FlowSpec, opChains execopnode.OpChains) error {
+) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execopnode.OpChains, bool) error {
+	return func(flows map[base.SQLInstanceID]*execinfrapb.FlowSpec, opChains execopnode.OpChains, vectorized bool) error {
 		var diagram execinfrapb.FlowDiagram
 		if planner.instrumentation.shouldSaveDiagrams() {
 			diagramFlags := execinfrapb.DiagramFlags{
@@ -845,20 +914,23 @@ func (p *PlanningCtx) getDefaultSaveFlowsFunc(
 		}
 		var explainVec []string
 		var explainVecVerbose []string
-		if planner.instrumentation.collectBundle && planner.curPlan.flags.IsSet(planFlagVectorized) {
-			flowCtx := newFlowCtxForExplainPurposes(p, planner)
+		if planner.instrumentation.collectBundle && vectorized {
+			flowCtx, cleanup := newFlowCtxForExplainPurposes(ctx, p, planner)
+			defer cleanup()
 			getExplain := func(verbose bool) []string {
-				explain, cleanup, err := colflow.ExplainVec(
+				// When we're collecting the bundle, we're always recording the
+				// stats.
+				const recordingStats = true
+				explain, err := colflow.ExplainVec(
 					ctx, flowCtx, flows, p.infra.LocalProcessors, opChains,
 					planner.extendedEvalCtx.DistSQLPlanner.gatewaySQLInstanceID,
-					verbose, planner.curPlan.flags.IsDistributed(),
+					verbose, planner.curPlan.flags.IsDistributed(), recordingStats,
 				)
-				cleanup()
 				if err != nil {
 					// In some edge cases (like when subqueries are present or
 					// when certain component doesn't implement execopnode.OpNode
 					// interface) an error might occur. In such scenario, we
-					// don't want to fail the collection of the bundle, so we
+					// don't want to fail the collection of the bundle, so we're
 					// deliberately ignoring the error.
 					explain = nil
 				}
@@ -1000,9 +1072,8 @@ func (h *distSQLNodeHealth) checkSystem(
 		// artifact of rpcContext's reconnection mechanism at the time of
 		// writing). This is better than having it used in 100% of cases
 		// (until the liveness check below kicks in).
-		err := h.connHealth(roachpb.NodeID(sqlInstanceID), rpc.DefaultClass)
-		if err != nil && !errors.Is(err, rpc.ErrNotHeartbeated) {
-			// This host is known to be unhealthy. Don't use it (use the gateway
+		if err := h.connHealth(roachpb.NodeID(sqlInstanceID), rpc.DefaultClass); err != nil {
+			// This host isn't known to be healthy. Don't use it (use the gateway
 			// instead). Note: this can never happen for our sqlInstanceID (which
 			// always has its address in the nodeMap).
 			log.VEventf(ctx, 1, "marking n%d as unhealthy for this plan: %v", sqlInstanceID, err)
@@ -1098,13 +1169,13 @@ func (dsp *DistSQLPlanner) PartitionSpans(
 		// If we're planning locally, map all spans to the gateway.
 		return []SpanPartition{{dsp.gatewaySQLInstanceID, spans}}, nil
 	}
-	if dsp.codec.ForSystemTenant() {
-		return dsp.partitionSpansSystem(ctx, planCtx, spans)
+	if dsp.useGossipPlanning(ctx, planCtx) {
+		return dsp.deprecatedPartitionSpansSystem(ctx, planCtx, spans)
 	}
-	return dsp.partitionSpansTenant(ctx, planCtx, spans)
+	return dsp.partitionSpans(ctx, planCtx, spans)
 }
 
-// partitionSpans takes a single span and splits it up according to the owning
+// partitionSpan takes a single span and splits it up according to the owning
 // nodes (if the span touches multiple ranges).
 //
 //   - partitions is the set of SpanPartitions so far. The updated set is
@@ -1210,14 +1281,14 @@ func (dsp *DistSQLPlanner) partitionSpan(
 	return partitions, lastPartitionIdx, nil
 }
 
-// partitionSpansSystem finds node owners for ranges touching the given spans
+// deprecatedPartitionSpansSystem finds node owners for ranges touching the given spans
 // for a system tenant.
-func (dsp *DistSQLPlanner) partitionSpansSystem(
+func (dsp *DistSQLPlanner) deprecatedPartitionSpansSystem(
 	ctx context.Context, planCtx *PlanningCtx, spans roachpb.Spans,
 ) (partitions []SpanPartition, _ error) {
 	nodeMap := make(map[base.SQLInstanceID]int)
 	resolver := func(nodeID roachpb.NodeID) base.SQLInstanceID {
-		return dsp.getSQLInstanceIDForKVNodeIDSystem(ctx, planCtx, nodeID)
+		return dsp.deprecatedSQLInstanceIDForKVNodeIDSystem(ctx, planCtx, nodeID)
 	}
 	for _, span := range spans {
 		var err error
@@ -1231,14 +1302,16 @@ func (dsp *DistSQLPlanner) partitionSpansSystem(
 	return partitions, nil
 }
 
-// partitionSpansTenant assigns SQL instances in a tenant to spans. It performs
-// region-aware physical planning among all available SQL instances if the
-// region information is available on at least some of the instances, and it
-// falls back to naive round-robin assignment if not.
-func (dsp *DistSQLPlanner) partitionSpansTenant(
+// partitionSpans assigns SQL instances to spans. In mixed sql and KV mode it
+// generally assigns each span to the instance hosted on the KV node chosen by
+// the configured replica oracle, while in clusters operating with standalone
+// SQL instances it performs locality-aware physical planning among all
+// available SQL instances if the locality info is available on at least some of
+// the instances, and it falls back to naive round-robin assignment if not.
+func (dsp *DistSQLPlanner) partitionSpans(
 	ctx context.Context, planCtx *PlanningCtx, spans roachpb.Spans,
 ) (partitions []SpanPartition, _ error) {
-	resolver, instances, hasLocalitySet, err := dsp.makeSQLInstanceIDForKVNodeIDTenantResolver(ctx)
+	resolver, instances, err := dsp.makeInstanceResolver(ctx, planCtx.localityFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -1249,7 +1322,7 @@ func (dsp *DistSQLPlanner) partitionSpansTenant(
 		// Rows with column families may have been split into different spans.
 		// These spans should be assigned the same pod so that the pod can
 		// stitch together the rows correctly. Split rows are in adjacent spans.
-		if safeKey, err := keys.EnsureSafeSplitKey(span.Key); err == nil {
+		if safeKey, err := keys.EnsureSafeSplitKey(span.Key); err == nil && len(safeKey) > 0 {
 			if safeKey.Equal(lastKey) {
 				if log.V(1) {
 					log.Infof(ctx, "partitioning span %s", span)
@@ -1267,17 +1340,19 @@ func (dsp *DistSQLPlanner) partitionSpansTenant(
 			return nil, err
 		}
 	}
-	if err = dsp.maybeReassignToGatewaySQLInstance(partitions, instances, hasLocalitySet); err != nil {
-		return nil, err
+	if planCtx.localityFilter.Empty() {
+		if err = dsp.maybeReassignToGatewaySQLInstance(partitions, instances); err != nil {
+			return nil, err
+		}
 	}
 	return partitions, nil
 }
 
-// getSQLInstanceIDForKVNodeIDSystem returns the SQL instance ID that should
+// deprecatedSQLInstanceIDForKVNodeIDSystem returns the SQL instance that should
 // handle the range with the given node ID when planning is done on behalf of
 // the system tenant. It ensures that the chosen SQL instance is healthy and of
 // the compatible DistSQL version.
-func (dsp *DistSQLPlanner) getSQLInstanceIDForKVNodeIDSystem(
+func (dsp *DistSQLPlanner) deprecatedSQLInstanceIDForKVNodeIDSystem(
 	ctx context.Context, planCtx *PlanningCtx, nodeID roachpb.NodeID,
 ) base.SQLInstanceID {
 	sqlInstanceID := base.SQLInstanceID(nodeID)
@@ -1292,101 +1367,147 @@ func (dsp *DistSQLPlanner) getSQLInstanceIDForKVNodeIDSystem(
 	return sqlInstanceID
 }
 
-// makeSQLInstanceIDForKVNodeIDTenantResolver returns a function that can choose
-// the SQL instance ID for a provided node ID on behalf of a tenant. It also
-// returns a list of all healthy instances for the current tenant as well as a
-// boolean indicating whether the locality information is available for at least
-// some of those instances.
-func (dsp *DistSQLPlanner) makeSQLInstanceIDForKVNodeIDTenantResolver(
-	ctx context.Context,
-) (
-	resolver func(roachpb.NodeID) base.SQLInstanceID,
-	_ []sqlinstance.InstanceInfo,
-	hasLocalitySet bool,
-	_ error,
-) {
-	if dsp.sqlInstanceProvider == nil {
-		return nil, nil, false, errors.AssertionFailedf("sql instance provider not available in multi-tenant environment")
-	}
-	// GetAllInstances only returns healthy instances.
-	// TODO(yuzefovich): confirm that all instances are of compatible version.
-	instances, err := dsp.sqlInstanceProvider.GetAllInstances(ctx)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	if len(instances) == 0 {
-		return nil, nil, false, errors.New("no healthy sql instances available for planning")
+// instanceIDForKVNodeHostedInstance returns the SQL instance ID for an
+// instance that is hosted in the process of a KV node. Currently SQL
+// instances run in KV node processes have IDs fixed to be equal to the KV
+// nodes' IDs, and all of the SQL instances for a given tenant are _either_
+// run in this mixed mode or standalone, meaning if this server is in mixed
+// mode, we can safely assume every other server is as well, and thus has
+// IDs matching node IDs.
+func instanceIDForKVNodeHostedInstance(nodeID roachpb.NodeID) base.SQLInstanceID {
+	return base.SQLInstanceID(nodeID)
+}
+
+// makeInstanceResolver returns a function that can choose the SQL instance ID
+// for a provided KV node ID. It also returns a list of all healthy instances if
+// that list was used in choosing an instance, specifically if the localities of
+// those instances were used to decide the assignment, for use by any steps that
+// wish to post-process that assignment (such as adjusting based on localities).
+// If the instance was assigned statically or the instance list had no locality
+// information leading to random assignments then no instance list is returned.
+func (dsp *DistSQLPlanner) makeInstanceResolver(
+	ctx context.Context, locFilter roachpb.Locality,
+) (func(roachpb.NodeID) base.SQLInstanceID, []sqlinstance.InstanceInfo, error) {
+	_, mixedProcessMode := dsp.distSQLSrv.NodeID.OptionalNodeID()
+
+	if mixedProcessMode && locFilter.Empty() {
+		return instanceIDForKVNodeHostedInstance, nil, nil
 	}
 
-	// Populate a map from the region string to all healthy SQL instances in
-	// that region.
-	regionToSQLInstanceIDs := make(map[string][]base.SQLInstanceID)
-	for _, instance := range instances {
-		region, ok := instance.Locality.Find("region")
-		if !ok {
-			// If we can't determine the region of this instance, don't use it
-			// for planning.
-			log.Eventf(ctx, "could not find region for SQL instance %s", instance)
-			continue
-		}
-		instancesInRegion := regionToSQLInstanceIDs[region]
-		instancesInRegion = append(instancesInRegion, instance.InstanceID)
-		regionToSQLInstanceIDs[region] = instancesInRegion
+	// GetAllInstances only returns healthy instances.
+	// TODO(yuzefovich): confirm that all instances are of compatible version.
+	instances, err := dsp.sqlAddressResolver.GetAllInstances(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(instances) == 0 {
+		return nil, nil, errors.New("no healthy sql instances available for planning")
 	}
 
 	rng, _ := randutil.NewPseudoRand()
-	if len(regionToSQLInstanceIDs) > 0 {
-		// If we were able to determine the region information at least for some
-		// instances, use the region-aware resolver.
-		hasLocalitySet = true
-		resolver = func(nodeID roachpb.NodeID) base.SQLInstanceID {
+
+	instancesHaveLocality := false
+
+	var gatewayIsEligible bool
+	if locFilter.NonEmpty() {
+		eligible := make([]sqlinstance.InstanceInfo, 0, len(instances))
+		for i := range instances {
+			if ok, _ := instances[i].Locality.Matches(locFilter); ok {
+				eligible = append(eligible, instances[i])
+				if instances[i].InstanceID == dsp.gatewaySQLInstanceID {
+					gatewayIsEligible = true
+				}
+			}
+		}
+		if len(eligible) == 0 {
+			return nil, nil, errors.New("no healthy sql instances available matching locality requirement")
+		}
+		instances = eligible
+		instancesHaveLocality = true
+	} else {
+		for i := range instances {
+			if instances[i].Locality.NonEmpty() {
+				instancesHaveLocality = true
+				break
+			}
+		}
+		gatewayIsEligible = true
+	}
+
+	// If we were able to determine the locality information for at least some
+	// instances, use the locality-aware resolver.
+	if instancesHaveLocality {
+		resolver := func(nodeID roachpb.NodeID) base.SQLInstanceID {
+			// Lookup the node localities to compare to the instance localities.
 			nodeDesc, err := dsp.nodeDescs.GetNodeDescriptor(nodeID)
 			if err != nil {
 				log.Eventf(ctx, "unable to get node descriptor for KV node %s", nodeID)
 				return dsp.gatewaySQLInstanceID
 			}
-			region, ok := nodeDesc.Locality.Find("region")
-			if !ok {
-				log.Eventf(ctx, "could not find region for KV node %s", nodeDesc)
+
+			// If we're in mixed-mode, check if the picked node already matches the
+			// locality filter in which case we can just use it.
+			if mixedProcessMode {
+				if ok, _ := nodeDesc.Locality.Matches(locFilter); ok {
+					return instanceIDForKVNodeHostedInstance(nodeID)
+				} else {
+					log.VEventf(ctx, 2,
+						"node %d locality %s does not match locality filter %s, finding alternative placement...",
+						nodeID, nodeDesc.Locality, locFilter,
+					)
+				}
+			}
+
+			// TODO(dt): Pre-compute / cache this result, e.g. in the instance reader.
+			if closest := closestInstances(instances, nodeDesc.Locality); len(closest) > 0 {
+				return closest[rng.Intn(len(closest))]
+			}
+
+			// No instances had any locality tiers in common with the node locality so
+			// just return the gateway if it is eligible. If it isn't, just pick a
+			// random instance from the eligible instances.
+			if gatewayIsEligible {
 				return dsp.gatewaySQLInstanceID
 			}
-			instancesInRegion, ok := regionToSQLInstanceIDs[region]
-			if !ok {
-				// There are no instances in this region, so just use the
-				// gateway.
-				// TODO(yuzefovich): we should instead pick the closest instance
-				// in a different region.
-				return dsp.gatewaySQLInstanceID
-			}
-			// Pick a random instance in this region in order to spread the
-			// load.
-			// TODO(yuzefovich): consider using a different probability
-			// distribution for the "local" region (i.e. where the gateway is)
-			// where the gateway instance is favored. Also, if we had the
-			// information about latencies between different instances, we could
-			// favor those that are closer to the gateway. However, we need to
-			// be careful since non-query code paths (like CDC and BulkIO) do
-			// benefit from the even spread of the spans.
-			return instancesInRegion[rng.Intn(len(instancesInRegion))]
+			return instances[rng.Intn(len(instances))].InstanceID
 		}
-	} else {
-		// If it just so happens that we couldn't determine the region for all
-		// SQL instances, we'll use the naive round-robin strategy that is
-		// completely locality-ignorant.
-		hasLocalitySet = false
-		// Randomize the order in which we choose instances so that work is
-		// allocated fairly across queries.
-		rng.Shuffle(len(instances), func(i, j int) {
-			instances[i], instances[j] = instances[j], instances[i]
-		})
-		var i int
-		resolver = func(roachpb.NodeID) base.SQLInstanceID {
-			id := instances[i%len(instances)].InstanceID
-			i++
-			return id
+		return resolver, instances, nil
+	}
+
+	// If no sql instances have locality information, fallback to a naive
+	// round-robin strategy that is completely locality-ignorant. Randomize the
+	// order in which we choose instances so that work is allocated fairly across
+	// queries.
+	rng.Shuffle(len(instances), func(i, j int) {
+		instances[i], instances[j] = instances[j], instances[i]
+	})
+	var i int
+	resolver := func(roachpb.NodeID) base.SQLInstanceID {
+		id := instances[i%len(instances)].InstanceID
+		i++
+		return id
+	}
+	return resolver, nil, nil
+}
+
+// closestInstances returns the subset of instances which are closest to the
+// passed locality, i.e. those which jointly have the longest shared prefix of
+// at least length 1. Returns nil, rather than the entire input, if no instances
+// have *any* shared locality prefix.
+func closestInstances(
+	instances []sqlinstance.InstanceInfo, loc roachpb.Locality,
+) []base.SQLInstanceID {
+	best := 1
+	var res []base.SQLInstanceID
+	for _, i := range instances {
+		if l := i.Locality.SharedPrefix(loc); l > best {
+			best = l
+			res = append(res[:0], i.InstanceID)
+		} else if l == best {
+			res = append(res, i.InstanceID)
 		}
 	}
-	return resolver, instances, hasLocalitySet, nil
+	return res
 }
 
 // maybeReassignToGatewaySQLInstance checks whether the span partitioning is
@@ -1397,7 +1518,7 @@ func (dsp *DistSQLPlanner) makeSQLInstanceIDForKVNodeIDTenantResolver(
 // the locality information isn't available for the instances, then we assume
 // the assigned instance to be in the same region as the gateway.
 func (dsp *DistSQLPlanner) maybeReassignToGatewaySQLInstance(
-	partitions []SpanPartition, instances []sqlinstance.InstanceInfo, hasLocalitySet bool,
+	partitions []SpanPartition, instances []sqlinstance.InstanceInfo,
 ) error {
 	if len(partitions) != 1 || partitions[0].SQLInstanceID == dsp.gatewaySQLInstanceID {
 		// Keep the existing partitioning if more than one instance is used or
@@ -1405,7 +1526,7 @@ func (dsp *DistSQLPlanner) maybeReassignToGatewaySQLInstance(
 		return nil
 	}
 	var gatewayRegion, assignedRegion string
-	if hasLocalitySet {
+	if len(instances) > 0 {
 		assignedInstance := partitions[0].SQLInstanceID
 		var ok bool
 		for _, instance := range instances {
@@ -1432,6 +1553,7 @@ func (dsp *DistSQLPlanner) maybeReassignToGatewaySQLInstance(
 			}
 		}
 	}
+
 	if gatewayRegion == assignedRegion {
 		partitions[0].SQLInstanceID = dsp.gatewaySQLInstanceID
 	}
@@ -1464,14 +1586,19 @@ func (dsp *DistSQLPlanner) getInstanceIDForScan(
 		return 0, err
 	}
 
-	if dsp.codec.ForSystemTenant() {
-		return dsp.getSQLInstanceIDForKVNodeIDSystem(ctx, planCtx, replDesc.NodeID), nil
+	if dsp.useGossipPlanning(ctx, planCtx) && planCtx.localityFilter.Empty() {
+		return dsp.deprecatedSQLInstanceIDForKVNodeIDSystem(ctx, planCtx, replDesc.NodeID), nil
 	}
-	resolver, _, _, err := dsp.makeSQLInstanceIDForKVNodeIDTenantResolver(ctx)
+	resolver, _, err := dsp.makeInstanceResolver(ctx, planCtx.localityFilter)
 	if err != nil {
 		return 0, err
 	}
 	return resolver(replDesc.NodeID), nil
+}
+
+func (dsp *DistSQLPlanner) useGossipPlanning(ctx context.Context, planCtx *PlanningCtx) bool {
+	// TODO(dt): enable this by default, e.g. // && !dsp.distSQLSrv.Settings.Version.IsActive(ctx, clusterversion.V23_1)
+	return dsp.codec.ForSystemTenant() && planCtx.localityFilter.Empty()
 }
 
 // convertOrdering maps the columns in props.ordering to the output columns of a
@@ -1705,9 +1832,10 @@ func (dsp *DistSQLPlanner) planTableReaders(
 	ctx context.Context, planCtx *PlanningCtx, p *PhysicalPlan, info *tableReaderPlanningInfo,
 ) error {
 	var (
-		spanPartitions   []SpanPartition
-		parallelizeLocal bool
-		err              error
+		spanPartitions         []SpanPartition
+		parallelizeLocal       bool
+		ignoreMisplannedRanges bool
+		err                    error
 	)
 	if planCtx.isLocal {
 		spanPartitions, parallelizeLocal = dsp.maybeParallelizeLocalScans(ctx, planCtx, info)
@@ -1729,6 +1857,10 @@ func (dsp *DistSQLPlanner) planTableReaders(
 			return err
 		}
 		spanPartitions = []SpanPartition{{sqlInstanceID, info.spans}}
+		// The spans to scan might actually live on different nodes, so we don't
+		// want to create "misplanned ranges" metadata since it can result in
+		// false positives.
+		ignoreMisplannedRanges = true
 	}
 
 	corePlacement := make([]physicalplan.ProcessorCorePlacement, len(spanPartitions))
@@ -1752,6 +1884,7 @@ func (dsp *DistSQLPlanner) planTableReaders(
 		if !tr.Parallelize {
 			tr.BatchBytesLimit = dsp.distSQLSrv.TestingKnobs.TableReaderBatchBytesLimit
 		}
+		tr.IgnoreMisplannedRanges = ignoreMisplannedRanges
 		p.TotalEstimatedScannedRows += info.estimatedRowCount
 
 		corePlacement[i].SQLInstanceID = sp.SQLInstanceID
@@ -1773,7 +1906,7 @@ func (dsp *DistSQLPlanner) planTableReaders(
 	if parallelizeLocal {
 		// If we planned multiple table readers, we need to merge the streams
 		// into one.
-		p.AddSingleGroupStage(dsp.gatewaySQLInstanceID, execinfrapb.ProcessorCoreUnion{Noop: &execinfrapb.NoopCoreSpec{}}, execinfrapb.PostProcessSpec{}, p.GetResultTypes())
+		p.AddSingleGroupStage(ctx, dsp.gatewaySQLInstanceID, execinfrapb.ProcessorCoreUnion{Noop: &execinfrapb.NoopCoreSpec{}}, execinfrapb.PostProcessSpec{}, p.GetResultTypes())
 	}
 
 	return nil
@@ -1783,7 +1916,7 @@ func (dsp *DistSQLPlanner) planTableReaders(
 // corresponding to the render node. An evaluator stage is added if the render
 // node has any expressions which are not just simple column references.
 func (dsp *DistSQLPlanner) createPlanForRender(
-	p *PhysicalPlan, n *renderNode, planCtx *PlanningCtx,
+	ctx context.Context, p *PhysicalPlan, n *renderNode, planCtx *PlanningCtx,
 ) error {
 	typs, err := getTypesForPlanResult(n, nil /* planToStreamColMap */)
 	if err != nil {
@@ -1798,15 +1931,15 @@ func (dsp *DistSQLPlanner) createPlanForRender(
 		// plan.
 		deferSerialization := len(p.MergeOrdering.Columns) == 0
 		if deferSerialization {
-			defer p.EnsureSingleStreamOnGateway()
+			defer p.EnsureSingleStreamOnGateway(ctx)
 		} else {
-			p.EnsureSingleStreamOnGateway()
+			p.EnsureSingleStreamOnGateway(ctx)
 		}
 	}
 	newColMap := identityMap(p.PlanToStreamColMap, len(n.render))
 	newMergeOrdering := dsp.convertOrdering(n.reqOrdering, newColMap)
 	err = p.AddRendering(
-		n.render, planCtx, p.PlanToStreamColMap, typs, newMergeOrdering,
+		ctx, n.render, planCtx, p.PlanToStreamColMap, typs, newMergeOrdering,
 	)
 	if err != nil {
 		return err
@@ -1819,7 +1952,11 @@ func (dsp *DistSQLPlanner) createPlanForRender(
 // accordingly. When alreadyOrderedPrefix is non-zero, the input is already
 // ordered on the prefix ordering[:alreadyOrderedPrefix].
 func (dsp *DistSQLPlanner) addSorters(
-	p *PhysicalPlan, ordering colinfo.ColumnOrdering, alreadyOrderedPrefix int, limit int64,
+	ctx context.Context,
+	p *PhysicalPlan,
+	ordering colinfo.ColumnOrdering,
+	alreadyOrderedPrefix int,
+	limit int64,
 ) {
 	// Sorting is needed; we add a stage of sorting processors.
 	outputOrdering := execinfrapb.ConvertToMappedSpecOrdering(ordering, p.PlanToStreamColMap)
@@ -1844,6 +1981,7 @@ func (dsp *DistSQLPlanner) addSorters(
 			Limit: uint64(limit),
 		}
 		p.AddSingleGroupStage(
+			ctx,
 			p.GatewaySQLInstanceID,
 			execinfrapb.ProcessorCoreUnion{Noop: &execinfrapb.NoopCoreSpec{}},
 			post,
@@ -1869,7 +2007,7 @@ type aggregatorPlanningInfo struct {
 // addAggregators adds aggregators corresponding to a groupNode and updates the plan to
 // reflect the groupNode.
 func (dsp *DistSQLPlanner) addAggregators(
-	planCtx *PlanningCtx, p *PhysicalPlan, n *groupNode,
+	ctx context.Context, planCtx *PlanningCtx, p *PhysicalPlan, n *groupNode,
 ) error {
 	aggregations := make([]execinfrapb.AggregatorSpec_Aggregation, len(n.funcs))
 	argumentsColumnTypes := make([][]*types.T, len(n.funcs))
@@ -1891,7 +2029,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 		argumentsColumnTypes[i] = make([]*types.T, len(fholder.arguments))
 		for j, argument := range fholder.arguments {
 			var err error
-			aggregations[i].Arguments[j], err = physicalplan.MakeExpression(argument, planCtx, nil)
+			aggregations[i].Arguments[j], err = physicalplan.MakeExpression(ctx, argument, planCtx, nil)
 			if err != nil {
 				return err
 			}
@@ -1899,7 +2037,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 		}
 	}
 
-	return dsp.planAggregators(planCtx, p, &aggregatorPlanningInfo{
+	return dsp.planAggregators(ctx, planCtx, p, &aggregatorPlanningInfo{
 		aggregations:         aggregations,
 		argumentsColumnTypes: argumentsColumnTypes,
 		isScalar:             n.isScalar,
@@ -1928,7 +2066,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 //     All other expressions simply pass through unchanged, for e.g. '1' in
 //     'SELECT 1 GROUP BY k'.
 func (dsp *DistSQLPlanner) planAggregators(
-	planCtx *PlanningCtx, p *PhysicalPlan, info *aggregatorPlanningInfo,
+	ctx context.Context, planCtx *PlanningCtx, p *PhysicalPlan, info *aggregatorPlanningInfo,
 ) error {
 	aggType := execinfrapb.AggregatorSpec_NON_SCALAR
 	if info.isScalar {
@@ -1942,10 +2080,90 @@ func (dsp *DistSQLPlanner) planAggregators(
 		groupCols[i] = uint32(p.PlanToStreamColMap[idx])
 	}
 	orderedGroupCols := make([]uint32, len(info.groupColOrdering))
-	var orderedGroupColSet util.FastIntSet
+	var orderedGroupColSet intsets.Fast
 	for i, c := range info.groupColOrdering {
 		orderedGroupCols[i] = uint32(p.PlanToStreamColMap[c.ColIdx])
 		orderedGroupColSet.Add(c.ColIdx)
+	}
+
+	// planHashGroupJoin tracks whether we should plan a hash group-join for the
+	// first stage of aggregators (either local if multi-stage or final if
+	// single-stage), which is the case when
+	//   1. the corresponding session variable is enabled
+	//   2. the input stage are hash joiners
+	//      2.1. there is no ON expression
+	//      2.2. the PostProcessSpec can only be a pass-through or a simple
+	//           projection (i.e. no rendering, limits, nor offsets)
+	//      2.3. only inner and outer joins are supported at the moment
+	//   3. the join's equality columns are exactly the same as the
+	//      aggregation's grouping columns
+	//      3.1. the join's equality columns must be non-empty
+	//   4. the first stage we're planning are hash aggregators
+	//   5. the distribution of the joiners and the first stage of aggregators
+	//      is the same (i.e. both either local or distributed).
+	//      TODO(yuzefovich): we could consider lifting the condition 5. by
+	//      changing the distribution of the hash joiner stager.
+	planHashGroupJoin := planCtx.ExtendedEvalCtx.SessionData().ExperimentalHashGroupJoinEnabled
+	if planHashGroupJoin { // condition 1.
+		planHashGroupJoin = func() bool {
+			prevStageProc := p.Processors[p.ResultRouters[0]].Spec
+			hjSpec := prevStageProc.Core.HashJoiner
+			if hjSpec == nil {
+				return false // condition 2.
+			}
+			if !hjSpec.OnExpr.Empty() {
+				return false // condition 2.1.
+			}
+			pps := prevStageProc.Post
+			if pps.RenderExprs != nil || pps.Limit != 0 || pps.Offset != 0 {
+				return false // condition 2.2.
+			}
+			switch hjSpec.Type {
+			case descpb.InnerJoin, descpb.LeftOuterJoin, descpb.RightOuterJoin, descpb.FullOuterJoin:
+			default:
+				return false // condition 2.3.
+			}
+			if len(hjSpec.LeftEqColumns) != len(groupCols) {
+				return false // condition 3.
+			}
+			if len(hjSpec.LeftEqColumns) == 0 {
+				return false // condition 3.1.
+			}
+			if len(groupCols) == len(orderedGroupCols) {
+				// We will plan streaming aggregation. We shouldn't really ever
+				// get here since the hash join doesn't provide any ordering,
+				// but we want to be safe.
+				return false // condition 4.
+			}
+			// Join's equality columns refer to columns from the join's inputs
+			// whereas the grouping columns refer to the join's output columns.
+			// Thus, we need to translate one or the other to the common
+			// denominator, and we choose to map the grouping columns to the
+			// ordinals of the join's inputs.
+			//
+			// If we define `m` and `n` as the number of columns from the
+			// left and right inputs of the join, respectively, then columns
+			// 0, 1, ..., m-1 refer to the corresponding "left" columns whereas
+			// m, m+1, ..., m+n-1 refer to the "right" ones.
+			var joinEqCols intsets.Fast
+			m := len(prevStageProc.Input[0].ColumnTypes)
+			for _, leftEqCol := range hjSpec.LeftEqColumns {
+				joinEqCols.Add(int(leftEqCol))
+			}
+			for _, rightEqCol := range hjSpec.RightEqColumns {
+				joinEqCols.Add(m + int(rightEqCol))
+			}
+			for _, groupCol := range groupCols {
+				mappedCol := groupCol
+				if pps.OutputColumns != nil {
+					mappedCol = pps.OutputColumns[groupCol]
+				}
+				if !joinEqCols.Contains(int(mappedCol)) {
+					return false // condition 3.
+				}
+			}
+			return true
+		}()
 	}
 
 	// We can have a local stage of distinct processors if all aggregation
@@ -1958,7 +2176,7 @@ func (dsp *DistSQLPlanner) planAggregators(
 		}
 	}
 	if allDistinct {
-		var distinctColumnsSet util.FastIntSet
+		var distinctColumnsSet intsets.Fast
 		for _, e := range info.aggregations {
 			for _, colIdx := range e.ColIdx {
 				distinctColumnsSet.Add(int(colIdx))
@@ -1994,6 +2212,12 @@ func (dsp *DistSQLPlanner) planAggregators(
 			// Add distinct processors local to each existing current result
 			// processor.
 			p.AddNoGroupingStage(distinctSpec, execinfrapb.PostProcessSpec{}, inputTypes, p.MergeOrdering)
+
+			// The condition 4. above is not satisfied since we've just added
+			// a distinct stage before the first aggregation one.
+			// TODO(yuzefovich): re-evaluate whether it is worth skipping this
+			// local distinct stage in favor of getting hash group-join planned.
+			planHashGroupJoin = false
 		}
 	}
 
@@ -2025,6 +2249,11 @@ func (dsp *DistSQLPlanner) planAggregators(
 				multiStage = false
 				break
 			}
+		}
+		if !multiStage {
+			// The joiners are distributed whereas the aggregation cannot be
+			// distributed which fails condition 5.
+			planHashGroupJoin = false
 		}
 	}
 
@@ -2266,12 +2495,31 @@ func (dsp *DistSQLPlanner) planAggregators(
 			OutputOrdering:   execinfrapb.Ordering{Columns: ordCols},
 		}
 
-		p.AddNoGroupingStage(
-			execinfrapb.ProcessorCoreUnion{Aggregator: &localAggsSpec},
-			execinfrapb.PostProcessSpec{},
-			intermediateTypes,
-			execinfrapb.Ordering{Columns: ordCols},
-		)
+		if planHashGroupJoin {
+			prevStageProc := p.Processors[p.ResultRouters[0]].Spec
+			hjSpec := prevStageProc.Core.HashJoiner
+			pps := prevStageProc.Post
+			hgjSpec := execinfrapb.HashGroupJoinerSpec{
+				HashJoinerSpec:    *hjSpec,
+				JoinOutputColumns: pps.OutputColumns,
+				AggregatorSpec:    localAggsSpec,
+			}
+			p.ReplaceLastStage(
+				execinfrapb.ProcessorCoreUnion{HashGroupJoiner: &hgjSpec},
+				execinfrapb.PostProcessSpec{},
+				intermediateTypes,
+				execinfrapb.Ordering{Columns: ordCols},
+			)
+			// Let the final aggregation be planned as normal.
+			planHashGroupJoin = false
+		} else {
+			p.AddNoGroupingStage(
+				execinfrapb.ProcessorCoreUnion{Aggregator: &localAggsSpec},
+				execinfrapb.PostProcessSpec{},
+				intermediateTypes,
+				execinfrapb.Ordering{Columns: ordCols},
+			)
+		}
 
 		finalAggsSpec = execinfrapb.AggregatorSpec{
 			Type:             aggType,
@@ -2301,7 +2549,8 @@ func (dsp *DistSQLPlanner) planAggregators(
 					mappedIdx := int(finalIdxMap[finalIdx])
 					var err error
 					renderExprs[i], err = physicalplan.MakeExpression(
-						h.IndexedVar(mappedIdx), planCtx, nil /* indexVarMap */)
+						ctx, h.IndexedVar(mappedIdx), planCtx, nil, /* indexVarMap */
+					)
 					if err != nil {
 						return err
 					}
@@ -2321,8 +2570,8 @@ func (dsp *DistSQLPlanner) planAggregators(
 						return err
 					}
 					renderExprs[i], err = physicalplan.MakeExpression(
-						expr, planCtx,
-						nil /* indexVarMap */)
+						ctx, expr, planCtx, nil, /* indexVarMap */
+					)
 					if err != nil {
 						return err
 					}
@@ -2359,7 +2608,22 @@ func (dsp *DistSQLPlanner) planAggregators(
 	// has been programmed to produce the same columns as the groupNode.
 	p.PlanToStreamColMap = identityMap(p.PlanToStreamColMap, len(info.aggregations))
 
-	if len(finalAggsSpec.GroupCols) == 0 || len(p.ResultRouters) == 1 {
+	if planHashGroupJoin {
+		prevStageProc := p.Processors[p.ResultRouters[0]].Spec
+		hjSpec := prevStageProc.Core.HashJoiner
+		pps := prevStageProc.Post
+		hgjSpec := execinfrapb.HashGroupJoinerSpec{
+			HashJoinerSpec:    *hjSpec,
+			JoinOutputColumns: pps.OutputColumns,
+			AggregatorSpec:    finalAggsSpec,
+		}
+		p.ReplaceLastStage(
+			execinfrapb.ProcessorCoreUnion{HashGroupJoiner: &hgjSpec},
+			execinfrapb.PostProcessSpec{},
+			finalOutTypes,
+			dsp.convertOrdering(info.reqOrdering, p.PlanToStreamColMap),
+		)
+	} else if len(finalAggsSpec.GroupCols) == 0 || len(p.ResultRouters) == 1 {
 		// No GROUP BY, or we have a single stream. Use a single final aggregator.
 		// If the previous stage was all on a single node, put the final
 		// aggregator there. Otherwise, bring the results back on this node.
@@ -2368,6 +2632,7 @@ func (dsp *DistSQLPlanner) planAggregators(
 			node = prevStageNode
 		}
 		p.AddSingleGroupStage(
+			ctx,
 			node,
 			execinfrapb.ProcessorCoreUnion{Aggregator: &finalAggsSpec},
 			finalAggsPost,
@@ -2416,7 +2681,9 @@ func (dsp *DistSQLPlanner) planAggregators(
 		// Connect the streams.
 		for bucket := 0; bucket < len(p.ResultRouters); bucket++ {
 			pIdx := pIdxStart + physicalplan.ProcessorIdx(bucket)
-			p.MergeResultStreams(p.ResultRouters, bucket, p.MergeOrdering, pIdx, 0, false /* forceSerialization */)
+			p.MergeResultStreams(ctx, p.ResultRouters, bucket, p.MergeOrdering, pIdx, 0, false, /* forceSerialization */
+				physicalplan.SerialStreamErrorSpec{},
+			)
 		}
 
 		// Set the new result routers.
@@ -2467,7 +2734,7 @@ func (dsp *DistSQLPlanner) createPlanForIndexJoin(
 	}
 
 	fetchColIDs := make([]descpb.ColumnID, len(n.cols))
-	var fetchOrdinals util.FastIntSet
+	var fetchOrdinals intsets.Fast
 	for i := range n.cols {
 		fetchColIDs[i] = n.cols[i].GetID()
 		fetchOrdinals.Add(n.cols[i].Ordinal())
@@ -2503,6 +2770,7 @@ func (dsp *DistSQLPlanner) createPlanForIndexJoin(
 	} else {
 		// We have a single stream, so use a single join reader on that node.
 		plan.AddSingleGroupStage(
+			ctx,
 			plan.Processors[plan.ResultRouters[0]].SQLInstanceID,
 			execinfrapb.ProcessorCoreUnion{JoinReader: &joinReaderSpec},
 			execinfrapb.PostProcessSpec{},
@@ -2523,17 +2791,14 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 
 	// If any of the ordering columns originate from the lookup table, this is a
 	// case where we are ordering on a prefix of input columns followed by the
-	// lookup columns. We need to maintain the index ordering on each lookup.
+	// lookup columns.
 	var maintainLookupOrdering bool
 	numInputCols := len(plan.GetResultTypes())
 	for i := range n.reqOrdering {
 		if n.reqOrdering[i].ColIdx >= numInputCols {
+			// We need to maintain the index ordering on each lookup.
 			maintainLookupOrdering = true
-			if n.reqOrdering[i].Direction == encoding.Descending {
-				// Validate that an ordering on lookup columns does not contain
-				// descending columns.
-				panic(errors.AssertionFailedf("ordering on a lookup index with descending columns"))
-			}
+			break
 		}
 	}
 
@@ -2550,10 +2815,11 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 		OutputGroupContinuationForLeftRow: n.isFirstJoinInPairedJoiner,
 		LookupBatchBytesLimit:             dsp.distSQLSrv.TestingKnobs.JoinReaderBatchBytesLimit,
 		LimitHint:                         n.limitHint,
+		RemoteOnlyLookups:                 n.remoteOnlyLookups,
 	}
 
 	fetchColIDs := make([]descpb.ColumnID, len(n.table.cols))
-	var fetchOrdinals util.FastIntSet
+	var fetchOrdinals intsets.Fast
 	for i := range n.table.cols {
 		fetchColIDs[i] = n.table.cols[i].GetID()
 		fetchOrdinals.Add(n.table.cols[i].Ordinal())
@@ -2614,7 +2880,7 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 	if n.lookupExpr != nil {
 		var err error
 		joinReaderSpec.LookupExpr, err = physicalplan.MakeExpression(
-			n.lookupExpr, planCtx, nil, /* indexVarMap */
+			ctx, n.lookupExpr, planCtx, nil, /* indexVarMap */
 		)
 		if err != nil {
 			return nil, err
@@ -2626,7 +2892,7 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 		}
 		var err error
 		joinReaderSpec.RemoteLookupExpr, err = physicalplan.MakeExpression(
-			n.remoteLookupExpr, planCtx, nil, /* indexVarMap */
+			ctx, n.remoteLookupExpr, planCtx, nil, /* indexVarMap */
 		)
 		if err != nil {
 			return nil, err
@@ -2637,7 +2903,7 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 	if n.onCond != nil {
 		var err error
 		joinReaderSpec.OnExpr, err = physicalplan.MakeExpression(
-			n.onCond, planCtx, nil, /* indexVarMap */
+			ctx, n.onCond, planCtx, nil, /* indexVarMap */
 		)
 		if err != nil {
 			return nil, err
@@ -2688,7 +2954,7 @@ func (dsp *DistSQLPlanner) createPlanForInvertedJoin(
 		return nil, err
 	}
 
-	invCol, err := n.table.desc.FindColumnWithID(n.table.index.InvertedColumnID())
+	invCol, err := catalog.MustFindColumnByID(n.table.desc, n.table.index.InvertedColumnID())
 	if err != nil {
 		return nil, err
 	}
@@ -2703,14 +2969,14 @@ func (dsp *DistSQLPlanner) createPlanForInvertedJoin(
 	}
 
 	if invertedJoinerSpec.InvertedExpr, err = physicalplan.MakeExpression(
-		n.invertedExpr, planCtx, nil, /* indexVarMap */
+		ctx, n.invertedExpr, planCtx, nil, /* indexVarMap */
 	); err != nil {
 		return nil, err
 	}
 	// Set the ON condition.
 	if n.onExpr != nil {
 		if invertedJoinerSpec.OnExpr, err = physicalplan.MakeExpression(
-			n.onExpr, planCtx, nil, /* indexVarMap */
+			ctx, n.onExpr, planCtx, nil, /* indexVarMap */
 		); err != nil {
 			return nil, err
 		}
@@ -2747,7 +3013,7 @@ func (dsp *DistSQLPlanner) createPlanForInvertedJoin(
 
 // createPlanForZigzagJoin creates a distributed plan for a zigzagJoinNode.
 func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
-	planCtx *PlanningCtx, n *zigzagJoinNode,
+	ctx context.Context, planCtx *PlanningCtx, n *zigzagJoinNode,
 ) (plan *PhysicalPlan, err error) {
 
 	sides := make([]zigzagPlanningSide, len(n.sides))
@@ -2755,7 +3021,7 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 	for i, side := range n.sides {
 		// The fixed values are represented as a Values node with one tuple.
 		typs := getTypesFromResultColumns(side.fixedVals.columns)
-		valuesSpec, err := dsp.createValuesSpecFromTuples(planCtx, side.fixedVals.tuples, typs)
+		valuesSpec, err := dsp.createValuesSpecFromTuples(ctx, planCtx, side.fixedVals.tuples, typs)
 		if err != nil {
 			return nil, err
 		}
@@ -2771,7 +3037,7 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 		}
 	}
 
-	return dsp.planZigzagJoin(planCtx, zigzagPlanningInfo{
+	return dsp.planZigzagJoin(ctx, planCtx, zigzagPlanningInfo{
 		sides:       sides,
 		columns:     n.columns,
 		onCond:      n.onCond,
@@ -2797,7 +3063,7 @@ type zigzagPlanningInfo struct {
 }
 
 func (dsp *DistSQLPlanner) planZigzagJoin(
-	planCtx *PlanningCtx, pi zigzagPlanningInfo,
+	ctx context.Context, planCtx *PlanningCtx, pi zigzagPlanningInfo,
 ) (plan *PhysicalPlan, err error) {
 
 	plan = planCtx.NewPhysicalPlan()
@@ -2836,7 +3102,7 @@ func (dsp *DistSQLPlanner) planZigzagJoin(
 	// Set the ON condition.
 	if pi.onCond != nil {
 		zigzagJoinerSpec.OnExpr, err = physicalplan.MakeExpression(
-			pi.onCond, planCtx, nil, /* indexVarMap */
+			ctx, pi.onCond, planCtx, nil, /* indexVarMap */
 		)
 		if err != nil {
 			return nil, err
@@ -2882,7 +3148,8 @@ func (dsp *DistSQLPlanner) createPlanForInvertedFilter(
 			Type: n.preFiltererType,
 		}
 		if invertedFiltererSpec.PreFiltererSpec.Expression, err = physicalplan.MakeExpression(
-			n.preFiltererExpr, planCtx, nil); err != nil {
+			ctx, n.preFiltererExpr, planCtx, nil,
+		); err != nil {
 			return nil, err
 		}
 	}
@@ -2899,7 +3166,7 @@ func (dsp *DistSQLPlanner) createPlanForInvertedFilter(
 	if len(plan.ResultRouters) == 1 {
 		// Last stage is a single processor.
 		lastSQLInstanceID := plan.Processors[plan.ResultRouters[0]].SQLInstanceID
-		plan.AddSingleGroupStage(lastSQLInstanceID,
+		plan.AddSingleGroupStage(ctx, lastSQLInstanceID,
 			execinfrapb.ProcessorCoreUnion{
 				InvertedFilterer: invertedFiltererSpec,
 			},
@@ -2928,6 +3195,7 @@ func (dsp *DistSQLPlanner) createPlanForInvertedFilter(
 		distinctColumns = append(distinctColumns, uint32(i))
 	}
 	plan.AddSingleGroupStage(
+		ctx,
 		dsp.gatewaySQLInstanceID,
 		execinfrapb.ProcessorCoreUnion{
 			Distinct: dsp.createDistinctSpec(
@@ -2997,7 +3265,7 @@ func (dsp *DistSQLPlanner) createPlanForJoin(
 		rightPlanToStreamColMap: rightMap,
 	}
 	post, joinToStreamColMap := helper.joinOutColumns(n.pred.joinType, n.columns)
-	onExpr, err := helper.remapOnExpr(planCtx, n.pred.onCond)
+	onExpr, err := helper.remapOnExpr(ctx, planCtx, n.pred.onCond)
 	if err != nil {
 		return nil, err
 	}
@@ -3035,11 +3303,11 @@ func (dsp *DistSQLPlanner) createPlanForJoin(
 		leftPlanDistribution:  leftPlan.GetLastStageDistribution(),
 		rightPlanDistribution: rightPlan.GetLastStageDistribution(),
 	}
-	return dsp.planJoiners(planCtx, &info, n.reqOrdering), nil
+	return dsp.planJoiners(ctx, planCtx, &info, n.reqOrdering), nil
 }
 
 func (dsp *DistSQLPlanner) planJoiners(
-	planCtx *PlanningCtx, info *joinPlanningInfo, reqOrdering ReqOrdering,
+	ctx context.Context, planCtx *PlanningCtx, info *joinPlanningInfo, reqOrdering ReqOrdering,
 ) *PhysicalPlan {
 	// Outline of the planning process for joins when given PhysicalPlans for
 	// the left and right side (with each plan having a set of output routers
@@ -3086,7 +3354,7 @@ func (dsp *DistSQLPlanner) planJoiners(
 	}
 
 	p.AddJoinStage(
-		sqlInstances, info.makeCoreSpec(), info.post,
+		ctx, sqlInstances, info.makeCoreSpec(), info.post,
 		info.leftEqCols, info.rightEqCols,
 		info.leftPlan.GetResultTypes(), info.rightPlan.GetResultTypes(),
 		info.leftMergeOrd, info.rightMergeOrd,
@@ -3106,10 +3374,9 @@ func (dsp *DistSQLPlanner) planJoiners(
 func (dsp *DistSQLPlanner) createPhysPlan(
 	ctx context.Context, planCtx *PlanningCtx, plan planMaybePhysical,
 ) (physPlan *PhysicalPlan, cleanup func(), err error) {
-	log.Info(ctx,"createPhysPlan")
 	if plan.isPhysicalPlan() {
-		// TODO(yuzefovich): figure out how to propagate
-		// planCtx.getCleanupFunc() from the experimental DistSQL spec factory.
+		// Note that planCtx.getCleanupFunc() is already set in
+		// plan.physPlan.onClose, so here we return a noop cleanup function.
 		return plan.physPlan.PhysicalPlan, func() {}, nil
 	}
 	physPlan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, plan.planNode)
@@ -3120,11 +3387,10 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 	ctx context.Context, planCtx *PlanningCtx, node planNode,
 ) (plan *PhysicalPlan, err error) {
 	planCtx.planDepth++
-	log.Infof(ctx, "planDepth %v", planCtx.CountofPL)
+
 	switch n := node.(type) {
 	// Keep these cases alphabetized, please!
 	case *createStatsNode:
-		log.Info(ctx, "createStatsNode")
 		if n.runAsJob {
 			plan, err = dsp.wrapPlan(ctx, planCtx, n, false /* allowPartialDistribution */)
 		} else {
@@ -3139,103 +3405,116 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 
 	case *distinctNode:
-		log.Info(ctx, "distinctNode")
 		plan, err = dsp.createPlanForDistinct(ctx, planCtx, n)
 
 	case *exportNode:
-		log.Info(ctx, "exportNode")
 		plan, err = dsp.createPlanForExport(ctx, planCtx, n)
 
 	case *filterNode:
-		log.Info(ctx, "filterNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source.plan)
 		if err != nil {
 			return nil, err
 		}
 
-		if err := plan.AddFilter(n.filter, planCtx, plan.PlanToStreamColMap); err != nil {
+		if err := plan.AddFilter(ctx, n.filter, planCtx, plan.PlanToStreamColMap); err != nil {
 			return nil, err
 		}
 
 	case *groupNode:
-		log.Info(ctx, "groupNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
 		if err != nil {
 			return nil, err
 		}
 
-		if err := dsp.addAggregators(planCtx, plan, n); err != nil {
+		if err := dsp.addAggregators(ctx, planCtx, plan, n); err != nil {
 			return nil, err
 		}
 
 	case *indexJoinNode:
-		log.Info(ctx, "indexJoinNode")
 		plan, err = dsp.createPlanForIndexJoin(ctx, planCtx, n)
 
+	case *insertNode:
+		if planCtx.isVectorInsert {
+			plan, err = dsp.createPlanForInsert(ctx, planCtx, n)
+		} else {
+			plan, err = dsp.wrapPlan(ctx, planCtx, n, false /* allowPartialDistribution */)
+		}
+
 	case *invertedFilterNode:
-		log.Info(ctx, "invertedFilterNode")
 		plan, err = dsp.createPlanForInvertedFilter(ctx, planCtx, n)
 
 	case *invertedJoinNode:
-		log.Info(ctx, "invertedJoinNode")
 		plan, err = dsp.createPlanForInvertedJoin(ctx, planCtx, n)
 
 	case *joinNode:
-		log.Info(ctx, "joinNode")
 		plan, err = dsp.createPlanForJoin(ctx, planCtx, n)
 
 	case *limitNode:
-		log.Info(ctx, "limitNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
 		if err != nil {
 			return nil, err
 		}
 		var count, offset int64
-		if count, offset, err = evalLimit(planCtx.EvalContext(), n.countExpr, n.offsetExpr); err != nil {
+		if count, offset, err = evalLimit(ctx, planCtx.EvalContext(), n.countExpr, n.offsetExpr); err != nil {
 			return nil, err
 		}
-		if err := plan.AddLimit(count, offset, planCtx); err != nil {
+		if err := plan.AddLimit(ctx, count, offset, planCtx); err != nil {
 			return nil, err
 		}
 
 	case *lookupJoinNode:
-		log.Info(ctx, "lookupJoinNode")
 		plan, err = dsp.createPlanForLookupJoin(ctx, planCtx, n)
 
 	case *ordinalityNode:
-		log.Info(ctx, "ordinalityNode")
 		plan, err = dsp.createPlanForOrdinality(ctx, planCtx, n)
 
 	case *projectSetNode:
-		log.Info(ctx, "projectSetNode")
 		plan, err = dsp.createPlanForProjectSet(ctx, planCtx, n)
 
 	case *renderNode:
-		log.Info(ctx, "renderNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source.plan)
 		if err != nil {
 			return nil, err
 		}
-		err = dsp.createPlanForRender(plan, n, planCtx)
+		err = dsp.createPlanForRender(ctx, plan, n, planCtx)
 		if err != nil {
 			return nil, err
 		}
 
+	case *rowCountNode:
+		if in, ok := n.source.(*insertNode); ok {
+			var valNode planNode
+			// We support two cases, a render around a values and a straight values.
+			if r, ok := in.source.(*renderNode); ok {
+				valNode = r.source.plan
+			} else {
+				valNode = in.source
+			}
+			if v, ok := valNode.(*valuesNode); ok {
+				if v.coldataBatch != nil {
+					planCtx.isVectorInsert = true
+				}
+			}
+		}
+
+		if planCtx.isVectorInsert {
+			plan, err = dsp.createPlanForRowCount(ctx, planCtx, n)
+		} else {
+			plan, err = dsp.wrapPlan(ctx, planCtx, n, false /* allowPartialDistribution */)
+		}
+
 	case *scanNode:
-		log.Info(ctx, "scanNode")
 		plan, err = dsp.createTableReaders(ctx, planCtx, n)
 
 	case *sortNode:
-		log.Info(ctx, "sortNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
 		if err != nil {
 			return nil, err
 		}
 
-		dsp.addSorters(plan, n.ordering, n.alreadyOrderedPrefix, 0 /* limit */)
+		dsp.addSorters(ctx, plan, n.ordering, n.alreadyOrderedPrefix, 0 /* limit */)
 
 	case *topKNode:
-		log.Info(ctx, "topKNode")
 		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
 		if err != nil {
 			return nil, err
@@ -3244,44 +3523,44 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		if n.k <= 0 {
 			return nil, errors.New("negative or zero value for LIMIT")
 		}
-		dsp.addSorters(plan, n.ordering, n.alreadyOrderedPrefix, n.k)
+		dsp.addSorters(ctx, plan, n.ordering, n.alreadyOrderedPrefix, n.k)
 
 	case *unaryNode:
-		log.Info(ctx, "unaryNode")
 		plan, err = dsp.createPlanForUnary(planCtx, n)
 
 	case *unionNode:
-		log.Info(ctx, "unionNode")
 		plan, err = dsp.createPlanForSetOp(ctx, planCtx, n)
 
 	case *valuesNode:
-		log.Info(ctx, "valuesNode")
 		if mustWrapValuesNode(planCtx, n.specifiedInQuery) {
 			plan, err = dsp.wrapPlan(ctx, planCtx, n, false /* allowPartialDistribution */)
 		} else {
 			colTypes := getTypesFromResultColumns(n.columns)
 			var spec *execinfrapb.ValuesCoreSpec
-			spec, err = dsp.createValuesSpecFromTuples(planCtx, n.tuples, colTypes)
+			spec, err = dsp.createValuesSpecFromTuples(ctx, planCtx, n.tuples, colTypes)
 			if err != nil {
 				return nil, err
 			}
-			plan, err = dsp.createValuesPlan(planCtx, spec, colTypes)
+			var idx physicalplan.ProcessorIdx
+			plan, idx, err = dsp.createValuesPlan(planCtx, spec, colTypes)
+			if n.coldataBatch != nil {
+				if plan.LocalVectorSources == nil {
+					plan.LocalVectorSources = make(map[int32]any)
+				}
+				plan.LocalVectorSources[int32(idx)] = n.coldataBatch
+			}
 		}
 
 	case *windowNode:
-		log.Info(ctx, "windowNode")
 		plan, err = dsp.createPlanForWindow(ctx, planCtx, n)
 
 	case *zeroNode:
-		log.Info(ctx, "zeroNode")
 		plan, err = dsp.createPlanForZero(planCtx, n)
 
 	case *zigzagJoinNode:
-		log.Info(ctx, "zigzagJoinNode")
-		plan, err = dsp.createPlanForZigzagJoin(planCtx, n)
+		plan, err = dsp.createPlanForZigzagJoin(ctx, planCtx, n)
 
 	default:
-		log.Info(ctx, "default")
 		// Can't handle a node? We wrap it and continue on our way.
 		plan, err = dsp.wrapPlan(ctx, planCtx, n, false /* allowPartialDistribution */)
 	}
@@ -3290,19 +3569,18 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		return plan, err
 	}
 
-	if planCtx.traceMetadata != nil {
+	if planCtx.associateNodeWithComponents != nil {
 		processors := make(execComponents, len(plan.ResultRouters))
 		for i, resultProcIdx := range plan.ResultRouters {
-			log.Infof(ctx, "processors[i] %v" ,processors[i])
 			processors[i] = execinfrapb.ProcessorComponentID(
 				plan.Processors[resultProcIdx].SQLInstanceID,
 				execinfrapb.FlowID{UUID: planCtx.infra.FlowID},
 				int32(resultProcIdx),
 			)
 		}
-		planCtx.traceMetadata.associateNodeWithComponents(node, processors)
+		planCtx.associateNodeWithComponents(node, processors)
 	}
-	log.Infof(ctx, "plan %v", plan)
+
 	return plan, err
 }
 
@@ -3368,17 +3646,15 @@ func (dsp *DistSQLPlanner) wrapPlan(
 	// expecting is in fact RowsAffected. RowsAffected statements return a single
 	// row with the number of rows affected by the statement, and are the only
 	// types of statement where it's valid to invoke a plan's fast path.
-	wrapper, err := makePlanNodeToRowSource(n,
+	wrapper := newPlanNodeToRowSource(
+		n,
 		runParams{
 			extendedEvalCtx: &evalCtx,
 			p:               planCtx.planner,
 		},
 		useFastPath,
+		firstNotWrapped,
 	)
-	if err != nil {
-		return nil, err
-	}
-	wrapper.firstNotWrapped = firstNotWrapped
 
 	localProcIdx := p.AddLocalProcessor(wrapper)
 	var input []execinfrapb.InputSyncSpec
@@ -3412,7 +3688,9 @@ func (dsp *DistSQLPlanner) wrapPlan(
 	if firstNotWrapped != nil {
 		// If we found a DistSQL-plannable subtree, we need to add a result stream
 		// between it and the physicalPlan we're creating here.
-		p.MergeResultStreams(p.ResultRouters, 0, p.MergeOrdering, pIdx, 0, false /* forceSerialization */)
+		p.MergeResultStreams(ctx, p.ResultRouters, 0, p.MergeOrdering, pIdx, 0, false, /* forceSerialization */
+			physicalplan.SerialStreamErrorSpec{},
+		)
 	}
 	// ResultRouters gets overwritten each time we add a new PhysicalPlan. We will
 	// just have a single result router, since local processors aren't
@@ -3439,7 +3717,7 @@ func (dsp *DistSQLPlanner) createValuesSpec(
 	}
 
 	for i, t := range resultTypes {
-		s.Columns[i].Encoding = descpb.DatumEncoding_VALUE
+		s.Columns[i].Encoding = catenumpb.DatumEncoding_VALUE
 		s.Columns[i].Type = t
 	}
 
@@ -3453,7 +3731,7 @@ func (dsp *DistSQLPlanner) createValuesSpec(
 // located on the gateway node.
 func (dsp *DistSQLPlanner) createValuesPlan(
 	planCtx *PlanningCtx, spec *execinfrapb.ValuesCoreSpec, resultTypes []*types.T,
-) (*PhysicalPlan, error) {
+) (*PhysicalPlan, physicalplan.ProcessorIdx, error) {
 	p := planCtx.NewPhysicalPlan()
 
 	pIdx := p.AddProcessor(physicalplan.Processor{
@@ -3469,13 +3747,13 @@ func (dsp *DistSQLPlanner) createValuesPlan(
 	p.Distribution = physicalplan.LocalPlan
 	p.PlanToStreamColMap = identityMapInPlace(make([]int, len(resultTypes)))
 
-	return p, nil
+	return p, pIdx, nil
 }
 
 // createValuesSpecFromTuples creates a ValuesCoreSpec from the results of
 // evaluating the given tuples.
 func (dsp *DistSQLPlanner) createValuesSpecFromTuples(
-	planCtx *PlanningCtx, tuples [][]tree.TypedExpr, resultTypes []*types.T,
+	ctx context.Context, planCtx *PlanningCtx, tuples [][]tree.TypedExpr, resultTypes []*types.T,
 ) (*execinfrapb.ValuesCoreSpec, error) {
 	var a tree.DatumAlloc
 	evalCtx := &planCtx.ExtendedEvalCtx.Context
@@ -3489,12 +3767,12 @@ func (dsp *DistSQLPlanner) createValuesSpecFromTuples(
 	for rowIdx, tuple := range tuples {
 		var buf []byte
 		for colIdx, typedExpr := range tuple {
-			datum, err := eval.Expr(evalCtx, typedExpr)
+			datum, err := eval.Expr(ctx, evalCtx, typedExpr)
 			if err != nil {
 				return nil, err
 			}
 			encDatum := rowenc.DatumToEncDatum(resultTypes[colIdx], datum)
-			buf, err = encDatum.Encode(resultTypes[colIdx], &a, descpb.DatumEncoding_VALUE, buf)
+			buf, err = encDatum.Encode(resultTypes[colIdx], &a, catenumpb.DatumEncoding_VALUE, buf)
 			if err != nil {
 				return nil, err
 			}
@@ -3514,7 +3792,8 @@ func (dsp *DistSQLPlanner) createPlanForUnary(
 	}
 
 	spec := dsp.createValuesSpec(planCtx, types, 1 /* numRows */, nil /* rawBytes */)
-	return dsp.createValuesPlan(planCtx, spec, types)
+	plan, _, err := dsp.createValuesPlan(planCtx, spec, types)
+	return plan, err
 }
 
 func (dsp *DistSQLPlanner) createPlanForZero(
@@ -3526,7 +3805,8 @@ func (dsp *DistSQLPlanner) createPlanForZero(
 	}
 
 	spec := dsp.createValuesSpec(planCtx, types, 0 /* numRows */, nil /* rawBytes */)
-	return dsp.createValuesPlan(planCtx, spec, types)
+	plan, _, err := dsp.createValuesPlan(planCtx, spec, types)
+	return plan, err
 }
 
 func (dsp *DistSQLPlanner) createDistinctSpec(
@@ -3559,12 +3839,12 @@ func (dsp *DistSQLPlanner) createPlanForDistinct(
 		n.errorOnDup,
 		dsp.convertOrdering(n.reqOrdering, plan.PlanToStreamColMap),
 	)
-	dsp.addDistinctProcessors(plan, spec)
+	dsp.addDistinctProcessors(ctx, plan, spec)
 	return plan, nil
 }
 
 func (dsp *DistSQLPlanner) addDistinctProcessors(
-	plan *PhysicalPlan, spec *execinfrapb.DistinctSpec,
+	ctx context.Context, plan *PhysicalPlan, spec *execinfrapb.DistinctSpec,
 ) {
 	distinctSpec := execinfrapb.ProcessorCoreUnion{
 		Distinct: spec,
@@ -3578,7 +3858,7 @@ func (dsp *DistSQLPlanner) addDistinctProcessors(
 
 	sqlInstanceIDs := getSQLInstanceIDsOfRouters(plan.ResultRouters, plan.Processors)
 	plan.AddStageOnNodes(
-		sqlInstanceIDs, distinctSpec, execinfrapb.PostProcessSpec{},
+		ctx, sqlInstanceIDs, distinctSpec, execinfrapb.PostProcessSpec{},
 		distinctSpec.Distinct.DistinctColumns, plan.GetResultTypes(),
 		plan.GetResultTypes(), plan.MergeOrdering, plan.ResultRouters,
 	)
@@ -3602,13 +3882,13 @@ func (dsp *DistSQLPlanner) createPlanForOrdinality(
 
 	// WITH ORDINALITY never gets distributed so that the gateway node can
 	// always number each row in order.
-	plan.AddSingleGroupStage(dsp.gatewaySQLInstanceID, ordinalitySpec, execinfrapb.PostProcessSpec{}, outputTypes)
+	plan.AddSingleGroupStage(ctx, dsp.gatewaySQLInstanceID, ordinalitySpec, execinfrapb.PostProcessSpec{}, outputTypes)
 
 	return plan, nil
 }
 
 func createProjectSetSpec(
-	planCtx *PlanningCtx, n *projectSetPlanningInfo, indexVarMap []int,
+	ctx context.Context, planCtx *PlanningCtx, n *projectSetPlanningInfo, indexVarMap []int,
 ) (*execinfrapb.ProjectSetSpec, error) {
 	spec := execinfrapb.ProjectSetSpec{
 		Exprs:                 make([]execinfrapb.Expression, len(n.exprs)),
@@ -3618,7 +3898,7 @@ func createProjectSetSpec(
 	}
 	for i, expr := range n.exprs {
 		var err error
-		spec.Exprs[i], err = physicalplan.MakeExpression(expr, planCtx, indexVarMap)
+		spec.Exprs[i], err = physicalplan.MakeExpression(ctx, expr, planCtx, indexVarMap)
 		if err != nil {
 			return nil, err
 		}
@@ -3640,19 +3920,19 @@ func (dsp *DistSQLPlanner) createPlanForProjectSet(
 	if err != nil {
 		return nil, err
 	}
-	err = dsp.addProjectSet(plan, planCtx, &n.projectSetPlanningInfo)
+	err = dsp.addProjectSet(ctx, plan, planCtx, &n.projectSetPlanningInfo)
 	return plan, err
 }
 
 // addProjectSet adds a grouping stage consisting of a single
 // projectSetProcessor that is planned on the gateway.
 func (dsp *DistSQLPlanner) addProjectSet(
-	plan *PhysicalPlan, planCtx *PlanningCtx, info *projectSetPlanningInfo,
+	ctx context.Context, plan *PhysicalPlan, planCtx *PlanningCtx, info *projectSetPlanningInfo,
 ) error {
 	numResults := len(plan.GetResultTypes())
 
 	// Create the project set processor spec.
-	projectSetSpec, err := createProjectSetSpec(planCtx, info, plan.PlanToStreamColMap)
+	projectSetSpec, err := createProjectSetSpec(ctx, planCtx, info, plan.PlanToStreamColMap)
 	if err != nil {
 		return err
 	}
@@ -3666,7 +3946,7 @@ func (dsp *DistSQLPlanner) addProjectSet(
 	// filtered), we could try to detect these cases and use AddNoGroupingStage
 	// instead.
 	outputTypes := append(plan.GetResultTypes(), projectSetSpec.GeneratedColumns...)
-	plan.AddSingleGroupStage(dsp.gatewaySQLInstanceID, spec, execinfrapb.PostProcessSpec{}, outputTypes)
+	plan.AddSingleGroupStage(ctx, dsp.gatewaySQLInstanceID, spec, execinfrapb.PostProcessSpec{}, outputTypes)
 
 	// Add generated columns to PlanToStreamColMap.
 	for i := range projectSetSpec.GeneratedColumns {
@@ -3854,8 +4134,19 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 					mergeOrdering,
 				),
 			}
-			p.AddSingleGroupStage(dsp.gatewaySQLInstanceID, distinctSpec, execinfrapb.PostProcessSpec{}, resultTypes)
+			p.AddSingleGroupStage(ctx, dsp.gatewaySQLInstanceID, distinctSpec, execinfrapb.PostProcessSpec{}, resultTypes)
 		} else {
+			var serialStreamErrorSpec physicalplan.SerialStreamErrorSpec
+			if n.enforceHomeRegion {
+				// When inputIdx of the SerialUnorderedSynchronizer is incremented to 1,
+				// error out.
+				serialStreamErrorSpec.SerialInputIdxExclusiveUpperBound = 1
+				serialStreamErrorSpec.ExceedsInputIdxExclusiveUpperBoundError =
+					pgerror.Newf(pgcode.QueryHasNoHomeRegion,
+						"Query has no home region. Try using a lower LIMIT value or running the query from a different region. %s",
+						sqlerrors.EnforceHomeRegionFurtherInfo,
+					)
+			}
 			// With UNION ALL, we can end up with multiple streams on the same node.
 			// We don't want to have unnecessary routers and cross-node streams, so
 			// merge these streams now.
@@ -3870,7 +4161,7 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 				// multiple streams on the same node, we force the serialization of the
 				// merge operation (otherwise, it would be possible that we have a
 				// source of unbounded parallelism, see #51548).
-				p.EnsureSingleStreamPerNode(true /* forceSerialization */, execinfrapb.PostProcessSpec{})
+				p.EnsureSingleStreamPerNode(ctx, true /* forceSerialization */, execinfrapb.PostProcessSpec{}, serialStreamErrorSpec)
 			} else {
 				if p.GetLastStageDistribution() != physicalplan.LocalPlan {
 					return nil, errors.AssertionFailedf("we expect that limited UNION ALL queries are only planned locally")
@@ -3885,8 +4176,10 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 				// behavior that we want (in particular, it won't execute the
 				// right child if the limit is reached by the left child).
 				p.EnsureSingleStreamPerNode(
+					ctx,
 					true, /* forceSerialization */
 					execinfrapb.PostProcessSpec{Limit: n.hardLimit},
+					serialStreamErrorSpec,
 				)
 			}
 
@@ -3895,7 +4188,7 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 			// which would violate an assumption later down the line. Check for this
 			// condition and add a no-op stage if it exists.
 			if err := p.CheckLastStagePost(); err != nil {
-				p.EnsureSingleStreamOnGateway()
+				p.EnsureSingleStreamOnGateway(ctx)
 			}
 		}
 	} else {
@@ -3940,14 +4233,14 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 
 		if n.all {
 			p.AddJoinStage(
-				nodes, core, post, eqCols, eqCols,
+				ctx, nodes, core, post, eqCols, eqCols,
 				leftPlan.GetResultTypes(), rightPlan.GetResultTypes(),
 				leftPlan.MergeOrdering, rightPlan.MergeOrdering,
 				leftRouters, rightRouters, resultTypes,
 			)
 		} else {
 			p.AddDistinctSetOpStage(
-				nodes, core, distinctSpecs[:], post, eqCols,
+				ctx, nodes, core, distinctSpecs[:], post, eqCols,
 				leftPlan.GetResultTypes(), rightPlan.GetResultTypes(),
 				leftPlan.MergeOrdering, rightPlan.MergeOrdering,
 				leftRouters, rightRouters, resultTypes,
@@ -4016,7 +4309,7 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 	newResultTypes := make([]*types.T, len(plan.GetResultTypes())+len(n.funcs))
 	copy(newResultTypes, plan.GetResultTypes())
 	for windowFnSpecIdx, windowFn := range n.funcs {
-		windowFnSpec, outputType, err := createWindowFnSpec(planCtx, plan, windowFn)
+		windowFnSpec, outputType, err := createWindowFnSpec(ctx, planCtx, plan, windowFn)
 		if err != nil {
 			return nil, err
 		}
@@ -4035,6 +4328,7 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 			sqlInstanceID = sqlInstanceIDs[0]
 		}
 		plan.AddSingleGroupStage(
+			ctx,
 			sqlInstanceID,
 			execinfrapb.ProcessorCoreUnion{Windower: &windowerSpec},
 			execinfrapb.PostProcessSpec{},
@@ -4113,6 +4407,10 @@ func (dsp *DistSQLPlanner) createPlanForExport(
 		return nil, err
 	}
 
+	if err = logAndSanitizeExportDestination(ctx, n.destination); err != nil {
+		return nil, err
+	}
+
 	var core execinfrapb.ProcessorCoreUnion
 	core.Exporter = &execinfrapb.ExportSpec{
 		Destination: n.destination,
@@ -4124,17 +4422,22 @@ func (dsp *DistSQLPlanner) createPlanForExport(
 		UserProto:   planCtx.planner.User().EncodeProto(),
 	}
 
-	resTypes := make([]*types.T, len(colinfo.ExportColumns))
-	for i := range colinfo.ExportColumns {
-		resTypes[i] = colinfo.ExportColumns[i].Typ
-	}
 	plan.AddNoGroupingStage(
-		core, execinfrapb.PostProcessSpec{}, resTypes, execinfrapb.Ordering{},
+		core, execinfrapb.PostProcessSpec{}, colinfo.ExportColumnTypes, execinfrapb.Ordering{},
 	)
 
 	// The CSVWriter produces the same columns as the EXPORT statement.
 	plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(colinfo.ExportColumns))
 	return plan, nil
+}
+
+func logAndSanitizeExportDestination(ctx context.Context, dest string) error {
+	clean, err := cloud.SanitizeExternalStorageURI(dest, nil)
+	if err != nil {
+		return err
+	}
+	log.Ops.Infof(ctx, "export planning to connect to destination %v", redact.Safe(clean))
+	return nil
 }
 
 // checkScanParallelizationIfLocal returns whether the plan contains scanNodes
@@ -4247,21 +4550,46 @@ func (dsp *DistSQLPlanner) NewPlanningCtx(
 	txn *kv.Txn,
 	distributionType DistributionType,
 ) *PlanningCtx {
+	return dsp.NewPlanningCtxWithOracle(
+		ctx, evalCtx, planner, txn, distributionType, physicalplan.DefaultReplicaChooser, roachpb.Locality{},
+	)
+}
+
+// NewPlanningCtxWithOracle is a variant of NewPlanningCtx that allows passing a
+// replica choice oracle as well.
+func (dsp *DistSQLPlanner) NewPlanningCtxWithOracle(
+	ctx context.Context,
+	evalCtx *extendedEvalContext,
+	planner *planner,
+	txn *kv.Txn,
+	distributionType DistributionType,
+	oracle replicaoracle.Oracle,
+	localityFiler roachpb.Locality,
+) *PlanningCtx {
 	distribute := distributionType == DistributionTypeAlways || (distributionType == DistributionTypeSystemTenantOnly && evalCtx.Codec.ForSystemTenant())
+	infra := physicalplan.NewPhysicalInfrastructure(uuid.FastMakeV4(), dsp.gatewaySQLInstanceID)
 	planCtx := &PlanningCtx{
 		ExtendedEvalCtx: evalCtx,
-		infra:           physicalplan.MakePhysicalInfrastructure(uuid.FastMakeV4(), dsp.gatewaySQLInstanceID),
+		localityFilter:  localityFiler,
+		infra:           infra,
 		isLocal:         !distribute,
 		planner:         planner,
+		// Make sure to release the physical infrastructure after the execution
+		// finishes. Note that onFlowCleanup might not be called in some cases
+		// (when DistSQLPlanner.Run is not called), but that is ok since on the
+		// main query path it will get called.
+		onFlowCleanup: []func(){infra.Release},
 	}
 	if !distribute {
-		if planner == nil || dsp.spanResolver == nil || planner.curPlan.flags.IsSet(planFlagContainsMutation) {
+		if planner == nil || dsp.spanResolver == nil || planner.curPlan.flags.IsSet(planFlagContainsMutation) ||
+			planner.curPlan.flags.IsSet(planFlagContainsNonDefaultLocking) {
 			// Don't parallelize the scans if we have a local plan if
 			// - we don't have a planner which is the case when we are not on
 			// the main query path;
 			// - we don't have a span resolver (this can happen only in tests);
 			// - the plan contains a mutation operation - we currently don't
-			// support any parallelism when mutations are present.
+			// support any parallelism when mutations are present;
+			// - the plan uses non-default key locking strength (see #94290).
 			return planCtx
 		}
 		prohibitParallelization, hasScanNodeToParallelize := checkScanParallelizationIfLocal(ctx, &planner.curPlan.planComponents)
@@ -4272,7 +4600,7 @@ func (dsp *DistSQLPlanner) NewPlanningCtx(
 		// we still need to instantiate a full planning context.
 		planCtx.parallelizeScansIfLocal = true
 	}
-	planCtx.spanIter = dsp.spanResolver.NewSpanResolverIterator(txn)
+	planCtx.spanIter = dsp.spanResolver.NewSpanResolverIterator(txn, oracle)
 	planCtx.nodeStatuses = make(map[base.SQLInstanceID]NodeStatus)
 	planCtx.nodeStatuses[dsp.gatewaySQLInstanceID] = NodeOK
 	return planCtx
@@ -4344,21 +4672,21 @@ func maybeMoveSingleFlowToGateway(planCtx *PlanningCtx, plan *PhysicalPlan, rowC
 
 // FinalizePlan adds a final "result" stage and a final projection if necessary
 // as well as populates the endpoints of the plan.
-func (dsp *DistSQLPlanner) FinalizePlan(planCtx *PlanningCtx, plan *PhysicalPlan) {
-	dsp.finalizePlanWithRowCount(planCtx, plan, -1 /* rowCount */)
+func FinalizePlan(ctx context.Context, planCtx *PlanningCtx, plan *PhysicalPlan) {
+	finalizePlanWithRowCount(ctx, planCtx, plan, -1 /* rowCount */)
 }
 
 // finalizePlanWithRowCount adds a final "result" stage and a final projection
 // if necessary as well as populates the endpoints of the plan.
 // - rowCount is the estimated number of rows that the plan outputs. Use a
 // negative number if the stats were not available to make an estimate.
-func (dsp *DistSQLPlanner) finalizePlanWithRowCount(
-	planCtx *PlanningCtx, plan *PhysicalPlan, rowCount int64,
+func finalizePlanWithRowCount(
+	ctx context.Context, planCtx *PlanningCtx, plan *PhysicalPlan, rowCount int64,
 ) {
 	maybeMoveSingleFlowToGateway(planCtx, plan, rowCount)
 
 	// Add a final "result" stage if necessary.
-	plan.EnsureSingleStreamOnGateway()
+	plan.EnsureSingleStreamOnGateway(ctx)
 
 	// Add a final projection so that DistSQLReceiver gets the rows of the
 	// desired schema.
@@ -4382,8 +4710,78 @@ func (dsp *DistSQLPlanner) finalizePlanWithRowCount(
 	})
 
 	// Assign processor IDs.
-	for i := range plan.Processors {
+	for i, p := range plan.Processors {
 		plan.Processors[i].Spec.ProcessorID = int32(i)
-		//println("processor id[%d]", i)
+		// Double check that our reliance on ProcessorID == index is good.
+		if _, ok := plan.LocalVectorSources[int32(i)]; ok {
+			// Ensure processor is a values spec.
+			if p.Spec.Core.Values == nil {
+				panic(errors.AssertionFailedf("expected processor to be Values"))
+			}
+		}
 	}
+}
+
+// TODO(cucaroach): this doesn't work, get it working as part of effort to make
+// distsql inserts handle general inserts.
+func (dsp *DistSQLPlanner) createPlanForRowCount(
+	ctx context.Context, planCtx *PlanningCtx, n *rowCountNode,
+) (*PhysicalPlan, error) {
+	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source)
+	plan.PlanToStreamColMap = identityMap(nil, 1)
+	// fn := newAggregateFuncHolder(
+	// 	execinfrapb.AggregatorSpec_Func_name[int32(execinfrapb.AggregatorSpec_COUNT_ROWS)],
+	// 	[]int{0},
+	// 	nil,   /* arguments */
+	// 	false, /* isDistinct */
+	// )
+	// gn := groupNode{
+	// 	columns:   []colinfo.ResultColumn{{Name: "rowCount", Typ: types.Int}},
+	// 	plan:      n,
+	// 	groupCols: []int{0},
+	// 	isScalar:  true,
+	// 	funcs:     []*aggregateFuncHolder{fn},
+	// }
+	// // This errors:  no builtin aggregate for COUNT_ROWS on [int]
+	// if err := dsp.addAggregators(ctx, planCtx, plan, &gn); err != nil {
+	// 	return nil, err
+	// }
+	return plan, err
+}
+
+func (dsp *DistSQLPlanner) createPlanForInsert(
+	ctx context.Context, planCtx *PlanningCtx, n *insertNode,
+) (*PhysicalPlan, error) {
+	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source)
+	if err != nil {
+		return nil, err
+	}
+	insColIDs := make([]descpb.ColumnID, len(n.run.insertCols))
+	for i, c := range n.run.insertCols {
+		insColIDs[i] = c.GetID()
+	}
+	var buff bytes.Buffer
+	if !n.run.checkOrds.Empty() {
+		if err := n.run.checkOrds.Encode(&buff); err != nil {
+			return nil, err
+		}
+	}
+	insertSpec := execinfrapb.InsertSpec{
+		Table:      *n.run.ti.tableDesc().TableDesc(),
+		ColumnIDs:  insColIDs,
+		CheckOrds:  buff.Bytes(),
+		AutoCommit: n.run.ti.autoCommit == autoCommitEnabled,
+	}
+	var typs []*types.T
+	if len(n.columns) > 0 {
+		return nil, errors.AssertionFailedf("distsql insert doesn't support RETURNING")
+	} else {
+		typs = []*types.T{types.Int}
+	}
+	plan.AddNoGroupingStage(
+		execinfrapb.ProcessorCoreUnion{Insert: &insertSpec},
+		execinfrapb.PostProcessSpec{},
+		typs,
+		execinfrapb.Ordering{})
+	return plan, nil
 }

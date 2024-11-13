@@ -12,6 +12,7 @@ package schemachange
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -33,8 +34,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // seqNum may be shared across multiple instances of this, so it should only
@@ -54,7 +55,6 @@ type operationGeneratorParams struct {
 // The OperationBuilder has the sole responsibility of generating ops
 type operationGenerator struct {
 	params                *operationGeneratorParams
-	potentialExecErrors   errorCodeSet
 	expectedCommitErrors  errorCodeSet
 	potentialCommitErrors errorCodeSet
 
@@ -73,37 +73,58 @@ type operationGenerator struct {
 	stmtsInTxt []*opStmt
 
 	// opGenLog log of statement used to generate the current statement.
-	opGenLog strings.Builder
+	opGenLog []interface{}
+}
+
+// OpGenLogQuery a query with a single value result.
+type OpGenLogQuery struct {
+	Query     string      `json:"query"`
+	QueryArgs interface{} `json:"queryArgs,omitempty"`
+	Result    interface{} `json:"result,omitempty"`
+}
+
+// OpGenLogMessage an informational message directly written into the OpGen log.
+type OpGenLogMessage struct {
+	Message string `json:"message"`
 }
 
 // LogQueryResults logs a string query result.
-func (og *operationGenerator) LogQueryResults(queryName string, result string) {
-	og.opGenLog.WriteString(fmt.Sprintf("QUERY [%s] :", queryName))
-	og.opGenLog.WriteString(result)
-	og.opGenLog.WriteString("\n")
-}
-
-// LogQueryResultArray logs a query result that is a strng array.
-func (og *operationGenerator) LogQueryResultArray(queryName string, results []string) {
-	og.opGenLog.WriteString(fmt.Sprintf("QUERY [%s] : ", queryName))
-	for _, result := range results {
-		og.opGenLog.WriteString(result)
-		og.opGenLog.WriteString(",")
+func (og *operationGenerator) LogQueryResults(
+	queryName string, result interface{}, queryArgs ...interface{},
+) {
+	formattedQuery := queryName
+	parsedQuery, err := parser.Parse(queryName)
+	if err == nil {
+		formattedQuery = parsedQuery.String()
 	}
 
-	og.opGenLog.WriteString("\n")
+	query := &OpGenLogQuery{
+		Query:  formattedQuery,
+		Result: result,
+	}
+	if len(queryArgs) != 0 {
+		query.QueryArgs = queryArgs
+	}
+	og.opGenLog = append(og.opGenLog, query)
+}
+
+// LogMessage logs an information mesage into the OpGen log.
+func (og *operationGenerator) LogMessage(message string) {
+	query := &OpGenLogMessage{
+		Message: message,
+	}
+	og.opGenLog = append(og.opGenLog, query)
 }
 
 // GetOpGenLog fetches the generated log entries.
-func (og *operationGenerator) GetOpGenLog() string {
-	return og.opGenLog.String()
+func (og *operationGenerator) GetOpGenLog() []interface{} {
+	return og.opGenLog
 }
 
 func makeOperationGenerator(params *operationGeneratorParams) *operationGenerator {
 	return &operationGenerator{
 		params:                        params,
 		expectedCommitErrors:          makeExpectedErrorSet(),
-		potentialExecErrors:           makeExpectedErrorSet(),
 		potentialCommitErrors:         makeExpectedErrorSet(),
 		candidateExpectedCommitErrors: makeExpectedErrorSet(),
 	}
@@ -112,8 +133,6 @@ func makeOperationGenerator(params *operationGeneratorParams) *operationGenerato
 // Reset internal state used per operation within a transaction
 func (og *operationGenerator) resetOpState() {
 	og.candidateExpectedCommitErrors.reset()
-	og.potentialExecErrors.reset()
-	og.opGenLog = strings.Builder{}
 }
 
 // Reset internal state used per transaction
@@ -227,7 +246,7 @@ func init() {
 var opWeights = []int{
 	addColumn:               1,
 	addConstraint:           0, // TODO(spaskob): unimplemented
-	addForeignKeyConstraint: 1,
+	addForeignKeyConstraint: 0, // Disabled and tracked with #91195
 	addRegion:               1,
 	addUniqueConstraint:     0,
 	alterTableLocality:      1,
@@ -256,9 +275,9 @@ var opWeights = []int{
 	renameView:              1,
 	setColumnDefault:        1,
 	setColumnNotNull:        1,
-	setColumnType:           0,  // Disabled and tracked with #66662.
-	survive:                 0,  // Disabled and tracked with #83831
-	insertRow:               10, // Temporarily reduced because of #80820
+	setColumnType:           0, // Disabled and tracked with #66662.
+	survive:                 0, // Disabled and tracked with #83831
+	insertRow:               0, // Disabled and tracked with #91863
 	selectStmt:              10,
 	validate:                2, // validate twice more often
 }
@@ -271,18 +290,6 @@ func adjustOpWeightsForCockroachVersion(
 	tx, err := pool.Get().Begin(ctx)
 	if err != nil {
 		return err
-	}
-	// First validate if we even support foreign key constraints on the active
-	// version, since we need builtins.
-	fkConstraintsEnabled, err := isFkConstraintsEnabled(ctx, tx)
-	if err != nil {
-		if rbErr := tx.Rollback(ctx); rbErr != nil {
-			err = errors.WithSecondaryError(err, rbErr)
-		}
-		return err
-	}
-	if !fkConstraintsEnabled {
-		opWeights[addForeignKeyConstraint] = 0
 	}
 	return tx.Rollback(ctx)
 }
@@ -658,7 +665,7 @@ func (og *operationGenerator) scanRegionNames(
 	if rows.Err() != nil {
 		return nil, errors.Wrapf(rows.Err(), "failed to get regions: %s", query)
 	}
-	og.LogQueryResultArray(query, regionNamesForLog)
+	og.LogQueryResults(query, regionNamesForLog)
 	return regionNames, nil
 }
 
@@ -881,7 +888,7 @@ func (og *operationGenerator) addForeignKeyConstraint(
 	// perfectly if an error is expected. We can confirm post transaction with a time
 	// travel query.
 	_ = rowsSatisfyConstraint
-	og.potentialExecErrors.add(pgcode.ForeignKeyViolation)
+	stmt.potentialExecErrors.add(pgcode.ForeignKeyViolation)
 	og.potentialCommitErrors.add(pgcode.ForeignKeyViolation)
 
 	// It's possible for the table to be dropped concurrently, while we are running
@@ -1107,6 +1114,15 @@ func (og *operationGenerator) createSequence(ctx context.Context, tx pgx.Tx) (*o
 		{code: pgcode.UndefinedSchema, condition: !schemaExists},
 		{code: pgcode.DuplicateRelation, condition: sequenceExists && !ifNotExists},
 	}.add(stmt.expectedExecErrors)
+	// Descriptor ID generator may be temporarily unavailable, so
+	// allow this to be detected.
+	potentialDescIDGeneratorError, err := maybeExpectPotentialDescIDGenerationError(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	codesWithConditions{
+		{code: pgcode.Uncategorized, condition: potentialDescIDGeneratorError},
+	}.add(stmt.potentialExecErrors)
 
 	var seqOptions tree.SequenceOptions
 	// Decide if the sequence should be owned by a column. If so, it can
@@ -1183,6 +1199,70 @@ func (og *operationGenerator) createTable(ctx context.Context, tx pgx.Tx) (*opSt
 	stmt := randgen.RandCreateTableWithColumnIndexNumberGenerator(og.params.rng, "table", tableIdx, databaseHasMultiRegion, og.newUniqueSeqNum)
 	stmt.Table = *tableName
 	stmt.IfNotExists = og.randIntn(2) == 0
+	tsQueryNotSupported, err := isClusterVersionLessThan(
+		ctx,
+		tx,
+		clusterversion.ByKey(clusterversion.V23_1))
+	if err != nil {
+		return nil, err
+	}
+	hasUnsupportedTSQuery := func() bool {
+		if !tsQueryNotSupported {
+			return false
+		}
+		// Check if any of the indexes have text search types involved.
+		for _, def := range stmt.Defs {
+			if col, ok := def.(*tree.ColumnTableDef); ok &&
+				(col.Type.SQLString() == "TSQUERY" || col.Type.SQLString() == "TSVECTOR") {
+				return true
+			}
+		}
+		return false
+	}()
+	// Forward indexes for arrays were added in 23.1, so check the index
+	// definitions for them in mixed version states.
+	forwardIndexesOnArraysNotSupported, err := isClusterVersionLessThan(
+		ctx,
+		tx,
+		clusterversion.ByKey(clusterversion.V23_1))
+	if err != nil {
+		return nil, err
+	}
+	hasUnsupportedForwardQueries, err := func() (bool, error) {
+		if !forwardIndexesOnArraysNotSupported {
+			return false, nil
+		}
+		colInfoMap := make(map[tree.Name]*tree.ColumnTableDef)
+		for _, def := range stmt.Defs {
+			if colDef, ok := def.(*tree.ColumnTableDef); ok {
+				colInfoMap[colDef.Name] = colDef
+			}
+			var idxDef *tree.IndexTableDef
+			if _, ok := def.(*tree.IndexTableDef); ok {
+				idxDef = def.(*tree.IndexTableDef)
+			} else if _, ok := def.(*tree.UniqueConstraintTableDef); ok {
+				idxDef = &(def.(*tree.UniqueConstraintTableDef)).IndexTableDef
+			}
+			if idxDef != nil {
+				for _, col := range idxDef.Columns {
+					if col.Column != "" {
+						colInfo := colInfoMap[col.Column]
+						typ, err := tree.ResolveType(ctx, colInfo.Type, &txTypeResolver{tx: tx})
+						if err != nil {
+							return false, err
+						}
+						if typ.Family() == types.ArrayFamily {
+							return true, err
+						}
+					}
+				}
+			}
+		}
+		return false, nil
+	}()
+	if err != nil {
+		return nil, err
+	}
 
 	tableExists, err := og.tableExists(ctx, tx, tableName)
 	if err != nil {
@@ -1197,6 +1277,22 @@ func (og *operationGenerator) createTable(ctx context.Context, tx pgx.Tx) (*opSt
 		{code: pgcode.DuplicateRelation, condition: tableExists && !stmt.IfNotExists},
 		{code: pgcode.UndefinedSchema, condition: !schemaExists},
 	}.add(opStmt.expectedExecErrors)
+	// Compatibility errors aren't guaranteed since the cluster version update is not
+	// fully transaction aware.
+	codesWithConditions{
+		{code: pgcode.Syntax, condition: hasUnsupportedTSQuery},
+		{code: pgcode.FeatureNotSupported, condition: hasUnsupportedTSQuery},
+		{code: pgcode.FeatureNotSupported, condition: hasUnsupportedForwardQueries},
+	}.add(opStmt.potentialExecErrors)
+	// Descriptor ID generator may be temporarily unavailable, so
+	// allow uncategorized errors temporarily.
+	potentialDescIDGeneratorError, err := maybeExpectPotentialDescIDGenerationError(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	codesWithConditions{
+		{code: pgcode.Uncategorized, condition: potentialDescIDGeneratorError},
+	}.add(opStmt.potentialExecErrors)
 	opStmt.sql = tree.Serialize(stmt)
 	return opStmt, nil
 }
@@ -1215,6 +1311,15 @@ func (og *operationGenerator) createEnum(ctx context.Context, tx pgx.Tx) (*opStm
 		{code: pgcode.DuplicateObject, condition: typeExists},
 		{code: pgcode.InvalidSchemaName, condition: !schemaExists},
 	}.add(opStmt.expectedExecErrors)
+	// Descriptor ID generator may be temporarily unavailable, so
+	// allow uncategorized errors temporarily.
+	potentialDescIDGeneratorError, err := maybeExpectPotentialDescIDGenerationError(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	codesWithConditions{
+		{code: pgcode.Uncategorized, condition: potentialDescIDGeneratorError},
+	}.add(opStmt.potentialExecErrors)
 	stmt := randgen.RandCreateType(og.params.rng, typName.Object(), "asdf")
 	stmt.(*tree.CreateType).TypeName = typName.ToUnresolvedObjectName()
 	opStmt.sql = tree.Serialize(stmt)
@@ -1337,6 +1442,22 @@ func (og *operationGenerator) createTableAs(ctx context.Context, tx pgx.Tx) (*op
 		{code: pgcode.DuplicateAlias, condition: duplicateSourceTables},
 		{code: pgcode.DuplicateColumn, condition: duplicateColumns},
 	}.add(opStmt.expectedExecErrors)
+	// Descriptor ID generator may be temporarily unavailable, so
+	// allow uncategorized errors temporarily.
+	potentialDescIDGeneratorError, err := maybeExpectPotentialDescIDGenerationError(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	codesWithConditions{
+		{code: pgcode.Uncategorized, condition: potentialDescIDGeneratorError},
+	}.add(opStmt.potentialExecErrors)
+	// Confirm the select itself doesn't run into any column generation errors,
+	// by executing it independently first until we add validation when adding
+	// generated columns. See issue: #81698?, which will allow us to remove this
+	// logic in the future.
+	if opStmt.expectedExecErrors.empty() {
+		opStmt.potentialExecErrors.merge(getValidGenerationErrors())
+	}
 
 	opStmt.sql = fmt.Sprintf(`CREATE TABLE %s AS %s FETCH FIRST %d ROWS ONLY`,
 		destTableName, selectStatement.String(), MaxRowsToConsume)
@@ -1459,7 +1580,15 @@ func (og *operationGenerator) createView(ctx context.Context, tx pgx.Tx) (*opStm
 		{code: pgcode.DuplicateAlias, condition: duplicateSourceTables},
 		{code: pgcode.DuplicateColumn, condition: duplicateColumns},
 	}.add(opStmt.expectedExecErrors)
-
+	// Descriptor ID generator may be temporarily unavailable, so
+	// allow uncategorized errors temporarily.
+	potentialDescIDGeneratorError, err := maybeExpectPotentialDescIDGenerationError(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	codesWithConditions{
+		{code: pgcode.Uncategorized, condition: potentialDescIDGeneratorError},
+	}.add(opStmt.potentialExecErrors)
 	opStmt.sql = fmt.Sprintf(`CREATE VIEW %s AS %s`,
 		destViewName, selectStatement.String())
 	return opStmt, nil
@@ -2404,7 +2533,7 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 			return nil, err
 		}
 		// We may have errors that are possible, but not guaranteed.
-		potentialErrors.add(og.potentialExecErrors)
+		potentialErrors.add(stmt.potentialExecErrors)
 		if invalidInsert {
 			generatedErrors.add(stmt.expectedExecErrors)
 			// We will be pessimistic and assume that other column related errors can
@@ -2434,13 +2563,7 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 		}
 		// Verify if the new row will violate fk constraints by checking the constraints and rows
 		// in the database.
-		fkConstraintsEnabled, err := isFkConstraintsEnabled(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
-		if fkConstraintsEnabled {
-			fkViolation, err = og.violatesFkConstraints(ctx, tx, tableName, colNames, rows)
-		}
+		fkViolation, err = og.violatesFkConstraints(ctx, tx, tableName, colNames, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -2503,6 +2626,18 @@ func (s *opStmt) String() string {
 		s.potentialExecErrors)
 }
 
+func (s *opStmt) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		SQL              string `json:"sql"`
+		ExpectedExecErr  string `json:"expectedExecErr,omitempty"`
+		PotentialExecErr string `json:"potentialExecErr,omitempty"`
+	}{
+		SQL:              s.sql,
+		ExpectedExecErr:  s.expectedExecErrors.String(),
+		PotentialExecErr: s.potentialExecErrors.String(),
+	})
+}
+
 // makeOpStmtForSingleError constructs a statement that will only produce
 // an error.
 func makeOpStmtForSingleError(queryType opStmtType, sql string, codes ...pgcode.Code) *opStmt {
@@ -2523,23 +2658,41 @@ func makeOpStmt(queryType opStmtType) *opStmt {
 	}
 }
 
-// getErrorState dumps the object state when an error is hit
-func (og *operationGenerator) getErrorState(op *opStmt) string {
-	return fmt.Sprintf("Dumping state before death:\n"+
-		"Expected errors: %s\n"+
-		"Potential errors: %s\n"+
-		"Expected commit errors: %s\n"+
-		"Potential commit errors: %s\n"+
-		"===========================\n"+
-		"Executed queries for generating errors: %s\n"+
-		"===========================\n"+
-		"Previous statements %s\n",
-		op.expectedExecErrors,
-		op.potentialExecErrors,
-		og.expectedCommitErrors.String(),
-		og.potentialCommitErrors.String(),
-		og.GetOpGenLog(),
-		og.stmtsInTxt)
+// ErrorState wraps schemachange workload errors to have state information for
+// the purpose of dumping in our JSON log.
+type ErrorState struct {
+	cause                      error
+	ExpectedErrors             []string      `json:"expectedErrors,omitempty"`
+	PotentialErrors            []string      `json:"potentialErrors,omitempty"`
+	ExpectedCommitErrors       []string      `json:"expectedCommitErrors,omitempty"`
+	PotentialCommitErrors      []string      `json:"potentialCommitErrors,omitempty"`
+	QueriesForGeneratingErrors []interface{} `json:"queriesForGeneratingErrors,omitempty"`
+	PreviousStatements         []string      `json:"previousStatements,omitempty"`
+}
+
+func (es *ErrorState) Unwrap() error {
+	return es.cause
+}
+
+func (es *ErrorState) Error() string {
+	return es.cause.Error()
+}
+
+// WrapWithErrorState dumps the object state when an error is hit
+func (og *operationGenerator) WrapWithErrorState(err error, op *opStmt) error {
+	previousStmts := make([]string, 0, len(og.stmtsInTxt))
+	for _, stmt := range og.stmtsInTxt {
+		previousStmts = append(previousStmts, stmt.sql)
+	}
+	return &ErrorState{
+		cause:                      err,
+		ExpectedErrors:             op.expectedExecErrors.StringSlice(),
+		PotentialErrors:            op.potentialExecErrors.StringSlice(),
+		ExpectedCommitErrors:       og.expectedCommitErrors.StringSlice(),
+		PotentialCommitErrors:      og.potentialCommitErrors.StringSlice(),
+		QueriesForGeneratingErrors: og.GetOpGenLog(),
+		PreviousStatements:         previousStmts,
+	}
 }
 
 // executeStmt executes the given operation statement, and validates the result
@@ -2559,8 +2712,7 @@ func (s *opStmt) executeStmt(ctx context.Context, tx pgx.Tx, og *operationGenera
 		pgErr := new(pgconn.PgError)
 		if !errors.As(err, &pgErr) {
 			return errors.Mark(
-				errors.Wrapf(err, "***UNEXPECTED ERROR; Received a non pg error.\n %s",
-					og.getErrorState(s)),
+				og.WrapWithErrorState(errors.Wrap(err, "***UNEXPECTED ERROR; Received a non pg error."), s),
 				errRunInTxnFatalSentinel,
 			)
 		}
@@ -2570,21 +2722,23 @@ func (s *opStmt) executeStmt(ctx context.Context, tx pgx.Tx, og *operationGenera
 		if !s.expectedExecErrors.contains(pgcode.MakeCode(pgErr.Code)) &&
 			!s.potentialExecErrors.contains(pgcode.MakeCode(pgErr.Code)) {
 			return errors.Mark(
-				errors.Wrapf(err, "***UNEXPECTED ERROR; Received an unexpected execution error.\n %s",
-					og.getErrorState(s)),
+				og.WrapWithErrorState(errors.Wrap(err, "***UNEXPECTED ERROR; Received an unexpected execution error."),
+					s),
 				errRunInTxnFatalSentinel,
 			)
 		}
-		return errors.Mark(
-			errors.Wrapf(err, "ROLLBACK; Successfully got expected execution error.\n %s",
-				og.getErrorState(s)),
+		return errors.Mark(errors.Wrap(err, "ROLLBACK; Successfully got expected execution error."),
 			errRunInTxnRbkSentinel,
 		)
 	}
 	if !s.expectedExecErrors.empty() {
+		// Clean up the result set, if we didn't encounter an expected error.
+		if rows != nil {
+			rows.Close()
+		}
 		return errors.Mark(
-			errors.Newf("***FAIL; Failed to receive an execution error when errors were expected. %s",
-				og.getErrorState(s)),
+			og.WrapWithErrorState(errors.New("***FAIL; Failed to receive an execution error when errors were expected"),
+				s),
 			errRunInTxnFatalSentinel,
 		)
 	}
@@ -2864,39 +3018,21 @@ func (og *operationGenerator) randParentColumnForFkRelation(
 	var typName string
 	var nullable string
 
-	for {
-		nestedTxn, err := tx.Begin(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		err = nestedTxn.QueryRow(ctx, fmt.Sprintf(`
+	nestedTxn, err := tx.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	err = nestedTxn.QueryRow(ctx, fmt.Sprintf(`
 	SELECT table_schema, table_name, column_name, crdb_sql_type, is_nullable FROM (
 		%s
 	)`, subQuery.String())).Scan(&tableSchema, &tableName, &columnName, &typName, &nullable)
-		if err == nil {
-			err := nestedTxn.Commit(ctx)
-			if err != nil {
-				return nil, nil, err
-			}
-			break
-		}
-		pgErr := (*pgconn.PgError)(nil)
-		if !errors.As(err, &pgErr) {
-			return nil, nil, err
-		}
-		// Intermittent undefined table errors are valid for the query above, since
-		// we are not leasing out the tables, when picking our random table.
-		if code := pgcode.MakeCode(pgErr.Code); code == pgcode.UndefinedTable ||
-			code == pgcode.UndefinedSchema {
-			err := nestedTxn.Rollback(ctx)
-			if err != nil {
-				return nil, nil, err
-			}
-			continue
-		}
+	if err != nil {
 		if rbErr := nestedTxn.Rollback(ctx); rbErr != nil {
 			err = errors.CombineErrors(err, rbErr)
 		}
+		return nil, nil, err
+	}
+	if err = nestedTxn.Commit(ctx); err != nil {
 		return nil, nil, err
 	}
 
@@ -2909,7 +3045,6 @@ func (og *operationGenerator) randParentColumnForFkRelation(
 		ExplicitSchema: true,
 	}, tree.Name(tableName))
 
-	var err error
 	columnToReturn.typ, err = og.typeFromTypeName(ctx, tx, typName)
 	if err != nil {
 		return nil, nil, err
@@ -3379,7 +3514,7 @@ func (og *operationGenerator) selectStmt(ctx context.Context, tx pgx.Tx) (stmt *
 			selectColumns.WriteString(",")
 		}
 		selectColumns.WriteString(fmt.Sprintf("t%d.", tableIdx))
-		selectColumns.WriteString(col.name)
+		selectColumns.WriteString(tree.NameString(col.name))
 		selectColumns.WriteString(" AS ")
 		selectColumns.WriteString(fmt.Sprintf("col%d", colIdx))
 	}
@@ -3428,6 +3563,16 @@ func (og *operationGenerator) selectStmt(ctx context.Context, tx pgx.Tx) (stmt *
 			}
 		}
 		if err := rows.Err(); err != nil {
+			pgErr := new(pgconn.PgError)
+			// For select statements, we can have out of memory or temporary
+			// space errors at runtime when fetching the result set. So,
+			// deal with the min here.
+			if errors.As(err, &pgErr) &&
+				stmt.potentialExecErrors.contains(pgcode.MakeCode(pgErr.Code)) {
+				return errors.Mark(errors.Wrap(err, "ROLLBACK; Successfully got expected execution error."),
+					errRunInTxnRbkSentinel,
+				)
+			}
 			return err
 		}
 		return nil
@@ -3438,6 +3583,10 @@ func (og *operationGenerator) selectStmt(ctx context.Context, tx pgx.Tx) (stmt *
 	// TODO(fqazi): Temporarily allow out of memory errors on select queries. Not
 	// sure where we are hitting these, need to investigate further.
 	stmt.potentialExecErrors.add(pgcode.OutOfMemory)
+	// Disk errors can happen since there are limits on spill, and cross
+	// joins which are deep cannot do much of the FETCH FIRST X ROWS ONLY
+	// limit
+	stmt.potentialExecErrors.add(pgcode.DiskFull)
 	return stmt, nil
 }
 
@@ -3457,7 +3606,7 @@ func (og *operationGenerator) pctExisting(shouldAlreadyExist bool) int {
 	return og.params.errorRate
 }
 
-func (og operationGenerator) alwaysExisting() int {
+func (og *operationGenerator) alwaysExisting() int {
 	return 100
 }
 
@@ -3483,11 +3632,11 @@ func (og *operationGenerator) typeFromTypeName(
 	if err != nil {
 		return nil, errors.Wrapf(err, "typeFromTypeName: %s", typeName)
 	}
-	typ, err := tree.ResolveType(
-		context.Background(),
-		stmt.AST.(*tree.Select).Select.(*tree.SelectClause).Exprs[0].Expr.(*tree.CastExpr).Type,
-		&txTypeResolver{tx: tx},
-	)
+	typRef, err := parser.GetTypeFromCastOrCollate(stmt.AST.(*tree.Select).Select.(*tree.SelectClause).Exprs[0].Expr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetTypeFromCastOrCollate: %s", typeName)
+	}
+	typ, err := tree.ResolveType(ctx, typRef, &txTypeResolver{tx: tx})
 	if err != nil {
 		return nil, errors.Wrapf(err, "ResolveType: %v", typeName)
 	}
@@ -3512,11 +3661,9 @@ func isClusterVersionLessThan(
 	return clusterVersion.LessEq(targetVersion), nil
 }
 
-// isFkConstraintsEnabled detects if server side builtins for validating
-// foreign key constraints are available.
-func isFkConstraintsEnabled(ctx context.Context, tx pgx.Tx) (bool, error) {
-	fkConstraintDisabledVersion, err := isClusterVersionLessThan(ctx,
-		tx,
-		clusterversion.ByKey(clusterversion.Start22_2))
-	return !fkConstraintDisabledVersion, err
+func maybeExpectPotentialDescIDGenerationError(ctx context.Context, tx pgx.Tx) (bool, error) {
+	descIDGenerationVersion := clusterversion.ByKey(clusterversion.V23_1DescIDSequenceForSystemTenant)
+	descIDGenerationErrorPossible, err := isClusterVersionLessThan(ctx,
+		tx, descIDGenerationVersion)
+	return descIDGenerationErrorPossible, err
 }

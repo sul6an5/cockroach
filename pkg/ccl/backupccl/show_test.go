@@ -53,6 +53,7 @@ func TestShowBackup(t *testing.T) {
 	defer cleanupEmptyCluster()
 	sqlDB.ExecMultiple(t, strings.Split(`
 SET CLUSTER SETTING sql.cross_db_fks.enabled = TRUE;
+SET CLUSTER SETTING bulkio.backup.file_size = '1';
 CREATE TYPE data.welcome AS ENUM ('hello', 'hi');
 USE data; CREATE SCHEMA sc;
 CREATE TABLE data.sc.t1 (a INT);
@@ -522,7 +523,7 @@ func TestShowBackups(t *testing.T) {
 
 	// check that full and remote incremental backups appear
 	b3 := sqlDBRestore.QueryStr(t,
-		`SELECT * FROM [SHOW BACKUP LATEST IN $1 WITH incremental_location= 'nodelocal://0/foo/inc'] WHERE object_type='table'`, full)
+		`SELECT * FROM [SHOW BACKUP LATEST IN $1 WITH incremental_location = $2 ] WHERE object_type ='table'`, full, remoteInc)
 	require.Equal(t, 3, len(b3))
 
 }
@@ -590,23 +591,23 @@ func TestShowBackupTenantView(t *testing.T) {
 
 	_ = security.EmbeddedTenantIDs()
 
-	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
-	defer conn10.Close()
+	_, conn2 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(2)})
+	defer conn2.Close()
 
-	tenant10 := sqlutils.MakeSQLRunner(conn10)
+	tenant2 := sqlutils.MakeSQLRunner(conn2)
 	dataQuery := `CREATE DATABASE foo; CREATE TABLE foo.bar(i int primary key); INSERT INTO foo.bar VALUES (110), (210)`
 	backupQuery := `BACKUP TABLE foo.bar INTO $1`
 	showBackupQuery := "SELECT object_name, object_type, rows FROM [SHOW BACKUP FROM LATEST IN $1]"
-	tenant10.Exec(t, dataQuery)
+	tenant2.Exec(t, dataQuery)
 
 	// First, assert that SHOW BACKUPS on a tenant backup returns the same results if
-	// either the system tenant or tenant10 calls it.
+	// either the system tenant or tenant2 calls it.
 	tenantAddr, httpServerCleanup := makeInsecureHTTPServer(t)
 	defer httpServerCleanup()
 
-	tenant10.Exec(t, backupQuery, tenantAddr)
+	tenant2.Exec(t, backupQuery, tenantAddr)
 	systemTenantShowRes := systemDB.QueryStr(t, showBackupQuery, tenantAddr)
-	require.Equal(t, systemTenantShowRes, tenant10.QueryStr(t, showBackupQuery, tenantAddr))
+	require.Equal(t, systemTenantShowRes, tenant2.QueryStr(t, showBackupQuery, tenantAddr))
 
 	// If the system tenant created the same data, and conducted the same backup,
 	// the row counts should look the same.
@@ -629,7 +630,7 @@ func TestShowBackupTenants(t *testing.T) {
 	// NB: tenant certs for 10, 11, 20 are embedded. See:
 	_ = security.EmbeddedTenantIDs()
 
-	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
 	defer conn10.Close()
 	tenant10 := sqlutils.MakeSQLRunner(conn10)
 	tenant10.Exec(t, `CREATE DATABASE foo; CREATE TABLE foo.bar(i int primary key); INSERT INTO foo.bar VALUES (110), (210)`)
@@ -711,67 +712,6 @@ func TestShowBackupPrivileges(t *testing.T) {
 
 	_, err = testuser.Exec(`SHOW BACKUP $1`, full)
 	require.NoError(t, err)
-}
-
-func TestShowUpgradedForeignKeys(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	var (
-		testdataBase = testutils.TestDataPath(t, "restore_old_versions")
-		fkRevDirs    = testdataBase + "/fk-rev-history"
-	)
-
-	dirs, err := os.ReadDir(fkRevDirs)
-	require.NoError(t, err)
-	for _, dir := range dirs {
-		require.True(t, dir.IsDir())
-		exportDir, err := filepath.Abs(filepath.Join(fkRevDirs, dir.Name()))
-		require.NoError(t, err)
-		t.Run(dir.Name(), showUpgradedForeignKeysTest(exportDir))
-	}
-}
-
-func showUpgradedForeignKeysTest(exportDir string) func(t *testing.T) {
-	return func(t *testing.T) {
-		params := base.TestServerArgs{}
-		const numAccounts = 1000
-		_, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
-			InitManualReplication, base.TestClusterArgs{ServerArgs: params})
-		defer cleanup()
-		err := os.Symlink(exportDir, filepath.Join(dir, "foo"))
-		require.NoError(t, err)
-
-		type testCase struct {
-			table                     string
-			expectedForeignKeyPattern string
-		}
-		for _, tc := range []testCase{
-			{
-				"circular",
-				"CONSTRAINT self_fk FOREIGN KEY \\(selfid\\) REFERENCES public\\.circular\\(selfid\\) NOT VALID",
-			},
-			{
-				"child",
-				"CONSTRAINT \\w+ FOREIGN KEY \\(\\w+\\) REFERENCES public\\.parent\\(\\w+\\)",
-			},
-			{
-				"child_pk",
-				"CONSTRAINT \\w+ FOREIGN KEY \\(\\w+\\) REFERENCES public\\.parent\\(\\w+\\)",
-			},
-		} {
-			results := sqlDB.QueryStr(t, `
-				SELECT
-					create_statement
-				FROM
-					[SHOW BACKUP SCHEMAS $1]
-				WHERE
-					object_type = 'table' AND object_name = $2
-				`, localFoo, tc.table)
-			require.NotEmpty(t, results)
-			require.Regexp(t, regexp.MustCompile(tc.expectedForeignKeyPattern), results[0][0])
-		}
-	}
 }
 
 func TestShowBackupWithDebugIDs(t *testing.T) {

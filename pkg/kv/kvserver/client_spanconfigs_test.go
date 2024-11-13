@@ -13,17 +13,17 @@ package kvserver_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -41,9 +41,11 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 	spanConfigStore := spanconfigstore.New(
 		roachpb.TestingDefaultSpanConfig(),
 		cluster.MakeTestingClusterSettings(),
+		spanconfigstore.NewEmptyBoundsReader(),
 		nil,
 	)
-	mockSubscriber := newMockSpanConfigSubscriber(spanConfigStore)
+	var t0 = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	mockSubscriber := newMockSpanConfigSubscriber(t0, spanConfigStore)
 
 	ctx := context.Background()
 
@@ -62,8 +64,8 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(context.Background())
 
-	_, err := s.InternalExecutor().(sqlutil.InternalExecutor).ExecEx(ctx, "inline-exec", nil,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+	_, err := s.InternalExecutor().(isql.Executor).ExecEx(ctx, "inline-exec", nil,
+		sessiondata.RootUserSessionDataOverride,
 		`SET CLUSTER SETTING spanconfig.store.enabled = true`)
 	require.NoError(t, err)
 
@@ -100,24 +102,90 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 	})
 }
 
+// TestFallbackSpanConfigOverride ensures that
+// spanconfig.store.fallback_config_override works as expected.
+func TestFallbackSpanConfigOverride(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	st := cluster.MakeTestingClusterSettings()
+	spanConfigStore := spanconfigstore.New(
+		roachpb.TestingDefaultSpanConfig(),
+		st,
+		spanconfigstore.NewEmptyBoundsReader(),
+		nil,
+	)
+	var t0 = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	mockSubscriber := newMockSpanConfigSubscriber(t0, spanConfigStore)
+
+	ctx := context.Background()
+	args := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				DisableMergeQueue: true,
+				DisableSplitQueue: true,
+				DisableGCQueue:    true,
+			},
+			SpanConfig: &spanconfig.TestingKnobs{
+				StoreKVSubscriberOverride: mockSubscriber,
+			},
+		},
+	}
+	s, _, _ := serverutils.StartServer(t, args)
+	defer s.Stopper().Stop(context.Background())
+
+	_, err := s.InternalDB().(isql.DB).Executor().ExecEx(ctx, "inline-exec", nil,
+		sessiondata.RootUserSessionDataOverride,
+		`SET CLUSTER SETTING spanconfig.store.enabled = true`)
+	require.NoError(t, err)
+
+	key, err := s.ScratchRange()
+	require.NoError(t, err)
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
+	require.NoError(t, err)
+	repl := store.LookupReplica(keys.MustAddr(key))
+	span := repl.Desc().RSpan().AsRawSpanWithNoLocals()
+
+	conf := roachpb.SpanConfig{NumReplicas: 5, NumVoters: 3}
+	spanconfigstore.FallbackConfigOverride.Override(ctx, &st.SV, &conf)
+
+	require.NotNil(t, mockSubscriber.callback)
+	mockSubscriber.callback(ctx, span) // invoke the callback
+	testutils.SucceedsSoon(t, func() error {
+		repl := store.LookupReplica(keys.MustAddr(key))
+		gotConfig := repl.SpanConfig()
+		if !gotConfig.Equal(conf) {
+			return errors.Newf("expected config=%s, got config=%s", conf.String(), gotConfig.String())
+		}
+		return nil
+	})
+}
+
 type mockSpanConfigSubscriber struct {
-	callback func(ctx context.Context, config roachpb.Span)
+	callback    func(ctx context.Context, config roachpb.Span)
+	lastUpdated time.Time
 	spanconfig.Store
 }
 
 var _ spanconfig.KVSubscriber = &mockSpanConfigSubscriber{}
 
-func newMockSpanConfigSubscriber(store spanconfig.Store) *mockSpanConfigSubscriber {
-	return &mockSpanConfigSubscriber{Store: store}
+func newMockSpanConfigSubscriber(
+	lastUpdated time.Time, store spanconfig.Store,
+) *mockSpanConfigSubscriber {
+	return &mockSpanConfigSubscriber{
+		lastUpdated: lastUpdated,
+		Store:       store,
+	}
 }
 
-func (m *mockSpanConfigSubscriber) NeedsSplit(ctx context.Context, start, end roachpb.RKey) bool {
+func (m *mockSpanConfigSubscriber) NeedsSplit(
+	ctx context.Context, start, end roachpb.RKey,
+) (bool, error) {
 	return m.Store.NeedsSplit(ctx, start, end)
 }
 
 func (m *mockSpanConfigSubscriber) ComputeSplitKey(
 	ctx context.Context, start, end roachpb.RKey,
-) roachpb.RKey {
+) (roachpb.RKey, error) {
 	return m.Store.ComputeSplitKey(ctx, start, end)
 }
 
@@ -134,7 +202,7 @@ func (m *mockSpanConfigSubscriber) GetProtectionTimestamps(
 }
 
 func (m *mockSpanConfigSubscriber) LastUpdated() hlc.Timestamp {
-	panic("unimplemented")
+	return hlc.Timestamp{WallTime: m.lastUpdated.UnixNano()}
 }
 
 func (m *mockSpanConfigSubscriber) Subscribe(callback func(context.Context, roachpb.Span)) {

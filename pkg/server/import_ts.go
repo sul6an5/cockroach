@@ -22,12 +22,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	yaml "gopkg.in/yaml.v2"
@@ -38,6 +39,10 @@ import (
 const maxBatchSize = 10000
 
 func maybeImportTS(ctx context.Context, s *Server) (returnErr error) {
+	// We don't want to do startup retries as this is not meant to be run in
+	// production.
+	ctx = startup.WithoutChecks(ctx)
+
 	var deferError func(error)
 	{
 		var defErr error
@@ -77,9 +82,7 @@ func maybeImportTS(ctx context.Context, s *Server) (returnErr error) {
 	} {
 		if _, err := s.sqlServer.internalExecutor.ExecEx(
 			ctx, "tsdump-cfg", nil, /* txn */
-			sessiondata.InternalExecutorOverride{
-				User: username.RootUserName(),
-			},
+			sessiondata.RootUserSessionDataOverride,
 			stmt,
 		); err != nil {
 			return errors.Wrapf(err, "%s", stmt)
@@ -188,8 +191,8 @@ func maybeImportTS(ctx context.Context, s *Server) (returnErr error) {
 			continue
 		}
 
-		p := roachpb.NewPut(v.Key, v.Value)
-		p.(*roachpb.PutRequest).Inline = true
+		p := kvpb.NewPut(v.Key, v.Value)
+		p.(*kvpb.PutRequest).Inline = true
 		batch.AddRawRequest(p)
 		batchSize++
 		if err := maybeFlush(false /* force */); err != nil {

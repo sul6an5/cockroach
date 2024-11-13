@@ -19,16 +19,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -57,7 +57,6 @@ func runSampleAggregator(
 	t *testing.T,
 	server serverutils.TestServerInterface,
 	sqlDB *gosql.DB,
-	kvDB *kv.DB,
 	st *cluster.Settings,
 	evalCtx *eval.Context,
 	memLimitBytes int64,
@@ -70,10 +69,10 @@ func runSampleAggregator(
 ) {
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
-			DB:       kvDB,
-			Executor: server.InternalExecutor().(sqlutil.InternalExecutor),
+			DB:       server.InternalDB().(descs.DB),
 			Gossip:   gossip.MakeOptionalGossip(server.GossipI().(*gossip.Gossip)),
 		},
 	}
@@ -164,12 +163,12 @@ func runSampleAggregator(
 			Sketches:      sketchSpecs,
 		}
 		p, err := newSamplerProcessor(
-			&flowCtx, 0 /* processorID */, spec, in[i], &execinfrapb.PostProcessSpec{}, outputs[i],
+			context.Background(), &flowCtx, 0 /* processorID */, spec, in[i], &execinfrapb.PostProcessSpec{},
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Run(context.Background())
+		p.Run(context.Background(), outputs[i])
 	}
 	// Randomly interleave the output rows from the samplers into a single buffer.
 	samplerResults := distsqlutils.NewRowBuffer(samplerOutTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
@@ -198,12 +197,12 @@ func runSampleAggregator(
 	}
 
 	agg, err := newSampleAggregator(
-		&flowCtx, 0 /* processorID */, spec, samplerResults, &execinfrapb.PostProcessSpec{}, finalOut,
+		context.Background(), &flowCtx, 0 /* processorID */, spec, samplerResults, &execinfrapb.PostProcessSpec{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	agg.Run(context.Background())
+	agg.Run(context.Background(), finalOut)
 	// Make sure there was no error.
 	finalOut.GetRowsNoMeta(t)
 	r := sqlutils.MakeSQLRunner(sqlDB)
@@ -251,7 +250,7 @@ func runSampleAggregator(
 
 			for _, b := range h.Buckets {
 				ed, _, err := rowenc.EncDatumFromBuffer(
-					types.Int, descpb.DatumEncoding_ASCENDING_KEY, b.UpperBound,
+					catenumpb.DatumEncoding_ASCENDING_KEY, b.UpperBound,
 				)
 				if err != nil {
 					t.Fatal(err)
@@ -307,7 +306,7 @@ func runSampleAggregator(
 func TestSampleAggregator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	server, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	server, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer server.Stopper().Stop(context.Background())
 
 	st := cluster.MakeTestingClusterSettings()
@@ -455,7 +454,7 @@ func TestSampleAggregator(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			runSampleAggregator(
-				t, server, sqlDB, kvDB, st, &evalCtx, tc.memLimitBytes, tc.expectOutOfMemory,
+				t, server, sqlDB, st, &evalCtx, tc.memLimitBytes, tc.expectOutOfMemory,
 				tc.childNumSamples, tc.childMinNumSamples, tc.aggNumSamples, tc.aggMinNumSamples,
 				tc.maxBuckets, tc.expectedMaxBuckets, tc.inputRows, tc.expected,
 			)

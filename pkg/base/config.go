@@ -12,6 +12,8 @@ package base
 
 import (
 	"context"
+	"math"
+	"math/big"
 	"net/url"
 	"os"
 	"time"
@@ -26,6 +28,10 @@ import (
 )
 
 // Base config defaults.
+//
+// When changing these, TestDefaultRaftConfig must also be updated via -rewrite,
+// and the result copied to the defaultRangeLeaseRaftElectionTimeoutMultiplier
+// comment with any adjustments to the surrounding reasoning.
 const (
 	defaultInsecure = false
 	defaultUser     = username.RootUser
@@ -47,39 +53,33 @@ const (
 	defaultSQLAddr  = ":" + DefaultPort
 	defaultHTTPAddr = ":" + DefaultHTTPPort
 
-	// NetworkTimeout is the timeout used for network operations.
-	NetworkTimeout = 3 * time.Second
-
-	// defaultRaftTickInterval is the default resolution of the Raft timer.
-	defaultRaftTickInterval = 200 * time.Millisecond
-
-	// defaultRangeLeaseRaftElectionTimeoutMultiplier specifies what multiple the
-	// leader lease active duration should be of the raft election timeout.
-	defaultRangeLeaseRaftElectionTimeoutMultiplier = 3
-
 	// NB: this can't easily become a variable as the UI hard-codes it to 10s.
 	// See https://github.com/cockroachdb/cockroach/issues/20310.
 	DefaultMetricsSampleInterval = 10 * time.Second
-
-	// defaultRaftHeartbeatIntervalTicks is the default value for
-	// RaftHeartbeatIntervalTicks, which determines the number of ticks between
-	// each heartbeat.
-	defaultRaftHeartbeatIntervalTicks = 5
-
-	// defaultRPCHeartbeatInterval is the default value of RPCHeartbeatInterval
-	// used by the rpc context.
-	defaultRPCHeartbeatInterval = 3 * time.Second
 
 	// defaultRangeLeaseRenewalFraction specifies what fraction the range lease
 	// renewal duration should be of the range lease active time. For example,
 	// with a value of 0.2 and a lease duration of 10 seconds, leases would be
 	// eagerly renewed 8 seconds into each lease.
+	//
+	// A range lease extension requires 1 RTT (Raft consensus), assuming the
+	// leaseholder is colocated with the Raft leader, so 3 seconds should be
+	// sufficient (see NetworkTimeout). However, on user ranges, Raft consensus
+	// uses the DefaultClass RPC class, and is thus subject to head-of-line
+	// blocking by other RPC traffic which can cause very high latencies under
+	// heavy load (several seconds).
 	defaultRangeLeaseRenewalFraction = 0.5
 
-	// livenessRenewalFraction specifies what fraction the node liveness
-	// renewal duration should be of the node liveness duration. For example,
-	// with a value of 0.2 and a liveness duration of 10 seconds, each node's
-	// liveness record would be eagerly renewed after 8 seconds.
+	// livenessRenewalFraction specifies what fraction the node liveness renewal
+	// duration should be of the node liveness duration. For example, with a value
+	// of 0.2 and a liveness duration of 10 seconds, each node's liveness record
+	// would be eagerly renewed after 8 seconds.
+	//
+	// A liveness record write requires 2 RTTs (RPC and Raft consensus). Assuming
+	// a max RTT of 600ms (see NetworkTimeout), 3 seconds is enough for 2 RTTs
+	// (2*600ms) and 1 RTO (900ms), with a 900ms buffer. The write is committed
+	// 1/2 RTT before this. Liveness RPCs including Raft messages are sent via
+	// SystemClass, and thus avoid head-of-line blocking by general RPC traffic.
 	livenessRenewalFraction = 0.5
 
 	// DefaultDescriptorLeaseDuration is the default mean duration a
@@ -97,6 +97,10 @@ const (
 	// DefaultDescriptorLeaseRenewalTimeout is the default time
 	// before a lease expires when acquisition to renew the lease begins.
 	DefaultDescriptorLeaseRenewalTimeout = time.Minute
+
+	// DefaultLeaseRenewalCrossValidate is the default setting for if
+	// we should validate descriptors on lease renewals.
+	DefaultLeaseRenewalCrossValidate = false
 )
 
 // DefaultCertsDirectory is the default value for the cert directory flag.
@@ -118,10 +122,125 @@ func DefaultHistogramWindowInterval() time.Duration {
 }
 
 var (
-	// defaultRaftElectionTimeoutTicks specifies the number of Raft Tick
-	// invocations that must pass between elections.
+	// NetworkTimeout is the timeout used for network operations that require a
+	// single network round trip. It is conservatively defined as one maximum
+	// network round trip time (RTT) plus one TCP packet retransmit (RTO) with an
+	// additional safety margin.
+	//
+	// The maximum RTT between cloud regions is roughly 400ms both in GCP
+	// (asia-south2 to southamerica-west1) and AWS (af-south-1 to sa-east-1), but
+	// p99 RTTs can occasionally approach 600ms.
+	// https://datastudio.google.com/reporting/fc733b10-9744-4a72-a502-92290f608571/page/70YCB
+	// https://www.cloudping.co/grid/p_99/timeframe/1W
+	//
+	// Linux has an RTT-dependant retransmission timeout (RTO) which we can
+	// approximate as 1.5x RTT (smoothed RTT + 4x RTT variance), with a lower
+	// bound of 200ms. It can thus be up to 900ms in the worst case.
+	//
+	// The NetworkTimeout is therefore set to 2 seconds: 600ms RTT plus 900ms RTO
+	// plus a 500ms safety margin.
+	NetworkTimeout = envutil.EnvOrDefaultDuration("COCKROACH_NETWORK_TIMEOUT", 2*time.Second)
+
+	// DialTimeout is the timeout used when dialing a node. gRPC connections take
+	// up to 3 roundtrips for the TCP + TLS handshakes. NetworkTimeout allows for
+	// both a network roundtrip and a TCP retransmit, but we don't need to
+	// tolerate more than 1 retransmit per connection attempt, so
+	// 2 * NetworkTimeout is sufficient.
+	DialTimeout = 2 * NetworkTimeout
+
+	// PingInterval is the interval between network heartbeat pings. It is used
+	// both for RPC heartbeat intervals and gRPC server keepalive pings. It is
+	// set to 1 second in order to fail fast, but with large default timeouts
+	// to tolerate high-latency multiregion clusters.
+	PingInterval = envutil.EnvOrDefaultDuration("COCKROACH_PING_INTERVAL", time.Second)
+
+	// defaultRangeLeaseDuration specifies the default range lease duration.
+	//
+	// Timers for Raft leadership election and lease expiration run in parallel.
+	// Although not required, we would like to elect a leader before the lease
+	// expires, such that we don't have to wait for a Raft election when we're
+	// ready to acquire the lease.
+	//
+	// The relevant operations and default time intervals are listed below. RTTs
+	// are assumed to range from 10ms to 400ms (see NetworkTimeout). Heartbeat
+	// offsets refer to the duration from the last heartbeat to the node crash
+	// (e.g. with a 1s heartbeat interval and 3s timeout, if a node crashes 1s
+	// after heartbeating then the timeout fires after 2s of unavailability and
+	// the offset is -1s).
+	//
+	// Raft election:
+	// - Heartbeat offset (0-1 heartbeat interval)    [-1.00s - 0.00s]
+	// - Election timeout (random 1x-2x timeout)      [ 2.00s - 4.00s]
+	// - Election (3x RTT: prevote, vote, append)     [ 0.03s - 1.20s]
+	// Total latency                                  [ 1.03s - 5.20s]
+	//
+	// Lease acquisition:
+	// - Heartbeat offset (0-1 heartbeat interval)    [-3.00s - 0.00s]
+	// - Lease expiration (constant)                  [ 6.00s - 6.00s]
+	// - Liveness epoch bump (2x RTT: CPut + append)  [ 0.02s - 0.80s]
+	// - Lease acquisition (1x RTT: append)           [ 0.01s - 0.40s]
+	// Total latency                                  [ 3.03s - 7.20s]
+	//
+	// (generated by TestDefaultRaftConfig)
+	//
+	// From the above, we note that the worst-case Raft election latency
+	// (4.03s-5.20s) is always less than the corresponding lease expiration +
+	// epoch bump time (6.02s-6.80s) regardless of RTT, such that the upper bound
+	// on unavailability is always given by the lease expiration time + 3x RTT
+	// (6.03s to 7.20s). With negligible RTT, the average latency is 4.5s for
+	// lease acquisition and 2.5s for Raft elections.
+	defaultRangeLeaseDuration = envutil.EnvOrDefaultDuration(
+		"COCKROACH_RANGE_LEASE_DURATION", 6*time.Second)
+
+	// defaultRPCHeartbeatTimeout is the default RPC heartbeat timeout. It is set
+	// very high at 3 * NetworkTimeout for several reasons: the gRPC transport may
+	// need to complete a dial/handshake before sending the heartbeat, the
+	// heartbeat has occasionally been seen to require 3 RTTs even post-dial (for
+	// unknown reasons), and under load the heartbeat may be head-of-line blocked
+	// by other RPC traffic.
+	//
+	// High-latency experiments with 6s RPC heartbeat timeouts showed that
+	// clusters running TPCC imports were stable at 400ms RTT, but started seeing
+	// RPC heartbeat failures at 500ms RTT. With light load (e.g. rate-limited
+	// kv50), clusters were stable at 1000ms RTT.
+	//
+	// The maximum p99 RPC heartbeat latency in any Cockroach Cloud cluster over a
+	// 90-day period was found to be 557ms. This was a single-region US cluster
+	// where the latency was caused by CPU overload.
+	//
+	// TODO(erikgrinaker): We should avoid head-of-line blocking for RPC
+	// heartbeats and reduce this to NetworkTimeout (plus DialTimeout for the
+	// initial heartbeat), see:
+	// https://github.com/cockroachdb/cockroach/issues/93397.
+	defaultRPCHeartbeatTimeout = 3 * NetworkTimeout
+
+	// defaultRaftTickInterval is the default resolution of the Raft timer.
+	defaultRaftTickInterval = envutil.EnvOrDefaultDuration(
+		"COCKROACH_RAFT_TICK_INTERVAL", 500*time.Millisecond)
+
+	// defaultRaftHeartbeatIntervalTicks is the default value for
+	// RaftHeartbeatIntervalTicks, which determines the number of ticks between
+	// each heartbeat.
+	defaultRaftHeartbeatIntervalTicks = envutil.EnvOrDefaultInt(
+		"COCKROACH_RAFT_HEARTBEAT_INTERVAL_TICKS", 2)
+
+	// defaultRaftElectionTimeoutTicks specifies the minimum number of Raft ticks
+	// before holding an election. The actual election timeout per replica is
+	// multiplied by a random factor of 1-2, to avoid ties.
+	//
+	// A timeout of 2 seconds with a Raft heartbeat sent every second gives each
+	// heartbeat 1 second to make it across the network. This is only half a
+	// network roundtrip, and as seen in NetworkTimeout 1 second is generally
+	// sufficient for a full network roundtrip. Raft heartbeats are also sent via
+	// SystemClass, avoiding head-of-line blocking by general RPC traffic. The 1-2
+	// random factor provides an additional buffer.
 	defaultRaftElectionTimeoutTicks = envutil.EnvOrDefaultInt(
-		"COCKROACH_RAFT_ELECTION_TIMEOUT_TICKS", 15)
+		"COCKROACH_RAFT_ELECTION_TIMEOUT_TICKS", 4)
+
+	// defaultRaftReproposalTimeoutTicks is the number of ticks before reproposing
+	// a Raft command.
+	defaultRaftReproposalTimeoutTicks = envutil.EnvOrDefaultInt(
+		"COCKROACH_RAFT_REPROPOSAL_TIMEOUT_TICKS", 6)
 
 	// defaultRaftLogTruncationThreshold specifies the upper bound that a single
 	// Range's Raft log can grow to before log truncations are triggered while at
@@ -146,6 +265,25 @@ var (
 	// will send to a given follower without hearing a response.
 	defaultRaftMaxInflightMsgs = envutil.EnvOrDefaultInt(
 		"COCKROACH_RAFT_MAX_INFLIGHT_MSGS", 128)
+
+	// defaultRaftMaxInflightBytes specifies the maximum aggregate byte size of
+	// Raft log entries that a leader will send to a follower without hearing
+	// responses. As such, it also bounds the amount of replication data buffered
+	// in memory on the receiver. Individual messages can still exceed this limit
+	// (consider the default command size limit at 64 MB).
+	//
+	// Normally, RaftMaxInflightMsgs * RaftMaxSizePerMsg will bound this at 4 MB
+	// (128 messages at 32 KB each). However, individual messages are allowed to
+	// exceed the 32 KB limit, typically large AddSSTable commands that can be
+	// around 10 MB each. To prevent followers running out of memory, we place an
+	// additional total byte limit of 32 MB, which is 8 times more than normal.
+	// This was found to significantly reduce OOM incidence during RESTORE with
+	// overloaded disks.
+	//
+	// Per the bandwidth-delay product, this will limit per-range throughput to
+	// 64 MB/s at 500 ms RTT, 320 MB/s at 100 ms RTT, and 3.2 GB/s at 10 ms RTT.
+	defaultRaftMaxInflightBytes = envutil.EnvOrDefaultBytes(
+		"COCKROACH_RAFT_MAX_INFLIGHT_BYTES", 32<<20 /* 32 MB */)
 )
 
 // Config is embedded by server.Config. A base config is not meant to be used
@@ -221,10 +359,22 @@ type Config struct {
 	// This is computed from HTTPAddr if specified otherwise Addr.
 	HTTPAdvertiseAddr string
 
-	// RPCHeartbeatInterval controls how often a Ping request is sent on peer
-	// connections to determine connection health and update the local view
-	// of remote clocks.
+	// RPCHeartbeatInterval controls how often Ping requests are sent on peer
+	// connections to determine connection health and update the local view of
+	// remote clocks.
 	RPCHeartbeatInterval time.Duration
+
+	// RPCHearbeatTimeout is the timeout for Ping requests.
+	RPCHeartbeatTimeout time.Duration
+
+	// SecondaryTenantPortOffset is the increment to add to the various
+	// addresses to generate the network configuration for the in-memory
+	// secondary tenant. If set to zero (the default), ports are
+	// auto-allocated randomly.
+	// TODO(knz): Remove this mechanism altogether in favor of a single
+	// network listener with protocol routing.
+	// See: https://github.com/cockroachdb/cockroach/issues/84585
+	SecondaryTenantPortOffset int
 
 	// Enables the use of an PTP hardware clock user space API for HLC current time.
 	// This contains the path to the device to be used (i.e. /dev/ptp0)
@@ -238,6 +388,10 @@ type Config struct {
 	// The flag exists mostly for the benefit of tests, and for
 	// `cockroach start-single-node`.
 	AutoInitializeCluster bool
+
+	// LocalityAddresses contains private IP addresses that can only be accessed
+	// in the corresponding locality.
+	LocalityAddresses []roachpb.LocalityAddress
 }
 
 // HistogramWindowInterval is used to determine the approximate length of time
@@ -273,11 +427,13 @@ func (cfg *Config) InitDefaults() {
 	cfg.SQLAdvertiseAddr = cfg.SQLAddr
 	cfg.SocketFile = ""
 	cfg.SSLCertsDir = DefaultCertsDirectory
-	cfg.RPCHeartbeatInterval = defaultRPCHeartbeatInterval
+	cfg.RPCHeartbeatInterval = PingInterval
+	cfg.RPCHeartbeatTimeout = defaultRPCHeartbeatTimeout
 	cfg.ClusterName = ""
 	cfg.DisableClusterNameVerification = false
 	cfg.ClockDevicePath = ""
 	cfg.AcceptSQLWithoutTLS = false
+	cfg.SecondaryTenantPortOffset = 0
 }
 
 // HTTPRequestScheme returns "http" or "https" based on the value of
@@ -302,17 +458,22 @@ type RaftConfig struct {
 	// RaftTickInterval is the resolution of the Raft timer.
 	RaftTickInterval time.Duration
 
-	// RaftElectionTimeoutTicks is the number of raft ticks before the
-	// previous election expires. This value is inherited by individual stores
+	// RaftElectionTimeoutTicks is the minimum number of raft ticks before holding
+	// an election. The actual election timeout is randomized by each replica to
+	// between 1-2 election timeouts. This value is inherited by individual stores
 	// unless overridden.
 	RaftElectionTimeoutTicks int
+
+	// RaftReproposalTimeoutTicks is the number of ticks before reproposing a Raft
+	// command. This also specifies the number of ticks between each reproposal
+	// check, so the actual timeout is 1-2 times this value.
+	RaftReproposalTimeoutTicks int
 
 	// RaftHeartbeatIntervalTicks is the number of ticks that pass between heartbeats.
 	RaftHeartbeatIntervalTicks int
 
-	// RangeLeaseRaftElectionTimeoutMultiplier specifies what multiple the leader
-	// lease active duration should be of the raft election timeout.
-	RangeLeaseRaftElectionTimeoutMultiplier float64
+	// RangeLeaseRaftElectionTimeoutMultiplier specifies the range lease duration.
+	RangeLeaseDuration time.Duration
 	// RangeLeaseRenewalFraction specifies what fraction the range lease renewal
 	// duration should be of the range lease active time. For example, with a
 	// value of 0.2 and a lease duration of 10 seconds, leases would be eagerly
@@ -348,20 +509,46 @@ type RaftConfig struct {
 	// value lowers the raft recovery cost (during initial probing and after
 	// message loss during normal operation). On the other hand, it limits the
 	// throughput during normal replication.
+	//
+	// Used in combination with RaftMaxInflightMsgs and RaftMaxInflightBytes.
 	RaftMaxSizePerMsg uint64
 
 	// RaftMaxCommittedSizePerReady controls the maximum aggregate byte size of
 	// committed Raft log entries a replica will receive in a single Ready.
 	RaftMaxCommittedSizePerReady uint64
 
-	// RaftMaxInflightMsgs controls how many "inflight" MsgApps Raft will send
-	// to a follower without hearing a response. The total number of Raft log
-	// entries is a combination of this setting and RaftMaxSizePerMsg. The
-	// current default settings provide for up to 4 MB of raft log to be sent
-	// without acknowledgement. With an average entry size of 1 KB that
-	// translates to ~4096 commands that might be executed in the handling of a
-	// single raft.Ready operation.
+	// RaftMaxInflightMsgs controls how many "inflight" MsgApps Raft will send to
+	// a follower without hearing a response. The total size of inflight Raft log
+	// entries is thus roughly limited by RaftMaxInflightMsgs * RaftMaxSizePerMsg,
+	// but also by RaftMaxInflightBytes. The current default settings provide for
+	// up to 4 MB of Raft log to be sent without acknowledgement. With an average
+	// entry size of 1 KB that translates to ~4096 commands that might be executed
+	// in the handling of a single raft.Ready operation.
+	//
+	// This setting is used both by sending and receiving end of Raft messages. To
+	// minimize dropped messages on the receiver, its size should at least match
+	// the sender's (being it the default size, or taken from the env variables).
 	RaftMaxInflightMsgs int
+
+	// RaftMaxInflightBytes controls the maximum aggregate byte size of Raft log
+	// entries that a leader will send to a follower without hearing responses.
+	// As such, it also bounds the amount of replication data buffered in memory
+	// on the receiver.
+	//
+	// Normally RaftMaxSizePerMsg * RaftMaxInflightMsgs is the actual limit. But
+	// the RaftMaxSizePerMsg is soft, and Raft may send individual messages
+	// arbitrarily larger than that (e.g. with a large write, or AddSST command),
+	// so it's possible that the overall limit is exceeded by a large multiple.
+	// RaftMaxInflightBytes is a stricter limit which can only be slightly
+	// exceeded (by a single message).
+	//
+	// This effectively bounds the bandwidth-delay product. Note that especially
+	// in high-latency deployments setting this too low can lead to a dramatic
+	// reduction in throughput. For example, with a peer that has a round-trip
+	// latency of 100ms to the leader and this setting is set to 1 MB, there is a
+	// throughput limit of 10 MB/s for this group. With RTT of 400ms, this drops
+	// to 2.5 MB/s. See Little's law to understand the maths behind.
+	RaftMaxInflightBytes uint64
 
 	// Splitting a range which has a replica needing a snapshot results in two
 	// ranges in that state. The delay configured here slows down splits when in
@@ -370,7 +557,7 @@ type RaftConfig struct {
 	// backup/restore.
 	//
 	// -1 to disable.
-	RaftDelaySplitToSuppressSnapshotTicks int
+	RaftDelaySplitToSuppressSnapshot time.Duration
 }
 
 // SetDefaults initializes unset fields.
@@ -384,11 +571,14 @@ func (cfg *RaftConfig) SetDefaults() {
 	if cfg.RaftHeartbeatIntervalTicks == 0 {
 		cfg.RaftHeartbeatIntervalTicks = defaultRaftHeartbeatIntervalTicks
 	}
-	if cfg.RangeLeaseRaftElectionTimeoutMultiplier == 0 {
-		cfg.RangeLeaseRaftElectionTimeoutMultiplier = defaultRangeLeaseRaftElectionTimeoutMultiplier
+	if cfg.RangeLeaseDuration == 0 {
+		cfg.RangeLeaseDuration = defaultRangeLeaseDuration
 	}
 	if cfg.RangeLeaseRenewalFraction == 0 {
 		cfg.RangeLeaseRenewalFraction = defaultRangeLeaseRenewalFraction
+	}
+	if cfg.RaftReproposalTimeoutTicks == 0 {
+		cfg.RaftReproposalTimeoutTicks = defaultRaftReproposalTimeoutTicks
 	}
 	// TODO(andrei): -1 is a special value for RangeLeaseRenewalFraction which
 	// really means "0" (never renew), except that the zero value means "use
@@ -420,17 +610,24 @@ func (cfg *RaftConfig) SetDefaults() {
 	if cfg.RaftMaxInflightMsgs == 0 {
 		cfg.RaftMaxInflightMsgs = defaultRaftMaxInflightMsgs
 	}
-	if cfg.RaftDelaySplitToSuppressSnapshotTicks == 0 {
-		// The Raft Ticks interval defaults to 200ms, and an election is 15
-		// ticks. Add a generous amount of ticks to make sure even a backed up
-		// Raft snapshot queue is going to make progress when a (not overly
-		// concurrent) amount of splits happens.
-		// The generous amount should result in a delay sufficient to
-		// transmit at least one snapshot with the slow delay, which
-		// with default settings is max 64MB at 2MB/s, ie 32 seconds.
-		//
-		// The resulting delay configured here is about 50s.
-		cfg.RaftDelaySplitToSuppressSnapshotTicks = 3*cfg.RaftElectionTimeoutTicks + 200
+
+	if cfg.RaftMaxInflightBytes == 0 {
+		cfg.RaftMaxInflightBytes = uint64(defaultRaftMaxInflightBytes)
+	}
+	// Fixup RaftMaxInflightBytes if it is lower than reasonable.
+	if other := maxInflightBytesFrom(
+		cfg.RaftMaxInflightMsgs, cfg.RaftMaxSizePerMsg,
+	); cfg.RaftMaxInflightBytes < other {
+		cfg.RaftMaxInflightBytes = other
+	}
+
+	if cfg.RaftDelaySplitToSuppressSnapshot == 0 {
+		// Use a generous delay to make sure even a backed up Raft snapshot queue is
+		// going to make progress when a (not overly concurrent) amount of splits
+		// happens. The generous amount should result in a delay sufficient to
+		// transmit at least one snapshot with the slow delay, which with default
+		// settings is max 512MB at 32MB/s, ie 16 seconds.
+		cfg.RaftDelaySplitToSuppressSnapshot = 45 * time.Second
 	}
 
 	// Minor validation to ensure sane tuning.
@@ -446,23 +643,9 @@ func (cfg RaftConfig) RaftElectionTimeout() time.Duration {
 }
 
 // RangeLeaseDurations computes durations for range lease expiration and
-// renewal based on a default multiple of Raft election timeout.
-func (cfg RaftConfig) RangeLeaseDurations() (rangeLeaseActive, rangeLeaseRenewal time.Duration) {
-	rangeLeaseActive = time.Duration(cfg.RangeLeaseRaftElectionTimeoutMultiplier *
-		float64(cfg.RaftElectionTimeout()))
-	renewalFraction := cfg.RangeLeaseRenewalFraction
-	if renewalFraction == -1 {
-		renewalFraction = 0
-	}
-	rangeLeaseRenewal = time.Duration(float64(rangeLeaseActive) * renewalFraction)
-	return
-}
-
-// RangeLeaseActiveDuration is the duration of the active period of leader
-// leases requested.
-func (cfg RaftConfig) RangeLeaseActiveDuration() time.Duration {
-	rangeLeaseActive, _ := cfg.RangeLeaseDurations()
-	return rangeLeaseActive
+// renewal.
+func (cfg RaftConfig) RangeLeaseDurations() (time.Duration, time.Duration) {
+	return cfg.RangeLeaseDuration, cfg.RangeLeaseRenewalDuration()
 }
 
 // RangeLeaseRenewalDuration specifies a time interval at the end of the
@@ -470,14 +653,27 @@ func (cfg RaftConfig) RangeLeaseActiveDuration() time.Duration {
 // period) during which operations will trigger an asynchronous renewal of the
 // lease.
 func (cfg RaftConfig) RangeLeaseRenewalDuration() time.Duration {
-	_, rangeLeaseRenewal := cfg.RangeLeaseDurations()
-	return rangeLeaseRenewal
+	if cfg.RangeLeaseRenewalFraction == -1 {
+		return 0
+	}
+	return time.Duration(cfg.RangeLeaseRenewalFraction * float64(cfg.RangeLeaseDuration))
+}
+
+// RangeLeaseAcquireTimeout is the timeout for lease acquisition.
+func (cfg RaftConfig) RangeLeaseAcquireTimeout() time.Duration {
+	// The Raft election timeout is randomized by a factor of 1-2x per replica
+	// (the first one will trigger the election), and reproposing the lease
+	// acquisition command can take up to 1 Raft election timeout. On average, we
+	// should be able to elect a leader and acquire a lease within 2 election
+	// timeouts, assuming negligible RTT; otherwise, lease acquisition will
+	// typically be retried, only adding a bit of tail latency.
+	return 2 * cfg.RaftElectionTimeout()
 }
 
 // NodeLivenessDurations computes durations for node liveness expiration and
 // renewal based on a default multiple of Raft election timeout.
 func (cfg RaftConfig) NodeLivenessDurations() (livenessActive, livenessRenewal time.Duration) {
-	livenessActive = cfg.RangeLeaseActiveDuration()
+	livenessActive = cfg.RangeLeaseDuration
 	livenessRenewal = time.Duration(float64(livenessActive) * livenessRenewalFraction)
 	return
 }
@@ -489,7 +685,7 @@ func (cfg RaftConfig) NodeLivenessDurations() (livenessActive, livenessRenewal t
 // propagate liveness. The replica which is the lease holder of the first range
 // gossips it.
 func (cfg RaftConfig) SentinelGossipTTL() time.Duration {
-	return cfg.RangeLeaseActiveDuration() / 2
+	return cfg.RangeLeaseDuration
 }
 
 // DefaultRetryOptions should be used for retrying most
@@ -503,6 +699,19 @@ func DefaultRetryOptions() retry.Options {
 		MaxBackoff:     1 * time.Second,
 		Multiplier:     2,
 	}
+}
+
+// maxInflightBytesFrom returns the minimal value for RaftMaxInflightBytes
+// config option based on RaftMaxInflightMsgs and RaftMaxSizePerMsg.
+func maxInflightBytesFrom(maxInflightMsgs int, maxSizePerMsg uint64) uint64 {
+	// Compute min(maxInflightMsgs * maxSizePerMsg, MaxUint64) safely.
+	if mul := new(big.Int).Mul(
+		big.NewInt(int64(maxInflightMsgs)),
+		new(big.Int).SetUint64(maxSizePerMsg),
+	); mul.IsUint64() {
+		return mul.Uint64()
+	}
+	return math.MaxUint64
 }
 
 // StorageConfig contains storage configs for all storage engine.
@@ -521,7 +730,7 @@ type StorageConfig struct {
 	// BallastSize is the amount reserved by a ballast file for manual
 	// out-of-disk recovery.
 	BallastSize int64
-	// Settings instance for cluster-wide knobs.
+	// Settings instance for cluster-wide knobs. Must not be nil.
 	Settings *cluster.Settings
 	// UseFileRegistry is true if the file registry is needed (eg: encryption-at-rest).
 	// This may force the store version to versionFileRegistry if currently lower.
@@ -563,7 +772,8 @@ type TempStorageConfig struct {
 	Mon *mon.BytesMonitor
 	// Spec stores the StoreSpec this TempStorageConfig will use.
 	Spec StoreSpec
-	// Settings stores the cluster.Settings this TempStoreConfig will use.
+	// Settings stores the cluster.Settings this TempStoreConfig will use. Must
+	// not be nil.
 	Settings *cluster.Settings
 }
 

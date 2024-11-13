@@ -1,7 +1,9 @@
 # Test schema only multi region restore this test is exactly the same as the 'multiregion' datadriven
 # test, except schema_only RESTORE is used
 
-new-server name=s1 allow-implicit-access localities=us-east-1,us-west-1,eu-central-1
+# disabled to run within tenant because multiregion primitives are not supported within tenant
+
+new-cluster name=s1 allow-implicit-access disable-tenant localities=us-east-1,us-west-1,eu-central-1
 ----
 
 exec-sql
@@ -26,11 +28,11 @@ BACKUP INTO 'nodelocal://1/full_cluster_backup/';
 ----
 
 # A new cluster with the same locality settings.
-new-server name=s2 share-io-dir=s1 allow-implicit-access localities=us-east-1,us-west-1,eu-central-1
+new-cluster name=s2 share-io-dir=s1 allow-implicit-access disable-tenant localities=us-east-1,us-west-1,eu-central-1
 ----
 
 exec-sql
-RESTORE FROM LATEST IN 'nodelocal://0/full_cluster_backup/' with schema_only;
+RESTORE FROM LATEST IN 'nodelocal://1/full_cluster_backup/' with schema_only;
 ----
 
 exec-sql
@@ -38,7 +40,7 @@ DROP DATABASE d;
 ----
 
 exec-sql
-RESTORE DATABASE d FROM LATEST IN 'nodelocal://0/database_backup/' with schema_only;
+RESTORE DATABASE d FROM LATEST IN 'nodelocal://1/database_backup/' with schema_only;
 ----
 
 query-sql
@@ -51,17 +53,17 @@ postgres root <nil> <nil> {} <nil>
 system node <nil> <nil> {} <nil>
 
 # A new cluster with different localities settings.
-new-server name=s3 share-io-dir=s1 allow-implicit-access localities=eu-central-1,eu-north-1
+new-cluster name=s3 share-io-dir=s1 allow-implicit-access disable-tenant localities=eu-central-1,eu-north-1
 ----
 
 exec-sql
-RESTORE DATABASE d FROM LATEST IN 'nodelocal://0/database_backup/' with schema_only;
+RESTORE DATABASE d FROM LATEST IN 'nodelocal://1/database_backup/' with schema_only;
 ----
 pq: detected a mismatch in regions between the restore cluster and the backup cluster, missing regions detected: us-east-1, us-west-1.
 HINT: there are two ways you can resolve this issue: 1) update the cluster to which you're restoring to ensure that the regions present on the nodes' --locality flags match those present in the backup image, or 2) restore with the "skip_localities_check" option
 
 exec-sql
-RESTORE FROM LATEST IN 'nodelocal://0/full_cluster_backup/' with schema_only;
+RESTORE FROM LATEST IN 'nodelocal://1/full_cluster_backup/' with schema_only;
 ----
 pq: detected a mismatch in regions between the restore cluster and the backup cluster, missing regions detected: us-east-1, us-west-1.
 HINT: there are two ways you can resolve this issue: 1) update the cluster to which you're restoring to ensure that the regions present on the nodes' --locality flags match those present in the backup image, or 2) restore with the "skip_localities_check" option
@@ -95,8 +97,7 @@ exec-sql
 DROP DATABASE no_region_db_2;
 ----
 
-exec-sql ignore-notice
-SET CLUSTER SETTING sql.defaults.primary_region = 'non-existent-region';
+set-cluster-setting setting=sql.defaults.primary_region value=non-existent-region
 ----
 
 exec-sql
@@ -107,8 +108,7 @@ HINT: valid regions: eu-central-1, eu-north-1
 --
 set the default PRIMARY REGION to a region that exists (see SHOW REGIONS FROM CLUSTER) then using SET CLUSTER SETTING sql.defaults.primary_region = 'region'
 
-exec-sql ignore-notice
-SET CLUSTER SETTING sql.defaults.primary_region = 'eu-central-1';
+set-cluster-setting setting=sql.defaults.primary_region value=eu-central-1
 ----
 
 exec-sql
@@ -136,18 +136,17 @@ CREATE DATABASE eu_central_db;
 CREATE TABLE eu_central_db.t (x INT);
 INSERT INTO eu_central_db.t VALUES (1), (2), (3);
 ----
-NOTICE: setting eu-central-1 as the PRIMARY REGION as no PRIMARY REGION was specified
+NOTICE: defaulting to 'WITH PRIMARY REGION "eu-central-1"' as no primary region was specified
 
 exec-sql
 BACKUP DATABASE eu_central_db INTO 'nodelocal://1/eu_central_database_backup/';
 ----
 
 # New cluster for a cluster backup.
-new-server name=s4 share-io-dir=s1 allow-implicit-access localities=eu-central-1,eu-north-1
+new-cluster name=s4 share-io-dir=s1 allow-implicit-access disable-tenant localities=eu-central-1,eu-north-1
 ----
 
-exec-sql ignore-notice
-SET CLUSTER SETTING sql.defaults.primary_region = 'eu-north-1';
+set-cluster-setting setting=sql.defaults.primary_region value=eu-north-1
 ----
 
 exec-sql

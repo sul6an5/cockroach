@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 7
+const configIdx = 6
 
 var execBuildLogicTestDir string
 
@@ -60,6 +60,9 @@ func runExecBuildLogicTest(t *testing.T, file string) {
 	serverArgs := logictest.TestServerArgs{
 		DisableWorkmemRandomization: true,
 		ForceProductionValues:       true,
+		// Disable the direct scans in order to keep the output of EXPLAIN (VEC)
+		// deterministic.
+		DisableDirectColumnarScans: true,
 	}
 	logictest.RunLogicTest(t, serverArgs, configIdx, filepath.Join(execBuildLogicTestDir, file))
 }
@@ -114,6 +117,13 @@ func TestExecBuild_distsql_distinct_on(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "distsql_distinct_on")
+}
+
+func TestExecBuild_distsql_group_join(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "distsql_group_join")
 }
 
 func TestExecBuild_distsql_indexjoin(

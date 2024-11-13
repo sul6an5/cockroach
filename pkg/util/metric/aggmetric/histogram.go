@@ -11,10 +11,7 @@
 package aggmetric
 
 import (
-	"time"
-
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/prometheus/client_golang/prometheus"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 )
 
@@ -23,24 +20,23 @@ import (
 // children, while its children are additionally exported to prometheus via the
 // PrometheusIterable interface.
 type AggHistogram struct {
-	h      metric.Histogram
-	create func() *metric.Histogram
+	h      metric.IHistogram
+	create func() metric.IHistogram
 	childSet
 }
 
 var _ metric.Iterable = (*AggHistogram)(nil)
 var _ metric.PrometheusIterable = (*AggHistogram)(nil)
 var _ metric.PrometheusExportable = (*AggHistogram)(nil)
+var _ metric.WindowedHistogram = (*AggHistogram)(nil)
 
 // NewHistogram constructs a new AggHistogram.
-func NewHistogram(
-	metadata metric.Metadata, duration time.Duration, buckets []float64, childLabels ...string,
-) *AggHistogram {
-	create := func() *metric.Histogram {
-		return metric.NewHistogram(metadata, duration, buckets)
+func NewHistogram(opts metric.HistogramOptions, childLabels ...string) *AggHistogram {
+	create := func() metric.IHistogram {
+		return metric.NewHistogram(opts)
 	}
 	a := &AggHistogram{
-		h:      *create(),
+		h:      create(),
 		create: create,
 	}
 	a.init(childLabels)
@@ -65,6 +61,31 @@ func (a *AggHistogram) GetMetadata() metric.Metadata { return a.h.GetMetadata() 
 // Inspect is part of the metric.Iterable interface.
 func (a *AggHistogram) Inspect(f func(interface{})) { f(a) }
 
+// TotalWindowed is part of the metric.WindowedHistogram interface
+func (a *AggHistogram) TotalWindowed() (int64, float64) {
+	return a.h.TotalWindowed()
+}
+
+// Total is part of the metric.WindowedHistogram interface
+func (a *AggHistogram) Total() (int64, float64) {
+	return a.h.Total()
+}
+
+// MeanWindowed is part of the metric.WindowedHistogram interface
+func (a *AggHistogram) MeanWindowed() float64 {
+	return a.h.MeanWindowed()
+}
+
+// Mean is part of the metric.WindowedHistogram interface
+func (a *AggHistogram) Mean() float64 {
+	return a.h.Mean()
+}
+
+// ValueAtQuantileWindowed is part of the metric.WindowedHistogram interface
+func (a *AggHistogram) ValueAtQuantileWindowed(q float64) float64 {
+	return a.h.ValueAtQuantileWindowed(q)
+}
+
 // GetType is part of the metric.PrometheusExportable interface.
 func (a *AggHistogram) GetType() *io_prometheus_client.MetricType {
 	return a.h.GetType()
@@ -80,19 +101,13 @@ func (a *AggHistogram) ToPrometheusMetric() *io_prometheus_client.Metric {
 	return a.h.ToPrometheusMetric()
 }
 
-// Windowed returns a copy of the current windowed histogram data and its
-// rotation interval.
-func (a *AggHistogram) Windowed() prometheus.Histogram {
-	return a.h.Windowed()
-}
-
 // AddChild adds a Counter to this AggCounter. This method panics if a Counter
 // already exists for this set of labelVals.
 func (a *AggHistogram) AddChild(labelVals ...string) *Histogram {
 	child := &Histogram{
 		parent:           a,
 		labelValuesSlice: labelValuesSlice(labelVals),
-		h:                *a.create(),
+		h:                a.create(),
 	}
 	a.add(child)
 	return child
@@ -105,7 +120,7 @@ func (a *AggHistogram) AddChild(labelVals ...string) *Histogram {
 type Histogram struct {
 	parent *AggHistogram
 	labelValuesSlice
-	h metric.Histogram
+	h metric.IHistogram
 }
 
 // ToPrometheusMetric constructs a prometheus metric for this Histogram.
@@ -113,9 +128,13 @@ func (g *Histogram) ToPrometheusMetric() *io_prometheus_client.Metric {
 	return g.h.ToPrometheusMetric()
 }
 
-// Destroy disconnects this Histogram from its parents. Unlike Gauge.Destroy, it
-// does not decrement its value from its parent.
-func (g *Histogram) Destroy() {
+// Unlink unlinks this child from the parent, i.e. the parent will no longer
+// track this child (i.e. won't generate labels for it, etc). However, the child
+// will continue to be functional and reference the parent, meaning updates to
+// it will be reflected in the aggregate stored in the parent.
+//
+// See tenantrate.TestUseAfterRelease.
+func (g *Histogram) Unlink() {
 	g.parent.remove(g)
 }
 

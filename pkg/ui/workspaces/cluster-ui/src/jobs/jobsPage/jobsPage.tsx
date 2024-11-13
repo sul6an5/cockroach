@@ -7,29 +7,44 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
 import { InlineAlert } from "@cockroachlabs/ui-components";
-import moment from "moment";
+import moment from "moment-timezone";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { RouteComponentProps } from "react-router-dom";
 import { JobsRequest, JobsResponse } from "src/api/jobsApi";
 import { Delayed } from "src/delayed";
-import { Dropdown, DropdownOption } from "src/dropdown";
+import { Dropdown } from "src/dropdown";
 import { Loading } from "src/loading";
 import { PageConfig, PageConfigItem } from "src/pageConfig";
-import { SortSetting } from "src/sortedtable";
-import { syncHistory } from "src/util";
-
-import { JobTable } from "./jobTable";
-import { statusOptions, showOptions, typeOptions } from "../util";
+import { ISortedTablePagination, SortSetting } from "src/sortedtable";
+import ColumnsSelector, {
+  SelectOption,
+} from "src/columnsSelector/columnsSelector";
+import { Pagination, ResultsPerPageLabel } from "src/pagination";
+import { isSelectedColumn } from "src/columnsSelector/utils";
+import { DATE_FORMAT_24_TZ, syncHistory, TimestampToMoment } from "src/util";
+import { jobsColumnLabels, JobsTable, makeJobsColumns } from "./jobsTable";
+import {
+  showOptions,
+  statusOptions,
+  typeOptions,
+  isValidJobStatus,
+  defaultRequestOptions,
+  isValidJobType,
+} from "../util";
 
 import { commonStyles } from "src/common";
+import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
 import styles from "../jobs.module.scss";
 import classNames from "classnames/bind";
+import { Timestamp } from "../../timestamp";
 
 const cx = classNames.bind(styles);
+const sortableTableCx = classNames.bind(sortableTableStyles);
 
+type ITimestamp = google.protobuf.ITimestamp;
 type JobType = cockroach.sql.jobs.jobspb.Type;
 
 export interface JobsPageStateProps {
@@ -39,7 +54,10 @@ export interface JobsPageStateProps {
   type: number;
   jobs: JobsResponse;
   jobsError: Error | null;
-  jobsLoading: boolean;
+  reqInFlight: boolean;
+  isDataValid: boolean;
+  columns: string[];
+  lastUpdated: moment.Moment | null;
 }
 
 export interface JobsPageDispatchProps {
@@ -47,18 +65,40 @@ export interface JobsPageDispatchProps {
   setStatus: (value: string) => void;
   setShow: (value: string) => void;
   setType: (value: JobType) => void;
+  onColumnsChange: (selectedColumns: string[]) => void;
   refreshJobs: (req: JobsRequest) => void;
-  onFilterChange?: (req: JobsRequest) => void;
+}
+
+interface PageState {
+  pagination: ISortedTablePagination;
 }
 
 export type JobsPageProps = JobsPageStateProps &
   JobsPageDispatchProps &
   RouteComponentProps;
 
-export class JobsPage extends React.Component<JobsPageProps> {
+const reqFromProps = (
+  props: JobsPageStateProps,
+): cockroach.server.serverpb.JobsRequest => {
+  const showAsInt = parseInt(props.show, 10);
+  return new cockroach.server.serverpb.JobsRequest({
+    limit: isNaN(showAsInt) ? 0 : showAsInt,
+    status: props.status,
+    type: props.type,
+  });
+};
+
+export class JobsPage extends React.Component<JobsPageProps, PageState> {
+  refreshDataInterval: NodeJS.Timeout;
+
   constructor(props: JobsPageProps) {
     super(props);
-
+    this.state = {
+      pagination: {
+        pageSize: 20,
+        current: 1,
+      },
+    };
     const { history } = this.props;
     const searchParams = new URLSearchParams(history.location.search);
 
@@ -76,8 +116,8 @@ export class JobsPage extends React.Component<JobsPageProps> {
     }
 
     // Filter Status.
-    const status = searchParams.get("status") || undefined;
-    if (this.props.setStatus && status && status != this.props.status) {
+    const status = searchParams.get("status");
+    if (this.props.setStatus && status && status !== this.props.status) {
       this.props.setStatus(status);
     }
 
@@ -94,34 +134,69 @@ export class JobsPage extends React.Component<JobsPageProps> {
     }
   }
 
-  private refresh(props = this.props): void {
-    const jobsRequest = new cockroach.server.serverpb.JobsRequest({
-      status: props.status,
-      type: props.type,
-      limit: parseInt(props.show, 10),
-    });
-    props.onFilterChange
-      ? props.onFilterChange(jobsRequest)
-      : props.refreshJobs(jobsRequest);
+  scheduleFetch(): void {
+    clearTimeout(this.refreshDataInterval);
+    const now = moment.utc();
+    const nextRefresh =
+      !this.props.isDataValid && !this.props.jobsError
+        ? now
+        : this.props.lastUpdated?.clone().add(10, "seconds") ?? now;
+    const msToNextRefresh = Math.max(0, nextRefresh.diff(now, "millisecond"));
+    this.refreshDataInterval = setTimeout(() => {
+      const req = reqFromProps(this.props);
+      this.props.refreshJobs(req);
+    }, msToNextRefresh);
   }
 
   componentDidMount(): void {
-    this.refresh();
+    this.scheduleFetch();
   }
 
   componentDidUpdate(prevProps: JobsPageProps): void {
+    // Because we removed the retrying status, we add this check
+    // just in case there exists an app that attempts to load a non-existent
+    // status.
+    if (!isValidJobStatus(this.props.status)) {
+      this.onStatusSelected(defaultRequestOptions.status);
+    }
+
+    if (!isValidJobType(this.props.type)) {
+      this.onTypeSelected(defaultRequestOptions.type.toString());
+    }
+
     if (
+      prevProps.lastUpdated !== this.props.lastUpdated ||
+      prevProps.show !== this.props.show ||
       prevProps.status !== this.props.status ||
-      prevProps.type !== this.props.type ||
-      prevProps.show !== this.props.show
+      prevProps.type !== this.props.type
     ) {
-      this.refresh();
+      this.scheduleFetch();
     }
   }
 
+  componentWillUnmount(): void {
+    clearTimeout(this.refreshDataInterval);
+  }
+
+  onChangePage = (current: number): void => {
+    const { pagination } = this.state;
+    this.setState({ pagination: { ...pagination, current } });
+  };
+
+  resetPagination = (): void => {
+    this.setState((prevState: PageState) => {
+      return {
+        pagination: {
+          current: 1,
+          pageSize: prevState.pagination.pageSize,
+        },
+      };
+    });
+  };
+
   onStatusSelected = (item: string): void => {
     this.props.setStatus(item);
-
+    this.resetPagination();
     syncHistory(
       {
         status: item,
@@ -130,12 +205,10 @@ export class JobsPage extends React.Component<JobsPageProps> {
     );
   };
 
-  statusMenuItems: DropdownOption[] = statusOptions;
-
   onTypeSelected = (item: string): void => {
     const type = parseInt(item, 10);
     this.props.setType(type);
-
+    this.resetPagination();
     syncHistory(
       {
         type: type.toString(),
@@ -144,11 +217,9 @@ export class JobsPage extends React.Component<JobsPageProps> {
     );
   };
 
-  typeMenuItems: DropdownOption[] = typeOptions;
-
   onShowSelected = (item: string): void => {
     this.props.setShow(item);
-
+    this.resetPagination();
     syncHistory(
       {
         show: item,
@@ -156,8 +227,6 @@ export class JobsPage extends React.Component<JobsPageProps> {
       this.props.history,
     );
   };
-
-  showMenuItems: DropdownOption[] = showOptions;
 
   changeSortSetting = (ss: SortSetting): void => {
     if (this.props.setSort) {
@@ -173,81 +242,149 @@ export class JobsPage extends React.Component<JobsPageProps> {
     );
   };
 
-  render(): React.ReactElement {
-    const isLoading = !this.props.jobs || this.props.jobsLoading;
-    const error = this.props.jobs && this.props.jobsError;
+  formatJobsRetentionMessage = (earliestRetainedTime: ITimestamp) => {
     return (
-      <div className={cx("jobs-page")}>
+      <>
+        Since{" "}
+        <Timestamp
+          time={TimestampToMoment(earliestRetainedTime)}
+          format={DATE_FORMAT_24_TZ}
+        />
+      </>
+    );
+  };
+
+  render(): React.ReactElement {
+    const {
+      jobs,
+      jobsError,
+      sort,
+      status,
+      reqInFlight,
+      isDataValid,
+      type,
+      show,
+      columns: columnsToDisplay,
+      onColumnsChange,
+    } = this.props;
+    const isLoading = reqInFlight && (!isDataValid || !jobs);
+    const { pagination } = this.state;
+    const filteredJobs = jobs?.jobs ?? [];
+    const columns = makeJobsColumns();
+    // Iterate over all available columns and create list of SelectOptions with initial selection
+    // values based on stored user selections in local storage and default column configs.
+    // Columns that are set to alwaysShow are filtered from the list.
+    const tableColumns = columns
+      .filter(c => !c.alwaysShow)
+      .map(
+        (c): SelectOption => ({
+          label: jobsColumnLabels[c.name],
+          value: c.name,
+          isSelected: isSelectedColumn(columnsToDisplay, c),
+        }),
+      );
+
+    // List of all columns that will be displayed based on the column selection.
+    const displayColumns = columns.filter(c =>
+      isSelectedColumn(this.props.columns, c),
+    );
+
+    return (
+      <div>
         <Helmet title="Jobs" />
         <h3 className={commonStyles("base-heading")}>Jobs</h3>
         <div>
           <PageConfig>
             <PageConfigItem>
-              <Dropdown
-                items={this.statusMenuItems}
-                onChange={this.onStatusSelected}
-              >
+              <Dropdown items={statusOptions} onChange={this.onStatusSelected}>
                 Status:{" "}
-                {
-                  statusOptions.find(
-                    option => option["value"] === this.props.status,
-                  )["name"]
-                }
+                {statusOptions.find(option => option.value === status)?.name}
               </Dropdown>
             </PageConfigItem>
             <PageConfigItem>
-              <Dropdown
-                items={this.typeMenuItems}
-                onChange={this.onTypeSelected}
-              >
+              <Dropdown items={typeOptions} onChange={this.onTypeSelected}>
                 Type:{" "}
                 {
-                  typeOptions.find(
-                    option => option["value"] === this.props.type.toString(),
-                  )["name"]
+                  typeOptions.find(option => option.value === type.toString())
+                    ?.name
                 }
               </Dropdown>
             </PageConfigItem>
             <PageConfigItem>
-              <Dropdown
-                items={this.showMenuItems}
-                onChange={this.onShowSelected}
-              >
-                Show:{" "}
-                {
-                  showOptions.find(
-                    option => option["value"] === this.props.show,
-                  )["name"]
-                }
+              <Dropdown items={showOptions} onChange={this.onShowSelected}>
+                Show: {showOptions.find(option => option.value === show)?.name}
               </Dropdown>
             </PageConfigItem>
           </PageConfig>
         </div>
-        <section className={cx("section")}>
+        <div className={cx("table-area")}>
+          {jobsError && jobs && (
+            <InlineAlert intent="danger" title={jobsError.message} />
+          )}
           <Loading
             loading={isLoading}
             page={"jobs"}
-            error={error}
-            render={() => (
-              <JobTable
-                isUsedFilter={
-                  this.props.status.length > 0 || this.props.type > 0
-                }
-                jobs={this.props.jobs}
-                setSort={this.changeSortSetting}
-                sort={this.props.sort}
+            error={!jobs ? jobsError : null}
+          >
+            <div>
+              <section className={sortableTableCx("cl-table-container")}>
+                <div className={sortableTableCx("cl-table-statistic")}>
+                  <ColumnsSelector
+                    options={tableColumns}
+                    onSubmitColumns={onColumnsChange}
+                    size={"small"}
+                  />
+                  <div className={cx("jobs-table-summary")}>
+                    <h4 className={cx("cl-count-title")}>
+                      <ResultsPerPageLabel
+                        pagination={{
+                          ...pagination,
+                          total: filteredJobs.length,
+                        }}
+                        pageName="jobs"
+                      />
+                      {jobs?.earliest_retained_time && (
+                        <>
+                          <span
+                            className={cx(
+                              "jobs-table-summary__retention-divider",
+                            )}
+                          >
+                            |
+                          </span>
+                          {this.formatJobsRetentionMessage(
+                            jobs?.earliest_retained_time,
+                          )}
+                        </>
+                      )}
+                    </h4>
+                  </div>
+                </div>
+                <JobsTable
+                  jobs={filteredJobs}
+                  sortSetting={sort}
+                  onChangeSortSetting={this.changeSortSetting}
+                  visibleColumns={displayColumns}
+                  pagination={pagination}
+                />
+              </section>
+              <Pagination
+                pageSize={pagination.pageSize}
+                current={pagination.current}
+                total={filteredJobs.length}
+                onChange={this.onChangePage}
               />
-            )}
-          />
-          {isLoading && !error && (
+            </div>
+          </Loading>
+          {isLoading && !jobsError && (
             <Delayed delay={moment.duration(2, "s")}>
               <InlineAlert
                 intent="info"
-                title="If the Jobs table contains a large amount of data, this page might take a while to load. To reduce the amount of data, try filtering the table."
+                title="If the Jobs table contains a large amount of data, this page might take a while to load."
               />
             </Delayed>
           )}
-        </section>
+        </div>
       </div>
     );
   }

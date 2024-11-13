@@ -52,28 +52,29 @@ func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNod
 	if n.Schema.ExplicitCatalog {
 		dbName = n.Schema.Catalog()
 	}
-	db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName,
-		tree.DatabaseLookupFlags{Required: true})
+	db, err := p.Descriptors().MutableByName(p.txn).Database(ctx, dbName)
 	if err != nil {
 		return nil, err
 	}
-	schema, err := p.Descriptors().GetSchemaByName(ctx, p.txn, db,
-		string(n.Schema.SchemaName), tree.SchemaLookupFlags{
-			Required:       true,
-			RequireMutable: true,
-		})
+	schema, err := p.Descriptors().ByName(p.txn).Get().Schema(ctx, db, string(n.Schema.SchemaName))
 	if err != nil {
 		return nil, err
 	}
-	// Explicitly disallow modifying Public schema in 22.1.
-	if schema.GetName() == tree.PublicSchema {
-		return nil, pgerror.Newf(pgcode.InvalidSchemaName, "cannot modify schema %q", n.Schema.String())
+	// Explicitly disallow renaming public schema. In the future, we may want
+	// to support this. In order to support it, we have to remove the logic that
+	// automatically re-creates the public schema if it doesn't exist.
+	_, isRename := n.Cmd.(*tree.AlterSchemaRename)
+	if schema.GetName() == tree.PublicSchema && isRename {
+		return nil, pgerror.Newf(pgcode.InvalidSchemaName, "cannot rename schema %q", n.Schema.String())
 	}
 	switch schema.SchemaKind() {
 	case catalog.SchemaPublic, catalog.SchemaVirtual, catalog.SchemaTemporary:
 		return nil, pgerror.Newf(pgcode.InvalidSchemaName, "cannot modify schema %q", n.Schema.String())
 	case catalog.SchemaUserDefined:
-		desc := schema.(*schemadesc.Mutable)
+		desc, err := p.Descriptors().MutableByID(p.txn).Schema(ctx, schema.GetID())
+		if err != nil {
+			return nil, err
+		}
 		// The user must be a superuser or the owner of the schema to modify it.
 		hasAdmin, err := p.HasAdminRole(ctx)
 		if err != nil {
@@ -119,9 +120,8 @@ func (n *alterSchemaNode) startExec(params runParams) error {
 			return sqlerrors.NewSchemaAlreadyExistsError(newName)
 		}
 
-		lookupFlags := tree.CommonLookupFlags{Required: true, AvoidLeased: true}
 		if err := maybeFailOnDependentDescInRename(
-			params.ctx, params.p, n.db, n.desc.GetName(), lookupFlags, catalog.Schema,
+			params.ctx, params.p, n.db, n.desc, false /* withLeased */, catalog.Schema,
 		); err != nil {
 			return err
 		}
@@ -169,7 +169,7 @@ func (p *planner) alterSchemaOwner(
 	}
 
 	// The user must also have CREATE privilege on the schema's database.
-	parentDBDesc, err := p.Descriptors().GetMutableDescriptorByID(ctx, p.txn, scDesc.GetParentID())
+	parentDBDesc, err := p.Descriptors().MutableByID(p.txn).Desc(ctx, scDesc.GetParentID())
 	if err != nil {
 		return err
 	}
@@ -231,7 +231,9 @@ func (p *planner) renameSchema(
 
 	// Write the new name and remove the old name.
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, desc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, desc); err != nil {
+		return err
+	}
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
 	}

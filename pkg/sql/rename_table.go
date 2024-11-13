@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -89,6 +90,11 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 		}
 	}
 
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
+		return nil, err
+	}
+
 	return &renameTableNode{n: n, oldTn: &oldTn, newTn: &newTn, tableDesc: tableDesc}, nil
 }
 
@@ -116,17 +122,11 @@ func (n *renameTableNode) startExec(params runParams) error {
 	if !newTn.ExplicitSchema && !newTn.ExplicitCatalog {
 		newTn.ObjectNamePrefix = oldTn.ObjectNamePrefix
 		var err error
-		targetDbDesc, err = p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
-			string(oldTn.CatalogName), tree.DatabaseLookupFlags{Required: true})
+		targetDbDesc, err = p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, string(oldTn.CatalogName))
 		if err != nil {
 			return err
 		}
-
-		targetSchemaDesc, err = p.Descriptors().GetMutableSchemaByName(
-			ctx, p.txn, targetDbDesc, oldTn.Schema(), tree.SchemaLookupFlags{
-				Required:       true,
-				RequireMutable: true,
-			})
+		targetSchemaDesc, err = p.Descriptors().ByName(p.txn).Get().Schema(ctx, targetDbDesc, oldTn.Schema())
 		if err != nil {
 			return err
 		}
@@ -191,8 +191,9 @@ func (n *renameTableNode) startExec(params runParams) error {
 		return nil
 	}
 
-	err := p.Descriptors().Direct().CheckObjectCollision(
+	err := descs.CheckObjectNameCollision(
 		params.ctx,
+		p.Descriptors(),
 		params.p.txn,
 		targetDbDesc.GetID(),
 		targetSchemaDesc.GetID(),
@@ -215,7 +216,9 @@ func (n *renameTableNode) startExec(params runParams) error {
 
 	// Populate namespace update batch.
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, tableDesc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, tableDesc); err != nil {
+		return err
+	}
 
 	// Write the updated table descriptor.
 	if err := p.writeSchemaChange(
@@ -248,7 +251,7 @@ func (n *renameTableNode) Close(context.Context)        {}
 func (p *planner) dependentError(
 	ctx context.Context, typeName string, objName string, parentID descpb.ID, id descpb.ID, op string,
 ) error {
-	desc, err := p.Descriptors().GetImmutableDescriptorByID(ctx, p.txn, id, tree.CommonLookupFlags{Required: true})
+	desc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Desc(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -311,22 +314,16 @@ func (n *renameTableNode) checkForCrossDbReferences(
 
 	// Checks inbound / outbound foreign key references for cross DB references.
 	// The refTableID flag determines if the reference or origin field are checked.
-	checkFkForCrossDbDep := func(fk *descpb.ForeignKeyConstraint, refTableID bool) error {
+	checkFkForCrossDbDep := func(fk catalog.ForeignKeyConstraint, refTableID bool) error {
 		if allowCrossDatabaseFKs.Get(&p.execCfg.Settings.SV) {
 			return nil
 		}
-		tableID := fk.ReferencedTableID
+		tableID := fk.GetReferencedTableID()
 		if !refTableID {
-			tableID = fk.OriginTableID
+			tableID = fk.GetOriginTableID()
 		}
 
-		referencedTable, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, tableID,
-			tree.ObjectLookupFlags{
-				CommonLookupFlags: tree.CommonLookupFlags{
-					Required:    true,
-					AvoidLeased: true,
-				},
-			})
+		referencedTable, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Table(ctx, tableID)
 		if err != nil {
 			return err
 		}
@@ -339,7 +336,7 @@ func (n *renameTableNode) checkForCrossDbReferences(
 			pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 				"a foreign key constraint %q will exist between databases after rename "+
 					"(see the '%s' cluster setting)",
-				fk.Name,
+				fk.GetName(),
 				allowCrossDatabaseFKsSetting),
 			crossDBReferenceDeprecationHint(),
 		)
@@ -350,12 +347,7 @@ func (n *renameTableNode) checkForCrossDbReferences(
 	type crossDBDepType int
 	const owner, reference crossDBDepType = 0, 1
 	checkDepForCrossDbRef := func(depID descpb.ID, depType crossDBDepType) error {
-		dependentObject, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, depID,
-			tree.ObjectLookupFlags{
-				CommonLookupFlags: tree.CommonLookupFlags{
-					Required:    true,
-					AvoidLeased: true,
-				}})
+		dependentObject, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Table(ctx, depID)
 		if err != nil {
 			return err
 		}
@@ -451,12 +443,7 @@ func (n *renameTableNode) checkForCrossDbReferences(
 		if allowCrossDatabaseViews.Get(&p.execCfg.Settings.SV) {
 			return nil
 		}
-		dependentObject, err := p.Descriptors().GetImmutableTypeByID(ctx, p.txn, depID,
-			tree.ObjectLookupFlags{
-				CommonLookupFlags: tree.CommonLookupFlags{
-					Required:    true,
-					AvoidLeased: true,
-				}})
+		dependentObject, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Type(ctx, depID)
 		if err != nil {
 			return err
 		}
@@ -477,18 +464,15 @@ func (n *renameTableNode) checkForCrossDbReferences(
 	// For tables check if any outbound or inbound foreign key references would
 	// be impacted.
 	if tableDesc.IsTable() {
-		err := tableDesc.ForeachOutboundFK(func(fk *descpb.ForeignKeyConstraint) error {
-			return checkFkForCrossDbDep(fk, true)
-		})
-		if err != nil {
-			return err
+		for _, fk := range tableDesc.OutboundForeignKeys() {
+			if err := checkFkForCrossDbDep(fk, false); err != nil {
+				return err
+			}
 		}
-
-		err = tableDesc.ForeachInboundFK(func(fk *descpb.ForeignKeyConstraint) error {
-			return checkFkForCrossDbDep(fk, false)
-		})
-		if err != nil {
-			return err
+		for _, fk := range tableDesc.InboundForeignKeys() {
+			if err := checkFkForCrossDbDep(fk, false); err != nil {
+				return err
+			}
 		}
 		// If cross database sequence owners are not allowed, then
 		// check if any column owns a sequence.

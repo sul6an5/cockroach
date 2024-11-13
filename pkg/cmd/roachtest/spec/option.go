@@ -28,6 +28,17 @@ func CPU(n int) Option {
 	return nodeCPUOption(n)
 }
 
+type nodeMemOption MemPerCPU
+
+func (o nodeMemOption) apply(spec *ClusterSpec) {
+	spec.Mem = MemPerCPU(o)
+}
+
+// Mem requests nodes with low/standard/high ratio of memory per CPU.
+func Mem(level MemPerCPU) Option {
+	return nodeMemOption(level)
+}
+
 type volumeSizeOption int
 
 func (o volumeSizeOption) apply(spec *ClusterSpec) {
@@ -89,6 +100,17 @@ type nodeLifetimeOption time.Duration
 
 func (o nodeLifetimeOption) apply(spec *ClusterSpec) {
 	spec.Lifetime = time.Duration(o)
+}
+
+type gatherCoresOption struct{}
+
+func (o gatherCoresOption) apply(spec *ClusterSpec) {
+	spec.GatherCores = true
+}
+
+// GatherCores enables core gathering after test runs.
+func GatherCores() Option {
+	return gatherCoresOption{}
 }
 
 // clusterReusePolicy indicates what clusters a particular test can run on and

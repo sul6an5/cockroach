@@ -13,39 +13,11 @@ CREATE TABLE defaultdb.foo (
 ----
 
 unimplemented
-ALTER TABLE defaultdb.foo ADD COLUMN j INT CHECK (j > 0)
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo ADD COLUMN j INT REFERENCES defaultdb.foo(i)
-----
-
-unimplemented
 ALTER TABLE defaultdb.foo ADD COLUMN j SERIAL
 ----
 
 unimplemented
-ALTER TABLE defaultdb.foo ADD CONSTRAINT j CHECK (i > 0)
-----
-
-unimplemented
 ALTER TABLE defaultdb.foo ALTER COLUMN i SET DATA TYPE STRING
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo DROP COLUMN k
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo DROP COLUMN l CASCADE;
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo DROP COLUMN m
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo DROP COLUMN n
 ----
 
 unimplemented
@@ -57,7 +29,7 @@ ALTER TABLE defaultdb.foo ADD COLUMN p INT, DROP COLUMN o
 ----
 
 unimplemented
-ALTER TABLE defaultdb.foo DROP CONSTRAINT foobar
+ALTER TABLE defaultdb.foo ADD COLUMN p INT NOT NULL UNIQUE
 ----
 
 unimplemented
@@ -66,10 +38,6 @@ ALTER TABLE defaultdb.foo ALTER COLUMN i DROP NOT NULL
 
 unimplemented
 ALTER TABLE defaultdb.foo ALTER COLUMN i DROP STORED
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo ALTER COLUMN i SET NOT NULL
 ----
 
 unimplemented
@@ -93,19 +61,7 @@ ALTER TABLE defaultdb.foo ALTER COLUMN i DROP DEFAULT
 ----
 
 unimplemented
-ALTER TABLE defaultdb.foo ADD UNIQUE(i);
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo ADD FOREIGN KEY (i) REFERENCES defaultdb.foo(i);
-----
-
-unimplemented
 ALTER TABLE defaultdb.foo ADD PRIMARY KEY (l);
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo VALIDATE CONSTRAINT foobar
 ----
 
 unimplemented
@@ -114,8 +70,4 @@ ALTER TABLE defaultdb.foo PARTITION BY NOTHING
 
 unimplemented
 ALTER TABLE defaultdb.foo INJECT STATISTICS '[]'
-----
-
-unimplemented
-ALTER TABLE defaultdb.foo ALTER PRIMARY KEY USING COLUMNS (l)
 ----

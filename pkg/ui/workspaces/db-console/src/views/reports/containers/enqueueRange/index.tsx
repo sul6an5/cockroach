@@ -11,7 +11,7 @@
 import React, { Fragment } from "react";
 import Helmet from "react-helmet";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import moment from "moment";
+import moment from "moment-timezone";
 
 import { enqueueRange } from "src/util/api";
 import { cockroach } from "src/js/protos";
@@ -20,6 +20,7 @@ import "./index.styl";
 
 import EnqueueRangeRequest = cockroach.server.serverpb.EnqueueRangeRequest;
 import EnqueueRangeResponse = cockroach.server.serverpb.EnqueueRangeResponse;
+import { BackToAdvanceDebug } from "src/views/reports/containers/util";
 
 const QUEUES = [
   "replicate",
@@ -198,6 +199,7 @@ export class EnqueueRange extends React.Component<
     return (
       <Fragment>
         <Helmet title="Enqueue Range" />
+        <BackToAdvanceDebug history={this.props.history} />
         <div className="content">
           <section className="section">
             <div className="form-container">

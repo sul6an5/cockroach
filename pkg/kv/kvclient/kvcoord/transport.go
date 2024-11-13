@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -64,7 +65,7 @@ type Transport interface {
 	//
 	// SendNext is also in charge of importing the remotely collected spans (if
 	// any) into the local trace.
-	SendNext(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, error)
+	SendNext(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, error)
 
 	// NextInternalClient returns the InternalClient to use for making RPC
 	// calls.
@@ -178,15 +179,13 @@ func (gt *grpcTransport) IsExhausted() bool {
 // client is ready. On success, the reply is sent on the channel;
 // otherwise an error is sent.
 func (gt *grpcTransport) SendNext(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	r := gt.replicas[gt.nextReplicaIdx]
 	iface, err := gt.NextInternalClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	ba.Replica = r
 	return gt.sendBatch(ctx, r.NodeID, iface, ba)
 }
 
@@ -195,8 +194,8 @@ func (gt *grpcTransport) sendBatch(
 	ctx context.Context,
 	nodeID roachpb.NodeID,
 	iface rpc.RestrictedInternalClient,
-	ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	// Bail out early if the context is already canceled. (GRPC will
 	// detect this pretty quickly, but the first check of the context
 	// in the local server comes pretty late)
@@ -208,26 +207,39 @@ func (gt *grpcTransport) sendBatch(
 	if rpc.IsLocal(iface) {
 		gt.opts.metrics.LocalSentCount.Inc(1)
 	}
-	reply, err := iface.Batch(ctx, &ba)
-	// If we queried a remote node, perform extra validation and
-	// import trace spans.
+	reply, err := iface.Batch(ctx, ba)
+	// If we queried a remote node, perform extra validation.
 	if reply != nil && !rpc.IsLocal(iface) {
-		for i := range reply.Responses {
-			if err := reply.Responses[i].GetInner().Verify(ba.Requests[i].GetInner()); err != nil {
-				log.Errorf(ctx, "%v", err)
+		if err == nil {
+			for i := range reply.Responses {
+				err = reply.Responses[i].GetInner().Verify(ba.Requests[i].GetInner())
+				if err != nil {
+					log.Errorf(ctx, "verification of response for %s failed: %v", ba.Requests[i].GetInner(), err)
+					break
+				}
 			}
-		}
-		// Import the remotely collected spans, if any.
-		if len(reply.CollectedSpans) != 0 {
-			span := tracing.SpanFromContext(ctx)
-			if span == nil {
-				return nil, errors.Errorf(
-					"trying to ingest remote spans but there is no recording span set up")
-			}
-			span.ImportRemoteRecording(reply.CollectedSpans)
 		}
 	}
-	return reply, err
+
+	// Import the remotely collected spans, if any. Do this on error too, to get
+	// traces in that case as well (or to at least have a chance).
+	//
+	// Note that the server fills in reply.CollectedSpans only on non-local
+	// requests - see setupSpanForIncomingRPC. For local RPCs, the Tracer is
+	// shared between the client and the server, and the server span is a child of
+	// the server span.
+	if reply != nil && len(reply.CollectedSpans) != 0 {
+		span := tracing.SpanFromContext(ctx)
+		if span == nil {
+			return nil, errors.Errorf(
+				"trying to ingest remote spans but there is no recording span set up")
+		}
+		span.ImportRemoteRecording(reply.CollectedSpans)
+	}
+	if err != nil {
+		return nil, errors.Wrapf(err, "ba: %s RPC error", ba.String())
+	}
+	return reply, nil
 }
 
 // NextInternalClient returns the next InternalClient to use for performing
@@ -328,21 +340,22 @@ func (s *senderTransport) IsExhausted() bool {
 }
 
 func (s *senderTransport) SendNext(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	if s.called {
 		panic("called an exhausted transport")
 	}
 	s.called = true
 
+	ba = ba.ShallowCopy()
 	ba.Replica = s.replica
 	log.Eventf(ctx, "%v", ba.String())
 	br, pErr := s.sender.Send(ctx, ba)
 	if br == nil {
-		br = &roachpb.BatchResponse{}
+		br = &kvpb.BatchResponse{}
 	}
 	if br.Error != nil {
-		panic(roachpb.ErrorUnexpectedlySet(s.sender, br))
+		panic(kvpb.ErrorUnexpectedlySet(s.sender, br))
 	}
 	br.Error = pErr
 	if pErr != nil {

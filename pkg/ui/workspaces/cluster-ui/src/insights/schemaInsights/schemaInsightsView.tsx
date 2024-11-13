@@ -26,6 +26,7 @@ import {
   defaultFilters,
   Filter,
   getFullFiltersAsStringRecord,
+  SelectedFilters,
 } from "../../queryFilter";
 import { queryByName, syncHistory } from "../../util";
 import { getTableSortFromURL } from "../../sortedtable/getTableSortFromURL";
@@ -38,8 +39,13 @@ import { InsightsError } from "../insightsErrorComponent";
 import { Pagination } from "../../pagination";
 import { EmptySchemaInsightsTablePlaceholder } from "./emptySchemaInsightsTablePlaceholder";
 import { CockroachCloudContext } from "../../contexts";
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import { insights } from "src/util";
+import { Anchor } from "src/anchor";
+import insightTableStyles from "../../insightsTable/insightsTable.module.scss";
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
+const insightTableCx = classNames.bind(insightTableStyles);
 
 export type SchemaInsightsViewStateProps = {
   schemaInsights: InsightRecommendation[];
@@ -48,12 +54,15 @@ export type SchemaInsightsViewStateProps = {
   schemaInsightsError: Error | null;
   filters: SchemaInsightEventFilters;
   sortSetting: SortSetting;
+  hasAdminRole: boolean;
+  maxSizeApiReached?: boolean;
 };
 
 export type SchemaInsightsViewDispatchProps = {
   onFiltersChange: (filters: SchemaInsightEventFilters) => void;
   onSortChange: (ss: SortSetting) => void;
   refreshSchemaInsights: () => void;
+  refreshUserSQLRoles: () => void;
 };
 
 export type SchemaInsightsViewProps = SchemaInsightsViewStateProps &
@@ -68,9 +77,12 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
   schemaInsightsTypes,
   schemaInsightsError,
   filters,
+  hasAdminRole,
   refreshSchemaInsights,
+  refreshUserSQLRoles,
   onFiltersChange,
   onSortChange,
+  maxSizeApiReached,
 }: SchemaInsightsViewProps) => {
   const isCockroachCloud = useContext(CockroachCloudContext);
   const [pagination, setPagination] = useState<ISortedTablePagination>({
@@ -83,13 +95,22 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
   );
 
   useEffect(() => {
-    // Refresh every 5mins.
+    // Refresh every 1 minute.
     refreshSchemaInsights();
-    const interval = setInterval(refreshSchemaInsights, 60 * 1000 * 5);
+    const interval = setInterval(refreshSchemaInsights, 60 * 1000);
     return () => {
       clearInterval(interval);
     };
   }, [refreshSchemaInsights]);
+
+  useEffect(() => {
+    // Refresh every 5 minutes.
+    refreshUserSQLRoles();
+    const interval = setInterval(refreshUserSQLRoles, 60 * 5000);
+    return () => {
+      clearInterval(interval);
+    };
+  }, [refreshUserSQLRoles]);
 
   useEffect(() => {
     // We use this effect to sync settings defined on the URL (sort, filters),
@@ -115,7 +136,7 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
     // redux changes and syncs the URL params with redux.
     syncHistory(
       {
-        ascending: sortSetting.ascending.toString(),
+        ascending: sortSetting.ascending?.toString(),
         columnTitle: sortSetting.columnTitle,
         ...getFullFiltersAsStringRecord(filters),
         [SCHEMA_INSIGHT_SEARCH_PARAM]: search,
@@ -200,12 +221,18 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
           />
         </PageConfigItem>
       </PageConfig>
+      <SelectedFilters
+        filters={filters}
+        onRemoveFilter={onSubmitFilters}
+        onClearFilters={clearFilters}
+        className={cx("margin-adjusted")}
+      />
       <div className={cx("table-area")}>
         <Loading
-          loading={schemaInsights == null}
+          loading={schemaInsights === null}
           page="schema insights"
           error={schemaInsightsError}
-          renderError={() => InsightsError()}
+          renderError={() => InsightsError(schemaInsightsError?.message)}
         >
           <div>
             <section className={sortableTableCx("cl-table-container")}>
@@ -216,21 +243,26 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
                   totalCount={filteredSchemaInsights?.length}
                   arrayItemName="schema insights"
                   activeFilters={countActiveFilters}
-                  onClearFilters={clearFilters}
                 />
               </div>
               <InsightsSortedTable
-                columns={makeInsightsColumns(isCockroachCloud)}
+                columns={makeInsightsColumns(
+                  isCockroachCloud,
+                  hasAdminRole,
+                  false,
+                )}
                 data={filteredSchemaInsights}
                 sortSetting={sortSetting}
                 onChangeSortSetting={onChangeSortSetting}
+                pagination={pagination}
                 renderNoResult={
                   <EmptySchemaInsightsTablePlaceholder
                     isEmptySearchResults={
-                      search?.length > 0 && filteredSchemaInsights?.length == 0
+                      search?.length > 0 && filteredSchemaInsights?.length === 0
                     }
                   />
                 }
+                tableWrapperClassName={insightTableCx("sorted-table")}
               />
             </section>
             <Pagination
@@ -239,6 +271,20 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
               total={filteredSchemaInsights?.length}
               onChange={onChangePage}
             />
+            {maxSizeApiReached && (
+              <InlineAlert
+                intent="info"
+                title={
+                  <>
+                    Not all insights are displayed because the maximum number of
+                    insights was reached in the console.&nbsp;
+                    <Anchor href={insights} target="_blank">
+                      Learn more
+                    </Anchor>
+                  </>
+                }
+              />
+            )}
           </div>
         </Loading>
       </div>

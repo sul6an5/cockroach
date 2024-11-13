@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
+
 package kvserver
 
 import (
@@ -21,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -54,9 +57,6 @@ func TestSSTSnapshotStorage(t *testing.T) {
 
 	f, err := scratch.NewFile(ctx, 0)
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, f.Close())
-	}()
 
 	// Check that even though the files aren't created, they are still recorded in SSTs().
 	require.Equal(t, len(scratch.SSTs()), 1)
@@ -69,8 +69,7 @@ func TestSSTSnapshotStorage(t *testing.T) {
 		}
 	}
 
-	_, err = f.Write([]byte("foo"))
-	require.NoError(t, err)
+	require.NoError(t, f.Write([]byte("foo")))
 
 	// After writing to files, check that they have been flushed to disk.
 	for _, fileName := range scratch.SSTs() {
@@ -83,19 +82,16 @@ func TestSSTSnapshotStorage(t *testing.T) {
 	}
 
 	// Check that closing is idempotent.
-	require.NoError(t, f.Close())
-	require.NoError(t, f.Close())
+	require.NoError(t, f.Finish())
 
 	// Check that writing to a closed file is an error.
-	_, err = f.Write([]byte("foo"))
+	err = f.Write([]byte("foo"))
 	require.EqualError(t, err, "file has already been closed")
 
 	// Check that closing an empty file is an error.
 	f, err = scratch.NewFile(ctx, 0)
 	require.NoError(t, err)
-	require.EqualError(t, f.Close(), "file is empty")
-	_, err = f.Write([]byte("foo"))
-	require.NoError(t, err)
+	require.EqualError(t, f.Finish(), "file is empty")
 
 	// Check that Close removes the snapshot directory as well as the range
 	// directory.
@@ -143,9 +139,6 @@ func TestSSTSnapshotStorageConcurrentRange(t *testing.T) {
 
 		f, err := scratch.NewFile(ctx, 0)
 		require.NoError(t, err)
-		defer func() {
-			require.NoError(t, f.Close())
-		}()
 
 		// Check that even though the files aren't created, they are still recorded in SSTs().
 		require.Equal(t, len(scratch.SSTs()), 1)
@@ -158,8 +151,7 @@ func TestSSTSnapshotStorageConcurrentRange(t *testing.T) {
 			}
 		}
 
-		_, err = f.Write([]byte("foo"))
-		require.NoError(t, err)
+		require.NoError(t, f.Write([]byte("foo")))
 
 		// After writing to files, check that they have been flushed to disk.
 		for _, fileName := range scratch.SSTs() {
@@ -172,19 +164,16 @@ func TestSSTSnapshotStorageConcurrentRange(t *testing.T) {
 		}
 
 		// Check that closing is idempotent.
-		require.NoError(t, f.Close())
-		require.NoError(t, f.Close())
+		require.NoError(t, f.Finish())
 
 		// Check that writing to a closed file is an error.
-		_, err = f.Write([]byte("foo"))
+		err = f.Write([]byte("foo"))
 		require.EqualError(t, err, "file has already been closed")
 
 		// Check that closing an empty file is an error.
 		f, err = scratch.NewFile(ctx, 0)
 		require.NoError(t, err)
-		require.EqualError(t, f.Close(), "file is empty")
-		_, err = f.Write([]byte("foo"))
-		require.NoError(t, err)
+		require.EqualError(t, f.Finish(), "file is empty")
 
 		// Check that Close removes the snapshot directory.
 		require.NoError(t, scratch.Close())
@@ -250,16 +239,15 @@ func TestSSTSnapshotStorageContextCancellation(t *testing.T) {
 	f, err := scratch.NewFile(ctx, 0)
 	require.NoError(t, err)
 	defer func() {
-		require.NoError(t, f.Close())
+		require.NoError(t, f.Finish())
 	}()
 
 	// Before context cancellation.
-	_, err = f.Write([]byte("foo"))
-	require.NoError(t, err)
+	require.NoError(t, f.Write([]byte("foo")))
 
 	// After context cancellation.
 	cancel()
-	_, err = f.Write([]byte("bar"))
+	err = f.Write([]byte("bar"))
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -297,7 +285,7 @@ func TestMultiSSTWriterInitSST(t *testing.T) {
 	var actualSSTs [][]byte
 	fileNames := msstw.scratch.SSTs()
 	for _, file := range fileNames {
-		sst, err := eng.ReadFile(file)
+		sst, err := fs.ReadFile(eng, file)
 		require.NoError(t, err)
 		actualSSTs = append(actualSSTs, sst)
 	}
@@ -307,7 +295,7 @@ func TestMultiSSTWriterInitSST(t *testing.T) {
 	var expectedSSTs [][]byte
 	for _, s := range keySpans {
 		func() {
-			sstFile := &storage.MemFile{}
+			sstFile := &storage.MemObject{}
 			sst := storage.MakeIngestionSSTWriter(ctx, cluster.MakeTestingClusterSettings(), sstFile)
 			defer sst.Close()
 			err := sst.ClearRawRange(s.Key, s.EndKey, true, true)
@@ -322,4 +310,17 @@ func TestMultiSSTWriterInitSST(t *testing.T) {
 	for i := range fileNames {
 		require.Equal(t, actualSSTs[i], expectedSSTs[i])
 	}
+}
+
+func newOnDiskEngine(ctx context.Context, t *testing.T) (func(), storage.Engine) {
+	dir, cleanup := testutils.TempDir(t)
+	eng, err := storage.Open(
+		ctx,
+		storage.Filesystem(dir),
+		cluster.MakeClusterSettings(),
+		storage.CacheSize(1<<20 /* 1 MiB */))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cleanup, eng
 }

@@ -23,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
@@ -31,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
@@ -207,6 +210,124 @@ var schemas = []string{
 		INDEX b_idx (b)
 	)
 	`,
+	`
+		CREATE TABLE single_col_histogram (k TEXT PRIMARY KEY);
+	`,
+	`
+		ALTER TABLE single_col_histogram INJECT STATISTICS '[
+		  {
+		    "columns": ["k"],
+		    "created_at": "2018-01-01 1:00:00.00000+00:00",
+		    "row_count": 30000,
+		    "distinct_count": 1100,
+		    "null_count": 0,
+		    "avg_size": 2,
+		    "histo_col_type": "STRING",
+		    "histo_buckets": [
+		      {"num_eq": 0, "num_range": 0, "distinct_range": 0, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________0"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________1900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________2900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________3900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________4900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________5900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________6900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________7900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________8900"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9000"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9100"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9200"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9300"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9400"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9500"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9600"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9700"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9800"},
+		      {"num_eq": 10, "num_range": 10, "distinct_range": 10, "upper_bound": "abcdefghijklmnopqrstuvwxyz___________________9900"}
+		    ]
+		  }
+		]'
+	`,
 }
 
 var queries = [...]benchQuery{
@@ -316,6 +437,11 @@ var queries = [...]benchQuery{
 				k10.m = k11.m
 		`,
 		args: []interface{}{1, 2, 3},
+	},
+	{
+		name:  "single-col-histogram-range",
+		query: "SELECT * FROM single_col_histogram WHERE k >= $1",
+		args:  []interface{}{"'abc'"},
 	},
 	{
 		name: "batch-insert-one",
@@ -591,6 +717,17 @@ func newHarness(tb testing.TB, query benchQuery, schemas []string) *harness {
 		evalCtx: eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 
+	// Setup the default session settings.
+	h.evalCtx.SessionData().OptimizerUseMultiColStats = true
+	h.evalCtx.SessionData().ZigzagJoinEnabled = true
+	h.evalCtx.SessionData().OptimizerUseForecasts = true
+	h.evalCtx.SessionData().OptimizerUseHistograms = true
+	h.evalCtx.SessionData().LocalityOptimizedSearch = true
+	h.evalCtx.SessionData().ReorderJoinsLimit = opt.DefaultJoinOrderLimit
+	h.evalCtx.SessionData().InsertFastPath = true
+	h.evalCtx.SessionData().OptSplitScanLimit = tabledesc.MaxBucketAllowed
+	h.evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
+
 	// Set up the test catalog.
 	h.testCat = testcat.New()
 	for _, schema := range schemas {
@@ -600,7 +737,7 @@ func newHarness(tb testing.TB, query benchQuery, schemas []string) *harness {
 		}
 	}
 
-	if err := h.semaCtx.Placeholders.Init(len(query.args), nil /* typeHints */, false /* fromSQL */); err != nil {
+	if err := h.semaCtx.Placeholders.Init(len(query.args), nil /* typeHints */); err != nil {
 		tb.Fatal(err)
 	}
 	// Run optbuilder to build the memo for Prepare. Even if we will not be using
@@ -705,6 +842,7 @@ func (h *harness) runSimple(tb testing.TB, query benchQuery, phase Phase) {
 
 	root := execMemo.RootExpr()
 	eb := execbuilder.New(
+		context.Background(),
 		explain.NewPlanGistFactory(exec.StubFactory{}),
 		&h.optimizer,
 		execMemo,
@@ -712,6 +850,7 @@ func (h *harness) runSimple(tb testing.TB, query benchQuery, phase Phase) {
 		root,
 		&h.evalCtx,
 		true, /* allowAutoCommit */
+		statements.IsANSIDML(stmt.AST),
 	)
 	if _, err = eb.Build(); err != nil {
 		tb.Fatalf("%v", err)
@@ -758,13 +897,15 @@ func (h *harness) runPrepared(tb testing.TB, phase Phase) {
 
 	root := execMemo.RootExpr()
 	eb := execbuilder.New(
+		context.Background(),
 		explain.NewPlanGistFactory(exec.StubFactory{}),
 		&h.optimizer,
 		execMemo,
 		nil, /* catalog */
 		root,
 		&h.evalCtx,
-		true, /* allowAutoCommit */
+		true,  /* allowAutoCommit */
+		false, /* isANSIDML */
 	)
 	if _, err := eb.Build(); err != nil {
 		tb.Fatalf("%v", err)
@@ -1860,6 +2001,44 @@ var slowSchemas = []string{
 			UNIQUE (col3_10 DESC, col3_3 ASC, col2_1 DESC, col3_9 ASC)
 		);
 	`,
+	`
+		CREATE TABLE multi_col_pk (
+			region STRING NOT NULL,
+			id INT NOT NULL,
+			c1 INT NOT NULL, c2 INT NOT NULL, c3 INT NOT NULL, c4 INT NOT NULL, c5 INT NOT NULL,
+			c6 INT NOT NULL, c7 INT NOT NULL, c8 INT NOT NULL, c9 INT NOT NULL, c10 INT NOT NULL,
+			c11 INT NOT NULL, c12 INT NOT NULL, c13 INT NOT NULL, c14 INT NOT NULL, c15 INT NOT NULL,
+			c16 INT NOT NULL, c17 INT NOT NULL, c18 INT NOT NULL, c19 INT NOT NULL, c20 INT NOT NULL,
+			c21 INT NOT NULL, c22 INT NOT NULL, c23 INT NOT NULL, c24 INT NOT NULL, c25 INT NOT NULL,
+			c26 INT NOT NULL, c27 INT NOT NULL, c28 INT NOT NULL, c29 INT NOT NULL, c30 INT NOT NULL,
+			c31 INT NOT NULL, c32 INT NOT NULL, c33 INT NOT NULL, c34 INT NOT NULL, c35 INT NOT NULL,
+			c36 INT NOT NULL, c37 INT NOT NULL, c38 INT NOT NULL, c39 INT NOT NULL, c40 INT NOT NULL,
+			c41 INT NOT NULL, c42 INT NOT NULL, c43 INT NOT NULL, c44 INT NOT NULL, c45 INT NOT NULL,
+			c46 INT NOT NULL, c47 INT NOT NULL, c48 INT NOT NULL, c49 INT NOT NULL, c50 INT NOT NULL,
+			CHECK (c41 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c42 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c43 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c44 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c45 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c46 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c47 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c48 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c49 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (c50 IN (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)),
+			CHECK (region IN ('east', 'west', 'north', 'south')),
+			INDEX (c41, c31),
+			INDEX (c42, c32),
+			INDEX (c43, c33),
+			INDEX (c44, c34),
+			INDEX (c45, c35),
+			INDEX (c46, c36),
+			INDEX (c47, c37),
+			INDEX (c48, c38),
+			INDEX (c49, c39),
+			INDEX (c50, c40),
+			PRIMARY KEY (region, id)
+		);
+	`,
 }
 
 var slowQueries = [...]benchQuery{
@@ -2051,12 +2230,27 @@ var slowQueries = [...]benchQuery{
     `,
 		args: []interface{}{},
 	},
+	{
+		name: "slow-query-4",
+		query: `
+			SELECT * FROM multi_col_pk t1
+			LEFT JOIN multi_col_pk t2 ON t1.region = t2.region AND t1.id = t2.id
+			LEFT JOIN multi_col_pk t3 ON t1.region = t3.region AND t1.id = t3.id
+			LEFT JOIN multi_col_pk t4 ON t1.region = t4.region AND t1.id = t4.id
+			LEFT JOIN multi_col_pk t5 ON t1.region = t5.region AND t1.id = t5.id
+			LEFT JOIN multi_col_pk t6 ON t1.region = t6.region AND t1.id = t6.id
+			LEFT JOIN multi_col_pk t7 ON t1.region = t7.region AND t1.id = t7.id
+			LEFT JOIN multi_col_pk t8 ON t1.region = t8.region AND t1.id = t8.id
+			LEFT JOIN multi_col_pk t9 ON t1.region = t9.region AND t1.id = t9.id
+			WHERE t1.c1 IN ($1, $2, $3) AND t1.c2 IN ($4, $5, $6) AND t1.c3 IN ($7, $8, $9)
+    `,
+		args: []interface{}{10, 20, 30, 40, 50, 60, 70, 80, 90},
+	},
 }
 
 func BenchmarkSlowQueries(b *testing.B) {
 	for _, query := range slowQueries {
 		h := newHarness(b, query, slowSchemas)
-		h.evalCtx.SessionData().ReorderJoinsLimit = 8
 		b.Run(query.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				h.runSimple(b, query, Explore)

@@ -15,7 +15,8 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -30,7 +31,7 @@ type lockedSender interface {
 	// WARNING: because the lock is released when calling this method and
 	// re-acquired before it returned, callers cannot rely on a single mutual
 	// exclusion zone mainted across the call.
-	SendLocked(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error)
+	SendLocked(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
 }
 
 // txnLockGatekeeper is a lockedSender that sits at the bottom of the
@@ -54,8 +55,8 @@ type txnLockGatekeeper struct {
 
 // SendLocked implements the lockedSender interface.
 func (gs *txnLockGatekeeper) SendLocked(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	// If so configured, protect against concurrent use of the txn. Concurrent
 	// requests don't work generally because of races between clients sending
 	// requests and the TxnCoordSender restarting the transaction, and also
@@ -66,13 +67,26 @@ func (gs *txnLockGatekeeper) SendLocked(
 	// As a special case, allow for async heartbeats to be sent whenever.
 	if !gs.allowConcurrentRequests && !ba.IsSingleHeartbeatTxnRequest() {
 		if gs.requestInFlight {
-			return nil, roachpb.NewError(
+			return nil, kvpb.NewError(
 				errors.AssertionFailedf("concurrent txn use detected. ba: %s", ba))
 		}
 		gs.requestInFlight = true
 		defer func() {
 			gs.requestInFlight = false
 		}()
+	}
+
+	isTransactionAbort := ba.Requests[len(ba.Requests)-1].GetEndTxn() != nil && !ba.Requests[len(ba.Requests)-1].GetEndTxn().Commit
+	isTransactionCommit := ba.Requests[len(ba.Requests)-1].GetEndTxn() != nil && ba.Requests[len(ba.Requests)-1].GetEndTxn().Commit
+	if isTransactionAbort {
+		// fmt.Printf("JUICER - TXN_LOCK_GATEKEEPER Transaction Abort %v\n", *ba.Header.Txn)
+		kvpb.TotalTransactionAborts.Add(1)
+		log.Errorf(ctx, "JUICER - TXN_LOCK_GATEKEEPER Transaction Abort %d %s", kvpb.TotalTransactionAborts.Load(), &ba.Header.Txn.ID)
+	}
+	if isTransactionCommit {
+		// fmt.Printf("JUICER - TXN_LOCK_GATEKEEPER Transaction Abort %v\n", *ba.Header.Txn)
+		kvpb.TotalTransactionCommits.Add(1)
+		log.Errorf(ctx, "JUICER - TXN_LOCK_GATEKEEPER Transaction Commit %d %s", kvpb.TotalTransactionCommits.Load(), &ba.Header.Txn.ID)
 	}
 
 	// Note the funky locking here: we unlock for the duration of the call and the

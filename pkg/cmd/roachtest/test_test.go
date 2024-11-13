@@ -15,6 +15,7 @@ import (
 	"context"
 	"io"
 	"math/rand"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -27,11 +28,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
@@ -43,38 +44,33 @@ const defaultParallelism = 10
 
 func mkReg(t *testing.T) testRegistryImpl {
 	t.Helper()
-	r, err := makeTestRegistry(spec.GCE, "", "", false /* preferSSD */)
-	require.NoError(t, err)
-	return r
+	return makeTestRegistry(spec.GCE, "", "", false /* preferSSD */)
 }
 
 func TestMatchOrSkip(t *testing.T) {
 	testCases := []struct {
-		filter       []string
-		name         string
-		tags         []string
-		expected     bool
-		expectedSkip string
+		filter   []string
+		name     string
+		tags     []string
+		expected registry.MatchType
 	}{
-		{nil, "foo", nil, true, ""},
-		{nil, "foo", []string{"bar"}, true, "[tag:default] does not match [bar]"},
-		{[]string{"tag:b"}, "foo", []string{"bar"}, true, ""},
-		{[]string{"tag:b"}, "foo", nil, true, "[tag:b] does not match [default]"},
-		{[]string{"tag:default"}, "foo", nil, true, ""},
-		{[]string{"tag:f"}, "foo", []string{"bar"}, true, "[tag:f] does not match [bar]"},
-		{[]string{"f"}, "foo", []string{"bar"}, true, "[tag:default] does not match [bar]"},
-		{[]string{"f"}, "bar", []string{"bar"}, false, ""},
-		{[]string{"f", "tag:b"}, "foo", []string{"bar"}, true, ""},
-		{[]string{"f", "tag:f"}, "foo", []string{"bar"}, true, "[tag:f] does not match [bar]"},
+		{nil, "foo", nil, registry.Matched},
+		{nil, "foo", []string{"bar"}, registry.FailedTags},
+		{[]string{"tag:b"}, "foo", []string{"bar"}, registry.Matched},
+		{[]string{"tag:b"}, "foo", nil, registry.FailedTags},
+		{[]string{"tag:default"}, "foo", nil, registry.Matched},
+		{[]string{"tag:f"}, "foo", []string{"bar"}, registry.FailedTags},
+		{[]string{"f"}, "foo", []string{"bar"}, registry.FailedTags},
+		{[]string{"f"}, "bar", []string{"bar"}, registry.FailedFilter},
+		{[]string{"f", "tag:b"}, "foo", []string{"bar"}, registry.Matched},
+		{[]string{"f", "tag:f"}, "foo", []string{"bar"}, registry.FailedTags},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
-			f := registry.NewTestFilter(c.filter)
+			f := registry.NewTestFilter(c.filter, false)
 			spec := &registry.TestSpec{Name: c.name, Owner: OwnerUnitTest, Tags: c.tags}
-			if value := spec.MatchOrSkip(f); c.expected != value {
-				t.Fatalf("expected %t, but found %t", c.expected, value)
-			} else if value && c.expectedSkip != spec.Skip {
-				t.Fatalf("expected %s, but found %s", c.expectedSkip, spec.Skip)
+			if value := spec.Match(f); c.expected != value {
+				t.Fatalf("expected %v, but found %v", c.expected, value)
 			}
 		})
 	}
@@ -98,8 +94,8 @@ func alwaysFailingClusterAllocator(
 	alloc *quotapool.IntAlloc,
 	artifactsDir string,
 	wStatus *workerStatus,
-) (*clusterImpl, error) {
-	return nil, errors.New("cluster creation failed")
+) (*clusterImpl, *vm.CreateOpts, error) {
+	return nil, nil, errors.New("cluster creation failed")
 }
 
 func TestRunnerRun(t *testing.T) {
@@ -183,6 +179,7 @@ func TestRunnerRun(t *testing.T) {
 			if exp := c.expOut; exp != "" && !strings.Contains(out, exp) {
 				t.Fatalf("'%s' not found in output:\n%s", exp, out)
 			}
+			t.Log(out)
 		})
 	}
 }
@@ -242,27 +239,33 @@ type runnerTest struct {
 func setupRunnerTest(t *testing.T, r testRegistryImpl, testFilters []string) *runnerTest {
 	ctx := context.Background()
 
-	tests := testsToRun(ctx, r, registry.NewTestFilter(testFilters))
+	tests := testsToRun(ctx, r, registry.NewTestFilter(testFilters, false))
 	cr := newClusterRegistry()
 
 	stopper := stop.NewStopper()
 	t.Cleanup(func() { stopper.Stop(ctx) })
-	runner := newTestRunner(cr, stopper, r.buildVersion)
+	runner := newUnitTestRunner(cr, stopper)
 
 	var stdout syncedBuffer
 	var stderr syncedBuffer
 	lopt := loggingOpt{
-		l:            nilLogger(),
+		l: func() *logger.Logger {
+			l, err := logger.RootLogger(filepath.Join(t.TempDir(), "test.log"), logger.NoTee)
+			if err != nil {
+				panic(err)
+			}
+			return l
+		}(),
 		tee:          logger.NoTee,
 		stdout:       &stdout,
 		stderr:       &stderr,
 		artifactsDir: "",
 	}
 	copt := clustersOpt{
-		typ:                       roachprodCluster,
-		user:                      "test_user",
-		cpuQuota:                  1000,
-		keepClustersOnTestFailure: false,
+		typ:       roachprodCluster,
+		user:      "test_user",
+		cpuQuota:  1000,
+		debugMode: NoDebug,
 	}
 	return &runnerTest{
 		stdout: &stdout,
@@ -320,7 +323,7 @@ func TestRunnerTestTimeout(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	cr := newClusterRegistry()
-	runner := newTestRunner(cr, stopper, version.Version{})
+	runner := newUnitTestRunner(cr, stopper)
 
 	var buf syncedBuffer
 	lopt := loggingOpt{
@@ -331,10 +334,10 @@ func TestRunnerTestTimeout(t *testing.T) {
 		artifactsDir: "",
 	}
 	copt := clustersOpt{
-		typ:                       roachprodCluster,
-		user:                      "test_user",
-		cpuQuota:                  1000,
-		keepClustersOnTestFailure: false,
+		typ:       roachprodCluster,
+		user:      "test_user",
+		cpuQuota:  1000,
+		debugMode: NoDebug,
 	}
 	test := registry.TestSpec{
 		Name:    `timeout`,
@@ -393,11 +396,8 @@ func TestRegistryPrepareSpec(t *testing.T) {
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
-			r, err := makeTestRegistry(spec.GCE, "", "", false /* preferSSD */)
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = r.prepareSpec(&c.spec)
+			r := makeTestRegistry(spec.GCE, "", "", false /* preferSSD */)
+			err := r.prepareSpec(&c.spec)
 			if !testutils.IsError(err, c.expectedErr) {
 				t.Fatalf("expected %q, but found %q", c.expectedErr, err.Error())
 			}
@@ -418,7 +418,7 @@ func runExitCodeTest(t *testing.T, injectedError error) error {
 	cr := newClusterRegistry()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	runner := newTestRunner(cr, stopper, version.Version{})
+	runner := newUnitTestRunner(cr, stopper)
 	r := mkReg(t)
 	r.Add(registry.TestSpec{
 		Name:    "boom",
@@ -430,7 +430,7 @@ func runExitCodeTest(t *testing.T, injectedError error) error {
 			}
 		},
 	})
-	tests := testsToRun(ctx, r, registry.NewTestFilter(nil))
+	tests := testsToRun(ctx, r, registry.NewTestFilter(nil, false))
 	lopt := loggingOpt{
 		l:            nilLogger(),
 		tee:          logger.NoTee,

@@ -42,16 +42,33 @@ type Encoder interface {
 }
 
 func getEncoder(
-	opts changefeedbase.EncodingOptions, targets changefeedbase.Targets,
+	opts changefeedbase.EncodingOptions,
+	targets changefeedbase.Targets,
+	encodeForQuery bool,
+	p externalConnectionProvider,
+	sliMetrics *sliMetrics,
 ) (Encoder, error) {
 	switch opts.Format {
 	case changefeedbase.OptFormatJSON:
-		return makeJSONEncoder(opts, targets)
+		return makeJSONEncoder(jsonEncoderOptions{EncodingOptions: opts, encodeForQuery: encodeForQuery})
 	case changefeedbase.OptFormatAvro, changefeedbase.DeprecatedOptFormatAvro:
-		return newConfluentAvroEncoder(opts, targets)
+		return newConfluentAvroEncoder(opts, targets, p, sliMetrics)
 	case changefeedbase.OptFormatCSV:
 		return newCSVEncoder(opts), nil
+	case changefeedbase.OptFormatParquet:
+		//We will return no encoder for parquet format because there is a separate
+		//sink implemented for parquet format for cloud storage, which does the job
+		//of both encoder and sink. See parquet_sink_cloudstorage.go file for more
+		//information on why this was needed.
+		return nil, nil
 	default:
 		return nil, errors.AssertionFailedf(`unknown format: %s`, opts.Format)
 	}
+}
+
+// timestampToString converts an internal timestamp to the string form used in
+// all encoders. This could be made more efficient. And/or it could be configurable
+// to include the Synthetic flag when present, but that's unlikely to be needed.
+func timestampToString(t hlc.Timestamp) string {
+	return t.WithSynthetic(false).AsOfSystemTime()
 }

@@ -11,10 +11,15 @@
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import { refreshStatements } from "src/redux/apiReducers";
+import {
+  refreshNodes,
+  refreshTxns,
+  refreshUserSQLRoles,
+} from "src/redux/apiReducers";
 import { resetSQLStatsAction } from "src/redux/sqlStats";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState } from "src/redux/state";
+import { selectHasAdminRole } from "src/redux/user";
 import { StatementsResponseMessage } from "src/util/api";
 
 import { PrintTime } from "src/views/reports/containers/range/print";
@@ -24,27 +29,33 @@ import {
   defaultFilters,
   util,
   TransactionsPageStateProps,
-  ActiveTransactionsViewDispatchProps,
-  ActiveTransactionsViewStateProps,
+  RecentTransactionsViewDispatchProps,
+  RecentTransactionsViewStateProps,
   TransactionsPageDispatchProps,
   TransactionsPageRoot,
   TransactionsPageRootProps,
+  api,
 } from "@cockroachlabs/cluster-ui";
 import { nodeRegionsByIDSelector } from "src/redux/nodes";
 import { setGlobalTimeScaleAction } from "src/redux/statements";
 import { LocalSetting } from "src/redux/localsettings";
 import { bindActionCreators } from "redux";
 import {
-  activeTransactionsPageActionCreators,
-  mapStateToActiveTransactionsPageProps,
-} from "./activeTransactionsSelectors";
+  recentTransactionsPageActionCreators,
+  mapStateToRecentTransactionsPageProps,
+} from "./recentTransactionsSelectors";
 import { selectTimeScale } from "src/redux/timeScale";
-import { selectStatementsLastUpdated } from "src/selectors/executionFingerprintsSelectors";
+import {
+  selectTxnsLastUpdated,
+  selectTxnsDataValid,
+  selectTxnsDataInFlight,
+} from "src/selectors/executionFingerprintsSelectors";
+import { trackApplySearchCriteriaAction } from "src/redux/analyticsActions";
 
-// selectStatements returns the array of AggregateStatistics to show on the
+// selectData returns the array of AggregateStatistics to show on the
 // TransactionsPage, based on if the appAttr route parameter is set.
 export const selectData = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
+  (state: AdminUIState) => state.cachedData.transactions,
   (state: CachedDataReducerState<StatementsResponseMessage>) => {
     if (!state.data || !state.valid) return null;
     return state.data;
@@ -54,9 +65,9 @@ export const selectData = createSelector(
 // selectLastReset returns a string displaying the last time the statement
 // statistics were reset.
 export const selectLastReset = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
+  (state: AdminUIState) => state.cachedData.transactions,
   (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
+    if (!state?.data) {
       return "unknown";
     }
 
@@ -65,7 +76,7 @@ export const selectLastReset = createSelector(
 );
 
 export const selectLastError = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
+  (state: AdminUIState) => state.cachedData.transactions,
   (state: CachedDataReducerState<StatementsResponseMessage>) => state.lastError,
 );
 
@@ -93,8 +104,22 @@ export const transactionColumnsLocalSetting = new LocalSetting(
   null,
 );
 
+export const reqSortSetting = new LocalSetting(
+  "reqSortSetting/TransactionsPage",
+  (state: AdminUIState) => state.localSettings,
+  api.DEFAULT_STATS_REQ_OPTIONS.sortTxn,
+);
+
+export const limitSetting = new LocalSetting(
+  "reqLimitSetting/TransactionsPage",
+  (state: AdminUIState) => state.localSettings,
+  api.DEFAULT_STATS_REQ_OPTIONS.limit,
+);
+
 const fingerprintsPageActions = {
-  refreshData: refreshStatements,
+  refreshData: refreshTxns,
+  refreshNodes,
+  refreshUserSQLRoles,
   resetSQLStats: resetSQLStatsAction,
   onTimeScaleChange: setGlobalTimeScaleAction,
   // We use `null` when the value was never set and it will show all columns.
@@ -116,16 +141,19 @@ const fingerprintsPageActions = {
     }),
   onFilterChange: (filters: Filters) => filtersLocalSetting.set(filters),
   onSearchComplete: (query: string) => searchLocalSetting.set(query),
+  onChangeLimit: (newLimit: number) => limitSetting.set(newLimit),
+  onChangeReqSort: (sort: api.SqlStatsSortType) => reqSortSetting.set(sort),
+  onApplySearchCriteria: trackApplySearchCriteriaAction,
 };
 
 type StateProps = {
   fingerprintsPageProps: TransactionsPageStateProps & RouteComponentProps;
-  activePageProps: ActiveTransactionsViewStateProps;
+  activePageProps: RecentTransactionsViewStateProps;
 };
 
 type DispatchProps = {
   fingerprintsPageProps: TransactionsPageDispatchProps;
-  activePageProps: ActiveTransactionsViewDispatchProps;
+  activePageProps: RecentTransactionsViewDispatchProps;
 };
 
 const TransactionsPageConnected = withRouter(
@@ -140,7 +168,9 @@ const TransactionsPageConnected = withRouter(
         ...props,
         columns: transactionColumnsLocalSetting.selectorToArray(state),
         data: selectData(state),
-        lastUpdated: selectStatementsLastUpdated(state),
+        isDataValid: selectTxnsDataValid(state),
+        isReqInFlight: selectTxnsDataInFlight(state),
+        lastUpdated: selectTxnsLastUpdated(state),
         timeScale: selectTimeScale(state),
         error: selectLastError(state),
         filters: filtersLocalSetting.selector(state),
@@ -148,9 +178,12 @@ const TransactionsPageConnected = withRouter(
         nodeRegions: nodeRegionsByIDSelector(state),
         search: searchLocalSetting.selector(state),
         sortSetting: sortSettingLocalSetting.selector(state),
-        statementsError: state.cachedData.statements.lastError,
+        statementsError: state.cachedData.transactions.lastError,
+        hasAdminRole: selectHasAdminRole(state),
+        limit: limitSetting.selector(state),
+        reqSortSetting: reqSortSetting.selector(state),
       },
-      activePageProps: mapStateToActiveTransactionsPageProps(state),
+      activePageProps: mapStateToRecentTransactionsPageProps(state),
     }),
     dispatch => ({
       fingerprintsPageProps: bindActionCreators(
@@ -158,7 +191,7 @@ const TransactionsPageConnected = withRouter(
         dispatch,
       ),
       activePageProps: bindActionCreators(
-        activeTransactionsPageActionCreators,
+        recentTransactionsPageActionCreators,
         dispatch,
       ),
     }),

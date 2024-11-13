@@ -25,14 +25,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
 func (b *Builder) buildMutationInput(
 	mutExpr, inputExpr memo.RelExpr, colList opt.ColList, p *memo.MutationPrivate,
 ) (execPlan, error) {
-	if b.shouldApplyImplicitLockingToMutationInput(mutExpr) {
+	shouldApplyImplicitLocking, err := b.shouldApplyImplicitLockingToMutationInput(mutExpr)
+	if err != nil {
+		return execPlan{}, err
+	}
+	if shouldApplyImplicitLocking {
 		// Re-entrance is not possible because mutations are never nested.
 		b.forceForUpdateLocking = true
 		defer func() { b.forceForUpdateLocking = false }()
@@ -146,8 +150,10 @@ func (b *Builder) tryBuildFastPathInsert(ins *memo.InsertExpr) (_ execPlan, ok b
 	//     that we send, not a number of rows. We use this as a guideline only,
 	//     and there is no guarantee that we won't produce a bigger batch.)
 	values, ok := ins.Input.(*memo.ValuesExpr)
-	// TODO(mgartner): Prevent fast path if there is a UDF invocation.
-	if !ok || values.ChildCount() > mutations.MaxBatchSize(false /* forceProductionMaxBatchSize */) || values.Relational().HasSubquery {
+	if !ok ||
+		values.ChildCount() > mutations.MaxBatchSize(false /* forceProductionMaxBatchSize */) ||
+		values.Relational().HasSubquery ||
+		values.Relational().HasUDF {
 		return execPlan{}, false, nil
 	}
 
@@ -196,19 +202,19 @@ func (b *Builder) tryBuildFastPathInsert(ins *memo.InsertExpr) (_ execPlan, ok b
 
 		out := &fkChecks[i]
 		out.InsertCols = make([]exec.TableColumnOrdinal, len(lookupJoin.KeyCols))
-		findCol := func(cols opt.OptionalColList, col opt.ColumnID) int {
-			res, ok := cols.Find(col)
-			if !ok {
-				panic(errors.AssertionFailedf("cannot find column %d", col))
-			}
-			return res
-		}
 		for i, keyCol := range lookupJoin.KeyCols {
 			// The keyCol comes from the WithScan operator. We must find the matching
 			// column in the mutation input.
-			withColOrd := findCol(opt.OptionalColList(withScan.OutCols), keyCol)
+			withColOrd, ok := withScan.OutCols.Find(keyCol)
+			if !ok {
+				return execPlan{}, false, errors.AssertionFailedf("cannot find column %d", keyCol)
+			}
 			inputCol := withScan.InCols[withColOrd]
-			out.InsertCols[i] = exec.TableColumnOrdinal(findCol(ins.InsertCols, inputCol))
+			inputColOrd, ok := ins.InsertCols.Find(inputCol)
+			if !ok {
+				return execPlan{}, false, errors.AssertionFailedf("cannot find column %d", inputCol)
+			}
+			out.InsertCols[i] = exec.TableColumnOrdinal(inputColOrd)
 		}
 
 		out.ReferencedTable = md.Table(lookupJoin.Table)
@@ -433,7 +439,10 @@ func (b *Builder) buildUpsert(ups *memo.UpsertExpr) (execPlan, error) {
 	tab := md.Table(ups.Table)
 	canaryCol := exec.NodeColumnOrdinal(-1)
 	if ups.CanaryCol != 0 {
-		canaryCol = input.getNodeColumnOrdinal(ups.CanaryCol)
+		canaryCol, err = input.getNodeColumnOrdinal(ups.CanaryCol)
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 	insertColOrds := ordinalSetFromColList(ups.InsertCols)
 	fetchColOrds := ordinalSetFromColList(ups.FetchCols)
@@ -491,25 +500,41 @@ func (b *Builder) buildDelete(del *memo.DeleteExpr) (execPlan, error) {
 	//
 	// TODO(andyk): Using ensureColumns here can result in an extra Render.
 	// Upgrade execution engine to not require this.
-	colList := make(opt.ColList, 0, len(del.FetchCols)+len(del.PartialIndexDelCols))
+	colList := make(opt.ColList, 0, len(del.FetchCols)+len(del.PassthroughCols)+len(del.PartialIndexDelCols))
 	colList = appendColsWhenPresent(colList, del.FetchCols)
+	// The RETURNING clause of the Delete can refer to the columns in any of the
+	// USING tables. As a result, the Update may need to passthrough those
+	// columns so the projection above can use them.
+	if del.NeedResults() {
+		colList = append(colList, del.PassthroughCols...)
+	}
 	colList = appendColsWhenPresent(colList, del.PartialIndexDelCols)
 
 	input, err := b.buildMutationInput(del, del.Input, colList, &del.MutationPrivate)
 	if err != nil {
 		return execPlan{}, err
 	}
-
 	// Construct the Delete node.
 	md := b.mem.Metadata()
 	tab := md.Table(del.Table)
 	fetchColOrds := ordinalSetFromColList(del.FetchCols)
 	returnColOrds := ordinalSetFromColList(del.ReturnCols)
+
+	//Construct the result columns for the passthrough set
+	var passthroughCols colinfo.ResultColumns
+	if del.NeedResults() {
+		for _, passthroughCol := range del.PassthroughCols {
+			colMeta := b.mem.Metadata().ColumnMeta(passthroughCol)
+			passthroughCols = append(passthroughCols, colinfo.ResultColumn{Name: colMeta.Alias, Typ: colMeta.Type})
+		}
+	}
+
 	node, err := b.factory.ConstructDelete(
 		input.root,
 		tab,
 		fetchColOrds,
 		returnColOrds,
+		passthroughCols,
 		b.allowAutoCommit && len(del.FKChecks) == 0 && len(del.FKCascades) == 0,
 	)
 	if err != nil {
@@ -636,8 +661,8 @@ func appendColsWhenPresent(dst opt.ColList, src opt.OptionalColList) opt.ColList
 // column ID in the given list. This is used with mutation operators, which
 // maintain lists that correspond to the target table, with zero column IDs
 // indicating columns that are not involved in the mutation.
-func ordinalSetFromColList(colList opt.OptionalColList) util.FastIntSet {
-	var res util.FastIntSet
+func ordinalSetFromColList(colList opt.OptionalColList) intsets.Fast {
+	var res intsets.Fast
 	for i, col := range colList {
 		if col != 0 {
 			res.Add(i)
@@ -696,7 +721,11 @@ func (b *Builder) buildUniqueChecks(checks memo.UniqueChecksExpr) error {
 		mkErr := func(row tree.Datums) error {
 			keyVals := make(tree.Datums, len(c.KeyCols))
 			for i, col := range c.KeyCols {
-				keyVals[i] = row[query.getNodeColumnOrdinal(col)]
+				ord, err := query.getNodeColumnOrdinal(col)
+				if err != nil {
+					return err
+				}
+				keyVals[i] = row[ord]
 			}
 			return mkUniqueCheckErr(md, c, keyVals)
 		}
@@ -722,7 +751,11 @@ func (b *Builder) buildFKChecks(checks memo.FKChecksExpr) error {
 		mkErr := func(row tree.Datums) error {
 			keyVals := make(tree.Datums, len(c.KeyCols))
 			for i, col := range c.KeyCols {
-				keyVals[i] = row[query.getNodeColumnOrdinal(col)]
+				ord, err := query.getNodeColumnOrdinal(col)
+				if err != nil {
+					return err
+				}
+				keyVals[i] = row[ord]
 			}
 			return mkFKCheckErr(md, c, keyVals)
 		}
@@ -945,26 +978,26 @@ var forUpdateLocking = opt.Locking{Strength: tree.ForUpdate}
 // shouldApplyImplicitLockingToMutationInput determines whether or not the
 // builder should apply a FOR UPDATE row-level locking mode to the initial row
 // scan of a mutation expression.
-func (b *Builder) shouldApplyImplicitLockingToMutationInput(mutExpr memo.RelExpr) bool {
+func (b *Builder) shouldApplyImplicitLockingToMutationInput(mutExpr memo.RelExpr) (bool, error) {
 	switch t := mutExpr.(type) {
 	case *memo.InsertExpr:
 		// Unlike with the other three mutation expressions, it never makes
 		// sense to apply implicit row-level locking to the input of an INSERT
 		// expression because any contention results in unique constraint
 		// violations.
-		return false
+		return false, nil
 
 	case *memo.UpdateExpr:
-		return b.shouldApplyImplicitLockingToUpdateInput(t)
+		return b.shouldApplyImplicitLockingToUpdateInput(t), nil
 
 	case *memo.UpsertExpr:
-		return b.shouldApplyImplicitLockingToUpsertInput(t)
+		return b.shouldApplyImplicitLockingToUpsertInput(t), nil
 
 	case *memo.DeleteExpr:
-		return b.shouldApplyImplicitLockingToDeleteInput(t)
+		return b.shouldApplyImplicitLockingToDeleteInput(t), nil
 
 	default:
-		panic(errors.AssertionFailedf("unexpected mutation expression %T", t))
+		return false, errors.AssertionFailedf("unexpected mutation expression %T", t)
 	}
 }
 

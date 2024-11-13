@@ -62,6 +62,8 @@ func TestHandleVars(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Contains(t, string(out), "# HELP proxy_sql_conns")
+	require.Contains(t, string(out), "# HELP proxy_balancer_rebalance_total")
+	require.Contains(t, string(out), "# HELP proxy_conn_migration_attempted")
 }
 
 func TestAwaitNoConnections(t *testing.T) {
@@ -79,18 +81,18 @@ func TestAwaitNoConnections(t *testing.T) {
 	proxyServer, err := NewServer(ctx, stopper, ProxyOptions{})
 	require.NoError(t, err)
 
-	//simulate a connection coming in
+	// Simulate a connection coming in.
 	proxyServer.metrics.CurConnCount.Inc(1)
 	begin := timeutil.Now()
 
-	// wait a few milliseconds and simulate the connection dropping
+	// Wait a few milliseconds and simulate the connection dropping.
 	waitTime := time.Millisecond * 150
 	_ = stopper.RunAsyncTask(ctx, "decrement-con-count", func(context.Context) {
 		<-time.After(waitTime)
 		proxyServer.metrics.CurConnCount.Dec(1)
 	})
-	// wait for there to be no connections
+	// Wait for there to be no connections.
 	<-proxyServer.AwaitNoConnections(ctx)
-	// make sure we waited for the connection to be dropped
+	// Make sure we waited for the connection to be dropped.
 	require.GreaterOrEqual(t, timeutil.Since(begin), waitTime)
 }

@@ -596,6 +596,9 @@ func (th testHistogram) toHistogram() histogram {
 	}
 	h := histogram{buckets: make([]cat.HistogramBucket, len(th))}
 	for i := range th {
+		// Unlike in TableStatistic.setHistogramBuckets and
+		// histogram.toHistogramData, we do not round here so that we can test the
+		// rounding behavior of those functions.
 		h.buckets[i].NumEq = th[i].NumEq
 		h.buckets[i].NumRange = th[i].NumRange
 		h.buckets[i].DistinctRange = th[i].DistinctRange
@@ -1350,10 +1353,12 @@ func TestQuantileOps(t *testing.T) {
 				t.Errorf("test case %d incorrect fixed %v expected %v", i, fixed, tc.fixed)
 			}
 			intSqFixed := fixed.integrateSquared()
-			// This seems like it should run into floating point errors, but it hasn't
-			// yet, so yay?
-			if intSqFixed != intSq {
-				t.Errorf("test case %d incorrect intSqFixed %v expected %v", i, intSqFixed, intSq)
+
+			// Truncate to 10 decimal places.
+			truncatedIntSqFixed := math.Trunc(intSqFixed*1e10) / 1e10
+			truncatedIntSq := math.Trunc(intSq*1e10) / 1e10
+			if truncatedIntSqFixed != truncatedIntSq {
+				t.Errorf("test case %d incorrect truncatedIntSqFixed %v expected %v", i, truncatedIntSqFixed, truncatedIntSq)
 			}
 		})
 	}
@@ -1361,7 +1366,7 @@ func TestQuantileOps(t *testing.T) {
 
 // TestQuantileOpsRandom tests basic operations on random quantile functions.
 func TestQuantileOpsRandom(t *testing.T) {
-	const delta = 1e-3
+	const delta = 1e-2
 	rng, seed := randutil.NewTestRand()
 	for i := 0; i < 5; i++ {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {

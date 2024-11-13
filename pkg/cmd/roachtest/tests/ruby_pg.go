@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -85,6 +86,7 @@ func registerRubyPG(r registry.Registry) {
 			"install ruby 3.1.2",
 			`mkdir -p ruby-install && \
         curl -fsSL https://github.com/postmodern/ruby-install/archive/v0.8.3.tar.gz | tar --strip-components=1 -C ruby-install -xz && \
+        sudo rm -rf /usr/local/bin/* && \
         sudo make -C ruby-install install && \
         sudo ruby-install --system ruby 3.1.2 && \
         sudo gem update --system`,
@@ -129,7 +131,7 @@ func registerRubyPG(r registry.Registry) {
 			c,
 			node,
 			"installing gems",
-			`cd /mnt/data1/ruby-pg/ && bundle install`,
+			`cd /mnt/data1/ruby-pg/ && sudo bundle install`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -152,16 +154,10 @@ func registerRubyPG(r registry.Registry) {
 			`cd /mnt/data1/ruby-pg/ && bundle exec rake compile test`,
 		)
 
-		// Expected to fail but we should still scan the error to check if
-		// there's an SSH/roachprod error.
-		if err != nil {
-			// install.NonZeroExitCode includes unrelated to SSH errors ("255")
-			// or roachprod errors, so we call t.Fatal if the error is not an
-			// install.NonZeroExitCode error
-			commandError := (*install.NonZeroExitCode)(nil)
-			if !errors.As(err, &commandError) {
-				t.Fatal(err)
-			}
+		// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+		// Proceed for any other (command) errors
+		if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+			t.Fatal(err)
 		}
 
 		rawResults := []byte(result.Stdout + result.Stderr)
@@ -232,7 +228,7 @@ func registerRubyPG(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:       "ruby-pg",
-		Owner:      registry.OwnerSQLExperience,
+		Owner:      registry.OwnerSQLFoundations,
 		Cluster:    r.MakeClusterSpec(1),
 		NativeLibs: registry.LibGEOS,
 		Tags:       []string{`default`, `orm`},

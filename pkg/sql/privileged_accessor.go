@@ -15,7 +15,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -35,11 +34,11 @@ func (p *planner) LookupNamespaceID(
 		`SELECT id FROM [%d AS namespace] WHERE "parentID" = $1 AND "parentSchemaID" = $2 AND name = $3`,
 		keys.NamespaceTableID,
 	)
-	r, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
+	r, err := p.InternalSQLTxn().QueryRowEx(
 		ctx,
 		"crdb-internal-get-descriptor-id",
 		p.txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		query,
 		parentID,
 		parentSchemaID,
@@ -66,38 +65,22 @@ func (p *planner) LookupZoneConfigByNamespaceID(
 		return "", false, err
 	}
 
-	const query = `SELECT config FROM system.zones WHERE id = $1`
-	r, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
-		ctx,
-		"crdb-internal-get-zone",
-		p.txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-		query,
-		id,
-	)
+	zc, err := p.Descriptors().GetZoneConfig(ctx, p.Txn(), descpb.ID(id))
 	if err != nil {
 		return "", false, err
 	}
-	if r == nil {
+	if zc == nil {
 		return "", false, nil
 	}
-	return tree.MustBeDBytes(r[0]), true, nil
+
+	return tree.DBytes(zc.GetRawBytesInStorage()), true, nil
 }
 
 // checkDescriptorPermissions returns nil if the executing user has permissions
 // to check the permissions of a descriptor given its ID, or the id given
 // is not a descriptor of a table or database.
 func (p *planner) checkDescriptorPermissions(ctx context.Context, id descpb.ID) error {
-	desc, err := p.Descriptors().GetImmutableDescriptorByID(
-		ctx, p.txn, id,
-		tree.CommonLookupFlags{
-			IncludeDropped: true,
-			IncludeOffline: true,
-			// Note that currently the ByID API implies required regardless of whether it
-			// is set. Set it just to be explicit.
-			Required: true,
-		},
-	)
+	desc, err := p.Descriptors().ByIDWithLeased(p.txn).Get().Desc(ctx, id)
 	if err != nil {
 		// Filter the error due to the descriptor not existing.
 		if errors.Is(err, catalog.ErrDescriptorNotFound) {
@@ -106,7 +89,7 @@ func (p *planner) checkDescriptorPermissions(ctx context.Context, id descpb.ID) 
 		return err
 	}
 	if err := p.CheckAnyPrivilege(ctx, desc); err != nil {
-		return pgerror.New(pgcode.InsufficientPrivilege, "insufficient privilege")
+		return pgerror.Wrapf(err, pgcode.InsufficientPrivilege, "insufficient privilege")
 	}
 	return nil
 }

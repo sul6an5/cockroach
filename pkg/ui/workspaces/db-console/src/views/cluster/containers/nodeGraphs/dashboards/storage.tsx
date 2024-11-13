@@ -11,7 +11,7 @@
 import React from "react";
 import _ from "lodash";
 
-import { LineGraph } from "src/views/cluster/components/linegraph";
+import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
 
 import {
@@ -26,8 +26,17 @@ import {
 import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
 export default function (props: GraphDashboardProps) {
-  const { nodeIDs, nodesSummary, nodeSources, storeSources, tooltipSelection } =
-    props;
+  const {
+    nodeIDs,
+    nodeSources,
+    storeSources,
+    tooltipSelection,
+    storeIDsByNodeID,
+    nodeDisplayNameByID,
+  } = props;
+
+  const getNodeNameById = (id: string) =>
+    nodeDisplayName(nodeDisplayNameByID, id);
 
   return [
     <LineGraph
@@ -44,6 +53,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Live Bytes"
+      isKvGraph={false}
       sources={storeSources}
       tooltip={<LiveBytesGraphTooltip tooltipSelection={tooltipSelection} />}
     >
@@ -64,8 +74,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.raft.process.logcommit.latency-p99"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -82,8 +92,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.raft.process.logcommit.latency-p50"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -101,8 +111,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.raft.process.commandcommit.latency-p99"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -120,8 +130,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.raft.process.commandcommit.latency-p50"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -137,8 +147,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.rocksdb.read-amplification"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -154,8 +164,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.rocksdb.num-sstables"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>
@@ -183,8 +193,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.rocksdb.flushed-bytes"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
             nonNegativeRate
           />
         ))}
@@ -201,8 +211,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.rocksdb.compacted-bytes-written"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
             nonNegativeRate
           />
         ))}
@@ -219,8 +229,8 @@ export default function (props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.rocksdb.ingested-bytes"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={getNodeNameById(nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
             nonNegativeRate
           />
         ))}

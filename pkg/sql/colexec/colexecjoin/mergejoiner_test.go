@@ -101,11 +101,13 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 		leftMJSource, rightMJSource, typs, typs,
 		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-		testDiskAcc, evalCtx,
+		testDiskAcc, testMemAcc, evalCtx,
 	)
 	mj.Init(ctx)
-	hj := NewHashJoiner(
-		testAllocator, testAllocator, HashJoinerSpec{
+	hj := NewHashJoiner(NewHashJoinerArgs{
+		BuildSideAllocator:       testAllocator,
+		OutputUnlimitedAllocator: testAllocator,
+		Spec: HashJoinerSpec{
 			JoinType: descpb.InnerJoin,
 			Left: hashJoinerSourceSpec{
 				EqCols: []uint32{0}, SourceTypes: typs,
@@ -113,8 +115,11 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 			Right: hashJoinerSourceSpec{
 				EqCols: []uint32{0}, SourceTypes: typs,
 			},
-		}, leftHJSource, rightHJSource, HashJoinerInitialNumBuckets,
-	)
+		},
+		LeftSource:        leftHJSource,
+		RightSource:       rightHJSource,
+		InitialNumBuckets: HashJoinerInitialNumBuckets,
+	})
 	hj.Init(ctx)
 
 	var mjOutputTuples, hjOutputTuples colexectestutils.Tuples
@@ -190,7 +195,7 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			descpb.InnerJoin, leftSource, rightSource, sourceTypes, sourceTypes,
 			[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 			[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-			testDiskAcc,
+			testDiskAcc, testMemAcc,
 		)
 		return &mergeJoinInnerOp{mergeJoinBase: base}
 	}

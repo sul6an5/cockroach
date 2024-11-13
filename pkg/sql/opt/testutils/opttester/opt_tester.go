@@ -61,9 +61,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/floatcmp"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -108,7 +110,7 @@ var (
 )
 
 // RuleSet efficiently stores an unordered set of RuleNames.
-type RuleSet = util.FastIntSet
+type RuleSet = intsets.Fast
 
 // OptTester is a helper for testing the various optimizer components. It
 // contains the boiler-plate code for the following useful tasks:
@@ -131,6 +133,7 @@ type OptTester struct {
 	appliedRules RuleSet
 
 	builder strings.Builder
+	f       *norm.Factory
 }
 
 // Flags are control knobs for tests. Note that specific testcases can
@@ -208,7 +211,7 @@ type Flags struct {
 
 	// IgnoreTables specifies the subset of stats tables which should not be
 	// outputted by the stats-quality command.
-	IgnoreTables util.FastIntSet
+	IgnoreTables intsets.Fast
 
 	// File specifies the name of the file to import. This field is only used by
 	// the import command.
@@ -251,6 +254,10 @@ type Flags struct {
 	// SkipRace indicates that a test should be skipped if the race detector is
 	// enabled.
 	SkipRace bool
+
+	// RoundFloatsInStringsSigFigs specifies the number of significant figures
+	// to round floats embedded in strings to where zero means do not round.
+	RoundFloatsInStringsSigFigs int
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
@@ -264,6 +271,8 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 		semaCtx: tree.MakeSemaContext(),
 		evalCtx: eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
+	ot.f = &norm.Factory{}
+	ot.f.Init(ot.ctx, &ot.evalCtx, ot.catalog)
 	ot.evalCtx.SessionData().ReorderJoinsLimit = opt.DefaultJoinOrderLimit
 	ot.evalCtx.SessionData().OptimizerUseMultiColStats = true
 	ot.Flags.ctx = ot.ctx
@@ -285,6 +294,11 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData().ReorderJoinsLimit = opt.DefaultJoinOrderLimit
 	ot.evalCtx.SessionData().InsertFastPath = true
 	ot.evalCtx.SessionData().OptSplitScanLimit = tabledesc.MaxBucketAllowed
+	ot.evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
+	ot.evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
+	ot.evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
+	ot.evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = true
+	ot.evalCtx.SessionData().OptimizerAlwaysUseHistograms = true
 
 	return ot
 }
@@ -558,6 +572,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 
 	ot.evalCtx.TestingKnobs.OptimizerCostPerturbation = ot.Flags.PerturbCost
 	ot.evalCtx.Locality = ot.Flags.Locality
+	ot.evalCtx.OriginalLocality = ot.Flags.Locality
 	ot.evalCtx.Placeholders = nil
 
 	switch d.Cmd {
@@ -618,6 +633,9 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
+		if ot.Flags.RoundFloatsInStringsSigFigs > 0 {
+			return floatcmp.RoundFloatsInString(ot.FormatExpr(e), ot.Flags.RoundFloatsInStringsSigFigs)
+		}
 		return ot.FormatExpr(e)
 
 	case "assign-placeholders-build", "assign-placeholders-norm", "assign-placeholders-opt":
@@ -807,7 +825,9 @@ func (ot *OptTester) FormatExpr(e opt.Expr) string {
 	if rel, ok := e.(memo.RelExpr); ok {
 		mem = rel.Memo()
 	}
-	return memo.FormatExpr(e, ot.Flags.ExprFormat, mem, ot.catalog)
+	return memo.FormatExpr(
+		ot.ctx, e, ot.Flags.ExprFormat, false /* redactableValues */, mem, ot.catalog,
+	)
 }
 
 func formatRuleSet(r RuleSet) string {
@@ -837,34 +857,34 @@ func (ot *OptTester) checkExpectedRules(tb testing.TB, d *datadriven.TestData) {
 }
 
 func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Expr) {
-	fillInLazyProps(e)
+	ot.fillInLazyProps(e)
 
 	if rel, ok := e.(memo.RelExpr); ok {
 		for _, cols := range ot.Flags.ColStats {
-			memo.RequestColStat(&ot.evalCtx, rel, cols)
+			memo.RequestColStat(ot.ctx, &ot.evalCtx, rel, cols)
 		}
 	}
 	ot.checkExpectedRules(tb, d)
 }
 
 // Fills in lazily-derived properties (for display).
-func fillInLazyProps(e opt.Expr) {
+func (ot *OptTester) fillInLazyProps(e opt.Expr) {
 	if rel, ok := e.(memo.RelExpr); ok {
 		// These properties are derived from the normalized expression.
 		rel = rel.FirstExpr()
 
 		// Derive columns that are candidates for pruning.
-		norm.DerivePruneCols(rel, util.FastIntSet{} /* disabledRules */)
+		ot.f.CustomFuncs().DerivePruneCols(rel, intsets.Fast{} /* disabledRules */)
 
 		// Derive columns that are candidates for null rejection.
-		norm.DeriveRejectNullCols(rel, util.FastIntSet{} /* disabledRules */)
+		norm.DeriveRejectNullCols(rel, intsets.Fast{} /* disabledRules */)
 
 		// Make sure the interesting orderings are calculated.
 		ordering.DeriveInterestingOrderings(rel)
 	}
 
 	for i, n := 0, e.ChildCount(); i < n; i++ {
-		fillInLazyProps(e.Child(i))
+		ot.fillInLazyProps(e.Child(i))
 	}
 }
 
@@ -884,6 +904,15 @@ func ruleNamesToRuleSet(args []string) (RuleSet, error) {
 // See OptTester.RunCommand for supported flags.
 func (f *Flags) Set(arg datadriven.CmdArg) error {
 	switch arg.Key {
+	case "round-in-strings":
+		if len(arg.Vals) != 1 {
+			return fmt.Errorf("round-in-strings requires a single argument")
+		}
+		sigFigs, err := strconv.Atoi(arg.Vals[0])
+		if err != nil {
+			return err
+		}
+		f.RoundFloatsInStringsSigFigs = sigFigs
 	case "set":
 		for _, val := range arg.Vals {
 			s := strings.Split(val, "=")
@@ -1008,7 +1037,7 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 		f.Table = arg.Vals[0]
 
 	case "ignore-tables":
-		var tables util.FastIntSet
+		var tables intsets.Fast
 		addTables := func(val string) error {
 			table, err := strconv.Atoi(val)
 			if err != nil {
@@ -1250,23 +1279,25 @@ func (ot *OptTester) Memo() (string, error) {
 	if _, err := ot.optimizeExpr(o, nil); err != nil {
 		return "", err
 	}
-	return o.FormatMemo(ot.Flags.MemoFormat), nil
+	return o.FormatMemo(ot.Flags.MemoFormat, false /* redactableValues */), nil
 }
 
 // Expr parses the input directly into an expression; see exprgen.Build.
 func (ot *OptTester) Expr() (opt.Expr, error) {
 	var f norm.Factory
-	f.Init(&ot.evalCtx, ot.catalog)
+	f.Init(ot.ctx, &ot.evalCtx, ot.catalog)
+	ot.f = &f
 	f.DisableOptimizations()
 
-	return exprgen.Build(ot.catalog, &f, ot.sql)
+	return exprgen.Build(ot.ctx, ot.catalog, &f, ot.sql)
 }
 
 // ExprNorm parses the input directly into an expression and runs
 // normalization; see exprgen.Build.
 func (ot *OptTester) ExprNorm() (opt.Expr, error) {
 	var f norm.Factory
-	f.Init(&ot.evalCtx, ot.catalog)
+	f.Init(ot.ctx, &ot.evalCtx, ot.catalog)
+	ot.f = &f
 	f.SetDisabledRules(ot.Flags.DisableRules)
 
 	if !ot.Flags.NoStableFolds {
@@ -1283,7 +1314,7 @@ func (ot *OptTester) ExprNorm() (opt.Expr, error) {
 		ot.appliedRules.Add(int(ruleName))
 	})
 
-	return exprgen.Build(ot.catalog, &f, ot.sql)
+	return exprgen.Build(ot.ctx, ot.catalog, &f, ot.sql)
 }
 
 // ExprOpt parses the input directly into an expression and runs normalization
@@ -1304,7 +1335,7 @@ func (ot *OptTester) ExprOpt() (opt.Expr, error) {
 		ot.appliedRules.Add(int(ruleName))
 	})
 
-	return exprgen.Optimize(ot.catalog, o, ot.sql)
+	return exprgen.Optimize(ot.ctx, ot.catalog, o, ot.sql)
 }
 
 // RuleStats performs the optimization and returns statistics about how many
@@ -1440,7 +1471,7 @@ func (ot *OptTester) OptSteps() (string, error) {
 			return "", err
 		}
 
-		next = os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat)
+		next = os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat, false /* redactableValues */)
 
 		// This call comes after setting "next", because we want to output the
 		// final expression, even though there were no diffs from the previous
@@ -1511,7 +1542,7 @@ func (ot *OptTester) optStepsNormDiff() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		expr := os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat)
+		expr := os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat, false /* redactableValues */)
 		name := "Initial"
 		if len(normSteps) > 0 {
 			rule := os.LastRuleName()
@@ -1576,11 +1607,14 @@ func (ot *OptTester) optStepsExploreDiff() (string, error) {
 			continue
 		}
 		newNodes := et.NewExprs()
-		before := et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat)
+		before := et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, false /* redactableValues */)
 
 		for i := range newNodes {
 			name := et.LastRuleName().String()
-			after := memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, et.fo.o.Memo(), ot.catalog)
+			after := memo.FormatExpr(
+				ot.ctx, newNodes[i], ot.Flags.ExprFormat, false /* redactableValues */, et.fo.o.Memo(),
+				ot.catalog,
+			)
 
 			diff := difflib.UnifiedDiff{
 				A:        difflib.SplitLines(before),
@@ -1770,13 +1804,16 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 		ot.output("%s\n", et.LastRuleName())
 		ot.separator("=")
 		ot.output("Source expression:\n")
-		ot.indent(et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat))
+		ot.indent(et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, false /* redactableValues */))
 		if len(newNodes) == 0 {
 			ot.output("\nNo new expressions.\n")
 		}
 		for i := range newNodes {
 			ot.output("\nNew expression %d of %d:\n", i+1, len(newNodes))
-			ot.indent(memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, et.fo.o.Memo(), ot.catalog))
+			ot.indent(memo.FormatExpr(
+				ot.ctx, newNodes[i], ot.Flags.ExprFormat, false /* redactableValues */, et.fo.o.Memo(),
+				ot.catalog,
+			))
 		}
 	}
 	return ot.builder.String(), nil
@@ -1800,7 +1837,7 @@ func (ot *OptTester) Import(tb testing.TB) {
 // testFixturePath returns the path of a fixture inside opttester/testfixtures.
 func (ot *OptTester) testFixturePath(tb testing.TB, file string) string {
 	if bazel.BuiltWithBazel() {
-		runfile := testutils.RewritableDataPath(tb, "pkg", "sql", "opt", "testutils", "opttester", "testfixtures", file)
+		runfile := datapathutils.RewritableDataPath(tb, "pkg", "sql", "opt", "testutils", "opttester", "testfixtures", file)
 		if _, err := os.Stat(runfile); oserror.IsNotExist(err) {
 			tb.Fatalf("%s; is your package missing a dependency on \"//pkg/sql/opt/testutils/opttester:testfixtures\"?", err)
 		}
@@ -2014,14 +2051,14 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 
 		// Make sure we have estimated stats for this column.
 		colSet := opt.MakeColSet(col)
-		memo.RequestColStat(&ot.evalCtx, rel, colSet)
-		stat, ok := relProps.Stats.ColStats.Lookup(colSet)
+		memo.RequestColStat(ot.ctx, &ot.evalCtx, rel, colSet)
+		stat, ok := relProps.Statistics().ColStats.Lookup(colSet)
 		if !ok {
 			return nil, fmt.Errorf("could not find statistic for column %s", colName)
 		}
 		jsonStats[i] = ot.makeStat(
 			[]string{colName},
-			uint64(int64(math.Round(relProps.Stats.RowCount))),
+			uint64(int64(math.Round(relProps.Statistics().RowCount))),
 			uint64(int64(math.Round(stat.DistinctCount))),
 			uint64(int64(math.Round(stat.NullCount))),
 		)
@@ -2157,14 +2194,17 @@ func (ot *OptTester) IndexRecommendations() (string, error) {
 	}
 	md := normExpr.(memo.RelExpr).Memo().Metadata()
 	indexCandidates := indexrec.FindIndexCandidateSet(normExpr, md)
-	_, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
+	_, hypTables := indexrec.BuildOptAndHypTableMaps(ot.catalog, indexCandidates)
 
 	optExpr, err := ot.OptimizeWithTables(hypTables)
 	if err != nil {
 		return "", err
 	}
 	md = optExpr.(memo.RelExpr).Memo().Metadata()
-	recs := indexrec.FindRecs(optExpr, md)
+	recs, err := indexrec.FindRecs(ot.ctx, optExpr, md)
+	if err != nil {
+		return "", err
+	}
 	if len(recs) == 0 {
 		return fmt.Sprintf("no index recommendations\n--\noptimal plan:\n%s", ot.FormatExpr(optExpr)), nil
 	}
@@ -2196,7 +2236,7 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 	if err != nil {
 		return err
 	}
-	if err := ot.semaCtx.Placeholders.Init(stmt.NumPlaceholders, nil /* typeHints */, false /* fromSQL */); err != nil {
+	if err := ot.semaCtx.Placeholders.Init(stmt.NumPlaceholders, nil /* typeHints */); err != nil {
 		return err
 	}
 	ot.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
@@ -2210,6 +2250,7 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 func (ot *OptTester) makeOptimizer() *xform.Optimizer {
 	var o xform.Optimizer
 	o.Init(ot.ctx, &ot.evalCtx, ot.catalog)
+	ot.f = o.Factory()
 	o.Factory().SetDisabledRules(ot.Flags.DisableRules)
 	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
 		// Exploration rules are marked as "applied" if they generate one or
@@ -2231,14 +2272,14 @@ func (ot *OptTester) optimizeExpr(
 		return nil, err
 	}
 	if tables != nil {
-		o.Memo().Metadata().UpdateTableMeta(tables)
+		o.Memo().Metadata().UpdateTableMeta(&ot.evalCtx, tables)
 	}
 	root, err := o.Optimize()
 	if err != nil {
 		return nil, err
 	}
+	o.Memo().ResetLogProps(ot.ctx, &ot.evalCtx)
 	if ot.Flags.PerturbCost != 0 {
-		o.Memo().ResetLogProps(&ot.evalCtx)
 		o.RecomputeCost()
 	}
 	return root, nil
@@ -2279,13 +2320,15 @@ func ruleFromString(str string) (opt.RuleName, error) {
 func (ot *OptTester) ExecBuild(f exec.Factory, mem *memo.Memo, expr opt.Expr) (exec.Plan, error) {
 	// For DDL we need a fresh root transaction that isn't system tenant.
 	if opt.IsDDLOp(expr) {
-		ot.evalCtx.Codec = keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+		ot.evalCtx.Codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 		factory := kv.MockTxnSenderFactory{}
-		clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+		clock := hlc.NewClockForTesting(nil)
 		stopper := stop.NewStopper()
 		db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 		ot.evalCtx.Txn = kv.NewTxn(context.Background(), db, 1)
 	}
-	bld := execbuilder.New(f, ot.makeOptimizer(), mem, ot.catalog, expr, &ot.evalCtx, true)
+	bld := execbuilder.New(context.Background(), f, ot.makeOptimizer(), mem, ot.catalog, expr, &ot.evalCtx, true,
+		false, /* isANSIDML */
+	)
 	return bld.Build()
 }

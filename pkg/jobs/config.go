@@ -32,6 +32,7 @@ const (
 	executionErrorsMaxEntriesKey   = "jobs.execution_errors.max_entries"
 	executionErrorsMaxEntrySizeKey = "jobs.execution_errors.max_entry_size"
 	debugPausePointsSettingKey     = "jobs.debug.pausepoints"
+	metricsPollingIntervalKey      = "jobs.metrics.interval.poll"
 )
 
 const (
@@ -70,6 +71,10 @@ const (
 	// error. If this size is exceeded, the error will be formatted as a string
 	// and then truncated to fit the size.
 	defaultExecutionErrorsMaxEntrySize = 64 << 10 // 64 KiB
+
+	// defaultPollForMetricsInterval is the default interval to poll the jobs
+	// table for metrics.
+	defaultPollForMetricsInterval = 30 * time.Second
 )
 
 var (
@@ -100,6 +105,16 @@ var (
 		settings.PositiveDuration,
 	)
 
+	// PollJobsMetricsInterval is the interval at which a tenant in the cluster
+	// will poll the jobs table for metrics
+	PollJobsMetricsInterval = settings.RegisterDurationSetting(
+		settings.TenantWritable,
+		metricsPollingIntervalKey,
+		"the interval at which a node in the cluster will poll the jobs table for metrics",
+		defaultPollForMetricsInterval,
+		settings.PositiveDuration,
+	)
+
 	gcIntervalSetting = settings.RegisterDurationSetting(
 		settings.TenantWritable,
 		gcIntervalSettingKey,
@@ -113,7 +128,7 @@ var (
 	RetentionTimeSetting = settings.RegisterDurationSetting(
 		settings.TenantWritable,
 		retentionTimeSettingKey,
-		"the amount of time to retain records for completed jobs before",
+		"the amount of time for which records for completed jobs are retained",
 		defaultRetentionTime,
 		settings.PositiveDuration,
 	).WithPublic()

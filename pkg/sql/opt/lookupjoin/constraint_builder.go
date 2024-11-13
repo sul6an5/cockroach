@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -79,10 +79,10 @@ type Constraint struct {
 	// be projected on the lookup join's input.
 	InputProjections memo.ProjectionsExpr
 
-	// ConstFilters contains constant equalities and ranges in either KeyCols or
-	// LookupExpr that are used to aid selectivity estimation. See
-	// memo.LookupJoinPrivate.ConstFilters.
-	ConstFilters memo.FiltersExpr
+	// AllLookupFilters contains equalities and other filters in either KeyCols or
+	// LookupExpr that are used to aid selectivity estimation and logical props
+	// calculation. See memo.LookupJoinPrivate.AllLookupFilters.
+	AllLookupFilters memo.FiltersExpr
 
 	// RemainingFilters contains explicit ON filters that are not represented by
 	// KeyCols or LookupExpr. These filters must be included as ON filters in
@@ -139,25 +139,33 @@ func (b *ConstraintBuilder) Init(
 // The constraint returned may be unconstrained if no constraint could be built.
 // foundEqualityCols indicates whether any equality conditions were used to
 // constrain the index columns; this can be used to decide whether to build a
-// lookup join.
+// lookup join. `derivedFkOnFilters` is a set of extra equijoin predicates,
+// derived from a foreign key constraint, to add to the explicit ON clause,
+// but which should not be used in calculating join selectivity estimates.
 func (b *ConstraintBuilder) Build(
-	index cat.Index, onFilters, optionalFilters memo.FiltersExpr,
+	index cat.Index, onFilters, optionalFilters, derivedFkOnFilters memo.FiltersExpr,
 ) (_ Constraint, foundEqualityCols bool) {
-	// Extract the equality columns from onFilters. We cannot use the results of
-	// the extraction in Init because onFilters may be reduced by the caller
-	// after Init due to partial index implication. If the filters are reduced,
-	// eqFilterOrds calculated during Init would no longer be valid because the
-	// ordinals of the filters will have changed.
+	// Combine the ON and derived FK filters which can contain equality
+	// conditions.
+	allFilters := make(memo.FiltersExpr, 0, len(onFilters)+len(derivedFkOnFilters)+len(optionalFilters))
+	allFilters = append(allFilters, onFilters...)
+	allFilters = append(allFilters, derivedFkOnFilters...)
+
+	// Extract the equality columns from the ON and derived FK filters.
 	leftEq, rightEq, eqFilterOrds :=
-		memo.ExtractJoinEqualityColumns(b.leftCols, b.rightCols, onFilters)
+		memo.ExtractJoinEqualityColumnsWithFilterOrds(b.leftCols, b.rightCols, allFilters)
 	rightEqSet := rightEq.ToSet()
 
-	// Retrieve the inequality columns from onFilters.
-	_, rightCmp, inequalityFilterOrds := memo.ExtractJoinConditionColumns(
-		b.leftCols, b.rightCols, onFilters, true, /* inequality */
-	)
+	// Retrieve the inequality columns from the ON and derived FK filters.
+	var rightCmp opt.ColList
+	var inequalityFilterOrds []int
+	if b.evalCtx.SessionData().VariableInequalityLookupJoinEnabled {
+		rightCmp, inequalityFilterOrds =
+			memo.ExtractJoinInequalityRightColumnsWithFilterOrds(b.leftCols, b.rightCols, onFilters)
+	}
 
-	allFilters := append(onFilters, optionalFilters...)
+	// Add the optional filters.
+	allFilters = append(allFilters, optionalFilters...)
 
 	// Check if the first column in the index either:
 	//
@@ -172,7 +180,7 @@ func (b *ConstraintBuilder) Build(
 	firstIdxCol := b.table.IndexColumnID(index, 0)
 	if _, ok := rightEq.Find(firstIdxCol); !ok {
 		if _, ok := b.findComputedColJoinEquality(b.table, firstIdxCol, rightEqSet); !ok {
-			if _, _, ok := FindJoinFilterConstants(allFilters, firstIdxCol, b.evalCtx); !ok {
+			if !HasJoinFilterConstants(allFilters, firstIdxCol, b.evalCtx) {
 				if _, ok := rightCmp.Find(firstIdxCol); !ok {
 					return Constraint{}, false
 				}
@@ -184,16 +192,36 @@ func (b *ConstraintBuilder) Build(
 	// an equality with another column or a constant.
 	numIndexKeyCols := index.LaxKeyColumnCount()
 
-	keyCols := make(opt.ColList, 0, numIndexKeyCols)
 	var derivedEquivCols opt.ColSet
-	rightSideCols := make(opt.ColList, 0, numIndexKeyCols)
+	// Don't change the selectivity estimate of this join vs. other joins which
+	// don't use derivedFkOnFilters. Add column IDs from these filters to the set
+	// of columns to ignore for join selectivity estimation. The alternative would
+	// be to derive these filters for all joins, but it's not clear that this
+	// would always be better given that some joins like hash join would have more
+	// terms to evaluate. Also, that approach may cause selectivity
+	// underestimation, so would require more effort to make sure correlations
+	// between columns are accurately captured.
+	for _, filtersItem := range derivedFkOnFilters {
+		if eqExpr, ok := filtersItem.Condition.(*memo.EqExpr); ok {
+			leftVariable, leftOk := eqExpr.Left.(*memo.VariableExpr)
+			rightVariable, rightOk := eqExpr.Right.(*memo.VariableExpr)
+			if leftOk && rightOk {
+				derivedEquivCols.Add(leftVariable.Col)
+				derivedEquivCols.Add(rightVariable.Col)
+			}
+		}
+	}
+
+	colsAlloc := make(opt.ColList, numIndexKeyCols*2)
+	keyCols := colsAlloc[0:0:numIndexKeyCols]
+	rightSideCols := colsAlloc[numIndexKeyCols : numIndexKeyCols : numIndexKeyCols*2]
 	var inputProjections memo.ProjectionsExpr
 	var lookupExpr memo.FiltersExpr
-	var constFilters memo.FiltersExpr
-	var filterOrdsToExclude util.FastIntSet
+	var allLookupFilters memo.FiltersExpr
+	var filterOrdsToExclude intsets.Fast
 	foundLookupCols := false
 	lookupExprRequired := false
-	remainingFilters := make(memo.FiltersExpr, 0, len(onFilters))
+	var remainingFilters memo.FiltersExpr
 
 	// addEqualityColumns adds the given columns as an equality in keyCols if
 	// lookupExprRequired is false. Otherwise, the equality is added as an
@@ -233,6 +261,7 @@ func (b *ConstraintBuilder) Build(
 		idxCol := b.table.IndexColumnID(index, j)
 		idxColIsDesc := index.Column(j).Descending
 		if eqIdx, ok := rightEq.Find(idxCol); ok {
+			allLookupFilters = append(allLookupFilters, allFilters[eqFilterOrds[eqIdx]])
 			addEqualityColumns(leftEq[eqIdx], idxCol)
 			filterOrdsToExclude.Add(eqFilterOrds[eqIdx])
 			foundEqualityCols = true
@@ -287,7 +316,7 @@ func (b *ConstraintBuilder) Build(
 				b.f.ConstructConstVal(foundVals[0], idxColType),
 				constColID,
 			))
-			constFilters = append(constFilters, allFilters[allIdx])
+			allLookupFilters = append(allLookupFilters, allFilters[allIdx])
 			addEqualityColumns(constColID, idxCol)
 			filterOrdsToExclude.Add(allIdx)
 			continue
@@ -310,7 +339,7 @@ func (b *ConstraintBuilder) Build(
 				})
 			}
 			lookupExpr = append(lookupExpr, valsFilter)
-			constFilters = append(constFilters, valsFilter)
+			allLookupFilters = append(allLookupFilters, allFilters[allIdx])
 			filterOrdsToExclude.Add(allIdx)
 			continue
 		}
@@ -323,12 +352,14 @@ func (b *ConstraintBuilder) Build(
 		if foundStart {
 			convertToLookupExpr()
 			lookupExpr = append(lookupExpr, allFilters[startIdx])
+			allLookupFilters = append(allLookupFilters, allFilters[startIdx])
 			filterOrdsToExclude.Add(startIdx)
 			foundLookupCols = true
 		}
 		if foundEnd {
 			convertToLookupExpr()
 			lookupExpr = append(lookupExpr, allFilters[endIdx])
+			allLookupFilters = append(allLookupFilters, allFilters[endIdx])
 			filterOrdsToExclude.Add(endIdx)
 			foundLookupCols = true
 		}
@@ -350,9 +381,10 @@ func (b *ConstraintBuilder) Build(
 			// A constant range filter could be found.
 			convertToLookupExpr()
 			lookupExpr = append(lookupExpr, *rangeFilter)
-			constFilters = append(constFilters, *rangeFilter)
+			allLookupFilters = append(allLookupFilters, allFilters[filterIdx])
 			filterOrdsToExclude.Add(filterIdx)
 			if remaining != nil {
+				remainingFilters = make(memo.FiltersExpr, 0, len(onFilters))
 				remainingFilters = append(remainingFilters, *remaining)
 			}
 		}
@@ -379,12 +411,15 @@ func (b *ConstraintBuilder) Build(
 		RightSideCols:    rightSideCols,
 		LookupExpr:       lookupExpr,
 		InputProjections: inputProjections,
-		ConstFilters:     constFilters,
+		AllLookupFilters: allLookupFilters,
 	}
 
 	// Reduce the remaining filters.
 	for i := range onFilters {
 		if !filterOrdsToExclude.Contains(i) {
+			if remainingFilters == nil {
+				remainingFilters = make(memo.FiltersExpr, 0, len(onFilters))
+			}
 			remainingFilters = append(remainingFilters, onFilters[i])
 		}
 	}

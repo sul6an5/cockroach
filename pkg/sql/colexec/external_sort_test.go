@@ -44,6 +44,7 @@ func TestExternalSort(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -93,20 +94,14 @@ func TestExternalSort(t *testing.T) {
 						if tc.k == 0 || tc.k >= uint64(len(tc.tuples)) {
 							semsToCheck = append(semsToCheck, sem)
 						}
-						// TODO(asubiotto): Pass in the testing.T of the caller to this
-						//  function and do substring matching on the test name to
-						//  conditionally explicitly call Close() on the sorter (through
-						//  result.ToClose) in cases where it is know the sorter will not
-						//  be drained.
 						sorter, closers, err := createDiskBackedSorter(
 							ctx, flowCtx, input, tc.typs, tc.ordCols, tc.matchLen, tc.k, func() {},
 							numForcedRepartitions, false /* delegateFDAcquisition */, queueCfg, sem,
 							&monitorRegistry,
 						)
-						// Check that the sort was added as a Closer.
-						// TODO(asubiotto): Explicitly Close when testing.T is passed into
-						//  this constructor and we do a substring match.
-						require.Equal(t, 1, len(closers))
+						// Check that the sort as well as the disk spiller were
+						// added as Closers.
+						require.Equal(t, 2, len(closers))
 						return sorter, err
 					})
 				for i, sem := range semsToCheck {
@@ -126,6 +121,7 @@ func TestExternalSortRandomized(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -205,7 +201,7 @@ func TestExternalSortRandomized(t *testing.T) {
 							)
 							// TODO(asubiotto): Explicitly Close when testing.T is passed into
 							//  this constructor and we do a substring match.
-							require.Equal(t, 1, len(closers))
+							require.Equal(t, 2, len(closers))
 							return sorter, err
 						})
 					for i, sem := range semsToCheck {
@@ -226,6 +222,7 @@ func BenchmarkExternalSort(b *testing.B) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},

@@ -15,9 +15,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -62,7 +62,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	num_replicas = 3,
 	num_voters = 3,
 	constraints = '{+region=ajstorm-1: 1}',
@@ -75,7 +75,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER PARTITION "ajstorm-1" OF INDEX t.public.test@new_primary_key CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	num_replicas = 3,
 	num_voters = 3,
 	constraints = '{+region=ajstorm-1: 1}',
@@ -95,7 +95,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER TABLE t.public.test CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	global_reads = true,
 	num_replicas = 3,
 	num_voters = 3,
@@ -109,7 +109,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER PARTITION "ajstorm-1" OF INDEX t.public.test@new_primary_key CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	global_reads = true,
 	num_replicas = 3,
 	num_voters = 3,
@@ -130,7 +130,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	num_replicas = 3,
 	num_voters = 3,
 	constraints = '{+region=ajstorm-1: 1}',
@@ -150,7 +150,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	num_replicas = 3,
 	num_voters = 3,
 	constraints = '{+region=ajstorm-1: 1}',
@@ -639,7 +639,7 @@ CREATE TABLE regional_by_row (
 			payload,
 			false
 		) AS job
-		FROM system.jobs
+		FROM "".crdb_internal.system_jobs
 		)
     SELECT count(*)
     FROM jobs
@@ -659,7 +659,7 @@ CREATE TABLE regional_by_row (
 			payload,
 			false
 		) AS job
-		FROM system.jobs
+		FROM "".crdb_internal.system_jobs
 		)
     SELECT status, job->'schemaChangeGC' as details
     FROM jobs
@@ -799,6 +799,7 @@ USE t;
 	for _, rbrChange := range regionalByRowChanges {
 		for _, regionChange := range regionChanges {
 			t.Run(fmt.Sprintf("setup %s executing %s with racing %s", rbrChange.setup, rbrChange.cmd, regionChange.cmd), func(t *testing.T) {
+				defer log.Scope(t).Close(t)
 				interruptStartCh := make(chan struct{})
 				interruptEndCh := make(chan struct{})
 				performInterrupt := false
@@ -854,6 +855,7 @@ USE t;
 	for _, regionChange := range regionChanges {
 		for _, rbrChange := range regionalByRowChanges {
 			t.Run(fmt.Sprintf("setup %s executing %s with racing %s", rbrChange.setup, regionChange.cmd, rbrChange.cmd), func(t *testing.T) {
+				defer log.Scope(t).Close(t)
 				interruptStartCh := make(chan struct{})
 				interruptEndCh := make(chan struct{})
 				performInterrupt := false
@@ -910,7 +912,7 @@ USE t;
 func TestIndexDescriptorUpdateForImplicitColumns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
 	c, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
 		t, 3 /* numServers */, base.TestingKnobs{},

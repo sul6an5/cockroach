@@ -15,21 +15,21 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -211,7 +211,7 @@ const (
 type Refresher struct {
 	log.AmbientContext
 	st      *cluster.Settings
-	ex      sqlutil.InternalExecutor
+	ex      isql.Executor
 	cache   *TableStatisticsCache
 	randGen autoStatsRand
 
@@ -243,6 +243,15 @@ type Refresher struct {
 
 	// numTablesEnsured is an internal counter for testing ensureAllTables.
 	numTablesEnsured int
+
+	// drainAutoStats is a channel that is closed when the server starts
+	// to shut down gracefully.
+	drainAutoStats chan struct{}
+	setDraining    sync.Once
+
+	// startedTasksWG is a sync group that tracks the auto-stats
+	// background tasks.
+	startedTasksWG sync.WaitGroup
 }
 
 // mutation contains metadata about a SQL mutation and is the message passed to
@@ -267,7 +276,7 @@ type settingOverride struct {
 func MakeRefresher(
 	ambientCtx log.AmbientContext,
 	st *cluster.Settings,
-	ex sqlutil.InternalExecutor,
+	ex isql.Executor,
 	cache *TableStatisticsCache,
 	asOfTime time.Duration,
 ) *Refresher {
@@ -285,6 +294,7 @@ func MakeRefresher(
 		extraTime:        time.Duration(rand.Int63n(int64(time.Hour))),
 		mutationCounts:   make(map[descpb.ID]int64, 16),
 		settingOverrides: make(map[descpb.ID]catpb.AutoStatsSettings),
+		drainAutoStats:   make(chan struct{}),
 	}
 }
 
@@ -351,11 +361,10 @@ func (r *Refresher) autoStatsFractionStaleRows(explicitSettings *catpb.AutoStats
 func (r *Refresher) getTableDescriptor(
 	ctx context.Context, tableID descpb.ID,
 ) (desc catalog.TableDescriptor) {
-	if err := r.cache.collectionFactory.Txn(ctx, r.cache.ClientDB, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+	if err := r.cache.db.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
 	) (err error) {
-		flags := tree.ObjectLookupFlagsWithRequired()
-		if desc, err = descriptors.GetImmutableTableByID(ctx, txn, tableID, flags); err != nil {
+		if desc, err = txn.Descriptors().ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, tableID); err != nil {
 			err = errors.Wrapf(err,
 				"failed to get table descriptor for automatic stats on table id: %d", tableID)
 		}
@@ -366,6 +375,23 @@ func (r *Refresher) getTableDescriptor(
 	return desc
 }
 
+// WaitForAutoStatsShutdown waits for all auto-stats tasks to shut down.
+func (r *Refresher) WaitForAutoStatsShutdown(ctx context.Context) {
+	log.Infof(ctx, "starting to wait for auto-stats tasks to shut down")
+	defer log.Infof(ctx, "auto-stats tasks successfully shut down")
+	r.startedTasksWG.Wait()
+}
+
+// SetDraining informs the job system if the node is draining.
+//
+// NB: Check the implementation of drain before adding code that would
+// make this block.
+func (r *Refresher) SetDraining() {
+	r.setDraining.Do(func() {
+		close(r.drainAutoStats)
+	})
+}
+
 // Start starts the stats refresher thread, which polls for messages about
 // new SQL mutations and refreshes the table statistics with probability
 // proportional to the percentage of rows affected.
@@ -373,7 +399,10 @@ func (r *Refresher) Start(
 	ctx context.Context, stopper *stop.Stopper, refreshInterval time.Duration,
 ) error {
 	bgCtx := r.AnnotateCtx(context.Background())
-	_ = stopper.RunAsyncTask(bgCtx, "refresher", func(ctx context.Context) {
+	r.startedTasksWG.Add(1)
+	if err := stopper.RunAsyncTask(bgCtx, "refresher", func(ctx context.Context) {
+		defer r.startedTasksWG.Done()
+
 		// We always sleep for r.asOfTime at the beginning of each refresh, so
 		// subtract it from the refreshInterval.
 		refreshInterval -= r.asOfTime
@@ -388,14 +417,20 @@ func (r *Refresher) Start(
 		// once on startup.
 		const initialTableCollectionDelay = time.Second
 		initialTableCollection := time.After(initialTableCollectionDelay)
+		var ensuringAllTables bool
 
 		for {
 			select {
 			case <-initialTableCollection:
 				r.ensureAllTables(ctx, &r.st.SV, initialTableCollectionDelay)
+				if len(r.mutationCounts) > 0 {
+					ensuringAllTables = true
+				}
 
 			case <-timer.C:
 				mutationCounts := r.mutationCounts
+				refreshingAllTables := ensuringAllTables
+				ensuringAllTables = false
 
 				var settingOverrides map[descpb.ID]catpb.AutoStatsSettings
 				// For each mutation count, look up auto stats setting overrides using
@@ -412,8 +447,11 @@ func (r *Refresher) Start(
 					}
 				}
 
+				r.startedTasksWG.Add(1)
 				if err := stopper.RunAsyncTask(
 					ctx, "stats.Refresher: maybeRefreshStats", func(ctx context.Context) {
+						defer r.startedTasksWG.Done()
+
 						// Record the start time of processing this batch of tables.
 						start := timeutil.Now()
 
@@ -424,6 +462,8 @@ func (r *Refresher) Start(
 						select {
 						case <-timerAsOf.C:
 							break
+						case <-r.drainAutoStats:
+							return
 						case <-stopper.ShouldQuiesce():
 							return
 						}
@@ -436,7 +476,7 @@ func (r *Refresher) Start(
 							// processing the current table longer than the refresh
 							// interval, look up the table descriptor to ensure we don't
 							// have stale table settings.
-							if elapsed > DefaultRefreshInterval {
+							if elapsed > DefaultRefreshInterval || refreshingAllTables {
 								desc = r.getTableDescriptor(ctx, tableID)
 								if desc != nil {
 									if !r.autoStatsEnabled(desc) {
@@ -466,19 +506,23 @@ func (r *Refresher) Start(
 									explicitSettings = &settings
 								}
 							}
-							r.maybeRefreshStats(ctx, tableID, explicitSettings, rowsAffected, r.asOfTime)
+							r.maybeRefreshStats(ctx, stopper, tableID, explicitSettings, rowsAffected, r.asOfTime)
 
 							select {
 							case <-stopper.ShouldQuiesce():
 								// Don't bother trying to refresh the remaining tables if we
 								// are shutting down.
 								return
+							case <-r.drainAutoStats:
+								// Ditto.
+								return
 							default:
 							}
 						}
 						timer.Reset(refreshInterval)
 					}); err != nil {
-					log.Errorf(ctx, "failed to refresh stats: %v", err)
+					r.startedTasksWG.Done()
+					log.Errorf(ctx, "failed to start async stats task: %v", err)
 				}
 				// This clears out any tables that may have been added to the
 				// mutationCounts map by ensureAllTables and any mutation counts that
@@ -499,12 +543,18 @@ func (r *Refresher) Start(
 			case clusterSettingOverride := <-r.settings:
 				r.settingOverrides[clusterSettingOverride.tableID] = clusterSettingOverride.settings
 
+			case <-r.drainAutoStats:
+				log.Infof(ctx, "draining auto stats refresher")
+				return
 			case <-stopper.ShouldQuiesce():
 				log.Info(ctx, "quiescing auto stats refresher")
 				return
 			}
 		}
-	})
+	}); err != nil {
+		r.startedTasksWG.Done()
+		log.Warningf(ctx, "refresher task failed to start: %v", err)
+	}
 	return nil
 }
 
@@ -518,11 +568,12 @@ FROM
 		AS OF SYSTEM TIME '-%s'
 WHERE
 	tbl.database_name IS NOT NULL
-	AND tbl.database_name <> '%s'
+	AND tbl.table_id NOT IN (%d, %d, %d)  -- excluded system tables
 	AND tbl.drop_time IS NULL
 	AND (
 			crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', d.descriptor, false)->'table'->>'viewQuery'
 		) IS NULL
+	%s
 	%s`
 
 	explicitlyEnabledTablesPredicate = `AND
@@ -536,6 +587,10 @@ WHERE
 	 OR crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor',
 		d.descriptor, false)->'table'->'autoStatsSettings' ->> 'enabled' = 'true'
 	)`
+
+	autoStatsOnSystemTablesEnabledPredicate = `AND TRUE`
+
+	autoStatsOnSystemTablesDisabledPredicate = `AND tbl.database_name != 'system'`
 )
 
 func (r *Refresher) getApplicableTables(
@@ -581,29 +636,24 @@ func (r *Refresher) getApplicableTables(
 func (r *Refresher) ensureAllTables(
 	ctx context.Context, settings *settings.Values, initialTableCollectionDelay time.Duration,
 ) {
+	// A table-level setting of sql_stats_automatic_collection_enabled of null,
+	// meaning not set, or true qualifies rows we're interested in.
+	autoStatsPredicate := autoStatsEnabledOrNotSpecifiedPredicate
 	if !AutomaticStatisticsClusterMode.Get(settings) {
-		// Use a historical read so as to disable txn contention resolution.
-		// A table-level setting of sql_stats_automatic_collection_enabled=true is
-		// checked and only those tables are included in this scan.
-		getTablesWithAutoStatsExplicitlyEnabledQuery := fmt.Sprintf(
-			getAllTablesTemplateSQL,
-			initialTableCollectionDelay,
-			systemschema.SystemDatabaseName,
-			explicitlyEnabledTablesPredicate,
-		)
-		r.getApplicableTables(ctx, getTablesWithAutoStatsExplicitlyEnabledQuery,
-			"get-tables-with-autostats-explicitly-enabled", false)
-		return
+		autoStatsPredicate = explicitlyEnabledTablesPredicate
+	}
+
+	systemTablesPredicate := autoStatsOnSystemTablesEnabledPredicate
+	if !AutomaticStatisticsOnSystemTables.Get(settings) {
+		systemTablesPredicate = autoStatsOnSystemTablesDisabledPredicate
 	}
 
 	// Use a historical read so as to disable txn contention resolution.
-	// A table-level setting of sql_stats_automatic_collection_enabled of null,
-	// meaning not set, or true qualifies rows we're interested in.
 	getAllTablesQuery := fmt.Sprintf(
 		getAllTablesTemplateSQL,
 		initialTableCollectionDelay,
-		systemschema.SystemDatabaseName,
-		autoStatsEnabledOrNotSpecifiedPredicate,
+		keys.TableStatisticsTableID, keys.LeaseTableID, keys.ScheduledJobsTableID,
+		autoStatsPredicate, systemTablesPredicate,
 	)
 	r.getApplicableTables(ctx, getAllTablesQuery,
 		"get-tables", false)
@@ -672,6 +722,7 @@ func (r *Refresher) NotifyMutation(table catalog.TableDescriptor, rowsAffected i
 // for this table.
 func (r *Refresher) maybeRefreshStats(
 	ctx context.Context,
+	stopper *stop.Stopper,
 	tableID descpb.ID,
 	explicitSettings *catpb.AutoStatsSettings,
 	rowsAffected int64,
@@ -702,7 +753,7 @@ func (r *Refresher) maybeRefreshStats(
 		// refresh happens at exactly 2x the current average, and the average
 		// refresh time is calculated from the most recent 4 refreshes. See the
 		// comment in stats/delete_stats.go.)
-		maxTimeBetweenRefreshes := stat.CreatedAt.Add(2*avgRefreshTime(tableStats) + r.extraTime)
+		maxTimeBetweenRefreshes := stat.CreatedAt.Add(2*avgFullRefreshTime(tableStats) + r.extraTime)
 		if timeutil.Now().After(maxTimeBetweenRefreshes) {
 			mustRefresh = true
 		}
@@ -730,6 +781,7 @@ func (r *Refresher) maybeRefreshStats(
 		if errors.Is(err, ConcurrentCreateStatsError) {
 			// Another stats job was already running. Attempt to reschedule this
 			// refresh.
+			var newEvent mutation
 			if mustRefresh {
 				// For the cases where mustRefresh=true (stats don't yet exist or it
 				// has been 2x the average time since a refresh), we want to make sure
@@ -737,16 +789,29 @@ func (r *Refresher) maybeRefreshStats(
 				// cycle so that we have another chance to trigger a refresh. We pass
 				// rowsAffected=0 so that we don't force a refresh if another node has
 				// already done it.
-				r.mutations <- mutation{tableID: tableID, rowsAffected: 0}
+				newEvent = mutation{tableID: tableID, rowsAffected: 0}
 			} else {
 				// If this refresh was caused by a "dice roll", we want to make sure
 				// that the refresh is rescheduled so that we adhere to the
 				// AutomaticStatisticsFractionStaleRows statistical ideal. We
 				// ensure that the refresh is triggered during the next cycle by
 				// passing a very large number for rowsAffected.
-				r.mutations <- mutation{tableID: tableID, rowsAffected: math.MaxInt32}
+				newEvent = mutation{tableID: tableID, rowsAffected: math.MaxInt32}
 			}
-			return
+			select {
+			case r.mutations <- newEvent:
+				return
+			case <-r.drainAutoStats:
+				// Shutting down due to a graceful drain.
+				// We don't want to force a write to the mutations here
+				// otherwise we could block the graceful shutdown.
+				err = errors.New("server is shutting down")
+			case <-stopper.ShouldQuiesce():
+				// Shutting down due to direct stopper Stop call.
+				// This is not strictly required for correctness but
+				// helps avoiding log spam.
+				err = errors.New("server is shutting down")
+			}
 		}
 
 		// Log other errors but don't automatically reschedule the refresh, since
@@ -758,17 +823,19 @@ func (r *Refresher) maybeRefreshStats(
 
 func (r *Refresher) refreshStats(ctx context.Context, tableID descpb.ID, asOf time.Duration) error {
 	// Create statistics for all default column sets on the given table.
+	stmt := fmt.Sprintf(
+		"CREATE STATISTICS %s FROM [%d] WITH OPTIONS THROTTLING %g AS OF SYSTEM TIME '-%s'",
+		jobspb.AutoStatsName,
+		tableID,
+		AutomaticStatisticsMaxIdleTime.Get(&r.st.SV),
+		asOf.String(),
+	)
+	log.Infof(ctx, "automatically executing %q", stmt)
 	_ /* rows */, err := r.ex.Exec(
 		ctx,
 		"create-stats",
 		nil, /* txn */
-		fmt.Sprintf(
-			"CREATE STATISTICS %s FROM [%d] WITH OPTIONS THROTTLING %g AS OF SYSTEM TIME '-%s'",
-			jobspb.AutoStatsName,
-			tableID,
-			AutomaticStatisticsMaxIdleTime.Get(&r.st.SV),
-			asOf.String(),
-		),
+		stmt,
 	)
 	return err
 }
@@ -785,21 +852,20 @@ func mostRecentAutomaticStat(tableStats []*TableStatistic) *TableStatistic {
 	return nil
 }
 
-// avgRefreshTime returns the average time between automatic statistics
+// avgFullRefreshTime returns the average time between automatic full statistics
 // refreshes given a list of tableStats from one table. It does so by finding
-// the most recent automatically generated statistic (identified by the name
-// AutoStatsName), and then finds all previously generated automatic stats on
-// those same columns. The average is calculated as the average time between
-// each consecutive stat.
+// the most recent automatically generated statistic and then finds all
+// previously generated automatic stats on those same columns. The average is
+// calculated as the average time between each consecutive stat.
 //
 // If there are not at least two automatically generated statistics on the same
 // columns, the default value defaultAverageTimeBetweenRefreshes is returned.
-func avgRefreshTime(tableStats []*TableStatistic) time.Duration {
+func avgFullRefreshTime(tableStats []*TableStatistic) time.Duration {
 	var reference *TableStatistic
 	var sum time.Duration
 	var count int
 	for _, stat := range tableStats {
-		if stat.Name != jobspb.AutoStatsName {
+		if !stat.IsAuto() || stat.IsPartial() {
 			continue
 		}
 		if reference == nil {

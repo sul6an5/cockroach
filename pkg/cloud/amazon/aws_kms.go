@@ -13,6 +13,7 @@ package amazon
 import (
 	"context"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -21,6 +22,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -41,27 +47,50 @@ func init() {
 }
 
 type kmsURIParams struct {
-	accessKey        string
-	secret           string
-	tempToken        string
-	endpoint         string
-	region           string
-	auth             string
-	roleARN          string
-	delegateRoleARNs []string
+	customerMasterKeyID   string
+	accessKey             string
+	secret                string
+	tempToken             string
+	endpoint              string
+	region                string
+	auth                  string
+	roleProvider          roleProvider
+	delegateRoleProviders []roleProvider
+	verbose               bool
+}
+
+var reuseKMSSession = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"cloudstorage.aws.reuse_kms_session.enabled",
+	"persist the last opened AWS KMS session and reuse it when opening a new session with the same arguments",
+	util.ConstantWithMetamorphicTestBool("aws-reuse-kms", true),
+)
+
+var kmsClientCache struct {
+	syncutil.Mutex
+	key kmsURIParams
+	kms *awsKMS
 }
 
 func resolveKMSURIParams(kmsURI cloud.ConsumeURL) (kmsURIParams, error) {
-	assumeRole, delegateRoles := cloud.ParseRoleString(kmsURI.ConsumeParam(AssumeRoleParam))
+	assumeRoleProto, delegateRoleProtos := cloud.ParseRoleProvidersString(kmsURI.ConsumeParam(AssumeRoleParam))
+	assumeRoleProvider := makeRoleProvider(assumeRoleProto)
+	delegateProviders := make([]roleProvider, len(delegateRoleProtos))
+	for i := range delegateRoleProtos {
+		delegateProviders[i] = makeRoleProvider(delegateRoleProtos[i])
+	}
+
 	params := kmsURIParams{
-		accessKey:        kmsURI.ConsumeParam(AWSAccessKeyParam),
-		secret:           kmsURI.ConsumeParam(AWSSecretParam),
-		tempToken:        kmsURI.ConsumeParam(AWSTempTokenParam),
-		endpoint:         kmsURI.ConsumeParam(AWSEndpointParam),
-		region:           kmsURI.ConsumeParam(KMSRegionParam),
-		auth:             kmsURI.ConsumeParam(cloud.AuthParam),
-		roleARN:          assumeRole,
-		delegateRoleARNs: delegateRoles,
+		customerMasterKeyID:   strings.TrimPrefix(kmsURI.Path, "/"),
+		accessKey:             kmsURI.ConsumeParam(AWSAccessKeyParam),
+		secret:                kmsURI.ConsumeParam(AWSSecretParam),
+		tempToken:             kmsURI.ConsumeParam(AWSTempTokenParam),
+		endpoint:              kmsURI.ConsumeParam(AWSEndpointParam),
+		region:                kmsURI.ConsumeParam(KMSRegionParam),
+		auth:                  kmsURI.ConsumeParam(cloud.AuthParam),
+		roleProvider:          assumeRoleProvider,
+		delegateRoleProviders: delegateProviders,
+		verbose:               log.V(2),
 	}
 
 	// Validate that all the passed in parameters are supported.
@@ -98,11 +127,17 @@ func MakeAWSKMS(ctx context.Context, uri string, env cloud.KMSEnv) (cloud.KMS, e
 	if err != nil {
 		return nil, err
 	}
+
 	region := kmsURIParams.region
 	awsConfig := &aws.Config{
 		Credentials: credentials.NewStaticCredentials(kmsURIParams.accessKey,
 			kmsURIParams.secret, kmsURIParams.tempToken),
 	}
+	awsConfig.Logger = newLogAdapter(ctx)
+	if kmsURIParams.verbose {
+		awsConfig.LogLevel = awsVerboseLogging
+	}
+
 	if kmsURIParams.endpoint != "" {
 		if env.KMSConfig().DisableHTTP {
 			return nil, errors.New(
@@ -148,7 +183,7 @@ func MakeAWSKMS(ctx context.Context, uri string, env cloud.KMSEnv) (cloud.KMS, e
 	case cloud.AuthParamImplicit:
 		if env.KMSConfig().DisableImplicitCredentials {
 			return nil, errors.New(
-				"implicit credentials disallowed for s3 due to --external-io-implicit-credentials flag")
+				"implicit credentials disallowed for s3 due to --external-io-disable-implicit-credentials flag")
 		}
 		opts.SharedConfigState = session.SharedConfigEnable
 	default:
@@ -160,12 +195,16 @@ func MakeAWSKMS(ctx context.Context, uri string, env cloud.KMSEnv) (cloud.KMS, e
 		return nil, errors.Wrap(err, "new aws session")
 	}
 
-	if kmsURIParams.roleARN != "" {
+	if kmsURIParams.roleProvider != (roleProvider{}) {
+		if !env.ClusterSettings().Version.IsActive(ctx, clusterversion.TODODelete_V22_2SupportAssumeRoleAuth) {
+			return nil, errors.New("cannot authenticate to KMS via assume role until cluster has fully upgraded to 22.2")
+		}
+
 		// If there are delegate roles in the assume-role chain, we create a session
 		// for each role in order for it to fetch the credentials from the next role
 		// in the chain.
-		for _, role := range kmsURIParams.delegateRoleARNs {
-			intermediateCreds := stscreds.NewCredentials(sess, role)
+		for _, delegateProvider := range kmsURIParams.delegateRoleProviders {
+			intermediateCreds := stscreds.NewCredentials(sess, delegateProvider.roleARN, withExternalID(delegateProvider.externalID))
 			opts.Config.Credentials = intermediateCreds
 
 			sess, err = session.NewSessionWithOptions(opts)
@@ -174,7 +213,7 @@ func MakeAWSKMS(ctx context.Context, uri string, env cloud.KMSEnv) (cloud.KMS, e
 			}
 		}
 
-		creds := stscreds.NewCredentials(sess, kmsURIParams.roleARN)
+		creds := stscreds.NewCredentials(sess, kmsURIParams.roleProvider.roleARN, withExternalID(kmsURIParams.roleProvider.externalID))
 		opts.Config.Credentials = creds
 		sess, err = session.NewSessionWithOptions(opts)
 		if err != nil {
@@ -188,10 +227,28 @@ func MakeAWSKMS(ctx context.Context, uri string, env cloud.KMSEnv) (cloud.KMS, e
 		return nil, errors.New("could not find the aws kms region")
 	}
 	sess.Config.Region = aws.String(region)
-	return &awsKMS{
+
+	reuse := reuseKMSSession.Get(&env.ClusterSettings().SV)
+	if reuse {
+		kmsClientCache.Lock()
+		defer kmsClientCache.Unlock()
+
+		if reflect.DeepEqual(kmsClientCache.key, kmsURIParams) {
+			return kmsClientCache.kms, nil
+		}
+	}
+
+	kms := &awsKMS{
 		kms:                 kms.New(sess),
-		customerMasterKeyID: strings.TrimPrefix(kmsURI.Path, "/"),
-	}, nil
+		customerMasterKeyID: kmsURIParams.customerMasterKeyID,
+	}
+
+	if reuse {
+		// We already have the cache lock from reading the cached client.
+		kmsClientCache.key = kmsURIParams
+		kmsClientCache.kms = kms
+	}
+	return kms, nil
 }
 
 // MasterKeyID implements the KMS interface.

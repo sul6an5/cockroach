@@ -60,6 +60,9 @@ func runExecBuildLogicTest(t *testing.T, file string) {
 	serverArgs := logictest.TestServerArgs{
 		DisableWorkmemRandomization: true,
 		ForceProductionValues:       true,
+		// Disable the direct scans in order to keep the output of EXPLAIN (VEC)
+		// deterministic.
+		DisableDirectColumnarScans: true,
 	}
 	logictest.RunLogicTest(t, serverArgs, configIdx, filepath.Join(execBuildLogicTestDir, file))
 }
@@ -186,6 +189,13 @@ func TestExecBuild_explain_gist(
 	runExecBuildLogicTest(t, "explain_gist")
 }
 
+func TestExecBuild_explain_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "explain_redact")
+}
+
 func TestExecBuild_explain_shape(
 	t *testing.T,
 ) {
@@ -214,11 +224,25 @@ func TestExecBuild_forecast(
 	runExecBuildLogicTest(t, "forecast")
 }
 
+func TestExecBuild_forecast1401(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "forecast1401")
+}
+
 func TestExecBuild_geospatial(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "geospatial")
+}
+
+func TestExecBuild_group_join(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "group_join")
 }
 
 func TestExecBuild_hash_sharded_index(
@@ -368,6 +392,13 @@ func TestExecBuild_not_visible_index(
 	runExecBuildLogicTest(t, "not_visible_index")
 }
 
+func TestExecBuild_observability(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "observability")
+}
+
 func TestExecBuild_orderby(
 	t *testing.T,
 ) {
@@ -387,6 +418,13 @@ func TestExecBuild_partial_index(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "partial_index")
+}
+
+func TestExecBuild_partial_stats(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "partial_stats")
 }
 
 func TestExecBuild_prepare(
@@ -487,6 +525,13 @@ func TestExecBuild_sql_fn(
 	runExecBuildLogicTest(t, "sql_fn")
 }
 
+func TestExecBuild_sql_statistics_persisted(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "sql_statistics_persisted")
+}
+
 func TestExecBuild_srfs(
 	t *testing.T,
 ) {
@@ -527,6 +572,13 @@ func TestExecBuild_trigram_index(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "trigram_index")
+}
+
+func TestExecBuild_tsvector_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "tsvector_index")
 }
 
 func TestExecBuild_tuple(

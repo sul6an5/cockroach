@@ -13,8 +13,8 @@ go_library(
         "//pkg/sql/memsize",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
-        "//pkg/util",
         "//pkg/util/buildutil",
+        "//pkg/util/intsets",
         "//pkg/util/mon",
         "@com_github_cockroachdb_errors//:errors",
     ],
@@ -33,6 +33,7 @@ go_test(
     deps = [
         "//pkg/col/coldata",
         "//pkg/col/coldataext",
+        "//pkg/col/typeconv",
         "//pkg/settings/cluster",
         "//pkg/sql/colconv",
         "//pkg/sql/colexec/colexecutils",

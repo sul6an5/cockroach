@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -34,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -63,7 +65,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		*tree.BeginTransaction,
 		*tree.CommentOnColumn, *tree.CommentOnConstraint, *tree.CommentOnDatabase, *tree.CommentOnIndex, *tree.CommentOnTable, *tree.CommentOnSchema,
 		*tree.CommitTransaction,
-		*tree.CopyFrom, *tree.CreateDatabase, *tree.CreateIndex, *tree.CreateView,
+		*tree.CopyFrom, *tree.CopyTo, *tree.CreateDatabase, *tree.CreateIndex, *tree.CreateView,
 		*tree.CreateSequence,
 		*tree.CreateStats,
 		*tree.Deallocate, *tree.Discard, *tree.DropDatabase, *tree.DropIndex,
@@ -89,7 +91,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		// we need to set the expected output columns to the output columns of the
 		// prepared statement that the user is trying to execute.
 		name := string(t.Name)
-		prepared, ok := p.preparedStatements.Get(name)
+		prepared, ok := p.preparedStatements.Get(name, true /* touchLRU */)
 		if !ok {
 			// We're trying to prepare an EXECUTE of a statement that doesn't exist.
 			// Let's just give up at this point.
@@ -109,13 +111,18 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		}
 		stmt.Prepared.Columns = colinfo.ExplainPlanColumns
 		return opc.flags, nil
+
+	case *tree.ShowCommitTimestamp:
+		stmt.Prepared.Columns = colinfo.ShowCommitTimestampColumns
+		return opc.flags, nil
+
 	case *tree.DeclareCursor:
 		// Build memo for the purposes of typing placeholders.
 		// TODO(jordan): converting DeclareCursor to not be an opaque statement
 		// would be a better way to accomplish this goal. See CREATE TABLE for an
 		// example.
 		f := opc.optimizer.Factory()
-		bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &opc.catalog, f, t.Select)
+		bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), opc.catalog, f, t.Select)
 		if err := bld.Build(); err != nil {
 			return opc.flags, err
 		}
@@ -129,7 +136,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 			if !pm.TypeHints.Identical(p.semaCtx.Placeholders.TypeHints) {
 				opc.log(ctx, "query cache hit but type hints don't match")
 			} else {
-				isStale, err := cachedData.Memo.IsStale(ctx, p.EvalContext(), &opc.catalog)
+				isStale, err := cachedData.Memo.IsStale(ctx, p.EvalContext(), opc.catalog)
 				if err != nil {
 					return 0, err
 				}
@@ -187,10 +194,8 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		}
 	}
 
-	if p.semaCtx.Placeholders.PlaceholderTypesInfo.FromSQLPrepare {
-		// Fill blank placeholder types with the type hints.
-		p.semaCtx.Placeholders.MaybeExtendTypes()
-	}
+	// Fill blank placeholder types with the type hints.
+	p.semaCtx.Placeholders.MaybeExtendTypes()
 
 	// Verify that all placeholder types have been set.
 	if err := p.semaCtx.Placeholders.Types.AssertAllSet(); err != nil {
@@ -223,7 +228,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 // makeOptimizerPlan generates a plan using the cost-based optimizer.
 // On success, it populates p.curPlan.
 func (p *planner) makeOptimizerPlan(ctx context.Context) error {
-	ctx, sp := tracing.ChildSpan(ctx, "optimizer cost-based")
+	ctx, sp := tracing.ChildSpan(ctx, "optimizer")
 	defer sp.Finish()
 	p.curPlan.init(&p.stmt, &p.instrumentation)
 
@@ -233,25 +238,22 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	execMemo, err := opc.buildExecMemo(ctx)
 	if err != nil {
 		return err
-	}else{
-		log.Infof(ctx ,"Converting AST to memo = %v" , execMemo)
 	}
+
 	// Build the plan tree.
-	log.Info(ctx ,"-------- Build the plan tree ------")
 	if mode := p.SessionData().ExperimentalDistSQLPlanningMode; mode != sessiondatapb.ExperimentalDistSQLPlanningOff {
-		log.Info(ctx ,"-------- ExperimentalDistSQLPlanningMode ------")
 		planningMode := distSQLDefaultPlanning
 		// If this transaction has modified or created any types, it is not safe to
 		// distribute due to limitations around leasing descriptors modified in the
 		// current transaction.
 		if p.Descriptors().HasUncommittedTypes() {
-			log.Info(ctx ,"-------- HasUncommittedTypes ------")
 			planningMode = distSQLLocalOnlyPlanning
 		}
 		err := opc.runExecBuilder(
+			ctx,
 			&p.curPlan,
 			&p.stmt,
-			newDistSQLSpecExecFactory(p, planningMode),
+			newDistSQLSpecExecFactory(ctx, p, planningMode),
 			execMemo,
 			p.EvalContext(),
 			p.autoCommit,
@@ -283,9 +285,10 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 				// TODO(yuzefovich): remove this logic when deleting old
 				// execFactory.
 				err = opc.runExecBuilder(
+					ctx,
 					&p.curPlan,
 					&p.stmt,
-					newDistSQLSpecExecFactory(p, distSQLLocalOnlyPlanning),
+					newDistSQLSpecExecFactory(ctx, p, distSQLLocalOnlyPlanning),
 					execMemo,
 					p.EvalContext(),
 					p.autoCommit,
@@ -303,9 +306,10 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	}
 	// If we got here, we did not create a plan above.
 	return opc.runExecBuilder(
+		ctx,
 		&p.curPlan,
 		&p.stmt,
-		newExecFactory(p),
+		newExecFactory(ctx, p),
 		execMemo,
 		p.EvalContext(),
 		p.autoCommit,
@@ -317,7 +321,7 @@ type optPlanningCtx struct {
 
 	// catalog is initialized once, and reset for each query. This allows the
 	// catalog objects to be reused across queries in the same session.
-	catalog optCatalog
+	catalog optPlanningCatalog
 
 	// -- Fields below are reinitialized for each query ---
 
@@ -337,6 +341,7 @@ type optPlanningCtx struct {
 // also be called before each use.
 func (opc *optPlanningCtx) init(p *planner) {
 	opc.p = p
+	opc.catalog = &optCatalog{}
 	opc.catalog.init(p)
 }
 
@@ -344,7 +349,7 @@ func (opc *optPlanningCtx) init(p *planner) {
 func (opc *optPlanningCtx) reset(ctx context.Context) {
 	p := opc.p
 	opc.catalog.reset()
-	opc.optimizer.Init(ctx, p.EvalContext(), &opc.catalog)
+	opc.optimizer.Init(ctx, p.EvalContext(), opc.catalog)
 	opc.flags = 0
 
 	// We only allow memo caching for SELECT/INSERT/UPDATE/DELETE. We could
@@ -359,8 +364,11 @@ func (opc *optPlanningCtx) reset(ctx context.Context) {
 		// descriptor versions are bumped at most once per transaction, even if there
 		// are multiple DDL operations; and transactions can be aborted leading to
 		// potential reuse of versions. To avoid these issues, we prevent saving a
-		// memo (for prepare) or reusing a saved memo (for execute).
-		opc.allowMemoReuse = !p.Descriptors().HasUncommittedTables()
+		// memo (for prepare) or reusing a saved memo (for execute). If
+		// RemoteRegions is set in the eval context we're building a memo for the
+		// purposes of generating the proper error message, and memo reuse or
+		// caching should not be done.
+		opc.allowMemoReuse = !p.Descriptors().HasUncommittedTables() && len(p.EvalContext().RemoteRegions) == 0
 		opc.useCache = opc.allowMemoReuse && queryCacheEnabled.Get(&p.execCfg.Settings.SV)
 
 		if _, isCanned := p.stmt.AST.(*tree.CannedOptPlan); isCanned {
@@ -418,7 +426,7 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 	// that there's even less to do during the EXECUTE phase.
 	//
 	f := opc.optimizer.Factory()
-	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &opc.catalog, f, opc.p.stmt.AST)
+	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), opc.catalog, f, opc.p.stmt.AST)
 	bld.KeepPlaceholders = true
 	if err := bld.Build(); err != nil {
 		return nil, err
@@ -514,7 +522,7 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 
 		// If the prepared memo has been invalidated by schema or other changes,
 		// re-prepare it.
-		if isStale, err := prepared.Memo.IsStale(ctx, p.EvalContext(), &opc.catalog); err != nil {
+		if isStale, err := prepared.Memo.IsStale(ctx, p.EvalContext(), opc.catalog); err != nil {
 			return nil, err
 		} else if isStale {
 			opc.log(ctx, "rebuilding cached memo")
@@ -532,7 +540,7 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 		// Consult the query cache.
 		cachedData, ok := p.execCfg.QueryCache.Find(&p.queryCacheSession, opc.p.stmt.SQL)
 		if ok {
-			if isStale, err := cachedData.Memo.IsStale(ctx, p.EvalContext(), &opc.catalog); err != nil {
+			if isStale, err := cachedData.Memo.IsStale(ctx, p.EvalContext(), opc.catalog); err != nil {
 				return nil, err
 			} else if isStale {
 				opc.log(ctx, "query cache hit but needed update")
@@ -562,7 +570,7 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 	// available.
 	f := opc.optimizer.Factory()
 	f.FoldingControl().AllowStableFolds()
-	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &opc.catalog, f, opc.p.stmt.AST)
+	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), opc.catalog, f, opc.p.stmt.AST)
 	if err := bld.Build(); err != nil {
 		return nil, err
 	}
@@ -597,14 +605,15 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 		p.execCfg.QueryCache.Add(&p.queryCacheSession, &cachedData)
 		return memo, nil
 	}
-	log.Infof(ctx, "return f.Memo() %v", f.Memo())
-	return f.Memo(), nil
+
+	return f.ReleaseMemo(), nil
 }
 
 // runExecBuilder execbuilds a plan using the given factory and stores the
 // result in planTop. If required, also captures explain data using the explain
 // factory.
 func (opc *optPlanningCtx) runExecBuilder(
+	ctx context.Context,
 	planTop *planTop,
 	stmt *Statement,
 	f exec.Factory,
@@ -613,69 +622,51 @@ func (opc *optPlanningCtx) runExecBuilder(
 	allowAutoCommit bool,
 ) error {
 	var result *planComponents
-	var isDDL bool
-	var containsFullTableScan bool
-	var containsFullIndexScan bool
-	var containsLargeFullTableScan bool
-	var containsLargeFullIndexScan bool
-	var containsMutation bool
 	var gf *explain.PlanGistFactory
 	if !opc.p.SessionData().DisablePlanGists {
 		gf = explain.NewPlanGistFactory(f)
 		f = gf
 	}
+	var bld *execbuilder.Builder
 	if !planTop.instrumentation.ShouldBuildExplainPlan() {
-		bld := execbuilder.New(f, &opc.optimizer, mem, &opc.catalog, mem.RootExpr(), evalCtx, allowAutoCommit)
+		bld = execbuilder.New(ctx, f, &opc.optimizer, mem, opc.catalog, mem.RootExpr(),
+			evalCtx, allowAutoCommit, statements.IsANSIDML(stmt.AST))
 		plan, err := bld.Build()
 		if err != nil {
 			return err
 		}
 		result = plan.(*planComponents)
-		isDDL = bld.IsDDL
-		containsFullTableScan = bld.ContainsFullTableScan
-		containsFullIndexScan = bld.ContainsFullIndexScan
-		containsLargeFullTableScan = bld.ContainsLargeFullTableScan
-		containsLargeFullIndexScan = bld.ContainsLargeFullIndexScan
-		containsMutation = bld.ContainsMutation
-		planTop.instrumentation.maxFullScanRows = bld.MaxFullScanRows
-		planTop.instrumentation.totalScanRows = bld.TotalScanRows
-		planTop.instrumentation.nanosSinceStatsCollected = bld.NanosSinceStatsCollected
-		planTop.instrumentation.joinTypeCounts = bld.JoinTypeCounts
-		planTop.instrumentation.joinAlgorithmCounts = bld.JoinAlgorithmCounts
 	} else {
 		// Create an explain factory and record the explain.Plan.
 		explainFactory := explain.NewFactory(f)
-		bld := execbuilder.New(
-			explainFactory, &opc.optimizer, mem, &opc.catalog, mem.RootExpr(), evalCtx, allowAutoCommit,
-		)
+		bld = execbuilder.New(ctx, explainFactory, &opc.optimizer, mem, opc.catalog, mem.RootExpr(),
+			evalCtx, allowAutoCommit, statements.IsANSIDML(stmt.AST))
 		plan, err := bld.Build()
 		if err != nil {
 			return err
 		}
 		explainPlan := plan.(*explain.Plan)
 		result = explainPlan.WrappedPlan.(*planComponents)
-		isDDL = bld.IsDDL
-		containsFullTableScan = bld.ContainsFullTableScan
-		containsFullIndexScan = bld.ContainsFullIndexScan
-		containsLargeFullTableScan = bld.ContainsLargeFullTableScan
-		containsLargeFullIndexScan = bld.ContainsLargeFullIndexScan
-		containsMutation = bld.ContainsMutation
-		planTop.instrumentation.maxFullScanRows = bld.MaxFullScanRows
-		planTop.instrumentation.totalScanRows = bld.TotalScanRows
-		planTop.instrumentation.nanosSinceStatsCollected = bld.NanosSinceStatsCollected
-		planTop.instrumentation.joinTypeCounts = bld.JoinTypeCounts
-		planTop.instrumentation.joinAlgorithmCounts = bld.JoinAlgorithmCounts
-
 		planTop.instrumentation.RecordExplainPlan(explainPlan)
 	}
+	planTop.instrumentation.maxFullScanRows = bld.MaxFullScanRows
+	planTop.instrumentation.totalScanRows = bld.TotalScanRows
+	planTop.instrumentation.totalScanRowsWithoutForecasts = bld.TotalScanRowsWithoutForecasts
+	planTop.instrumentation.nanosSinceStatsCollected = bld.NanosSinceStatsCollected
+	planTop.instrumentation.nanosSinceStatsForecasted = bld.NanosSinceStatsForecasted
+	planTop.instrumentation.joinTypeCounts = bld.JoinTypeCounts
+	planTop.instrumentation.joinAlgorithmCounts = bld.JoinAlgorithmCounts
+	planTop.instrumentation.scanCounts = bld.ScanCounts
+	planTop.instrumentation.indexesUsed = bld.IndexesUsed
+
 	if gf != nil {
 		planTop.instrumentation.planGist = gf.PlanGist()
 	}
 	planTop.instrumentation.costEstimate = float64(mem.RootExpr().(memo.RelExpr).Cost())
-	available := mem.RootExpr().(memo.RelExpr).Relational().Stats.Available
+	available := mem.RootExpr().(memo.RelExpr).Relational().Statistics().Available
 	planTop.instrumentation.statsAvailable = available
 	if available {
-		planTop.instrumentation.outputRows = mem.RootExpr().(memo.RelExpr).Relational().Stats.RowCount
+		planTop.instrumentation.outputRows = mem.RootExpr().(memo.RelExpr).Relational().Statistics().RowCount
 	}
 
 	if stmt.ExpectedTypes != nil {
@@ -688,28 +679,30 @@ func (opc *optPlanningCtx) runExecBuilder(
 	planTop.planComponents = *result
 	planTop.stmt = stmt
 	planTop.flags = opc.flags
-	//print("planTop %v", planTop)
-	if isDDL {
+	if bld.IsDDL {
 		planTop.flags.Set(planFlagIsDDL)
 	}
-	if containsFullTableScan {
+	if bld.ContainsFullTableScan {
 		planTop.flags.Set(planFlagContainsFullTableScan)
 	}
-	if containsFullIndexScan {
+	if bld.ContainsFullIndexScan {
 		planTop.flags.Set(planFlagContainsFullIndexScan)
 	}
-	if containsLargeFullTableScan {
+	if bld.ContainsLargeFullTableScan {
 		planTop.flags.Set(planFlagContainsLargeFullTableScan)
 	}
-	if containsLargeFullIndexScan {
+	if bld.ContainsLargeFullIndexScan {
 		planTop.flags.Set(planFlagContainsLargeFullIndexScan)
 	}
-	if containsMutation {
+	if bld.ContainsMutation {
 		planTop.flags.Set(planFlagContainsMutation)
+	}
+	if bld.ContainsNonDefaultKeyLocking {
+		planTop.flags.Set(planFlagContainsNonDefaultLocking)
 	}
 	if planTop.instrumentation.ShouldSaveMemo() {
 		planTop.mem = mem
-		planTop.catalog = &opc.catalog
+		planTop.catalog = opc.catalog
 	}
 	return nil
 }
@@ -719,7 +712,7 @@ func (opc *optPlanningCtx) runExecBuilder(
 func (p *planner) DecodeGist(gist string, external bool) ([]string, error) {
 	var cat cat.Catalog
 	if !external {
-		cat = &p.optPlanningCtx.catalog
+		cat = p.optPlanningCtx.catalog
 	}
 	return explain.DecodePlanGistToRows(gist, cat)
 }
@@ -729,7 +722,24 @@ func (p *planner) DecodeGist(gist string, external bool) ([]string, error) {
 // indexes hypothetically added to the table. An index recommendation for the
 // query is outputted based on which hypothetical indexes are helpful in the
 // optimal plan.
-func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) error {
+func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// This code allows us to propagate internal errors without having to add
+			// error checks everywhere throughout the code. This is only possible
+			// because the code does not update shared state and does not manipulate
+			// locks.
+			if ok, e := errorutil.ShouldCatch(r); ok {
+				err = e
+				log.VEventf(ctx, 1, "%v", err)
+			} else {
+				// Other panic objects can't be considered "safe" and thus are
+				// propagated as crashes that terminate the session.
+				panic(r)
+			}
+		}
+	}()
+
 	// Save the normalized memo created by the optbuilder.
 	savedMemo := opc.optimizer.DetachMemo(ctx)
 
@@ -747,35 +757,38 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) err
 	opc.optimizer.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
 		return ruleName.IsNormalize()
 	})
-	if _, err := opc.optimizer.Optimize(); err != nil {
+	if _, err = opc.optimizer.Optimize(); err != nil {
 		return err
 	}
 
 	// Walk through the fully normalized memo to determine index candidates and
 	// create hypothetical tables.
 	indexCandidates := indexrec.FindIndexCandidateSet(f.Memo().RootExpr(), f.Metadata())
-	optTables, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
+	optTables, hypTables := indexrec.BuildOptAndHypTableMaps(opc.catalog, indexCandidates)
 
 	// Optimize with the saved memo and hypothetical tables. Walk through the
 	// optimal plan to determine index recommendations.
-	opc.optimizer.Init(ctx, f.EvalContext(), &opc.catalog)
+	opc.optimizer.Init(ctx, f.EvalContext(), opc.catalog)
 	f.CopyAndReplace(
 		savedMemo.RootExpr().(memo.RelExpr),
 		savedMemo.RootProps(),
 		f.CopyWithoutAssigningPlaceholders,
 	)
-	opc.optimizer.Memo().Metadata().UpdateTableMeta(hypTables)
-	if _, err := opc.optimizer.Optimize(); err != nil {
+	opc.optimizer.Memo().Metadata().UpdateTableMeta(f.EvalContext(), hypTables)
+	if _, err = opc.optimizer.Optimize(); err != nil {
 		return err
 	}
 
-	opc.p.instrumentation.indexRecs = indexrec.FindRecs(f.Memo().RootExpr(), f.Metadata())
+	opc.p.instrumentation.indexRecs, err = indexrec.FindRecs(ctx, f.Memo().RootExpr(), f.Metadata())
+	if err != nil {
+		return err
+	}
 
 	// Re-initialize the optimizer (which also re-initializes the factory) and
 	// update the saved memo's metadata with the original table information.
 	// Prepare to re-optimize and create an executable plan.
-	opc.optimizer.Init(ctx, f.EvalContext(), &opc.catalog)
-	savedMemo.Metadata().UpdateTableMeta(optTables)
+	opc.optimizer.Init(ctx, f.EvalContext(), opc.catalog)
+	savedMemo.Metadata().UpdateTableMeta(f.EvalContext(), optTables)
 	f.CopyAndReplace(
 		savedMemo.RootExpr().(memo.RelExpr),
 		savedMemo.RootProps(),

@@ -21,9 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3/tracker"
 )
 
+// pauseReplicationIOThreshold is the admission.io.overload threshold at which
+// we pause replication to non-essential followers.
 var pauseReplicationIOThreshold = settings.RegisterFloatSetting(
 	settings.SystemOnly,
 	"admission.kv.pause_replication_io_threshold",
@@ -310,7 +312,7 @@ func (r *Replica) updatePausedFollowersLocked(ctx context.Context, ioThresholdMa
 		return
 	}
 
-	if r.replicaID != r.mu.leaderID {
+	if !r.isRaftLeaderRLocked() {
 		// Only the raft leader pauses followers. Followers never send meaningful
 		// amounts of data in raft messages, so pausing doesn't make sense on them.
 		return
@@ -352,7 +354,7 @@ func (r *Replica) updatePausedFollowersLocked(ctx context.Context, ioThresholdMa
 		getProgressMap: func(_ context.Context) map[uint64]tracker.Progress {
 			prs := r.mu.internalRaftGroup.Status().Progress
 			updateRaftProgressFromActivity(ctx, prs, r.descRLocked().Replicas().AsProto(), func(id roachpb.ReplicaID) bool {
-				return r.mu.lastUpdateTimes.isFollowerActiveSince(ctx, id, now, r.store.cfg.RangeLeaseActiveDuration())
+				return r.mu.lastUpdateTimes.isFollowerActiveSince(ctx, id, now, r.store.cfg.RangeLeaseDuration)
 			})
 			return prs
 		},

@@ -15,6 +15,7 @@ go_library(
         "//pkg/workload/examples",
         "//pkg/workload/geospatial",
         "//pkg/workload/indexes",
+        "//pkg/workload/insights",
         "//pkg/workload/jsonload",
         "//pkg/workload/kv",
         "//pkg/workload/ledger",
@@ -29,8 +30,10 @@ go_library(
         "//pkg/workload/tpccchecks",
         "//pkg/workload/tpcds",
         "//pkg/workload/tpch",
+        "//pkg/workload/ttlbench",
         "//pkg/workload/ttllogger",
         "//pkg/workload/ycsb",
+        "//pkg/workload/ycsbt",
     ],
 )
 
@@ -47,7 +50,6 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/ccl",
-        "//pkg/ccl/utilccl",
         "//pkg/ccl/workloadccl",
         "//pkg/col/coldata",
         "//pkg/security/securityassets",

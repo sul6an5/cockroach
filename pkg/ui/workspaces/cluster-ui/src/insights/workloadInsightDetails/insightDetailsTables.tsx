@@ -8,50 +8,106 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React from "react";
-import { ColumnDescriptor, SortedTable } from "src/sortedtable";
-import { DATE_FORMAT, Duration } from "src/util";
-import { EventExecution, InsightExecEnum } from "../types";
-import { insightsTableTitles, QueriesCell } from "../workloadInsights/util";
+import React, { useState } from "react";
+import { ColumnDescriptor, SortedTable, SortSetting } from "src/sortedtable";
+import { DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT, Duration } from "src/util";
+import { ContentionDetails, ContentionEvent, InsightExecEnum } from "../types";
+import {
+  insightsTableTitles,
+  QueriesCell,
+  StatementDetailsLink,
+  TransactionDetailsLink,
+} from "../workloadInsights/util";
+import { TimeScale } from "../../timeScaleDropdown";
+import { Timestamp, Timezone } from "../../timestamp";
 
 interface InsightDetailsTableProps {
-  data: EventExecution[];
+  data: ContentionEvent[];
   execType: InsightExecEnum;
+  setTimeScale?: (tw: TimeScale) => void;
 }
 
 export function makeInsightDetailsColumns(
   execType: InsightExecEnum,
-): ColumnDescriptor<EventExecution>[] {
+): ColumnDescriptor<ContentionEvent>[] {
   return [
     {
       name: "executionID",
       title: insightsTableTitles.executionID(execType),
-      cell: (item: EventExecution) => String(item.executionID),
-      sort: (item: EventExecution) => item.executionID,
+      cell: (item: ContentionEvent) => String(item.executionID),
+      sort: (item: ContentionEvent) => item.executionID,
     },
     {
       name: "fingerprintID",
       title: insightsTableTitles.fingerprintID(execType),
-      cell: (item: EventExecution) => String(item.fingerprintID),
-      sort: (item: EventExecution) => item.fingerprintID,
+      cell: (item: ContentionEvent) =>
+        TransactionDetailsLink(item.fingerprintID),
+      sort: (item: ContentionEvent) => item.fingerprintID,
+    },
+    {
+      name: "waitingStmtId",
+      title: insightsTableTitles.waitingID(InsightExecEnum.STATEMENT),
+      cell: (item: ContentionEvent) => String(item.waitingStmtID),
+      sort: (item: ContentionEvent) => item.waitingStmtID,
+    },
+    {
+      name: "waitingStmtFingerprintID",
+      title: insightsTableTitles.waitingFingerprintID(
+        InsightExecEnum.STATEMENT,
+      ),
+      cell: (item: ContentionEvent) =>
+        item.stmtInsightEvent
+          ? StatementDetailsLink(item.stmtInsightEvent)
+          : item.waitingStmtFingerprintID,
+      sort: (item: ContentionEvent) => item.waitingStmtFingerprintID,
     },
     {
       name: "query",
       title: insightsTableTitles.query(execType),
-      cell: (item: EventExecution) => QueriesCell(item.queries, 50),
-      sort: (item: EventExecution) => item.queries.length,
+      cell: (item: ContentionEvent) => QueriesCell(item?.queries, 50),
+      sort: (item: ContentionEvent) => item.queries?.length,
     },
     {
-      name: "startTime",
-      title: insightsTableTitles.startTime(execType),
-      cell: (item: EventExecution) => item.startTime.format(DATE_FORMAT),
-      sort: (item: EventExecution) => item.startTime.unix(),
+      name: "contentionStartTime",
+      title: insightsTableTitles.contentionStartTime(execType),
+      cell: (item: ContentionEvent) => (
+        <Timestamp
+          time={item.startTime}
+          format={DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT}
+          fallback={"N/A"}
+        />
+      ),
+      sort: (item: ContentionEvent) => item.startTime.unix(),
     },
     {
-      name: "elapsedTime",
-      title: insightsTableTitles.elapsedTime(execType),
-      cell: (item: EventExecution) => Duration(item.elapsedTime * 1e6),
-      sort: (item: EventExecution) => item.elapsedTime,
+      name: "contention",
+      title: insightsTableTitles.contention(execType),
+      cell: (item: ContentionEvent) => Duration(item.contentionTimeMs * 1e6),
+      sort: (item: ContentionEvent) => item.contentionTimeMs,
+    },
+    {
+      name: "schemaName",
+      title: insightsTableTitles.schemaName(execType),
+      cell: (item: ContentionEvent) => item.schemaName,
+      sort: (item: ContentionEvent) => item.schemaName,
+    },
+    {
+      name: "databaseName",
+      title: insightsTableTitles.databaseName(execType),
+      cell: (item: ContentionEvent) => item.databaseName,
+      sort: (item: ContentionEvent) => item.databaseName,
+    },
+    {
+      name: "tableName",
+      title: insightsTableTitles.tableName(execType),
+      cell: (item: ContentionEvent) => item.tableName,
+      sort: (item: ContentionEvent) => item.tableName,
+    },
+    {
+      name: "indexName",
+      title: insightsTableTitles.indexName(execType),
+      cell: (item: ContentionEvent) => item.indexName,
+      sort: (item: ContentionEvent) => item.indexName,
     },
   ];
 }
@@ -60,7 +116,87 @@ export const WaitTimeDetailsTable: React.FC<
   InsightDetailsTableProps
 > = props => {
   const columns = makeInsightDetailsColumns(props.execType);
+  const [sortSetting, setSortSetting] = useState<SortSetting>({
+    ascending: false,
+    columnTitle: "contention",
+  });
   return (
-    <SortedTable className="statements-table" columns={columns} {...props} />
+    <SortedTable
+      className="statements-table"
+      columns={columns}
+      sortSetting={sortSetting}
+      onChangeSortSetting={setSortSetting}
+      {...props}
+    />
+  );
+};
+
+export function makeInsightStatementContentionColumns(): ColumnDescriptor<ContentionDetails>[] {
+  const execType = InsightExecEnum.STATEMENT;
+  return [
+    {
+      name: "executionID",
+      title: insightsTableTitles.executionID(InsightExecEnum.TRANSACTION),
+      cell: (item: ContentionDetails) => item.blockingExecutionID,
+      sort: (item: ContentionDetails) => item.blockingExecutionID,
+    },
+    {
+      name: "fingerprintId",
+      title: insightsTableTitles.fingerprintID(InsightExecEnum.TRANSACTION),
+      cell: (item: ContentionDetails) =>
+        TransactionDetailsLink(item.blockingTxnFingerprintID),
+      sort: (item: ContentionDetails) => item.blockingTxnFingerprintID,
+    },
+    {
+      name: "duration",
+      title: insightsTableTitles.contention(execType),
+      cell: (item: ContentionDetails) => Duration(item.contentionTimeMs * 1e6),
+      sort: (item: ContentionDetails) => item.contentionTimeMs,
+    },
+    {
+      name: "databaseName",
+      title: insightsTableTitles.databaseName(execType),
+      cell: (item: ContentionDetails) => item.databaseName,
+      sort: (item: ContentionDetails) => item.databaseName,
+    },
+    {
+      name: "schemaName",
+      title: insightsTableTitles.schemaName(execType),
+      cell: (item: ContentionDetails) => item.schemaName,
+      sort: (item: ContentionDetails) => item.schemaName,
+    },
+    {
+      name: "tableName",
+      title: insightsTableTitles.tableName(execType),
+      cell: (item: ContentionDetails) => item.tableName,
+      sort: (item: ContentionDetails) => item.tableName,
+    },
+    {
+      name: "indexName",
+      title: insightsTableTitles.indexName(execType),
+      cell: (item: ContentionDetails) => item.indexName,
+      sort: (item: ContentionDetails) => item.indexName,
+    },
+  ];
+}
+
+interface InsightContentionTableProps {
+  data: ContentionDetails[];
+  sortSetting?: SortSetting;
+  onChangeSortSetting?: (ss: SortSetting) => void;
+}
+
+export const ContentionStatementDetailsTable: React.FC<
+  InsightContentionTableProps
+> = props => {
+  const columns = makeInsightStatementContentionColumns();
+  return (
+    <SortedTable
+      className="statements-table"
+      columns={columns}
+      sortSetting={props.sortSetting}
+      onChangeSortSetting={props.onChangeSortSetting}
+      {...props}
+    />
   );
 };

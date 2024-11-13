@@ -11,14 +11,21 @@
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import { refreshStatements, refreshUserSQLRoles } from "src/redux/apiReducers";
+import {
+  refreshNodes,
+  refreshTxns,
+  refreshTxnInsights,
+  refreshUserSQLRoles,
+} from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
-import { txnFingerprintIdAttr } from "src/util/constants";
-import { getMatchParamByName } from "src/util/query";
+import { appNamesAttr, txnFingerprintIdAttr, unset } from "src/util/constants";
+import { getMatchParamByName, queryByName } from "src/util/query";
 import { nodeRegionsByIDSelector } from "src/redux/nodes";
 import {
+  reqSortSetting,
   selectData,
   selectLastError,
+  limitSetting,
 } from "src/views/transactions/transactionsPage";
 import {
   TransactionDetailsStateProps,
@@ -28,31 +35,44 @@ import {
 } from "@cockroachlabs/cluster-ui";
 import { setGlobalTimeScaleAction } from "src/redux/statements";
 import { selectTimeScale } from "src/redux/timeScale";
+import { selectTxnInsightsByFingerprint } from "src/views/insights/insightsSelectors";
+import { selectHasAdminRole } from "src/redux/user";
 
 export const selectTransaction = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
+  (state: AdminUIState) => state.cachedData.transactions,
   (_state: AdminUIState, props: RouteComponentProps) => props,
   (transactionState, props) => {
     const transactions = transactionState.data?.transactions;
     if (!transactions) {
       return {
-        isLoading: true,
+        isLoading: transactionState.inFlight,
         transaction: null,
+        lastUpdated: null,
+        isValid: transactionState.valid,
       };
     }
+
+    const apps = queryByName(props.location, appNamesAttr)
+      ?.split(",")
+      .map(s => s.trim());
+
     const txnFingerprintId = getMatchParamByName(
       props.match,
       txnFingerprintIdAttr,
     );
 
-    const transaction = transactions.filter(
+    const transaction = transactions.find(
       txn =>
-        txn.stats_data.transaction_fingerprint_id.toString() ==
-        txnFingerprintId,
-    )[0];
+        txn.stats_data.transaction_fingerprint_id.toString() ===
+          txnFingerprintId &&
+        (apps?.length ? apps.includes(txn.stats_data.app ?? unset) : true),
+    );
+
     return {
-      isLoading: false,
+      isLoading: transactionState.inFlight,
       transaction: transaction,
+      lastUpdated: transactionState?.setAt?.utc(),
+      isValid: transactionState.valid,
     };
   },
 );
@@ -63,7 +83,8 @@ export default withRouter(
       state: AdminUIState,
       props: TransactionDetailsProps,
     ): TransactionDetailsStateProps => {
-      const { isLoading, transaction } = selectTransaction(state, props);
+      const { isLoading, transaction, lastUpdated, isValid } =
+        selectTransaction(state, props);
       return {
         timeScale: selectTimeScale(state),
         error: selectLastError(state),
@@ -76,12 +97,20 @@ export default withRouter(
           txnFingerprintIdAttr,
         ),
         isLoading: isLoading,
+        lastUpdated: lastUpdated,
+        transactionInsights: selectTxnInsightsByFingerprint(state, props),
+        hasAdminRole: selectHasAdminRole(state),
+        isDataValid: isValid,
+        limit: limitSetting.selector(state),
+        reqSortSetting: reqSortSetting.selector(state),
       };
     },
     {
-      refreshData: refreshStatements,
+      refreshData: refreshTxns,
+      refreshNodes,
       refreshUserSQLRoles,
       onTimeScaleChange: setGlobalTimeScaleAction,
+      refreshTransactionInsights: refreshTxnInsights,
     },
   )(TransactionDetails),
 );

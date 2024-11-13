@@ -23,12 +23,14 @@ import (
 
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -45,7 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/raft/v3"
 )
 
 func (s *Store) Transport() *RaftTransport {
@@ -66,7 +68,9 @@ func (s *Store) FindTargetAndTransferLease(
 func (s *Store) AddReplica(repl *Replica) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.addReplicaInternalLocked(repl); err != nil {
+	if err := s.addToReplicasByRangeIDLocked(repl); err != nil {
+		return err
+	} else if err := s.addToReplicasByKeyLocked(repl, repl.Desc()); err != nil {
 		return err
 	}
 	s.metrics.ReplicaCount.Inc(1)
@@ -83,7 +87,7 @@ func (s *Store) ComputeMVCCStats() (enginepb.MVCCStats, error) {
 	now := s.Clock().PhysicalNow()
 	newStoreReplicaVisitor(s).Visit(func(r *Replica) bool {
 		var stats enginepb.MVCCStats
-		stats, err = rditer.ComputeStatsForRange(r.Desc(), s.Engine(), now)
+		stats, err = rditer.ComputeStatsForRange(r.Desc(), s.TODOEngine(), now)
 		if err != nil {
 			return false
 		}
@@ -202,7 +206,7 @@ func (s *Store) ManualRaftSnapshot(repl *Replica, target roachpb.ReplicaID) erro
 // ReservationCount counts the number of outstanding reservations that are not
 // running.
 func (s *Store) ReservationCount() int {
-	return int(s.cfg.SnapshotApplyLimit) - s.snapshotApplyQueue.Len()
+	return int(s.cfg.SnapshotApplyLimit) - s.snapshotApplyQueue.AvailableLen()
 }
 
 // RaftSchedulerPriorityID returns the Raft scheduler's prioritized range.
@@ -228,6 +232,10 @@ func NewTestStorePool(cfg StoreConfig) *storepool.StorePool {
 	)
 }
 
+func (r *Replica) Store() *Store {
+	return r.store
+}
+
 func (r *Replica) Breaker() *circuit2.Breaker {
 	return r.breaker.wrapped
 }
@@ -246,6 +254,13 @@ func (r *Replica) RaftLock() {
 
 func (r *Replica) RaftUnlock() {
 	r.raftMu.Unlock()
+}
+
+func (r *Replica) RaftReportUnreachable(id roachpb.ReplicaID) error {
+	return r.withRaftGroup(true, func(raftGroup *raft.RawNode) (bool, error) {
+		raftGroup.ReportUnreachable(uint64(id))
+		return false /* unquiesceAndWakeLeader */, nil
+	})
 }
 
 // LastAssignedLeaseIndexRLocked returns the last assigned lease index.
@@ -345,7 +360,7 @@ func (r *Replica) GetRaftLogSize() (int64, bool) {
 func (r *Replica) GetCachedLastTerm() uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.mu.lastTerm
+	return r.mu.lastTermNotDurable
 }
 
 func (r *Replica) IsRaftGroupInitialized() bool {
@@ -356,12 +371,12 @@ func (r *Replica) IsRaftGroupInitialized() bool {
 
 // SideloadedRaftMuLocked returns r.raftMu.sideloaded. Requires a previous call
 // to RaftLock() or some other guarantee that r.raftMu is held.
-func (r *Replica) SideloadedRaftMuLocked() SideloadStorage {
+func (r *Replica) SideloadedRaftMuLocked() logstore.SideloadStorage {
 	return r.raftMu.sideloaded
 }
 
 // LargestPreviousMaxRangeSizeBytes returns the in-memory value used to mitigate
-// backpressure when the zone.RangeMaxSize is decreased.
+// backpressure when the zone.RangeMaxBytes is decreased.
 func (r *Replica) LargestPreviousMaxRangeSizeBytes() int64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -377,7 +392,7 @@ func (r *Replica) LoadBasedSplitter() *split.Decider {
 func MakeSSTable(
 	ctx context.Context, key, value string, ts hlc.Timestamp,
 ) ([]byte, storage.MVCCKeyValue) {
-	sstFile := &storage.MemFile{}
+	sstFile := &storage.MemObject{}
 	sst := storage.MakeIngestionSSTWriter(ctx, cluster.MakeTestingClusterSettings(), sstFile)
 	defer sst.Close()
 
@@ -402,10 +417,10 @@ func MakeSSTable(
 }
 
 func ProposeAddSSTable(ctx context.Context, key, val string, ts hlc.Timestamp, store *Store) error {
-	var ba roachpb.BatchRequest
+	ba := &kvpb.BatchRequest{}
 	ba.RangeID = store.LookupReplica(roachpb.RKey(key)).RangeID
 
-	var addReq roachpb.AddSSTableRequest
+	var addReq kvpb.AddSSTableRequest
 	addReq.Data, _ = MakeSSTable(ctx, key, val, ts)
 	addReq.Key = roachpb.Key(key)
 	addReq.EndKey = addReq.Key.Next()
@@ -419,15 +434,15 @@ func ProposeAddSSTable(ctx context.Context, key, val string, ts hlc.Timestamp, s
 }
 
 func SetMockAddSSTable() (undo func()) {
-	prev, _ := batcheval.LookupCommand(roachpb.AddSSTable)
+	prev, _ := batcheval.LookupCommand(kvpb.AddSSTable)
 
 	// TODO(tschottdorf): this already does nontrivial work. Worth open-sourcing the relevant
 	// subparts of the real evalAddSSTable to make this test less likely to rot.
 	evalAddSSTable := func(
-		ctx context.Context, _ storage.ReadWriter, cArgs batcheval.CommandArgs, _ roachpb.Response,
+		ctx context.Context, _ storage.ReadWriter, cArgs batcheval.CommandArgs, _ kvpb.Response,
 	) (result.Result, error) {
 		log.Event(ctx, "evaluated testing-only AddSSTable mock")
-		args := cArgs.Args.(*roachpb.AddSSTableRequest)
+		args := cArgs.Args.(*kvpb.AddSSTableRequest)
 
 		return result.Result{
 			Replicated: kvserverpb.ReplicatedEvalResult{
@@ -439,11 +454,11 @@ func SetMockAddSSTable() (undo func()) {
 		}, nil
 	}
 
-	batcheval.UnregisterCommand(roachpb.AddSSTable)
-	batcheval.RegisterReadWriteCommand(roachpb.AddSSTable, batcheval.DefaultDeclareKeys, evalAddSSTable)
+	batcheval.UnregisterCommand(kvpb.AddSSTable)
+	batcheval.RegisterReadWriteCommand(kvpb.AddSSTable, batcheval.DefaultDeclareKeys, evalAddSSTable)
 	return func() {
-		batcheval.UnregisterCommand(roachpb.AddSSTable)
-		batcheval.RegisterReadWriteCommand(roachpb.AddSSTable, prev.DeclareKeys, prev.EvalRW)
+		batcheval.UnregisterCommand(kvpb.AddSSTable)
+		batcheval.RegisterReadWriteCommand(kvpb.AddSSTable, prev.DeclareKeys, prev.EvalRW)
 	}
 }
 
@@ -494,7 +509,7 @@ func WriteRandomDataToRange(
 	ctx := context.Background()
 	src, _ := randutil.NewTestRand()
 	for i := 0; i < 1000; i++ {
-		var req roachpb.Request
+		var req kvpb.Request
 		if src.Float64() < 0.05 {
 			// Write some occasional range tombstones.
 			startKey := append(keyPrefix.Clone(), randutil.RandBytes(src, int(src.Int31n(1<<4)))...)
@@ -502,8 +517,8 @@ func WriteRandomDataToRange(
 			for startKey.Compare(endKey) >= 0 {
 				endKey = append(keyPrefix.Clone(), randutil.RandBytes(src, int(src.Int31n(1<<4)))...)
 			}
-			req = &roachpb.DeleteRangeRequest{
-				RequestHeader: roachpb.RequestHeader{
+			req = &kvpb.DeleteRangeRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key:    startKey,
 					EndKey: endKey,
 				},
@@ -516,7 +531,7 @@ func WriteRandomDataToRange(
 			pArgs := putArgs(key, val)
 			req = &pArgs
 		}
-		_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{RangeID: rangeID}, req)
+		_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{RangeID: rangeID}, req)
 		require.NoError(t, pErr.GoError())
 	}
 	// Return a random non-empty split key.

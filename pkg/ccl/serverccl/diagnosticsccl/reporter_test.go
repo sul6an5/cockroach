@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -40,9 +39,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Dummy import to pull in kvtenantccl. This allows us to start tenants.
-var _ = kvtenantccl.Connector{}
-
 const elemName = "somestring"
 
 func TestTenantReport(t *testing.T) {
@@ -53,9 +49,8 @@ func TestTenantReport(t *testing.T) {
 	defer rt.Close()
 
 	tenantArgs := base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		AllowSettingClusterSettings: true,
-		TestingKnobs:                rt.testingKnobs,
+		TenantID:     serverutils.TestTenantID(),
+		TestingKnobs: rt.testingKnobs,
 	}
 	tenant, tenantDB := serverutils.StartTenant(t, rt.server, tenantArgs)
 	reporter := tenant.DiagnosticsReporter().(*diagnostics.Reporter)
@@ -89,7 +84,7 @@ func TestTenantReport(t *testing.T) {
 	require.NotZero(t, len(last.FeatureUsage))
 
 	// Call PeriodicallyReportDiagnostics and ensure it sends out a report.
-	reporter.PeriodicallyReportDiagnostics(ctx, rt.server.Stopper())
+	reporter.PeriodicallyReportDiagnostics(ctx, tenant.Stopper())
 	testutils.SucceedsSoon(t, func() error {
 		if rt.diagServer.NumRequests() != 2 {
 			return errors.Errorf("did not receive a diagnostics report")

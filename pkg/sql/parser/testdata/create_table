@@ -15,22 +15,6 @@ CREATE TABLE "family" (x INT8) -- literals removed
 CREATE TABLE _ (_ INT8) -- identifiers removed
 
 parse
-CREATE TABLE INDEX (x INT)
-----
-CREATE TABLE "index" (x INT8) -- normalized!
-CREATE TABLE "index" (x INT8) -- fully parenthesized
-CREATE TABLE "index" (x INT8) -- literals removed
-CREATE TABLE _ (_ INT8) -- identifiers removed
-
-parse
-CREATE TABLE NOTHING (x INT)
-----
-CREATE TABLE "nothing" (x INT8) -- normalized!
-CREATE TABLE "nothing" (x INT8) -- fully parenthesized
-CREATE TABLE "nothing" (x INT8) -- literals removed
-CREATE TABLE _ (_ INT8) -- identifiers removed
-
-parse
 CREATE TABLE MINVALUE (x INT)
 ----
 CREATE TABLE minvalue (x INT8) -- normalized!
@@ -471,6 +455,24 @@ CREATE TABLE a (b "char") -- literals removed
 CREATE TABLE _ (_ "char") -- identifiers removed
 
 parse
+CREATE TABLE a (b
+"char")
+----
+CREATE TABLE a (b "char") -- normalized!
+CREATE TABLE a (b "char") -- fully parenthesized
+CREATE TABLE a (b "char") -- literals removed
+CREATE TABLE _ (_ "char") -- identifiers removed
+
+parse
+CREATE TABLE a ("b"
+"char")
+----
+CREATE TABLE a (b "char") -- normalized!
+CREATE TABLE a (b "char") -- fully parenthesized
+CREATE TABLE a (b "char") -- literals removed
+CREATE TABLE _ (_ "char") -- identifiers removed
+
+parse
 CREATE TABLE a (b INT8 NULL)
 ----
 CREATE TABLE a (b INT8 NULL)
@@ -564,6 +566,15 @@ CREATE TABLE a (UNIQUE INDEX (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1
 CREATE TABLE a (UNIQUE (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1))) -- normalized!
 CREATE TABLE a (UNIQUE (b) PARTITION BY LIST (c) (PARTITION d VALUES IN ((1)))) -- fully parenthesized
 CREATE TABLE a (UNIQUE (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (_))) -- literals removed
+CREATE TABLE _ (UNIQUE (_) PARTITION BY LIST (_) (PARTITION _ VALUES IN (1))) -- identifiers removed
+
+# Regression test for #95238
+parse
+CREATE TABLE a (UNIQUE INDEX (b) PARTITION BY LIST ("c d") (PARTITION "e f" VALUES IN (1)))
+----
+CREATE TABLE a (UNIQUE (b) PARTITION BY LIST ("c d") (PARTITION "e f" VALUES IN (1))) -- normalized!
+CREATE TABLE a (UNIQUE (b) PARTITION BY LIST ("c d") (PARTITION "e f" VALUES IN ((1)))) -- fully parenthesized
+CREATE TABLE a (UNIQUE (b) PARTITION BY LIST ("c d") (PARTITION "e f" VALUES IN (_))) -- literals removed
 CREATE TABLE _ (UNIQUE (_) PARTITION BY LIST (_) (PARTITION _ VALUES IN (1))) -- identifiers removed
 
 parse
@@ -2051,6 +2062,14 @@ CREATE TABLE IF NOT EXISTS a (x, y FAMILY f1) AS SELECT (*) FROM b -- fully pare
 CREATE TABLE IF NOT EXISTS a (x, y FAMILY f1) AS SELECT * FROM b -- literals removed
 CREATE TABLE IF NOT EXISTS _ (_, _ FAMILY _) AS SELECT * FROM _ -- identifiers removed
 
+parse
+CREATE TABLE a WITH (fillfactor=100) AS SELECT * FROM b
+----
+CREATE TABLE a WITH (fillfactor = 100) AS SELECT * FROM b -- normalized!
+CREATE TABLE a WITH (fillfactor = (100)) AS SELECT (*) FROM b -- fully parenthesized
+CREATE TABLE a WITH (fillfactor = _) AS SELECT * FROM b -- literals removed
+CREATE TABLE _ WITH (_ = 100) AS SELECT * FROM _ -- identifiers removed
+
 error
 CREATE TABLE test (
   foo INT8 FAMILY a FAMILY b
@@ -2417,6 +2436,14 @@ CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE)
 CREATE TABLE _ (_ INT8, _ STRING, INDEX (_ ASC, _ DESC) STORING (_) NOT VISIBLE) -- identifiers removed
 
 parse
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) INVISIBLE)
+----
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE) -- normalized!
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE) -- fully parenthesized
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE) -- literals removed
+CREATE TABLE _ (_ INT8, _ STRING, INDEX (_ ASC, _ DESC) STORING (_) NOT VISIBLE) -- identifiers removed
+
+parse
 CREATE TABLE a (b INT8, c STRING, INVERTED INDEX (b ASC, c DESC) WHERE c > 3 NOT VISIBLE)
 ----
 CREATE TABLE a (b INT8, c STRING, INVERTED INDEX (b ASC, c DESC) WHERE c > 3 NOT VISIBLE)
@@ -2476,3 +2503,12 @@ DETAIL: source SQL:
 CREATE TABLE a (b INT8, c STRING, CONSTRAINT d UNIQUE WITHOUT INDEX (b, c) NOT VISIBLE)
                                                                                ^
 HINT: try \h CREATE TABLE
+
+# Regression test for #95238
+parse
+ALTER TABLE a PARTITION ALL BY LIST ("a b", "c.d") (PARTITION "e.f" VALUES IN (1))
+----
+ALTER TABLE a PARTITION ALL BY LIST ("a b", "c.d") (PARTITION "e.f" VALUES IN (1))
+ALTER TABLE a PARTITION ALL BY LIST ("a b", "c.d") (PARTITION "e.f" VALUES IN ((1))) -- fully parenthesized
+ALTER TABLE a PARTITION ALL BY LIST ("a b", "c.d") (PARTITION "e.f" VALUES IN (_)) -- literals removed
+ALTER TABLE _ PARTITION ALL BY LIST (_, _) (PARTITION _ VALUES IN (1)) -- identifiers removed

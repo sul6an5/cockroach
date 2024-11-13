@@ -8,17 +8,18 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
+import moment from "moment-timezone";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { JobsPage, JobsPageProps } from "./jobsPage";
 import { formatDuration } from "../util/duration";
 import { allJobsFixture, earliestRetainedTime } from "./jobsPage.fixture";
-import { render } from "@testing-library/react";
+import { prettyDOM, prettyFormat, render } from "@testing-library/react";
 import React from "react";
 import { MemoryRouter } from "react-router-dom";
 import * as H from "history";
 
 import Job = cockroach.server.serverpb.IJobResponse;
+import { CoordinatedUniversalTime, TimezoneContext } from "src/contexts";
 
 const getMockJobsPageProps = (jobs: Array<Job>): JobsPageProps => {
   const history = H.createHashHistory();
@@ -27,16 +28,19 @@ const getMockJobsPageProps = (jobs: Array<Job>): JobsPageProps => {
     status: "",
     show: "50",
     type: 0,
+    columns: [],
     setSort: () => {},
     setStatus: () => {},
     setShow: () => {},
     setType: () => {},
+    onColumnsChange: () => {},
     jobs: {
       jobs: jobs,
       earliest_retained_time: earliestRetainedTime,
-      toJSON: () => ({}),
     },
-    jobsLoading: false,
+    reqInFlight: false,
+    isDataValid: true,
+    lastUpdated: moment(),
     jobsError: null,
     refreshJobs: () => {},
     location: history.location,
@@ -62,7 +66,7 @@ describe("Jobs", () => {
   });
 
   it("renders expected jobs table columns", () => {
-    const { getByText } = render(
+    const { getAllByText } = render(
       <MemoryRouter>
         <JobsPage {...getMockJobsPageProps(allJobsFixture)} />
       </MemoryRouter>,
@@ -74,11 +78,12 @@ describe("Jobs", () => {
       "User Name",
       "Creation Time (UTC)",
       "Last Execution Time (UTC)",
+      "Last Modified Time (UTC)",
       "Execution Count",
     ];
 
     for (const columnTitle of expectedColumnTitles) {
-      getByText(columnTitle);
+      getAllByText(columnTitle);
     }
   });
 
@@ -89,7 +94,7 @@ describe("Jobs", () => {
       </MemoryRouter>,
     );
     const expectedText = [
-      "No jobs to show",
+      "No jobs found.",
       "The jobs page provides details about backup/restore jobs, schema changes, user-created table statistics, automatic table statistics jobs and changefeeds.",
     ];
 

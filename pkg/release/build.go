@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/build/util"
 	"github.com/cockroachdb/errors"
 )
@@ -30,13 +31,25 @@ import (
 type BuildOptions struct {
 	// True iff this is a release build.
 	Release bool
-	// BuildTag must be set if Release is set, and vice-versea.
+	// BuildTag overrides the build tag for a "Release" build.
+	// This can only be set for a Release build.
 	BuildTag string
 
 	// ExecFn.Run() is called to execute commands for this build.
 	// The zero value is appropriate in "real" scenarios but for
 	// tests you can update ExecFn.MockExecFn.
 	ExecFn ExecFn
+
+	// Channel represents the telemetry channel
+	Channel string
+}
+
+// ChannelFromPlatform retrurns the telemetry channel used for a particular platform.
+func ChannelFromPlatform(platform Platform) string {
+	if platform == PlatformLinuxFIPS {
+		return build.FIPSTelemetryChannel
+	}
+	return build.DefaultTelemetryChannel
 }
 
 // SuffixFromPlatform returns the suffix that will be appended to the
@@ -46,12 +59,16 @@ func SuffixFromPlatform(platform Platform) string {
 	switch platform {
 	case PlatformLinux:
 		return ".linux-2.6.32-gnu-amd64"
+	case PlatformLinuxFIPS:
+		return ".linux-2.6.32-gnu-amd64-fips"
 	case PlatformLinuxArm:
-		return ".linux-3.7.10-gnu-aarch64"
+		return ".linux-3.7.10-gnu-arm64"
 	case PlatformMacOS:
 		// TODO(#release): The architecture is at least 10.10 until v20.2 and 10.15 for
 		// v21.1 and after. Check whether this can be changed.
 		return ".darwin-10.9-amd64"
+	case PlatformMacOSArm:
+		return ".darwin-11.0-arm64.unsigned"
 	case PlatformWindows:
 		return ".windows-6.2-amd64.exe"
 	default:
@@ -65,10 +82,14 @@ func CrossConfigFromPlatform(platform Platform) string {
 	switch platform {
 	case PlatformLinux:
 		return "crosslinuxbase"
+	case PlatformLinuxFIPS:
+		return "crosslinuxfipsbase"
 	case PlatformLinuxArm:
 		return "crosslinuxarmbase"
 	case PlatformMacOS:
 		return "crossmacosbase"
+	case PlatformMacOSArm:
+		return "crossmacosarmbase"
 	case PlatformWindows:
 		return "crosswindowsbase"
 	default:
@@ -80,12 +101,14 @@ func CrossConfigFromPlatform(platform Platform) string {
 // into the cockroach binary for the given platform.
 func TargetTripleFromPlatform(platform Platform) string {
 	switch platform {
-	case PlatformLinux:
+	case PlatformLinux, PlatformLinuxFIPS:
 		return "x86_64-pc-linux-gnu"
 	case PlatformLinuxArm:
 		return "aarch64-unknown-linux-gnu"
 	case PlatformMacOS:
 		return "x86_64-apple-darwin19"
+	case PlatformMacOSArm:
+		return "aarch64-apple-darwin21.2"
 	case PlatformWindows:
 		return "x86_64-w64-mingw32"
 	default:
@@ -96,11 +119,11 @@ func TargetTripleFromPlatform(platform Platform) string {
 // SharedLibraryExtensionFromPlatform returns the shared library extensions for a given Platform.
 func SharedLibraryExtensionFromPlatform(platform Platform) string {
 	switch platform {
-	case PlatformLinux, PlatformLinuxArm:
+	case PlatformLinux, PlatformLinuxFIPS, PlatformLinuxArm:
 		return ".so"
 	case PlatformWindows:
 		return ".dll"
-	case PlatformMacOS:
+	case PlatformMacOS, PlatformMacOSArm:
 		return ".dylib"
 	default:
 		panic(errors.Newf("unknown platform %d", platform))
@@ -133,19 +156,28 @@ func MakeWorkload(opts BuildOptions, pkgDir string) error {
 
 // MakeRelease makes the release binary and associated files.
 func MakeRelease(platform Platform, opts BuildOptions, pkgDir string) error {
-	buildArgs := []string{"build", "//pkg/cmd/cockroach", "//c-deps:libgeos", "//pkg/cmd/cockroach-sql"}
+	if !(opts.Channel == build.DefaultTelemetryChannel || opts.Channel == build.FIPSTelemetryChannel) {
+		return errors.Newf("cannot set the telemetry channel to %s, supported channels: %s and %s", opts.Channel, build.DefaultTelemetryChannel, build.FIPSTelemetryChannel)
+	}
+	buildArgs := []string{"build", "//pkg/cmd/cockroach", "//pkg/cmd/cockroach-sql"}
+	if platform != PlatformMacOSArm {
+		buildArgs = append(buildArgs, "//c-deps:libgeos")
+	}
 	targetTriple := TargetTripleFromPlatform(platform)
+	var stampCommand string
 	if opts.Release {
 		if opts.BuildTag == "" {
-			return errors.Newf("must set BuildTag if Release is set")
+			stampCommand = fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s %s release", targetTriple, opts.Channel)
+		} else {
+			stampCommand = fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s %s release %s", targetTriple, opts.Channel, opts.BuildTag)
 		}
-		buildArgs = append(buildArgs, fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s official-binary %s release", targetTriple, opts.BuildTag))
 	} else {
 		if opts.BuildTag != "" {
-			return errors.Newf("cannot set BuildTag if Release is not set")
+			return errors.Newf("BuildTag cannot be set for non-Release builds")
 		}
-		buildArgs = append(buildArgs, fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s official-binary", targetTriple))
+		stampCommand = fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s %s", targetTriple, opts.Channel)
 	}
+	buildArgs = append(buildArgs, stampCommand)
 	configs := []string{"-c", "opt", "--config=ci", "--config=force_build_cdeps", "--config=with_ui", fmt.Sprintf("--config=%s", CrossConfigFromPlatform(platform))}
 	buildArgs = append(buildArgs, configs...)
 	cmd := exec.Command("bazel", buildArgs...)
@@ -173,7 +205,7 @@ func MakeRelease(platform Platform, opts BuildOptions, pkgDir string) error {
 		return err
 	}
 
-	if platform == PlatformLinux {
+	if platform == PlatformLinux || platform == PlatformLinuxFIPS {
 		suffix := SuffixFromPlatform(platform)
 		binaryName := "./cockroach" + suffix
 
@@ -204,6 +236,24 @@ func MakeRelease(platform Platform, opts BuildOptions, pkgDir string) error {
 		if err := scanner.Err(); err != nil {
 			return err
 		}
+
+		cmd = exec.Command("bazel", "run", "@go_sdk//:bin/go", "--", "tool", "nm", binaryName)
+		cmd.Dir = pkgDir
+		cmd.Stderr = os.Stderr
+		log.Printf("%s %s", cmd.Env, cmd.Args)
+		stdoutBytes, err = opts.ExecFn.Run(cmd)
+		if err != nil {
+			log.Fatalf("%s %s: out=%s err=%v", cmd.Env, cmd.Args, string(stdoutBytes), err)
+		}
+		out := string(stdoutBytes)
+		if platform == PlatformLinuxFIPS && !strings.Contains(out, "golang-fips") {
+			log.Print("`go nm tool` does not contain `golang-fips` in its output")
+			log.Fatalf("%s %s: out=%s", cmd.Env, cmd.Args, out)
+		}
+		if platform == PlatformLinux && strings.Contains(out, "golang-fips") {
+			log.Print("`go nm tool` contains `golang-fips` in its output")
+			log.Fatalf("%s %s: out=%s", cmd.Env, cmd.Args, out)
+		}
 	}
 	return nil
 }
@@ -223,7 +273,7 @@ var (
 		}, "|")
 		return regexp.MustCompile(libs)
 	}()
-	osVersionRe = regexp.MustCompile(`\d+(\.\d+)*-`)
+	osVersionRe = regexp.MustCompile(`\d+\.(\d+(\.)?)*?-`)
 )
 
 // Platform is an enumeration of the supported platforms for release.
@@ -232,10 +282,14 @@ type Platform int
 const (
 	// PlatformLinux is the Linux x86_64 target.
 	PlatformLinux Platform = iota
+	// PlatformLinuxFIPS is the Linux FIPS target.
+	PlatformLinuxFIPS
 	// PlatformLinuxArm is the Linux aarch64 target.
 	PlatformLinuxArm
 	// PlatformMacOS is the Darwin x86_64 target.
 	PlatformMacOS
+	// PlatformMacOSArm is the Darwin aarch6 target.
+	PlatformMacOSArm
 	// PlatformWindows is the Windows (mingw) x86_64 target.
 	PlatformWindows
 )
@@ -283,6 +337,9 @@ func stageBinary(
 }
 
 func stageLibraries(platform Platform, bazelBin string, dir string) error {
+	if platform == PlatformMacOSArm {
+		return nil
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}

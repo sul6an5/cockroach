@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -208,7 +208,7 @@ func (r *replicaTruncatorTest) printEngine(t *testing.T, eng storage.Engine) {
 	fmt.Fprintf(r.buf, "log entries:")
 	printPrefixStr := ""
 	for valid {
-		key := iter.Key()
+		key := iter.UnsafeKey()
 		_, index, err := encoding.DecodeUint64Ascending(key.Key[len(prefix):])
 		require.NoError(t, err)
 		fmt.Fprintf(r.buf, "%s %d", printPrefixStr, index)
@@ -289,7 +289,7 @@ func TestRaftLogTruncator(t *testing.T) {
 	truncator := makeRaftLogTruncator(
 		log.MakeTestingAmbientContext(tracing.NewTracer()), store, stopper)
 
-	datadriven.RunTest(t, testutils.TestDataPath(t, "raft_log_truncator"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "raft_log_truncator"),
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "create-replica":

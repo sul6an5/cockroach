@@ -11,9 +11,12 @@
 package sql
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -110,7 +113,9 @@ func serializeSessionState(
 }
 
 // DeserializeSessionState deserializes the given state into the current session.
-func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, error) {
+func (p *planner) DeserializeSessionState(
+	ctx context.Context, state *tree.DBytes,
+) (*tree.DBool, error) {
 	evalCtx := p.ExtendedEvalContext()
 	if !evalCtx.TxnIsSingleStmt {
 		return nil, pgerror.Newf(
@@ -136,7 +141,7 @@ func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, erro
 			"can only deserialize matching session users",
 		)
 	}
-	if err := p.checkCanBecomeUser(evalCtx.Ctx(), sd.User()); err != nil {
+	if err := p.checkCanBecomeUser(ctx, sd.User()); err != nil {
 		return nil, err
 	}
 
@@ -151,7 +156,7 @@ func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, erro
 			// The pgwire protocol only allows at most 1 statement here.
 			return nil, pgerror.WrongNumberOfPreparedStatements(len(stmts))
 		}
-		var parserStmt parser.Statement
+		var parserStmt statements.Statement[tree.Statement]
 		if len(stmts) == 1 {
 			parserStmt = stmts[0]
 		}
@@ -165,10 +170,29 @@ func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, erro
 			// with the type hints that were serialized.
 			placeholderTypes = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 			for i, t := range prepStmt.PlaceholderTypeHints {
+				// Postgres allows more parameter type hints than parameters. Ignore
+				// these if present. For example:
+				// PREPARE p (int) AS SELECT 1;
+				if i == stmt.NumPlaceholders {
+					break
+				}
 				// If the OID is user defined or unknown, then skip it and let the
 				// statementPreparer resolve the type.
 				if t == 0 || t == oid.T_unknown || types.IsOIDUserDefinedType(t) {
 					placeholderTypes[i] = nil
+					continue
+				}
+				// These special cases for json, json[] is here so we can
+				// support decoding parameters with oid=json/json[] without
+				// adding full support for these type.
+				// TODO(sql-exp): Remove this if we support JSON.
+				if t == oid.T_json {
+					// TODO(sql-exp): Remove this if we support JSON.
+					placeholderTypes[i] = types.Json
+					continue
+				}
+				if t == oid.T__json {
+					placeholderTypes[i] = types.JSONArrayForDecodingOnly
 					continue
 				}
 				v, ok := types.OidToType[t]
@@ -181,7 +205,7 @@ func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, erro
 		}
 
 		_, err = evalCtx.statementPreparer.addPreparedStmt(
-			evalCtx.Ctx(),
+			ctx,
 			prepStmt.Name,
 			stmt,
 			placeholderTypes,

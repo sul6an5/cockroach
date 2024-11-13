@@ -20,13 +20,11 @@ import (
 	"text/tabwriter"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -48,10 +46,9 @@ func TestTxnWithExecutorDataDriven(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t, ""), func(t *testing.T, path string) {
-		s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	datadriven.Walk(t, datapathutils.TestDataPath(t, ""), func(t *testing.T, path string) {
+		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 		defer s.Stopper().Stop(ctx)
-		cf := s.CollectionFactory().(*descs.CollectionFactory)
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			stmts, err := parser.Parse(d.Input)
 			require.NoError(t, err)
@@ -70,20 +67,19 @@ func TestTxnWithExecutorDataDriven(t *testing.T) {
 				searchPath = sessiondata.MakeSearchPath(strings.Split(sp, ","))
 			}
 			sd.SearchPath = &searchPath
-			err = cf.TxnWithExecutor(ctx, kvDB, nil /* sessionData */, func(
-				ctx context.Context, txn *kv.Txn, descriptors *descs.Collection, ie sqlutil.InternalExecutor,
-			) error {
+			ief := s.InternalDB().(descs.DB)
+			err = ief.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
 				for _, stmt := range stmts {
 					switch d.Cmd {
 					case "exec":
-						n, err := ie.ExecEx(ctx, "test", txn, sd, stmt.SQL)
+						n, err := txn.ExecEx(ctx, "test", txn.KV(), sd, stmt.SQL)
 						if err != nil {
 							return err
 						}
 						fmt.Fprintf(&out, "%d\t", n)
 					case "query":
-						rows, cols, err := ie.QueryBufferedExWithCols(
-							ctx, "test", txn, sd, stmt.SQL,
+						rows, cols, err := txn.QueryBufferedExWithCols(
+							ctx, "test", txn.KV(), sd, stmt.SQL,
 						)
 						if err != nil {
 							return err

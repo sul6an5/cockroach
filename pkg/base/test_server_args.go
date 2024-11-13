@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -54,14 +55,15 @@ type TestServerArgs struct {
 	Addr string
 	// SQLAddr (if nonempty) is the SQL address to use for the test server.
 	SQLAddr string
-	// TenantAddr is the tenant KV address to use for the test server. If this
-	// is nil, the tenant server will be set up using a random port. If this
-	// is the empty string, no tenant server will be set up.
-	TenantAddr *string
 	// HTTPAddr (if nonempty) is the HTTP address to use for the test server.
 	HTTPAddr string
 	// DisableTLSForHTTP if set, disables TLS for the HTTP interface.
 	DisableTLSForHTTP bool
+
+	// SecondaryTenantPortOffset if non-zero forces the network addresses
+	// generated for servers started by the serverController to be offset
+	// from the base addressed by the specified amount.
+	SecondaryTenantPortOffset int
 
 	// JoinAddr is the address of a node we are joining.
 	//
@@ -128,7 +130,7 @@ type TestServerArgs struct {
 
 	// If set, web session authentication will be disabled, even if the server
 	// is running in secure mode.
-	DisableWebSessionAuthentication bool
+	InsecureWebAccess bool
 
 	// IF set, the demo login endpoint will be enabled.
 	EnableDemoLoginEndpoint bool
@@ -157,6 +159,20 @@ type TestServerArgs struct {
 	// or if some of the functionality being tested is not accessible from
 	// within tenants.
 	DisableDefaultTestTenant bool
+
+	// StartDiagnosticsReporting checks cluster.TelemetryOptOut(), and
+	// if not disabled starts the asynchronous goroutine that checks for
+	// CockroachDB upgrades and periodically reports diagnostics to
+	// Cockroach Labs. Should remain disabled during unit testing.
+	StartDiagnosticsReporting bool
+
+	// ObsServiceAddr is the address to which events will be exported over OTLP.
+	// If empty, exporting events is inhibited.
+	ObsServiceAddr string
+
+	// AutoConfigProvider provides auto-configuration tasks to apply on
+	// the cluster during server initialization.
+	AutoConfigProvider acprovider.Provider
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -187,6 +203,13 @@ type TestClusterArgs struct {
 	// A copy of an entry from this map will be copied to each individual server
 	// and potentially adjusted according to ReplicationMode.
 	ServerArgsPerNode map[int]TestServerArgs
+
+	// If reusable listeners is true, then restart should keep listeners untouched
+	// so that servers are kept on the same ports. It is up to the test to set
+	// proxy listeners to TestServerArgs.Listener that would survive
+	// net.Listener.Close() and then allow restarted server to use them again.
+	// See testutils.ListenerRegistry.
+	ReusableListeners bool
 }
 
 var (
@@ -229,14 +252,28 @@ func DefaultTestTempStorageConfigWithSize(
 	}
 }
 
-// TestTenantArgs are the arguments used when creating a tenant from a
-// TestServer.
-type TestTenantArgs struct {
+// TestSharedProcessTenantArgs are the arguments to
+// TestServer.StartSharedProcessTenant.
+type TestSharedProcessTenantArgs struct {
+	// TenantName is the name of the tenant to be created. It must be set.
+	TenantName roachpb.TenantName
+	// TenantID is the ID of the tenant to be created. If not set, an ID is
+	// assigned automatically.
 	TenantID roachpb.TenantID
 
-	// Existing, if true, indicates an existing tenant, rather than a new tenant
-	// to be created by StartTenant.
-	Existing bool
+	Knobs TestingKnobs
+
+	// If set, this will be appended to the Postgres URL by functions that
+	// automatically open a connection to the server. That's equivalent to running
+	// SET DATABASE=foo, which works even if the database doesn't (yet) exist.
+	UseDatabase string
+}
+
+// TestTenantArgs are the arguments to TestServer.StartTenant.
+type TestTenantArgs struct {
+	TenantName roachpb.TenantName
+
+	TenantID roachpb.TenantID
 
 	// DisableCreateTenant disables the explicit creation of a tenant when
 	// StartTenant is attempted. It's used in cases where we want to validate
@@ -246,10 +283,6 @@ type TestTenantArgs struct {
 	// Settings allows the caller to control the settings object used for the
 	// tenant cluster.
 	Settings *cluster.Settings
-
-	// AllowSettingClusterSettings, if true, allows the tenant to set in-memory
-	// cluster settings.
-	AllowSettingClusterSettings bool
 
 	// Stopper, if not nil, is used to stop the tenant manually otherwise the
 	// TestServer stopper will be used.
@@ -294,9 +327,17 @@ type TestTenantArgs struct {
 	// embedded certs.
 	SSLCertsDir string
 
-	// StartingSQLPort, if it is non-zero, is added to the tenant ID in order to
-	// determine the tenant's SQL port.
-	StartingSQLPort int
+	// DisableTLSForHTTP, if set, disables TLS for the HTTP listener.
+	DisableTLSForHTTP bool
+
+	// EnableDemoLoginEndpoint enables the HTTP GET endpoint for user logins,
+	// which a feature unique to the demo shell.
+	EnableDemoLoginEndpoint bool
+
+	// StartingRPCAndSQLPort, if it is non-zero, is added to the tenant ID in order to
+	// determine the tenant's SQL+RPC port.
+	// If set, force disables SplitListenSQL.
+	StartingRPCAndSQLPort int
 
 	// StartingHTTPPort, if it is non-zero, is added to the tenant ID in order to
 	// determine the tenant's HTTP port.
@@ -304,9 +345,6 @@ type TestTenantArgs struct {
 
 	// TracingDefault controls whether the tracing will be on or off by default.
 	TracingDefault tracing.TracingMode
-
-	// RPCHeartbeatInterval controls how often the tenant sends Ping requests.
-	RPCHeartbeatInterval time.Duration
 
 	// GoroutineDumpDirName is used to initialize the same named field on the
 	// SQLServer.BaseConfig field. It is used as the directory name for
@@ -319,4 +357,10 @@ type TestTenantArgs struct {
 	// heapprofiler. If empty, no heap profiles will be collected during the test.
 	// If set, this directory should be cleaned up after the test completes.
 	HeapProfileDirName string
+
+	// StartDiagnosticsReporting checks cluster.TelemetryOptOut(), and
+	// if not disabled starts the asynchronous goroutine that checks for
+	// CockroachDB upgrades and periodically reports diagnostics to
+	// Cockroach Labs. Should remain disabled during unit testing.
+	StartDiagnosticsReporting bool
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -26,17 +27,17 @@ import (
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.GC, declareKeysGC, GC)
+	RegisterReadWriteCommand(kvpb.GC, declareKeysGC, GC)
 }
 
 func declareKeysGC(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
-	req roachpb.Request,
+	header *kvpb.Header,
+	req kvpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
-	gcr := req.(*roachpb.GCRequest)
+	gcr := req.(*kvpb.GCRequest)
 	if gcr.RangeKeys != nil {
 		// When GC-ing MVCC range key tombstones, we need to serialize with
 		// range key writes that overlap the MVCC range tombstone, as well as
@@ -54,11 +55,30 @@ func declareKeysGC(
 			Key: keys.MVCCRangeKeyGCKey(rs.GetRangeID()),
 		})
 	}
-	// For ClearRangeKey request we still obtain a wide write lock as we don't
-	// expect any operations running on the range.
-	if rk := gcr.ClearRangeKey; rk != nil {
-		latchSpans.AddMVCC(spanset.SpanReadWrite, roachpb.Span{Key: rk.StartKey, EndKey: rk.EndKey},
-			hlc.MaxTimestamp)
+	// We have three distinct cases for GCClearRange.
+	// First is when range has no timestamp which means we will attempt to delete
+	// all data in range and that requires wide lock of the whole key span. This
+	// is fine as we are discarding all data in range.
+	// Second is deleting multiple versions of a single key when most recent data
+	// remains. This case is not different from non-ranged GC for individual keys.
+	// See explanation of correctness below why we can avoid obtaining locks.
+	// Thirs case is deleting multiple keys, and for it we need to obtain a write
+	// lock to prevent any addition of the keys that would be covered by the
+	// request range span. We will obtain it on highest timestamp to avoid
+	// interference with readers that want to read keys. It is safe to read as per
+	// correctness explanation below because we only delete data below threshold
+	// and that data is not readable.
+	// This lock could create contention for writers, but in practice if range
+	// contain live data, we will not create wide GCClearRange requests. And if
+	// there's no live data for at least gc.ttl period, then it is not likely
+	// there would be other writes to the range.
+	// A corner case could be if writes were stopped for GCTTL and then resumed,
+	// they could hit contention on the first GC run.
+	if rk := gcr.ClearRange; rk != nil {
+		if rk.StartKeyTimestamp.IsEmpty() || !rk.StartKey.Next().Equal(rk.EndKey) {
+			latchSpans.AddMVCC(spanset.SpanReadWrite, roachpb.Span{Key: rk.StartKey, EndKey: rk.EndKey},
+				hlc.MaxTimestamp)
+		}
 	}
 	// The RangeGCThresholdKey is only written to if the
 	// req.(*GCRequest).Threshold is set. However, we always declare an exclusive
@@ -87,6 +107,8 @@ func declareKeysGC(
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeGCThresholdKey(rs.GetRangeID())})
 	// Needed for Range bounds checks in calls to EvalContext.ContainsKey.
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
+	// Needed for updating optional GC hint.
+	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeGCHintKey(rs.GetRangeID())})
 	latchSpans.DisableUndeclaredAccessAssertions()
 }
 
@@ -114,9 +136,9 @@ func mergeAdjacentSpans(spans []roachpb.Span) []roachpb.Span {
 // listed key along with the expiration timestamp. The GC metadata
 // specified in the args is persisted after GC.
 func GC(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.GCRequest)
+	args := cArgs.Args.(*kvpb.GCRequest)
 	h := cArgs.Header
 
 	// We do not allow GC requests to bump the GC threshold at the same time that
@@ -141,7 +163,7 @@ func GC(
 	//    GC request's effect from the raft log. Latches held on the leaseholder
 	//    would have no impact on a follower read.
 	if !args.Threshold.IsEmpty() &&
-		(len(args.Keys) != 0 || len(args.RangeKeys) != 0 || args.ClearRangeKey != nil) &&
+		(len(args.Keys) != 0 || len(args.RangeKeys) != 0 || args.ClearRange != nil) &&
 		!cArgs.EvalCtx.EvalKnobs().AllowGCWithNewThresholdAndKeys {
 		return result.Result{}, errors.AssertionFailedf(
 			"GC request can set threshold or it can GC keys, but it is unsafe for it to do both")
@@ -149,9 +171,10 @@ func GC(
 
 	// We do not allow removal of point or range keys combined with clear range
 	// operation as they could cover the same set of keys.
-	if (len(args.Keys) != 0 || len(args.RangeKeys) != 0) && args.ClearRangeKey != nil {
+	if (len(args.Keys) != 0 || len(args.RangeKeys) != 0) &&
+		args.ClearRange != nil {
 		return result.Result{}, errors.AssertionFailedf(
-			"GC request can remove point and range keys or clear entire range, but it is unsafe for it to do both")
+			"GC request can remove point and range keys or clear range, but it is unsafe for it to do both")
 	}
 
 	// All keys must be inside the current replica range. Keys outside
@@ -159,10 +182,10 @@ func GC(
 	// safe because they can simply be re-collected later on the correct
 	// replica. Discrepancies here can arise from race conditions during
 	// range splitting.
-	globalKeys := make([]roachpb.GCRequest_GCKey, 0, len(args.Keys))
+	globalKeys := make([]kvpb.GCRequest_GCKey, 0, len(args.Keys))
 	// Local keys are rarer, so don't pre-allocate slice. We separate the two
 	// kinds of keys since it is a requirement when calling MVCCGarbageCollect.
-	var localKeys []roachpb.GCRequest_GCKey
+	var localKeys []kvpb.GCRequest_GCKey
 	for _, k := range args.Keys {
 		if cArgs.EvalCtx.ContainsKey(k.Key) {
 			if keys.IsLocal(k.Key) {
@@ -174,7 +197,7 @@ func GC(
 	}
 
 	// Garbage collect the specified keys by expiration timestamps.
-	for _, gcKeys := range [][]roachpb.GCRequest_GCKey{localKeys, globalKeys} {
+	for _, gcKeys := range [][]kvpb.GCRequest_GCKey{localKeys, globalKeys} {
 		if err := storage.MVCCGarbageCollect(
 			ctx, readWriter, cArgs.Stats, gcKeys, h.Timestamp,
 		); err != nil {
@@ -182,48 +205,85 @@ func GC(
 		}
 	}
 
+	desc := cArgs.EvalCtx.Desc()
+
+	if cr := args.ClearRange; cr != nil {
+		// Check if we are performing a fast path operation to try to remove all user
+		// key data from the range. All data must be deleted by a range tombstone for
+		// the operation to succeed.
+		if cr.StartKeyTimestamp.IsEmpty() {
+			if !cr.StartKey.Equal(desc.StartKey.AsRawKey()) || !cr.EndKey.Equal(desc.EndKey.AsRawKey()) {
+				return result.Result{}, errors.Errorf("gc with clear range operation could only be used on the full range")
+			}
+
+			if err := storage.MVCCGarbageCollectWholeRange(ctx, readWriter, cArgs.Stats,
+				cr.StartKey, cr.EndKey, cArgs.EvalCtx.GetGCThreshold(),
+				cArgs.EvalCtx.GetMVCCStats()); err != nil {
+				return result.Result{}, err
+			}
+		} else {
+			// Otherwise garbage collect specified keys defined by clear range i.e. parts
+			// of the whole range containing no live data.
+			if err := storage.MVCCGarbageCollectPointsWithClearRange(ctx, readWriter, cArgs.Stats,
+				cr.StartKey, cr.EndKey, cr.StartKeyTimestamp,
+				cArgs.EvalCtx.GetGCThreshold()); err != nil {
+				return result.Result{}, err
+			}
+		}
+	}
+
 	// Garbage collect range keys. Note that we pass latch range boundaries for
 	// each key as we may need to merge range keys with adjacent ones, but we
 	// are restricted on how far we are allowed to read.
-	desc := cArgs.EvalCtx.Desc()
 	rangeKeys := makeCollectableGCRangesFromGCRequests(desc.StartKey.AsRawKey(),
 		desc.EndKey.AsRawKey(), args.RangeKeys)
 	if err := storage.MVCCGarbageCollectRangeKeys(ctx, readWriter, cArgs.Stats, rangeKeys); err != nil {
 		return result.Result{}, err
 	}
 
-	// Fast path operation to try to remove all user key data from the range.
-	if rk := args.ClearRangeKey; rk != nil {
-		if !rk.StartKey.Equal(desc.StartKey.AsRawKey()) || !rk.EndKey.Equal(desc.EndKey.AsRawKey()) {
-			return result.Result{}, errors.Errorf("gc with clear range operation could only be used on the full range")
-		}
-
-		if err := storage.MVCCGarbageCollectWholeRange(ctx, readWriter, cArgs.Stats,
-			rk.StartKey, rk.EndKey, cArgs.EvalCtx.GetGCThreshold(), cArgs.EvalCtx.GetMVCCStats()); err != nil {
-			return result.Result{}, err
-		}
-	}
-
-	// Optionally bump the GC threshold timestamp.
 	var res result.Result
-	if !args.Threshold.IsEmpty() {
-		oldThreshold := cArgs.EvalCtx.GetGCThreshold()
 
+	gcThreshold := cArgs.EvalCtx.GetGCThreshold()
+	// Optionally bump the GC threshold timestamp.
+	if !args.Threshold.IsEmpty() {
 		// Protect against multiple GC requests arriving out of order; we track
 		// the maximum timestamp by forwarding the existing timestamp.
-		newThreshold := oldThreshold
-		updated := newThreshold.Forward(args.Threshold)
+		updated := gcThreshold.Forward(args.Threshold)
 
 		// Don't write the GC threshold key unless we have to.
 		if updated {
 			if err := MakeStateLoader(cArgs.EvalCtx).SetGCThreshold(
-				ctx, readWriter, cArgs.Stats, &newThreshold,
+				ctx, readWriter, cArgs.Stats, &gcThreshold,
 			); err != nil {
 				return result.Result{}, err
 			}
 
 			res.Replicated.State = &kvserverpb.ReplicaState{
-				GCThreshold: &newThreshold,
+				GCThreshold: &gcThreshold,
+			}
+		}
+	}
+
+	// Check if optional GC hint on the range is expired (e.g. delete operation is
+	// older than GC threshold) and remove it. Otherwise this range could be
+	// unnecessarily GC'd with high priority again.
+	// We should only do that when we are doing actual cleanup as we want to have
+	// a hint when request is being handled.
+	if len(args.Keys) != 0 || len(args.RangeKeys) != 0 || args.ClearRange != nil {
+		sl := MakeStateLoader(cArgs.EvalCtx)
+		hint, err := sl.LoadGCHint(ctx, readWriter)
+		if err != nil {
+			return result.Result{}, err
+		}
+		if !hint.IsEmpty() {
+			if hint.LatestRangeDeleteTimestamp.LessEq(gcThreshold) {
+				hint.ResetLatestRangeDeleteTimestamp()
+				res.Replicated.State = &kvserverpb.ReplicaState{
+					GCHint: hint,
+				}
+				if _, err := sl.SetGCHint(ctx, readWriter, cArgs.Stats, hint); err != nil {
+					return result.Result{}, err
+				}
 			}
 		}
 	}
@@ -237,7 +297,7 @@ func GC(
 // ensure merging of range tombstones could be performed and at the same time
 // no data is accessed outside of latches.
 func makeLookupBoundariesForGCRanges(
-	rangeStart, rangeEnd roachpb.Key, rangeKeys []roachpb.GCRequest_GCRangeKey,
+	rangeStart, rangeEnd roachpb.Key, rangeKeys []kvpb.GCRequest_GCRangeKey,
 ) []roachpb.Span {
 	spans := make([]roachpb.Span, len(rangeKeys))
 	for i := range rangeKeys {
@@ -254,7 +314,7 @@ func makeLookupBoundariesForGCRanges(
 // containing ranges to be removed as well as safe iteration boundaries.
 // See makeLookupBoundariesForGCRanges for why additional boundaries are used.
 func makeCollectableGCRangesFromGCRequests(
-	rangeStart, rangeEnd roachpb.Key, rangeKeys []roachpb.GCRequest_GCRangeKey,
+	rangeStart, rangeEnd roachpb.Key, rangeKeys []kvpb.GCRequest_GCRangeKey,
 ) []storage.CollectableGCRangeKey {
 	latches := makeLookupBoundariesForGCRanges(rangeStart, rangeEnd, rangeKeys)
 	collectableKeys := make([]storage.CollectableGCRangeKey, len(rangeKeys))

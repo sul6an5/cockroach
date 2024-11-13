@@ -12,10 +12,11 @@ package kvcoord
 
 import (
 	"context"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -38,8 +39,8 @@ type txnMetricRecorder struct {
 
 // SendLocked is part of the txnInterceptor interface.
 func (m *txnMetricRecorder) SendLocked(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	if m.txnStartNanos == 0 {
 		m.txnStartNanos = timeutil.Now().UnixNano()
 	}
@@ -71,7 +72,9 @@ func (*txnMetricRecorder) populateLeafInputState(*roachpb.LeafTxnInputState) {}
 func (*txnMetricRecorder) populateLeafFinalState(*roachpb.LeafTxnFinalState) {}
 
 // importLeafFinalState is part of the txnInterceptor interface.
-func (*txnMetricRecorder) importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) {}
+func (*txnMetricRecorder) importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) error {
+	return nil
+}
 
 // epochBumpedLocked is part of the txnInterceptor interface.
 func (*txnMetricRecorder) epochBumpedLocked() {}
@@ -84,7 +87,6 @@ func (*txnMetricRecorder) rollbackToSavepointLocked(context.Context, savepoint) 
 
 // closeLocked is part of the txnInterceptor interface.
 func (m *txnMetricRecorder) closeLocked() {
-	ctx := context.Background()
 	if m.onePCCommit {
 		m.metrics.Commits1PC.Inc(1)
 	}
@@ -113,8 +115,6 @@ func (m *txnMetricRecorder) closeLocked() {
 	switch status {
 	case roachpb.ABORTED:
 		m.metrics.Aborts.Inc(1)
-		m.metrics.GetEva(ctx)
-		log.Info(ctx,"roachpb.ABORTED")
 	case roachpb.PENDING:
 		// NOTE(andrei): Getting a PENDING status here is possible when this
 		// interceptor is closed without a rollback ever succeeding.
@@ -124,13 +124,20 @@ func (m *txnMetricRecorder) closeLocked() {
 		// Record failed aborts separately as in this case EndTxn never succeeded
 		// which means intents are left for subsequent cleanup by reader.
 		m.metrics.RollbacksFailed.Inc(1)
-		m.metrics.GetEva(ctx)
-		log.Info(ctx,"roachpb.PENDING")
 	case roachpb.COMMITTED:
 		// Note that successful read-only txn are also counted as committed, even
 		// though they never had a txn record.
 		m.metrics.Commits.Inc(1)
-		m.metrics.GetEva(ctx)
-		log.Info(ctx,"roachpb.COMMITTED")
 	}
+
+	// stats
+	_, restarts_count := m.metrics.Restarts.Total()
+	aborts_count := m.metrics.Aborts.Count()
+	commits_count := m.metrics.Commits.Count()
+	txnCoordID := m.txn.TxnMeta.CoordinatorNodeID
+	txnName := m.txn.Name
+	txnID := m.txn.TxnMeta.ID
+	// baseKey := m.txn.TxnMeta.Key
+	log.Errorf(context.Background(), "coordID = %d. txnID = %s. txnName = %s. METRICS.Restart = %f. METRICS.ABORTED = %d. METRICS.COMMITTED = %d. Final_state = %d. txid = %s\n",
+		txnCoordID, txnID, txnName, restarts_count, aborts_count, commits_count, status, m.txn.ID)
 }

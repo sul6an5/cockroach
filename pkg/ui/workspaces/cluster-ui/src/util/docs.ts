@@ -82,12 +82,19 @@ export const nodeLivenessIssues = docsURL(
 export const howItWork = docsURL("cockroach-quit.html#how-it-works");
 export const clusterStore = docsURL("cockroach-start.html#store");
 export const clusterGlossary = docsURL("architecture/overview.html#glossary");
+export const clusterSettings = docsURL("cluster-settings");
 export const reviewOfCockroachTerminology = docsURL(
   "ui-replication-dashboard.html#review-of-cockroachdb-terminology",
 );
 export const sessionsTable = docsURL("ui-sessions-page.html");
 export const tableStatsClusterSetting = docsURL(
   "cost-based-optimizer.html#control-automatic-statistics",
+);
+export const performanceBestPractices = docsURL(
+  "performance-best-practices-overview",
+);
+export const stmtPerformanceRules = docsURL(
+  "make-queries-fast.html#sql-statement-performance-rules",
 );
 // Note that these explicitly don't use the current version, since we want to
 // link to the most up-to-date documentation available.
@@ -134,3 +141,4 @@ export const performanceTuningRecipes = docsURLNoVersion(
 export const transactionContention = docsURL(
   "transactions.html#transaction-contention",
 );
+export const insights = docsURL("ui-insights-page.html");

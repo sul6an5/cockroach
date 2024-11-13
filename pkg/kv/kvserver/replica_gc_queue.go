@@ -15,13 +15,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/raft/v3"
 )
 
 const (
@@ -83,6 +84,8 @@ type replicaGCQueue struct {
 	db      *kv.DB
 }
 
+var _ queueImpl = &replicaGCQueue{}
+
 // newReplicaGCQueue returns a new instance of replicaGCQueue.
 func newReplicaGCQueue(store *Store, db *kv.DB) *replicaGCQueue {
 	rgcq := &replicaGCQueue{
@@ -96,7 +99,7 @@ func newReplicaGCQueue(store *Store, db *kv.DB) *replicaGCQueue {
 			maxSize:                  defaultQueueMaxSize,
 			needsLease:               false,
 			needsRaftInitialized:     true,
-			needsSystemConfig:        false,
+			needsSpanConfigs:         false,
 			acceptsUnsplitRanges:     true,
 			processDestroyedReplicas: true,
 			successes:                store.metrics.ReplicaGCQueueSuccesses,
@@ -231,7 +234,7 @@ func (rgcq *replicaGCQueue) process(
 	// considering one of the metadata ranges: we must not do an inconsistent
 	// lookup in our own copy of the range.
 	rs, _, err := kv.RangeLookup(ctx, rgcq.db.NonTransactionalSender(), desc.StartKey.AsRawKey(),
-		roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
+		kvpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
 	if err != nil {
 		return false, err
 	}
@@ -269,7 +272,7 @@ func (rgcq *replicaGCQueue) process(
 		// the use of a snapshot when catching up to the new replica ID.
 		// We don't normally expect to have a *higher* local replica ID
 		// than the one in the meta descriptor, but it's possible after
-		// recovering with unsafe-remove-dead-replicas.
+		// recovering with "debug recover".
 		return false, nil
 	} else if sameRange {
 		// We are no longer a member of this range, but the range still exists.
@@ -336,7 +339,7 @@ func (rgcq *replicaGCQueue) process(
 		if leftRepl != nil {
 			leftDesc := leftRepl.Desc()
 			rs, _, err := kv.RangeLookup(ctx, rgcq.db.NonTransactionalSender(), leftDesc.StartKey.AsRawKey(),
-				roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
+				kvpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
 			if err != nil {
 				return false, err
 			}
@@ -363,6 +366,11 @@ func (rgcq *replicaGCQueue) process(
 		}
 	}
 	return true, nil
+}
+
+func (*replicaGCQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 func (*replicaGCQueue) timer(_ time.Duration) time.Duration {

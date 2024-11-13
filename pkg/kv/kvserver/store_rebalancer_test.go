@@ -17,10 +17,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
+	rload "github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/gossiputil"
@@ -30,8 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 var (
@@ -56,7 +58,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 3000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 10,
+				CPUPerSecond:     3000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 10),
 			},
 		},
 		{
@@ -74,7 +78,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 2800,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 5,
+				CPUPerSecond:     2800 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 5),
 			},
 		},
 		{
@@ -92,7 +98,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 2600,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 2,
+				CPUPerSecond:     2600 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 2),
 			},
 		},
 		{
@@ -110,7 +118,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 2400,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 10,
+				CPUPerSecond:     2400 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 10),
 			},
 		},
 		{
@@ -128,7 +138,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 2200,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 3,
+				CPUPerSecond:     2200 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 3),
 			},
 		},
 		{
@@ -146,7 +158,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 2000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 2,
+				CPUPerSecond:     2000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 2),
 			},
 		},
 		{
@@ -164,7 +178,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1800,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 10,
+				CPUPerSecond:     1800 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 10),
 			},
 		},
 		{
@@ -182,7 +198,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1600,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 5,
+				CPUPerSecond:     1600 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 5),
 			},
 		},
 		{
@@ -200,7 +218,9 @@ var (
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1400,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 3,
+				CPUPerSecond:     1400 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 3),
 			},
 		},
 	}
@@ -214,6 +234,7 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 1},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1500,
+				CPUPerSecond:     1500 * float64(time.Millisecond),
 			},
 		},
 		{
@@ -221,6 +242,7 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 2},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1300,
+				CPUPerSecond:     1300 * float64(time.Millisecond),
 			},
 		},
 		{
@@ -228,6 +250,7 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 3},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
 			},
 		},
 		{
@@ -235,6 +258,7 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 4},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 900,
+				CPUPerSecond:     900 * float64(time.Millisecond),
 			},
 		},
 		{
@@ -242,21 +266,24 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 5},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 500,
+				CPUPerSecond:     500 * float64(time.Millisecond),
 			},
 		},
 	}
 
 	// noLocalityAscendingReadAmpStores specifies a set of stores identical to
-	// noLocalityStores, however they have ascending read
-	// amplification. Where store 1, store 2 and store 3 are below the
-	// threshold, whilst store 4 and store 5 are above.
+	// noLocalityStores, however they have ascending IO overload threshold
+	// scores. Where store 1, store 2 and store 3 are below the threshold, whilst
+	// store 4 and store 5 are above.
 	noLocalityAscendingReadAmpStores = []*roachpb.StoreDescriptor{
 		{
 			StoreID: 1,
 			Node:    roachpb.NodeDescriptor{NodeID: 1},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1500,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 15,
+				CPUPerSecond:     1500 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 15),
 			},
 		},
 		{
@@ -264,7 +291,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 2},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1300,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 10,
+				CPUPerSecond:     1300 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 10),
 			},
 		},
 		{
@@ -272,7 +301,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 3},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 5,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 5),
 			},
 		},
 		{
@@ -280,7 +311,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 4},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 900,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 20,
+				CPUPerSecond:     900 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 20),
 			},
 		},
 		{
@@ -288,20 +321,24 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 5},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 500,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 25,
+				CPUPerSecond:     500 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 25),
 			},
 		},
 	}
 
 	// noLocalityUniformQPSHighReadAmp specifies a set of stores that are
-	// identical, except store 1 and 2 have high read amp.
+	// identical, except store 1 and 2 have a high IO overload score.
 	noLocalityUniformQPSHighReadAmp = []*roachpb.StoreDescriptor{
 		{
 			StoreID: 1,
 			Node:    roachpb.NodeDescriptor{NodeID: 1},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 100,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 100),
 			},
 		},
 		{
@@ -309,7 +346,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 2},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 15,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 15),
 			},
 		},
 		{
@@ -317,7 +356,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 3},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 100,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 100),
 			},
 		},
 		{
@@ -325,7 +366,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 4},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold - 15,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold - 15),
 			},
 		},
 		{
@@ -333,12 +376,14 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 5},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 100,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 100),
 			},
 		},
 	}
 	// noLocalityHighReadAmpStores specifies a set of stores identical to
-	// noLocalityStores, however they all have read amplification that exceeds
+	// noLocalityStores, however they all have an IO overload score that exceeds
 	// the threshold.
 	noLocalityHighReadAmpStores = []*roachpb.StoreDescriptor{
 		{
@@ -346,7 +391,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 1},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1500,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 1,
+				CPUPerSecond:     1500 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 1),
 			},
 		},
 		{
@@ -354,7 +401,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 2},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1300,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 1,
+				CPUPerSecond:     1300 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 1),
 			},
 		},
 		{
@@ -362,7 +411,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 3},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 1,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 1),
 			},
 		},
 		{
@@ -370,7 +421,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 4},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 900,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 1,
+				CPUPerSecond:     900 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 1),
 			},
 		},
 		{
@@ -378,12 +431,14 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 5},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 500,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 1,
+				CPUPerSecond:     500 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 1),
 			},
 		},
 	}
 	// noLocalityHighReadAmpSkewedStores specifies a set of stores identical to
-	// noLocalityStores, however they all have read amplification that exceeds
+	// noLocalityStores, however they all have an IO overload score that exceeds
 	// the threshold in ascending order.
 	noLocalityHighReadAmpSkewedStores = []*roachpb.StoreDescriptor{
 		{
@@ -391,7 +446,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 1},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1500,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 1,
+				CPUPerSecond:     1500 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 1),
 			},
 		},
 		{
@@ -399,7 +456,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 2},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1300,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 10,
+				CPUPerSecond:     1300 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 10),
 			},
 		},
 		{
@@ -407,7 +466,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 3},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 1000,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 50,
+				CPUPerSecond:     1000 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 50),
 			},
 		},
 		{
@@ -415,7 +476,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 4},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 900,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 100,
+				CPUPerSecond:     900 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 100),
 			},
 		},
 		{
@@ -423,7 +486,9 @@ var (
 			Node:    roachpb.NodeDescriptor{NodeID: 5},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 500,
-				L0Sublevels:      allocatorimpl.MaxL0SublevelThreshold + 100,
+				CPUPerSecond:     500 * float64(time.Millisecond),
+				IOThreshold: allocatorimpl.TestingIOThresholdWithScore(
+					allocatorimpl.DefaultReplicaIOOverloadThreshold + 100),
 			},
 		},
 	}
@@ -432,11 +497,13 @@ var (
 type testRange struct {
 	// The first storeID in the list will be the leaseholder.
 	voters, nonVoters []roachpb.StoreID
-	qps               float64
+	qps, reqCPU       float64
 }
 
-func loadRanges(rr *replicaRankings, s *Store, ranges []testRange) {
-	acc := rr.newAccumulator()
+func loadRanges(rr *ReplicaRankings, s *Store, ranges []testRange) {
+	// Track both CPU and QPS by default, the ordering the consumer uses will
+	// depend on the current rebalance objective.
+	acc := NewReplicaAccumulator(load.Queries, load.CPU)
 	for i, r := range ranges {
 		rangeID := roachpb.RangeID(i + 1)
 		repl := &Replica{store: s, RangeID: rangeID}
@@ -454,7 +521,9 @@ func loadRanges(rr *replicaRankings, s *Store, ranges []testRange) {
 			Expiration: &hlc.MaxTimestamp,
 			Replica:    repl.mu.state.Desc.InternalReplicas[0],
 		}
-		repl.mu.state.TruncatedState = &roachpb.RaftTruncatedState{}
+		// NB: We set the index to 2 corresponding to the match in
+		// TestingRaftStatusFn. Matches that are 0 are considered behind.
+		repl.mu.state.TruncatedState = &roachpb.RaftTruncatedState{Index: 2}
 		for _, storeID := range r.nonVoters {
 			repl.mu.state.Desc.InternalReplicas = append(repl.mu.state.Desc.InternalReplicas, roachpb.ReplicaDescriptor{
 				NodeID:    roachpb.NodeID(storeID),
@@ -463,19 +532,47 @@ func loadRanges(rr *replicaRankings, s *Store, ranges []testRange) {
 				Type:      roachpb.NON_VOTER,
 			})
 		}
-		// TODO(a-robinson): The below three lines won't be needed once the old
-		// rangeInfo code is ripped out of the allocator.
 		repl.mu.state.Stats = &enginepb.MVCCStats{}
+		repl.loadStats = rload.NewReplicaLoad(s.Clock(), nil)
+		repl.loadStats.TestingSetStat(rload.Queries, r.qps)
+		repl.loadStats.TestingSetStat(rload.ReqCPUNanos, r.reqCPU)
 
-		repl.loadStats = NewReplicaLoad(s.Clock(), nil)
-		repl.loadStats.batchRequests.SetMeanRateForTesting(r.qps)
-
-		acc.addReplica(replicaWithStats{
-			repl: repl,
-			qps:  r.qps,
+		acc.AddReplica(candidateReplica{
+			Replica: repl,
+			usage:   RangeUsageInfoForRepl(repl),
 		})
 	}
-	rr.update(acc)
+	rr.Update(acc)
+}
+
+// testRebalanceObjectiveProvider implements the RebalanceObjectiveProvider
+// interface and should be used in testing only.
+type testRebalanceObjectiveProvider struct {
+	objective LBRebalancingObjective
+}
+
+func (t *testRebalanceObjectiveProvider) Objective() LBRebalancingObjective {
+	return t.objective
+}
+
+func testWithDifferentRebalanceObjectives(
+	t *testing.T,
+	f func(t *testing.T),
+	objectiveProvider *testRebalanceObjectiveProvider,
+	objectives ...LBRebalancingObjective,
+) func(*testing.T) {
+	return func(t *testing.T) {
+		for _, objective := range objectives {
+			objectiveProvider.objective = objective
+			t.Run(objective.ToDimension().String(), f)
+		}
+	}
+}
+
+func withQPSCPU(
+	t *testing.T, objectiveProvider *testRebalanceObjectiveProvider, f func(t *testing.T),
+) func(*testing.T) {
+	return testWithDifferentRebalanceObjectives(t, f, objectiveProvider, LBRebalancingQueries, LBRebalancingCPU)
 }
 
 func TestChooseLeaseToTransfer(t *testing.T) {
@@ -486,7 +583,7 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	stopper, g, _, a, _ := allocatorimpl.CreateTestAllocatorWithKnobs(ctx,
+	stopper, g, sp, a, _ := allocatorimpl.CreateTestAllocatorWithKnobs(ctx,
 		10, false /* deterministic */, &allocator.TestingKnobs{
 			// Let the allocator pick lease transfer targets that are replicas in need
 			// of snapshots, in order to avoid mocking out a fake raft group for the
@@ -495,34 +592,35 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 		},
 	)
 	defer stopper.Stop(context.Background())
+	objectiveProvider := &testRebalanceObjectiveProvider{}
 	gossiputil.NewStoreGossiper(g).GossipStores(noLocalityStores, t)
-	storeList, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
-	storeMap := storeList.ToMap()
 	localDesc := *noLocalityStores[0]
 	cfg := TestStoreConfig(nil)
 	cfg.Gossip = g
+	cfg.StorePool = sp
 	s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 	s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
 	rq := newReplicateQueue(s, a)
-	rr := newReplicaRankings()
+	rr := NewReplicaRankings()
 
-	sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr)
+	sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr, objectiveProvider)
 
 	// Rather than trying to populate every Replica with a real raft group in
 	// order to pass replicaIsBehind checks, fake out the function for getting
 	// raft status with one that always returns all replicas as up to date.
-	sr.getRaftStatusFn = func(r *Replica) *raft.Status {
+	sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
 		return TestingRaftStatusFn(r)
 	}
 
 	testCases := []struct {
 		storeIDs     []roachpb.StoreID
-		qps          float64
+		qps, reqCPU  float64
 		expectTarget roachpb.StoreID
 	}{
 		{
 			storeIDs:     []roachpb.StoreID{1},
 			qps:          100,
+			reqCPU:       100 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 
@@ -530,29 +628,37 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 		// (1300 for stores 1 and 2) is close enough to the current leaseholder's
 		// QPS (1500).
 		{
-			storeIDs:     []roachpb.StoreID{1, 2},
-			qps:          100,
+			storeIDs: []roachpb.StoreID{1, 2},
+			qps:      100,
+			// NB: This is set +50 above qps, as the minimum threshold
+			// difference for store cpu is 50ms, while it is 100 qps for
+			// queries per second.
+			reqCPU:       150 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 2},
 			qps:          1000,
+			reqCPU:       1000 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 
 		{
 			storeIDs:     []roachpb.StoreID{1, 4},
 			qps:          100,
+			reqCPU:       100 * float64(time.Millisecond),
 			expectTarget: 4,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
 			qps:          100,
+			reqCPU:       100 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{5, 1},
 			qps:          100,
+			reqCPU:       100 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 		{
@@ -560,43 +666,54 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 			// be projected to have 1300 and 1200 qps respectively.
 			storeIDs:     []roachpb.StoreID{1, 3},
 			qps:          200,
+			reqCPU:       200 * float64(time.Millisecond),
 			expectTarget: 3,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 4},
 			qps:          200,
+			reqCPU:       200 * float64(time.Millisecond),
 			expectTarget: 4,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
 			qps:          200,
+			reqCPU:       200 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 2},
 			qps:          500,
+			reqCPU:       500 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 3},
 			qps:          500,
+			reqCPU:       500 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 		// s1 without the lease would be projected to have 1000 qps, which is close
 		// enough to s4's 900 qps.
 		{
-			storeIDs:     []roachpb.StoreID{1, 4},
-			qps:          500,
+			storeIDs: []roachpb.StoreID{1, 4},
+			qps:      500,
+			// NB: This is set +50 above qps, as the minimum threshold
+			// difference for store cpu is 50ms, while it is 100 qps for
+			// queries per second.
+			reqCPU:       550 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
 			qps:          500,
+			reqCPU:       500 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
 			qps:          600,
+			reqCPU:       600 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 
@@ -607,16 +724,19 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
 			qps:          800,
+			reqCPU:       800 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 4, 5},
 			qps:          800,
+			reqCPU:       800 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 3, 4, 5},
 			qps:          800,
+			reqCPU:       800 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 		// NB: However, if s1 is projected to have 750 qps, we would expect a lease
@@ -624,86 +744,91 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 		{
 			storeIDs:     []roachpb.StoreID{1, 3, 4, 5},
 			qps:          750,
+			reqCPU:       750 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 
 		{
 			storeIDs:     []roachpb.StoreID{1, 4},
 			qps:          1.5,
+			reqCPU:       1.5 * float64(time.Millisecond),
 			expectTarget: 4,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
 			qps:          1.5,
+			reqCPU:       1.5 * float64(time.Millisecond),
 			expectTarget: 5,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 4},
 			qps:          1.49,
+			reqCPU:       1.49 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
 			qps:          1.49,
+			reqCPU:       1.49 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 2, 3, 4},
 			qps:          1500,
+			reqCPU:       1500 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 2, 3, 4, 5},
 			qps:          1500,
+			reqCPU:       1500 * float64(time.Millisecond),
 			expectTarget: 0,
 		},
 	}
 
 	for _, tc := range testCases {
-		t.Run("", func(t *testing.T) {
-			loadRanges(rr, s, []testRange{{voters: tc.storeIDs, qps: tc.qps}})
-			hottestRanges := rr.topQPS()
+		t.Run("", withQPSCPU(t, objectiveProvider, func(t *testing.T) {
+			lbRebalanceDimension := objectiveProvider.Objective().ToDimension()
+			loadRanges(rr, s, []testRange{{voters: tc.storeIDs, qps: tc.qps, reqCPU: tc.reqCPU}})
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
+			options := sr.scorerOptions(ctx, lbRebalanceDimension)
+			options.LoadThreshold = allocatorimpl.WithAllDims(0.1)
+			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
 			_, target, _ := sr.chooseLeaseToTransfer(
 				ctx,
-				&hottestRanges,
-				&localDesc,
-				storeList,
-				storeMap,
-				nil, /* qpsScorerOptions */
+				rctx,
 			)
 			if target.StoreID != tc.expectTarget {
 				t.Errorf("got target store %d for range with replicas %v and %f qps; want %d",
 					target.StoreID, tc.storeIDs, tc.qps, tc.expectTarget)
 			}
-		})
+		}))
 	}
 }
 
 func randomNoLocalityStores(
-	numNodes int, qpsMultiplier float64,
-) (stores []*roachpb.StoreDescriptor, qpsMean float64) {
-	var totalQPS float64
+	numNodes int, loadMultiplier float64,
+) (stores []*roachpb.StoreDescriptor) {
 	for i := 1; i <= numNodes; i++ {
-		qps := rand.Float64() * qpsMultiplier
+		load := rand.Float64() * loadMultiplier
 		stores = append(
 			stores, &roachpb.StoreDescriptor{
 				StoreID:  roachpb.StoreID(i),
 				Node:     roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i)},
-				Capacity: roachpb.StoreCapacity{QueriesPerSecond: qps},
+				Capacity: roachpb.StoreCapacity{QueriesPerSecond: load, CPUPerSecond: load * float64(time.Millisecond)},
 			},
 		)
-		totalQPS = totalQPS + qps
 	}
-	return stores, totalQPS / float64(numNodes)
+	return stores
 }
 
 func logSummary(
-	ctx context.Context, allStores, deadStores []*roachpb.StoreDescriptor, meanQPS float64,
+	ctx context.Context, allStores, deadStores []*roachpb.StoreDescriptor, mean load.Load,
 ) {
 	var summary strings.Builder
 	for _, store := range allStores {
 		summary.WriteString(
-			fmt.Sprintf("s%d: %.2f qps", store.StoreID, store.Capacity.QueriesPerSecond),
+			fmt.Sprintf("s%d: %s", store.StoreID, store.Capacity.Load()),
 		)
 		for _, dead := range deadStores {
 			if dead.StoreID == store.StoreID {
@@ -712,67 +837,76 @@ func logSummary(
 		}
 		summary.WriteString("\n")
 	}
-	summary.WriteString(fmt.Sprintf("overall-mean: %.2f", meanQPS))
+	summary.WriteString(fmt.Sprintf("overall-mean: %s", mean))
 	log.Infof(ctx, "generated random store list:\n%s", summary.String())
 }
 
 func TestChooseRangeToRebalanceRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	objectiveProvider := &testRebalanceObjectiveProvider{}
 
 	const (
 		numIterations = 10
 
-		qpsMultiplier         = 2000
-		numVoters             = 3
-		numNonVoters          = 3
-		numNodes              = 12
-		numDeadNodes          = 3
-		perReplicaQPS         = 100
-		qpsRebalanceThreshold = 0.25
-
-		epsilon = 1
+		qpsMultiplier      = 2000
+		numVoters          = 3
+		numNonVoters       = 3
+		numNodes           = 12
+		numDeadNodes       = 3
+		perReplicaQPS      = 100
+		perReplicaReqCPU   = 100 * float64(time.Millisecond)
+		rebalanceThreshold = 0.25
 	)
+	epsilon := load.Set(1)
 
 	for i := 0; i < numIterations; i++ {
-		t.Run(fmt.Sprintf("%d", i+1), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%d", i+1), withQPSCPU(t, objectiveProvider, func(t *testing.T) {
 			ctx := context.Background()
-			stopper, g, _, a, _ := allocatorimpl.CreateTestAllocator(ctx, numNodes, false /* deterministic */)
+			stopper, g, sp, a, _ := allocatorimpl.CreateTestAllocator(ctx, numNodes, false /* deterministic */)
 			defer stopper.Stop(context.Background())
 
-			stores, actualQPSMean := randomNoLocalityStores(numNodes, qpsMultiplier)
-			deadStores := stores[len(stores)-numDeadNodes:]
-			logSummary(ctx, stores, deadStores, actualQPSMean)
-			meanQPS := func(targets []roachpb.StoreID) float64 {
-				var totalQPS float64
+			stores := randomNoLocalityStores(numNodes, qpsMultiplier)
+			meanLoad := func(targets []roachpb.StoreID) load.Load {
+				total := load.Vector{}
 				for _, store := range stores {
 					for _, target := range targets {
 						if target == store.StoreID {
-							totalQPS = totalQPS + store.Capacity.QueriesPerSecond
+							targetLoad := store.Capacity.Load()
+							total[load.Queries] += targetLoad.Dim(load.Queries)
+							total[load.CPU] += targetLoad.Dim(load.CPU)
 							break
 						}
 					}
 				}
-				return totalQPS / float64(len(stores))
+				return load.Scale(total, 1/float64(len(stores)))
 			}
+
+			storeIDs := make([]roachpb.StoreID, len(stores))
+			for i := range stores {
+				storeIDs[i] = stores[i].StoreID
+			}
+			deadStores := stores[len(stores)-numDeadNodes:]
+			logSummary(ctx, stores, deadStores, meanLoad(storeIDs))
 
 			// Test setup boilerplate.
 			gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
-			storeList, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
 			localDesc := *stores[0]
 			cfg := TestStoreConfig(nil)
+			cfg.StorePool = sp
 			s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 			s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
 			rq := newReplicateQueue(s, a)
-			rr := newReplicaRankings()
-			sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr)
+			rr := NewReplicaRankings()
+			sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr, objectiveProvider)
+
 			// Rather than trying to populate every Replica with a real raft group in
 			// order to pass replicaIsBehind checks, fake out the function for getting
 			// raft status with one that always returns all replicas as up to date.
-			sr.getRaftStatusFn = func(r *Replica) *raft.Status {
+			sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
 				return TestingRaftStatusFn(r)
 			}
-			a.StorePool.IsStoreReadyForRoutineReplicaTransfer = func(_ context.Context, this roachpb.StoreID) bool {
+			sp.OverrideIsStoreReadyForRoutineReplicaTransferFn = func(_ context.Context, this roachpb.StoreID) bool {
 				for _, deadStore := range deadStores {
 					// NodeID match StoreIDs here, so this comparison is valid.
 					if deadStore.StoreID == this {
@@ -792,23 +926,21 @@ func TestChooseRangeToRebalanceRandom(t *testing.T) {
 			for i := numVoters; i < numVoters+numNonVoters; i++ {
 				nonVoterStores = append(nonVoterStores, stores[i].StoreID)
 			}
+
+			lbRebalanceDimension := sr.RebalanceObjective().ToDimension()
 			loadRanges(
 				rr, s, []testRange{
-					{voters: voterStores, nonVoters: nonVoterStores, qps: perReplicaQPS},
+					{voters: voterStores, nonVoters: nonVoterStores, qps: perReplicaQPS, reqCPU: perReplicaReqCPU},
 				},
 			)
-			hottestRanges := rr.topQPS()
-			_, voterTargets, nonVoterTargets := sr.chooseRangeToRebalance(
-				ctx,
-				&hottestRanges,
-				&localDesc,
-				storeList,
-				&allocatorimpl.QPSScorerOptions{
-					StoreHealthOptions:    allocatorimpl.StoreHealthOptions{EnforcementLevel: allocatorimpl.StoreHealthNoAction},
-					Deterministic:         false,
-					QPSRebalanceThreshold: qpsRebalanceThreshold,
-				},
-			)
+
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
+			options := sr.scorerOptions(ctx, lbRebalanceDimension)
+			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
+			rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{ReplicaEnforcementLevel: allocatorimpl.IOOverloadThresholdIgnore}
+			rctx.options.LoadThreshold = allocatorimpl.WithAllDims(rebalanceThreshold)
+
+			_, voterTargets, nonVoterTargets := sr.chooseRangeToRebalance(ctx, rctx)
 			var rebalancedVoterStores, rebalancedNonVoterStores []roachpb.StoreID
 			for _, target := range voterTargets {
 				rebalancedVoterStores = append(rebalancedVoterStores, target.StoreID)
@@ -818,35 +950,35 @@ func TestChooseRangeToRebalanceRandom(t *testing.T) {
 			}
 			log.Infof(
 				ctx,
-				"rebalanced voters from %v to %v: %.2f qps -> %.2f qps",
+				"rebalanced voters from %v to %v: %s -> %s",
 				voterStores,
 				voterTargets,
-				meanQPS(voterStores),
-				meanQPS(rebalancedVoterStores),
+				meanLoad(voterStores),
+				meanLoad(rebalancedVoterStores),
 			)
 			log.Infof(
 				ctx,
-				"rebalanced non-voters from %v to %v: %.2f qps -> %.2f qps",
+				"rebalanced non-voters from %v to %v: %s -> %s",
 				nonVoterStores,
 				nonVoterTargets,
-				meanQPS(nonVoterStores),
-				meanQPS(rebalancedNonVoterStores),
+				meanLoad(nonVoterStores),
+				meanLoad(rebalancedNonVoterStores),
 			)
-			if r, o := meanQPS(rebalancedVoterStores), meanQPS(voterStores); r-o > epsilon {
-				t.Errorf("voters were rebalanced onto a set of stores with higher QPS (%.2f to %.2f)", o, r)
+			if r, o := meanLoad(rebalancedVoterStores), meanLoad(voterStores); load.Greater(load.Sub(r, o), epsilon, objectiveProvider.Objective().ToDimension()) {
+				t.Errorf("voters were rebalanced onto a set of stores with higher load (%s to %s)", o, r)
 			}
-			previousMean := meanQPS(append(voterStores, nonVoterStores...))
-			newMean := meanQPS(append(rebalancedVoterStores, rebalancedNonVoterStores...))
+			previousMean := meanLoad(append(voterStores, nonVoterStores...))
+			newMean := meanLoad(append(rebalancedVoterStores, rebalancedNonVoterStores...))
 			log.Infof(
 				ctx,
-				"rebalanced range from stores with %.2f average qps to %.2f average qps",
+				"rebalanced range from stores with %s average load to %s average load",
 				previousMean,
 				newMean,
 			)
-			if newMean-previousMean > epsilon {
-				t.Errorf("replicas were rebalanced onto a set of stores with higher QPS (%.2f to %.2f)", previousMean, newMean)
+			if load.Greater(load.Sub(newMean, previousMean), epsilon, objectiveProvider.Objective().ToDimension()) {
+				t.Errorf("replicas were rebalanced onto a set of stores with higher load (%.2f to %.2f)", previousMean, newMean)
 			}
-		})
+		}))
 	}
 }
 
@@ -857,6 +989,8 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
+
+	objectiveProvider := &testRebalanceObjectiveProvider{}
 
 	constraint := func(region string) roachpb.Constraint {
 		return roachpb.Constraint{
@@ -911,10 +1045,10 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 		// the first listed voter target is expected to be the leaseholder.
 		expRebalancedVoters, expRebalancedNonVoters []roachpb.StoreID
 	}{
-		// All the replicas are already on the best possible stores. No
-		// rebalancing should be attempted, note here that the high read
-		// amp of the current stores is ignored as it is not considered in
-		// moving a replica away from a store.
+		// All the replicas are already on the best possible stores. No rebalancing
+		// should be attempted, note here that the high IO overload score of the
+		// current stores is ignored as it is not considered in moving a replica
+		// away from a store.
 		{
 			name:                "no rebalance",
 			voters:              []roachpb.StoreID{3, 6, 9},
@@ -924,18 +1058,18 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 		// A replica is in a heavily loaded region, on a relatively heavily
 		// loaded store. We expect it to be moved to a less busy store
 		// within the same region. However, it cannot be the least busy
-		// store as it has high read amp (3).
+		// store as it has a high IO overload score (3).
 		{
 			name:                "rebalance one replica within heavy region",
 			voters:              []roachpb.StoreID{1, 6, 9},
 			constraints:         oneReplicaPerRegion,
-			expRebalancedVoters: []roachpb.StoreID{9, 6, 2},
+			expRebalancedVoters: []roachpb.StoreID{2, 6, 9},
 		},
-		// A replica is in a heavily loaded region, on a relatively heavily
-		// loaded store. We expect it to be moved to a less busy store
-		// within the same region. However, it cannot be the least busy
-		// store as it has high read amp (3). The new replica in the heavy
-		// region must also get the lease due to preferences.
+		// A replica is in a heavily loaded region, on a relatively heavily loaded
+		// store. We expect it to be moved to a less busy store within the same
+		// region. However, it cannot be the least busy store as it has a high IO
+		// overload score (3). The new replica in the heavy region must also get
+		// the lease due to preferences.
 		{
 			name:                "rebalance one replica within heavy region, prefer lease in heavy region",
 			voters:              []roachpb.StoreID{1, 6, 9},
@@ -951,7 +1085,7 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			voters:              []roachpb.StoreID{1, 2, 9},
 			constraints:         twoReplicasInHotRegion,
 			leasePreferences:    leasePreferredHotRegion,
-			expRebalancedVoters: []roachpb.StoreID{3, 2, 9},
+			expRebalancedVoters: []roachpb.StoreID{2, 3, 9},
 		},
 		// Two replicas are in the hot region, both on relatively heavily
 		// loaded nodes. We expect one of those replicas to be moved to a
@@ -962,43 +1096,41 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			name:                "rebalance two replicas out of three within heavy region, prefer lease in heavy region",
 			voters:              []roachpb.StoreID{1, 2, 9},
 			constraints:         twoReplicasInHotRegion,
-			expRebalancedVoters: []roachpb.StoreID{9, 2, 3},
+			expRebalancedVoters: []roachpb.StoreID{2, 9, 3},
 		},
 		{
 			name:        "rebalance two replicas out of five within heavy region",
 			voters:      []roachpb.StoreID{1, 2, 6, 8, 9},
 			constraints: twoReplicasInHotRegion,
 			// NB: Because of the diversity heuristic we won't rebalance to node 7.
-			expRebalancedVoters: []roachpb.StoreID{9, 3, 6, 8, 2},
+			expRebalancedVoters: []roachpb.StoreID{8, 3, 6, 9, 2},
 		},
 		{
 			name:        "rebalance two replicas out of five within heavy region",
 			voters:      []roachpb.StoreID{1, 2, 6, 8, 9},
 			constraints: twoReplicasInHotRegion,
 			// NB: Because of the diversity heuristic we won't rebalance to node 7.
-			expRebalancedVoters: []roachpb.StoreID{9, 3, 6, 8, 2},
+			expRebalancedVoters: []roachpb.StoreID{8, 3, 6, 9, 2},
 		},
 		// In the absence of any constraints, ensure that as long as diversity is
 		// maximized, replicas on hot stores are rebalanced to cooler stores within
 		// the same region.
 		{
-			// Within the hottest region, expect rebalance from the hottest
-			// node (n1) to the coolest node (n3), however since n3 has
-			// high read amp it should instead rebalance to n2. Within the
-			// least hot region, we don't expect a rebalance from n8 to n9
-			// because the qps difference between the two
-			// stores is too small.
+			// Within the hottest region, expect rebalance from the hottest node (n1)
+			// to the coolest node (n3), however since n3 has a high IO overload
+			// score it should instead rebalance to n2. Within the least hot region,
+			// we don't expect a rebalance from n8 to n9 because the qps difference
+			// between the two stores is too small.
 			name:                "QPS balance without constraints",
 			voters:              []roachpb.StoreID{1, 5, 8},
 			expRebalancedVoters: []roachpb.StoreID{8, 5, 2},
 		},
 		{
-			// Within the second hottest region, expect rebalance from the
-			// hottest node (n4) to the coolest node (n6), however since n6
-			// has high read amp instead expect n5 to be selected. Within
-			// the lease hot region, we don't expect a rebalance from n8 to
-			// n9 because the qps difference between the two stores is too
-			// small.
+			// Within the second hottest region, expect rebalance from the hottest
+			// node (n4) to the coolest node (n6), however since n6 has a high IO
+			// overload score, instead expect n5 to be selected. Within the lease hot
+			// region, we don't expect a rebalance from n8 to n9 because the qps
+			// difference between the two stores is too small.
 			name:                "QPS balance without constraints",
 			voters:              []roachpb.StoreID{8, 4, 3},
 			expRebalancedVoters: []roachpb.StoreID{8, 5, 3},
@@ -1014,10 +1146,10 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			voterConstraints: allReplicasInHotRegion,
 			constraints:      oneReplicaPerRegion,
 
-			expRebalancedVoters: []roachpb.StoreID{3, 2, 1},
+			expRebalancedVoters: []roachpb.StoreID{2, 3, 1},
 			// NB: Expect the non-voter on node 4 (hottest node in region B) to
 			// move to node 5 (least hot region in region B), the least hot
-			// node without high read amp.
+			// node without a high IO overload score.
 			expRebalancedNonVoters: []roachpb.StoreID{5, 9},
 		},
 		{
@@ -1028,8 +1160,10 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			voterConstraints: twoReplicasInSecondHottestRegion,
 			constraints:      oneReplicaPerRegion,
 			// NB: Expect the voter on node 4 (hottest node in region B) to move to
-			// node 6 (least hot region in region B).
-			expRebalancedVoters: []roachpb.StoreID{9, 5, 6, 8, 3},
+			// node 6 (least hot region in region B). Expect the lease to move to the
+			// lowest QPS node among nodes that pass the IO overload transfer check
+			// (n8).
+			expRebalancedVoters: []roachpb.StoreID{8, 5, 6, 9, 3},
 		},
 		{
 			name:   "primary region with second highest QPS, region survival, one voter on sub-optimal node, prefer lease hottest region",
@@ -1053,9 +1187,10 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			constraints:      oneReplicaPerRegion,
 			leasePreferences: leasePreferredSecondHotRegion,
 			// NB: Expect the voter on node 4 (hottest node in region B) to move to
-			// node 6 (least hot region in region B). Expect lease to transfer
-			// to least hot store, in the second hottest region (node 6).
-			expRebalancedVoters: []roachpb.StoreID{6, 5, 3, 8, 9},
+			// node 6 (least hot region in region B). Expect lease to transfer to
+			// least hot store, in the second hottest region that passes the lease IO
+			// overload check (node 5).
+			expRebalancedVoters: []roachpb.StoreID{5, 6, 3, 8, 9},
 		},
 		{
 			name:   "primary region with highest QPS, region survival, two voters on sub-optimal nodes",
@@ -1064,14 +1199,14 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			// constraints require at least one replica per each region.
 			voterConstraints: twoReplicasInHotRegion,
 			constraints:      oneReplicaPerRegion,
-			// NB: We've got 3 voters in the hottest region, but we only need
-			// 2. We expect that one of the voters from the hottest region
-			// will be moved to the least hot region. Additionally, in
-			// region B, we've got one replica on store 4 (which is the
-			// hottest store in that region). We expect that replica to be
-			// moved to store 5, which is the least hot node without high
-			// read amp.
-			expRebalancedVoters: []roachpb.StoreID{9, 2, 5, 8, 3},
+			// NB: We've got 3 voters in the hottest region, but we only need 2. We
+			// expect that one of the voters from the hottest region will be moved to
+			// the least hot region. Additionally, in region B, we've got one replica
+			// on store 4 (which is the hottest store in that region). We expect that
+			// replica to be moved to store 5, which is the least hot node without a
+			// high IO overload score. Expect the lease to move to s8 as it passes
+			// the IO overload transfer check.
+			expRebalancedVoters: []roachpb.StoreID{8, 2, 5, 9, 3},
 		},
 		{
 			name:        "one voter on sub-optimal node in the coldest region",
@@ -1095,14 +1230,14 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			expRebalancedVoters: []roachpb.StoreID{8, 5, 6},
 		},
 	}
+
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tc.name, withQPSCPU(t, objectiveProvider, func(t *testing.T) {
 			// Boilerplate for test setup.
 			testingKnobs := allocator.TestingKnobs{RaftStatusFn: TestingRaftStatusFn}
-			stopper, g, _, a, _ := allocatorimpl.CreateTestAllocatorWithKnobs(ctx, 10, false /* deterministic */, &testingKnobs)
+			stopper, g, sp, a, _ := allocatorimpl.CreateTestAllocatorWithKnobs(ctx, 10, false /* deterministic */, &testingKnobs)
 			defer stopper.Stop(context.Background())
 			gossiputil.NewStoreGossiper(g).GossipStores(multiRegionStores, t)
-			storeList, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
 
 			var localDesc roachpb.StoreDescriptor
 			for _, store := range multiRegionStores {
@@ -1111,17 +1246,18 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 				}
 			}
 			cfg := TestStoreConfig(nil)
+			cfg.StorePool = sp
 			s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 			s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
 			rq := newReplicateQueue(s, a)
-			rr := newReplicaRankings()
+			rr := NewReplicaRankings()
 
-			sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr)
+			sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr, objectiveProvider)
 
 			// Rather than trying to populate every Replica with a real raft group in
 			// order to pass replicaIsBehind checks, fake out the function for getting
 			// raft status with one that always returns all replicas as up to date.
-			sr.getRaftStatusFn = func(r *Replica) *raft.Status {
+			sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
 				return TestingRaftStatusFn(r)
 			}
 			s.cfg.DefaultSpanConfig.NumVoters = int32(len(tc.voters))
@@ -1130,28 +1266,32 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			s.cfg.DefaultSpanConfig.VoterConstraints = tc.voterConstraints
 			s.cfg.DefaultSpanConfig.LeasePreferences = tc.leasePreferences
 			const testingQPS = float64(60)
+			const testingReqCPU = 60 * float64(time.Millisecond)
+
+			lbRebalanceDimension := sr.RebalanceObjective().ToDimension()
 			loadRanges(
 				rr, s, []testRange{
-					{voters: tc.voters, nonVoters: tc.nonVoters, qps: testingQPS},
+					{voters: tc.voters, nonVoters: tc.nonVoters, qps: testingQPS, reqCPU: testingReqCPU},
 				},
 			)
-			hottestRanges := rr.topQPS()
+
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
+			options := sr.scorerOptions(ctx, lbRebalanceDimension)
+			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, LBRebalancingLeasesAndReplicas)
+			rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
+				ReplicaEnforcementLevel: allocatorimpl.IOOverloadThresholdBlockTransfers,
+			}
+			rctx.options.LoadThreshold = allocatorimpl.WithAllDims(0.05)
+
 			_, voterTargets, nonVoterTargets := sr.chooseRangeToRebalance(
 				ctx,
-				&hottestRanges,
-				&localDesc,
-				storeList,
-				&allocatorimpl.QPSScorerOptions{
-					StoreHealthOptions:    allocatorimpl.StoreHealthOptions{EnforcementLevel: allocatorimpl.StoreHealthBlockRebalanceTo},
-					Deterministic:         true,
-					QPSRebalanceThreshold: 0.05,
-				},
+				rctx,
 			)
 
 			require.Len(t, voterTargets, len(tc.expRebalancedVoters))
 			if len(voterTargets) > 0 && voterTargets[0].StoreID != tc.expRebalancedVoters[0] {
-				t.Errorf("chooseRangeToRebalance(existing=%v, qps=%f) chose s%d as leaseholder; want s%v",
-					tc.voters, testingQPS, voterTargets[0], tc.expRebalancedVoters[0])
+				t.Errorf("chooseRangeToRebalance(existing=%v, qps=%f, cpu=%f) chose s%d as leaseholder; want s%v",
+					tc.voters, testingQPS, testingReqCPU, voterTargets[0], tc.expRebalancedVoters[0])
 			}
 
 			voterStoreIDs := make([]roachpb.StoreID, len(voterTargets))
@@ -1171,7 +1311,7 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 				nonVoterStoreIDs[i] = target.StoreID
 			}
 			require.ElementsMatch(t, nonVoterStoreIDs, tc.expRebalancedNonVoters)
-		})
+		}))
 	}
 }
 
@@ -1188,45 +1328,56 @@ func TestChooseRangeToRebalanceIgnoresRangeOnBestStores(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	stopper, g, _, a, _ := allocatorimpl.CreateTestAllocatorWithKnobs(
+	stopper, g, sp, a, _ := allocatorimpl.CreateTestAllocatorWithKnobs(
 		ctx,
 		10,
 		false, /* deterministic */
 		&allocator.TestingKnobs{AllowLeaseTransfersToReplicasNeedingSnapshots: true},
 	)
 	defer stopper.Stop(context.Background())
-	storeList, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
 
-	localDesc := *noLocalityStores[len(noLocalityStores)-1]
-	cfg := TestStoreConfig(nil)
-	cfg.Gossip = g
-	cfg.StorePool = a.StorePool
-	cfg.DefaultSpanConfig.NumVoters = 1
-	cfg.DefaultSpanConfig.NumReplicas = 1
-	s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
-	gossiputil.NewStoreGossiper(cfg.Gossip).GossipStores(noLocalityStores, t)
-	s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
-	rq := newReplicateQueue(s, a)
-	rr := newReplicaRankings()
+	objectiveProvider := &testRebalanceObjectiveProvider{}
+	withQPSCPU(t, objectiveProvider, func(t *testing.T) {
+		localDesc := *noLocalityStores[len(noLocalityStores)-1]
+		cfg := TestStoreConfig(nil)
+		cfg.Gossip = g
+		cfg.StorePool = sp
+		cfg.DefaultSpanConfig.NumVoters = 1
+		cfg.DefaultSpanConfig.NumReplicas = 1
+		s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
+		gossiputil.NewStoreGossiper(cfg.Gossip).GossipStores(noLocalityStores, t)
+		s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
+		rq := newReplicateQueue(s, a)
+		rr := NewReplicaRankings()
 
-	sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr)
+		sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr, objectiveProvider)
+		lbRebalanceDimension := sr.RebalanceObjective().ToDimension()
 
-	// Load a fake hot range that's already on the best stores. We want to ensure
-	// that the store rebalancer doesn't attempt to rebalance ranges that it
-	// cannot find better rebalance opportunities for.
-	loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{localDesc.StoreID}, qps: 100}})
-	hottestRanges := rr.topQPS()
-	sr.chooseRangeToRebalance(
-		ctx, &hottestRanges, &localDesc, storeList, &allocatorimpl.QPSScorerOptions{
-			StoreHealthOptions:    allocatorimpl.StoreHealthOptions{EnforcementLevel: allocatorimpl.StoreHealthNoAction},
-			QPSRebalanceThreshold: 0.05,
-		},
-	)
-	trace := finishAndGetRecording()
-	require.Regexpf(
-		t, "could not find.*opportunities for r1",
-		trace, "expected the store rebalancer to explicitly ignore r1; but found %s", trace,
-	)
+		// Load a fake hot range that's already on the best stores. We want to ensure
+		// that the store rebalancer doesn't attempt to rebalance ranges that it
+		// cannot find better rebalance opportunities for.
+		loadRanges(rr, s,
+			[]testRange{
+				{voters: []roachpb.StoreID{localDesc.StoreID},
+					qps:    100,
+					reqCPU: 100 * float64(time.Millisecond)},
+			},
+		)
+
+		hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
+		options := sr.scorerOptions(ctx, lbRebalanceDimension)
+		rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
+		rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
+			ReplicaEnforcementLevel: allocatorimpl.IOOverloadThresholdIgnore}
+		rctx.options.LoadThreshold = allocatorimpl.WithAllDims(0.05)
+
+		sr.chooseRangeToRebalance(ctx, rctx)
+		trace := finishAndGetRecording()
+		require.Regexpf(
+			t, "could not find.*opportunities for r1",
+			trace, "expected the store rebalancer to explicitly ignore r1; but found %s", trace,
+		)
+	})
 }
 
 func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
@@ -1234,6 +1385,7 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
+	objectiveProvider := &testRebalanceObjectiveProvider{}
 	imbalancedStores := []*roachpb.StoreDescriptor{
 		{
 			StoreID: 1,
@@ -1242,6 +1394,7 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 12000,
+				CPUPerSecond:     12000 * float64(time.Millisecond),
 			},
 		},
 		{
@@ -1251,6 +1404,7 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 10000,
+				CPUPerSecond:     10000 * float64(time.Millisecond),
 			},
 		},
 		{
@@ -1260,6 +1414,7 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 8000,
+				CPUPerSecond:     8000 * float64(time.Millisecond),
 			},
 		},
 		{
@@ -1269,6 +1424,7 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 200,
+				CPUPerSecond:     200 * float64(time.Millisecond),
 			},
 		},
 		{
@@ -1278,18 +1434,20 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			},
 			Capacity: roachpb.StoreCapacity{
 				QueriesPerSecond: 100,
+				CPUPerSecond:     100 * float64(time.Millisecond),
 			},
 		},
 	}
 	for _, tc := range []struct {
-		voters, expRebalancedVoters []roachpb.StoreID
-		QPS, rebalanceThreshold     float64
-		shouldRebalance             bool
+		voters, expRebalancedVoters     []roachpb.StoreID
+		QPS, reqCPU, rebalanceThreshold float64
+		shouldRebalance                 bool
 	}{
 		{
 			voters:              []roachpb.StoreID{1, 2, 3},
 			expRebalancedVoters: []roachpb.StoreID{3, 4, 5},
 			QPS:                 5000,
+			reqCPU:              5000 * float64(time.Millisecond),
 			rebalanceThreshold:  0.25,
 			shouldRebalance:     true,
 		},
@@ -1297,6 +1455,7 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			voters:              []roachpb.StoreID{1, 2, 3},
 			expRebalancedVoters: []roachpb.StoreID{5, 2, 3},
 			QPS:                 5000,
+			reqCPU:              5000 * float64(time.Millisecond),
 			rebalanceThreshold:  0.8,
 			shouldRebalance:     true,
 		},
@@ -1304,12 +1463,14 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			voters:              []roachpb.StoreID{1, 2, 3},
 			expRebalancedVoters: []roachpb.StoreID{3, 4, 5},
 			QPS:                 1000,
+			reqCPU:              1000 * float64(time.Millisecond),
 			rebalanceThreshold:  0.05,
 			shouldRebalance:     true,
 		},
 		{
 			voters: []roachpb.StoreID{1, 2, 3},
 			QPS:    5000,
+			reqCPU: 5000 * float64(time.Millisecond),
 			// NB: This will lead to an overfull threshold of just above 12000. Thus,
 			// no store should be considered overfull and we should not rebalance at
 			// all.
@@ -1319,6 +1480,7 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 		{
 			voters:             []roachpb.StoreID{4},
 			QPS:                100,
+			reqCPU:             100 * float64(time.Millisecond),
 			rebalanceThreshold: 0.01,
 			// NB: We don't expect a rebalance here because the difference between s4
 			// and s5 is not high enough to justify a rebalance.
@@ -1328,16 +1490,16 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			voters:              []roachpb.StoreID{1, 2, 3},
 			expRebalancedVoters: []roachpb.StoreID{5, 2, 3},
 			QPS:                 10000,
+			reqCPU:              10000 * float64(time.Millisecond),
 			rebalanceThreshold:  0.01,
 			// NB: s5 will be hotter than s1 after this move.
 			shouldRebalance: true,
 		},
 	} {
-		t.Run("", func(t *testing.T) {
-			stopper, g, _, a, _ := allocatorimpl.CreateTestAllocator(ctx, 10, false /* deterministic */)
+		t.Run("", withQPSCPU(t, objectiveProvider, func(t *testing.T) {
+			stopper, g, sp, a, _ := allocatorimpl.CreateTestAllocator(ctx, 10, false /* deterministic */)
 			defer stopper.Stop(context.Background())
 			gossiputil.NewStoreGossiper(g).GossipStores(imbalancedStores, t)
-			storeList, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
 
 			var localDesc roachpb.StoreDescriptor
 			for _, store := range imbalancedStores {
@@ -1346,36 +1508,37 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 				}
 			}
 			cfg := TestStoreConfig(nil)
+			cfg.StorePool = sp
 			s := createTestStoreWithoutStart(
 				ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg,
 			)
 			s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
 			rq := newReplicateQueue(s, a)
-			rr := newReplicaRankings()
+			rr := NewReplicaRankings()
 
-			sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr)
+			sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr, objectiveProvider)
+			lbRebalanceDimension := sr.RebalanceObjective().ToDimension()
 
 			// Rather than trying to populate every Replica with a real raft group in
 			// order to pass replicaIsBehind checks, fake out the function for getting
 			// raft status with one that always returns all replicas as up to date.
-			sr.getRaftStatusFn = func(r *Replica) *raft.Status {
+			sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
 				return TestingRaftStatusFn(r)
 			}
 
 			s.cfg.DefaultSpanConfig.NumReplicas = int32(len(tc.voters))
-			loadRanges(rr, s, []testRange{{voters: tc.voters, qps: tc.QPS}})
-			hottestRanges := rr.topQPS()
-			_, voterTargets, _ := sr.chooseRangeToRebalance(
-				ctx,
-				&hottestRanges,
-				&localDesc,
-				storeList,
-				&allocatorimpl.QPSScorerOptions{
-					StoreHealthOptions:    allocatorimpl.StoreHealthOptions{EnforcementLevel: allocatorimpl.StoreHealthNoAction},
-					Deterministic:         true,
-					QPSRebalanceThreshold: tc.rebalanceThreshold,
-				},
+			loadRanges(rr, s,
+				[]testRange{{voters: tc.voters, qps: tc.QPS, reqCPU: tc.reqCPU}},
 			)
+
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
+			options := sr.scorerOptions(ctx, lbRebalanceDimension)
+			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
+			rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
+				ReplicaEnforcementLevel: allocatorimpl.IOOverloadThresholdIgnore}
+			rctx.options.LoadThreshold = allocatorimpl.WithAllDims(tc.rebalanceThreshold)
+
+			_, voterTargets, _ := sr.chooseRangeToRebalance(ctx, rctx)
 			require.Len(t, voterTargets, len(tc.expRebalancedVoters))
 
 			voterStoreIDs := make([]roachpb.StoreID, len(voterTargets))
@@ -1386,7 +1549,7 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			if tc.shouldRebalance {
 				require.ElementsMatch(t, voterStoreIDs, tc.expRebalancedVoters)
 			}
-		})
+		}))
 	}
 }
 
@@ -1394,50 +1557,25 @@ func TestNoLeaseTransferToBehindReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Lots of setup boilerplate.
-
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-
-	stopper, g, _, a, _ := allocatorimpl.CreateTestAllocatorWithKnobs(ctx,
-		10,
-		false, /* deterministic */
-		&allocator.TestingKnobs{AllowLeaseTransfersToReplicasNeedingSnapshots: true},
-	)
-	defer stopper.Stop(context.Background())
-	storeList, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
-	storeMap := storeList.ToMap()
-
-	localDesc := *noLocalityStores[0]
-	cfg := TestStoreConfig(nil)
-	cfg.Gossip = g
-	cfg.StorePool = a.StorePool
-	s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
-	gossiputil.NewStoreGossiper(cfg.Gossip).GossipStores(noLocalityStores, t)
-	s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
-	rq := newReplicateQueue(s, a)
-	rr := newReplicaRankings()
-
-	sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr)
-
-	// Load in a range with replicas on an overfull node, a slightly underfull
-	// node, and a very underfull node.
-	loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 4, 5}, qps: 100}})
-	hottestRanges := rr.topQPS()
-	repl := hottestRanges[0].repl
-
 	// Set up a fake RaftStatus that indicates s5 is behind (but all other stores
 	// are caught up). We thus shouldn't transfer a lease to s5.
-	sr.getRaftStatusFn = func(r *Replica) *raft.Status {
+	behindTestingRaftStatusFn := func(
+		r interface {
+			Desc() *roachpb.RangeDescriptor
+			StoreID() roachpb.StoreID
+		},
+	) *raft.Status {
 		status := &raft.Status{
 			Progress: make(map[uint64]tracker.Progress),
 		}
-		status.Lead = uint64(r.ReplicaID())
+		replDesc, ok := r.Desc().GetReplicaDescriptor(r.StoreID())
+		require.True(t, ok, "Could not find replica descriptor for replica on store with id %d", r.StoreID())
+
+		status.Lead = uint64(replDesc.ReplicaID)
 		status.RaftState = raft.StateLeader
-		status.Commit = 1
+		status.Commit = 2
 		for _, replica := range r.Desc().InternalReplicas {
-			match := uint64(1)
+			match := uint64(2)
 			if replica.StoreID == roachpb.StoreID(5) {
 				match = 0
 			}
@@ -1449,208 +1587,231 @@ func TestNoLeaseTransferToBehindReplicas(t *testing.T) {
 		return status
 	}
 
-	_, target, _ := sr.chooseLeaseToTransfer(
-		ctx,
-		&hottestRanges,
-		&localDesc,
-		storeList,
-		storeMap,
-		nil, /* qpsScorerOptions */
-	)
-	expectTarget := roachpb.StoreID(4)
-	if target.StoreID != expectTarget {
-		t.Errorf("got target store s%d for range with RaftStatus %v; want s%d",
-			target.StoreID, sr.getRaftStatusFn(repl), expectTarget)
-	}
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
 
-	// Then do the same, but for replica rebalancing. Make s5 an existing replica
-	// that's behind, and see how a new replica is preferred as the leaseholder
-	// over it.
-	loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 3, 5}, qps: 100}})
-	hottestRanges = rr.topQPS()
-	repl = hottestRanges[0].repl
-
-	_, targets, _ := sr.chooseRangeToRebalance(
-		ctx,
-		&hottestRanges,
-		&localDesc,
-		storeList,
-		&allocatorimpl.QPSScorerOptions{
-			StoreHealthOptions:    allocatorimpl.StoreHealthOptions{EnforcementLevel: allocatorimpl.StoreHealthNoAction},
-			Deterministic:         true,
-			QPSRebalanceThreshold: 0.05,
+	stopper, g, sp, a, _ := allocatorimpl.CreateTestAllocatorWithKnobs(ctx,
+		10,
+		false, /* deterministic */
+		&allocator.TestingKnobs{
+			AllowLeaseTransfersToReplicasNeedingSnapshots: false,
+			RaftStatusFn: behindTestingRaftStatusFn,
 		},
 	)
-	expectTargets := []roachpb.ReplicationTarget{
-		{NodeID: 4, StoreID: 4}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
-	}
-	if !reflect.DeepEqual(targets, expectTargets) {
-		t.Errorf("got targets %v for range with RaftStatus %v; want %v",
-			targets, sr.getRaftStatusFn(repl), expectTargets)
-	}
+	defer stopper.Stop(context.Background())
+
+	objectiveProvider := &testRebalanceObjectiveProvider{}
+	withQPSCPU(t, objectiveProvider, func(t *testing.T) {
+		localDesc := *noLocalityStores[0]
+		cfg := TestStoreConfig(nil)
+		cfg.Gossip = g
+		cfg.StorePool = sp
+		s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
+		gossiputil.NewStoreGossiper(cfg.Gossip).GossipStores(noLocalityStores, t)
+		s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
+		rq := newReplicateQueue(s, a)
+		rr := NewReplicaRankings()
+
+		sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr, objectiveProvider)
+		sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
+			return behindTestingRaftStatusFn(r)
+		}
+		lbRebalanceDimension := sr.RebalanceObjective().ToDimension()
+
+		// Load in a range with replicas on an overfull node, a slightly underfull
+		// node, and a very underfull node.
+		loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 4, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}})
+
+		hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
+		options := sr.scorerOptions(ctx, lbRebalanceDimension)
+		rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
+		repl := rctx.hottestRanges[0]
+
+		_, target, _ := sr.chooseLeaseToTransfer(ctx, rctx)
+		expectTarget := roachpb.StoreID(4)
+		if target.StoreID != expectTarget {
+			t.Errorf("got target store s%d for range with RaftStatus %v; want s%d",
+				target.StoreID, sr.getRaftStatusFn(repl), expectTarget)
+		}
+
+		// Then do the same, but for replica rebalancing. Make s5 an existing replica
+		// that's behind, and see how a new replica is preferred as the leaseholder
+		// over it.
+		loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 3, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}})
+
+		hottestRanges = sr.replicaRankings.TopLoad(lbRebalanceDimension)
+		options = sr.scorerOptions(ctx, lbRebalanceDimension)
+		rctx = sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
+		rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
+			ReplicaEnforcementLevel: allocatorimpl.IOOverloadThresholdIgnore}
+		rctx.options.LoadThreshold = allocatorimpl.WithAllDims(0.05)
+		rctx.options.Deterministic = true
+
+		repl = rctx.hottestRanges[0]
+
+		_, targets, _ := sr.chooseRangeToRebalance(ctx, rctx)
+		expectTargets := []roachpb.ReplicationTarget{
+			{NodeID: 4, StoreID: 4}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
+		}
+		if !reflect.DeepEqual(targets, expectTargets) {
+			t.Errorf("got targets %v for range with RaftStatus %v; want %v",
+				targets, sr.getRaftStatusFn(repl), expectTargets)
+		}
+	})
 }
 
-// TestStoreRebalancerReadAmpCheck checks that:
+// TestStoreRebalancerIOOverloadCheck checks that:
 //   - Under (1) disabled and (2) log that rebalancing decisions are unaffected
-//     by high read amplification.
-//   - Under (3) rebalanceOnly and (4) allocate that rebalance decisions exclude
-//     stores with high readamplification as candidate targets.
-func TestStoreRebalancerReadAmpCheck(t *testing.T) {
+//     by a high IO overload score.
+//   - Under (3) block rebalance to and (4) block all that rebalance decisions exclude
+//     stores with a high IO overload score as targets.
+func TestStoreRebalancerIOOverloadCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
+	objectiveProvider := &testRebalanceObjectiveProvider{}
 	type testCase struct {
 		name            string
 		stores          []*roachpb.StoreDescriptor
 		conf            roachpb.SpanConfig
 		expectedTargets []roachpb.ReplicationTarget
-		enforcement     allocatorimpl.StoreHealthEnforcement
+		enforcement     allocatorimpl.IOOverloadEnforcementLevel
 	}
 	tests := []testCase{
 		{
-			name: "ignore read amp on allocation when storeHealthNoAction enforcement",
-			// NB: All stores have high read amp, this should be ignored.
+			name: "ignore io overload on allocation when no action enforcement",
+			// NB: All stores have a high IO overload score, this should be ignored.
 			stores: noLocalityHighReadAmpStores,
 			conf:   roachpb.SpanConfig{},
 			expectedTargets: []roachpb.ReplicationTarget{
 				{NodeID: 4, StoreID: 4}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
 			},
-			enforcement: allocatorimpl.StoreHealthNoAction,
+			enforcement: allocatorimpl.IOOverloadThresholdIgnore,
 		},
 		{
-			name: "ignore read amp on allocation when storeHealthLogOnly enforcement",
-			// NB: All stores have high read amp, this should be ignored.
+			name: "don't stop rebalancing when the io overload score uniformly above threshold and block rebalance to enforcement",
+			// NB: All stores have a high uniformly high IO overload score (threshold+1) this should be ignored.
 			stores: noLocalityHighReadAmpStores,
 			conf:   roachpb.SpanConfig{},
 			expectedTargets: []roachpb.ReplicationTarget{
 				{NodeID: 4, StoreID: 4}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
 			},
-			enforcement: allocatorimpl.StoreHealthLogOnly,
+			enforcement: allocatorimpl.IOOverloadThresholdBlockTransfers,
 		},
 		{
-			name: "don't stop rebalancing when read amp uniformly above threshold and storeHealthBlockRebalanceTo enforcement",
-			// NB: All stores have high uniformly high read  (threshold+1) this should be ignored.
+			name: "don't stop rebalancing when the io overload score is uniformly above threshold and block rebalance to enforcement",
+			// NB: All stores have a high uniformly high IO overload score (threshold+1) this should be ignored.
 			stores: noLocalityHighReadAmpStores,
 			conf:   roachpb.SpanConfig{},
 			expectedTargets: []roachpb.ReplicationTarget{
 				{NodeID: 4, StoreID: 4}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
 			},
-			enforcement: allocatorimpl.StoreHealthBlockRebalanceTo,
+			enforcement: allocatorimpl.IOOverloadThresholdBlockAll,
 		},
 		{
-			name: "don't stop rebalancing when read amp uniformly above threshold and storeHealthBlockRebalanceTo enforcement",
-			// NB: All stores have high uniformly high read  (threshold+1) this should be ignored.
-			stores: noLocalityHighReadAmpStores,
-			conf:   roachpb.SpanConfig{},
-			expectedTargets: []roachpb.ReplicationTarget{
-				{NodeID: 4, StoreID: 4}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
-			},
-			enforcement: allocatorimpl.StoreHealthBlockAll,
-		},
-		{
-			name: "rebalance should ignore stores with high read amp that are also above the mean when storeHealthBlockAll enforcement",
-			// NB: All stores have high read amp, however store 2 is below the mean read amp so is a viable candidate.
+			name: "rebalance should ignore stores with a high io overload score that are also above the mean when storeHealthBlockAll enforcement",
+			// NB: All stores have a high IO overload score, however store 2 is below
+			// the mean IO overload score so is a viable candidate.
 			stores: noLocalityHighReadAmpSkewedStores,
 			conf:   roachpb.SpanConfig{},
 			expectedTargets: []roachpb.ReplicationTarget{
 				{NodeID: 2, StoreID: 2}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
 			},
-			enforcement: allocatorimpl.StoreHealthBlockAll,
+			enforcement: allocatorimpl.IOOverloadThresholdBlockAll,
 		},
 		{
-			name: "rebalance should ignore stores with high read amp that are also above the mean when storeHealthBlockRebalanceTo enforcement",
-			// NB: All stores have high read amp, however store 2 is below the mean read amp so is a viable candidate.
+			name: "rebalance should ignore stores with high IO overload scores that are also above the mean when block rebalance to enforcement",
+			// NB: All stores have a high IO overload score, however store 2 is below
+			// the mean IO overload so is a viable candidate.
 			stores: noLocalityHighReadAmpSkewedStores,
 			conf:   roachpb.SpanConfig{},
 			expectedTargets: []roachpb.ReplicationTarget{
 				{NodeID: 2, StoreID: 2}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
 			},
-			enforcement: allocatorimpl.StoreHealthBlockRebalanceTo,
+			enforcement: allocatorimpl.IOOverloadThresholdBlockTransfers,
 		},
 		{
-			name: "rebalance should ignore stores with high read amp when storeHealthBlockRebalanceTo enforcement",
-			// NB: Store 4, 5 have high read amp, they should not be rebalance
-			// targets. Only 1,2,3 are valid targets, yet only 2 is not already
-			// a voter. 1 should transfer it's lease to 2. 5 could also have
-			// transferred its lease to 2, However, high read amp does not
-			// affect removing replicas from stores, only in blocking new
-			// replicas.
+			name: "rebalance should ignore stores with high IO overload when block rebalance to enforcement",
+			// NB: Store 4, 5 have a high IO overload score, they should not be
+			// rebalance targets. Only 1,2,3 are valid targets, yet only 2 is not
+			// already a voter. 1 should transfer it's lease to 2. 5 could also have
+			// transferred its lease to 2, However, high a IO overload score does not
+			// affect removing replicas from stores, only in blocking new replicas.
 			stores: noLocalityAscendingReadAmpStores,
 			conf:   roachpb.SpanConfig{},
 			expectedTargets: []roachpb.ReplicationTarget{
 				{NodeID: 2, StoreID: 2}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
 			},
-			enforcement: allocatorimpl.StoreHealthBlockRebalanceTo,
+			enforcement: allocatorimpl.IOOverloadThresholdBlockTransfers,
 		},
 		{
-			name: "rebalance should ignore stores with high read amp when storeHealthBlockAll enforcement",
-			// NB: This scenario and result should be identical to storeHealthBlockRebalanceTo.
+			name: "rebalance should ignore stores with high IO overload scores when block all enforcement level",
+			// NB: This scenario and result should be identical to block rebalance to enforcement level.
 			stores: noLocalityAscendingReadAmpStores,
 			conf:   roachpb.SpanConfig{},
 			expectedTargets: []roachpb.ReplicationTarget{
 				{NodeID: 2, StoreID: 2}, {NodeID: 3, StoreID: 3}, {NodeID: 5, StoreID: 5},
 			},
-			enforcement: allocatorimpl.StoreHealthBlockAll,
+			enforcement: allocatorimpl.IOOverloadThresholdBlockAll,
 		},
 		{
-			name: "rebalance should not rebalance away from stores with high read amp when storeHealthBlockAll enforcement",
-			// NB: Node 1,3,5 all have extremely high read amp. However, since
-			// read amp does not trigger rebalancing away, only blocking
+			name: "rebalance should not rebalance away from stores with high IO overload scores when block all enforcement level",
+			// NB: Node 1,3,5 all have an extremely high IO overload score. However,
+			// since IO overload does not trigger rebalancing away, only blocking
 			// rebalancing to this should be ignored and no action taken.
 			stores:          noLocalityUniformQPSHighReadAmp,
 			conf:            roachpb.SpanConfig{},
 			expectedTargets: nil,
-			enforcement:     allocatorimpl.StoreHealthBlockAll,
+			enforcement:     allocatorimpl.IOOverloadThresholdBlockAll,
 		},
 		{
-			name: "rebalance should not rebalance away from stores with high read amp when storeHealthBlockRebalanceTo enforcement",
-			// NB: Node 1,3,5 all have extremely high read amp. However, since
-			// read amp does not trigger rebalancing away, only blocking
+			name: "rebalance should not rebalance away from stores with high IO overload scores when block rebalance to enforcement level",
+			// NB: Node 1,3,5 all have an extremely high IO overload score. However,
+			// since IO overload does not trigger rebalancing away, only blocking
 			// rebalancing to this should be ignored and no action taken.
 			stores:          noLocalityUniformQPSHighReadAmp,
 			conf:            roachpb.SpanConfig{},
 			expectedTargets: nil,
-			enforcement:     allocatorimpl.StoreHealthBlockRebalanceTo,
+			enforcement:     allocatorimpl.IOOverloadThresholdBlockTransfers,
 		},
 	}
 
 	for i, test := range tests {
-		t.Run(fmt.Sprintf("%d_%s", i+1, test.name), func(t *testing.T) {
-			stopper, g, _, a, _ := allocatorimpl.CreateTestAllocator(ctx, 10, false /* deterministic */)
+		t.Run(fmt.Sprintf("%d_%s", i+1, test.name), withQPSCPU(t, objectiveProvider, func(t *testing.T) {
+			stopper, g, sp, a, _ := allocatorimpl.CreateTestAllocator(ctx, 10, false /* deterministic */)
 			defer stopper.Stop(ctx)
-			storeList, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
 
 			localDesc := *noLocalityStores[0]
 			cfg := TestStoreConfig(nil)
 			cfg.Gossip = g
-			cfg.StorePool = a.StorePool
+			cfg.StorePool = sp
 			s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 			gossiputil.NewStoreGossiper(cfg.Gossip).GossipStores(test.stores, t)
 			s.Ident = &roachpb.StoreIdent{StoreID: localDesc.StoreID}
 			rq := newReplicateQueue(s, a)
-			rr := newReplicaRankings()
+			rr := NewReplicaRankings()
 
-			sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr)
+			sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr, objectiveProvider)
+			lbRebalanceDimension := sr.RebalanceObjective().ToDimension()
 
 			// Load in a range with replicas on an overfull node, a slightly underfull
 			// node, and a very underfull node.
-			loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 3, 5}, qps: 100}})
-			hottestRanges := rr.topQPS()
+			loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 3, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}})
 
-			_, targetVoters, _ := sr.chooseRangeToRebalance(
-				ctx,
-				&hottestRanges,
-				&localDesc,
-				storeList,
-				&allocatorimpl.QPSScorerOptions{
-					StoreHealthOptions:    allocatorimpl.StoreHealthOptions{EnforcementLevel: test.enforcement, L0SublevelThreshold: allocatorimpl.MaxL0SublevelThreshold},
-					Deterministic:         true,
-					QPSRebalanceThreshold: 0.05,
-				},
-			)
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
+			options := sr.scorerOptions(ctx, lbRebalanceDimension)
+			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
+			require.Greater(t, len(rctx.hottestRanges), 0)
+
+			rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
+				ReplicaEnforcementLevel: test.enforcement, ReplicaIOOverloadThreshold: allocatorimpl.DefaultReplicaIOOverloadThreshold}
+			rctx.options.LoadThreshold = allocatorimpl.WithAllDims(0.05)
+
+			_, targetVoters, _ := sr.chooseRangeToRebalance(ctx, rctx)
 			require.Equal(t, test.expectedTargets, targetVoters)
-		})
+		}))
 	}
 }
 
@@ -1673,10 +1834,10 @@ func TestingRaftStatusFn(
 
 	status.Lead = uint64(replDesc.ReplicaID)
 	status.RaftState = raft.StateLeader
-	status.Commit = 1
+	status.Commit = 2
 	for _, replica := range r.Desc().InternalReplicas {
 		status.Progress[uint64(replica.ReplicaID)] = tracker.Progress{
-			Match: 1,
+			Match: 2,
 			State: tracker.StateReplicate,
 		}
 	}

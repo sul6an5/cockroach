@@ -15,7 +15,7 @@ proc start_secure_server {argv certs_dir extra} {
 
 start_secure_server $argv $certs_dir ""
 
-spawn $argv sql --certs-dir=$certs_dir
+spawn $argv sql --certs-dir=$certs_dir --no-line-editor
 eexpect root@
 
 start_test "Test initialization"
@@ -110,17 +110,31 @@ eexpect foo@
 eexpect "/system>"
 end_test
 
+start_test "Check that the client-side connect cmd can change users with automatic client cert detection"
+send "\\c - root - - autocerts\r"
+eexpect "using new connection URL"
+eexpect root@
+eexpect "/system>"
+end_test
+
+start_test "Check that the auto-cert feature properly fails if certs were not found"
+send "\\c - unknownuser - - autocerts\r"
+eexpect "unable to find TLS client cert and key"
+eexpect root@
+eexpect "/system>"
+end_test
+
 start_test "Check that the client-side connect cmd can detect syntax errors"
 send "\\c - - - - abc\r"
 eexpect "unknown syntax"
-eexpect foo@
+eexpect root@
 eexpect "/system>"
 end_test
 
 start_test "Check that the client-side connect cmd recognizes invalid URLs"
 send "\\c postgres://root@localhost:26257/defaultdb?sslmode=invalid&sslcert=$certs_dir%2Fclient.root.crt&sslkey=$certs_dir%2Fclient.root.key&sslrootcert=$certs_dir%2Fca.crt\r"
 eexpect "unrecognized sslmode parameter"
-eexpect foo@
+eexpect root@
 eexpect "/system>"
 end_test
 
@@ -147,7 +161,7 @@ set ::env(HOME) "."
 system "mkdir -p ./.cockroach-certs"
 system "cp $certs_dir/* ./.cockroach-certs/"
 
-spawn $argv sql
+spawn $argv sql --no-line-editor
 eexpect root@
 eexpect "/defaultdb>"
 send "\\c\r"
@@ -163,7 +177,7 @@ eexpect eof
 
 start_test "Check that extra URL params are preserved when changing database"
 
-spawn $argv sql --certs-dir=$certs_dir --url=postgres://root@localhost:26257/defaultdb?options=--search_path%3Dcustom_path&statement_timeout=1234
+spawn $argv sql --no-line-editor --certs-dir=$certs_dir --url=postgres://root@localhost:26257/defaultdb?options=--search_path%3Dcustom_path&statement_timeout=1234
 eexpect root@
 eexpect "/defaultdb>"
 send "SHOW search_path;\r"
@@ -188,7 +202,7 @@ eexpect eof
 
 start_test "Check that the client-side connect cmd prints the current conn details with password redacted"
 
-spawn $argv sql --certs-dir=$certs_dir --url=postgres://foo:abc@localhost:26257/defaultdb
+spawn $argv sql --no-line-editor --certs-dir=$certs_dir --url=postgres://foo:abc@localhost:26257/defaultdb
 eexpect foo@
 send "\\c\r"
 eexpect "Connection string: postgresql://foo:~~~~~~@"
@@ -206,7 +220,7 @@ stop_server $argv
 set ::env(COCKROACH_INSECURE) "true"
 start_server $argv
 
-spawn $argv sql
+spawn $argv sql --no-line-editor
 eexpect root@
 eexpect "defaultdb>"
 
@@ -224,3 +238,26 @@ end_test
 
 stop_server $argv
 
+system "rm -rf logs/db"
+start_server $argv
+
+start_test "Check that the connect cmd does not generate an error when the cluster ID changes"
+send "\\c - root\r"
+eexpect "warning: the cluster ID has changed"
+eexpect "Previous ID"
+eexpect "New Cluster ID"
+eexpect "system>"
+
+send "\\q\r"
+expect {
+    "ERROR" {
+	report "reconnect generated an unexpected error"
+	exit 1
+    }
+    eof { }
+}
+
+end_test
+
+
+stop_server $argv

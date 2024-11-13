@@ -16,14 +16,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -33,40 +33,49 @@ type testStreamClient struct{}
 var _ Client = testStreamClient{}
 
 // Dial implements Client interface.
-func (sc testStreamClient) Dial(ctx context.Context) error {
+func (sc testStreamClient) Dial(_ context.Context) error {
 	return nil
 }
 
 // Create implements the Client interface.
 func (sc testStreamClient) Create(
-	ctx context.Context, target roachpb.TenantID,
-) (streaming.StreamID, error) {
-	return streaming.StreamID(1), nil
+	_ context.Context, _ roachpb.TenantName,
+) (streampb.ReplicationProducerSpec, error) {
+	return streampb.ReplicationProducerSpec{
+		StreamID:             streampb.StreamID(1),
+		ReplicationStartTime: hlc.Timestamp{WallTime: timeutil.Now().UnixNano()},
+	}, nil
 }
 
 // Plan implements the Client interface.
-func (sc testStreamClient) Plan(ctx context.Context, ID streaming.StreamID) (Topology, error) {
+func (sc testStreamClient) Plan(_ context.Context, _ streampb.StreamID) (Topology, error) {
 	return Topology{
-		{SrcAddr: "test://host1"},
-		{SrcAddr: "test://host2"},
+		Partitions: []PartitionInfo{
+			{
+				SrcAddr: "test://host1",
+			},
+			{
+				SrcAddr: "test://host2",
+			},
+		},
 	}, nil
 }
 
 // Heartbeat implements the Client interface.
 func (sc testStreamClient) Heartbeat(
-	ctx context.Context, ID streaming.StreamID, _ hlc.Timestamp,
+	_ context.Context, _ streampb.StreamID, _ hlc.Timestamp,
 ) (streampb.StreamReplicationStatus, error) {
 	return streampb.StreamReplicationStatus{}, nil
 }
 
 // Close implements the Client interface.
-func (sc testStreamClient) Close(ctx context.Context) error {
+func (sc testStreamClient) Close(_ context.Context) error {
 	return nil
 }
 
 // Subscribe implements the Client interface.
 func (sc testStreamClient) Subscribe(
-	ctx context.Context, stream streaming.StreamID, spec SubscriptionToken, checkpoint hlc.Timestamp,
+	_ context.Context, _ streampb.StreamID, _ SubscriptionToken, _ hlc.Timestamp, _ hlc.Timestamp,
 ) (Subscription, error) {
 	sampleKV := roachpb.KeyValue{
 		Key: []byte("key_1"),
@@ -92,9 +101,7 @@ func (sc testStreamClient) Subscribe(
 }
 
 // Complete implements the streamclient.Client interface.
-func (sc testStreamClient) Complete(
-	ctx context.Context, streamID streaming.StreamID, successfulIngestion bool,
-) error {
+func (sc testStreamClient) Complete(_ context.Context, _ streampb.StreamID, _ bool) error {
 	return nil
 }
 
@@ -103,7 +110,7 @@ type testStreamSubscription struct {
 }
 
 // Subscribe implements the Subscription interface.
-func (t testStreamSubscription) Subscribe(ctx context.Context) error {
+func (t testStreamSubscription) Subscribe(_ context.Context) error {
 	return nil
 }
 
@@ -115,6 +122,15 @@ func (t testStreamSubscription) Events() <-chan streamingccl.Event {
 // Err implements the Subscription interface.
 func (t testStreamSubscription) Err() error {
 	return nil
+}
+
+func TestGetFirstActiveClientEmpty(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var streamAddresses []string
+	activeClient, err := GetFirstActiveClient(context.Background(), streamAddresses)
+	require.ErrorContains(t, err, "failed to connect, no partition addresses")
+	require.Nil(t, activeClient)
 }
 
 func TestGetFirstActiveClient(t *testing.T) {
@@ -175,10 +191,11 @@ func ExampleClient() {
 		_ = client.Close(ctx)
 	}()
 
-	id, err := client.Create(ctx, roachpb.MakeTenantID(1))
+	prs, err := client.Create(ctx, "system")
 	if err != nil {
 		panic(err)
 	}
+	id := prs.StreamID
 
 	var ingested struct {
 		ts hlc.Timestamp
@@ -217,9 +234,9 @@ func ExampleClient() {
 			panic(err)
 		}
 
-		for _, partition := range topology {
+		for _, partition := range topology.Partitions {
 			// TODO(dt): use Subscribe helper and partition.SrcAddr
-			sub, err := client.Subscribe(ctx, id, partition.SubscriptionToken, ts)
+			sub, err := client.Subscribe(ctx, id, partition.SubscriptionToken, hlc.Timestamp{}, ts)
 			if err != nil {
 				panic(err)
 			}

@@ -13,7 +13,7 @@ package delegate
 import (
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -41,12 +41,12 @@ LEFT JOIN
 			type = %d
 	) c
 ON
-	c.object_id = d.id`, keys.DatabaseCommentType)
+	c.object_id = d.id`, catalogkeys.DatabaseCommentType)
 	}
 
 	query += `
 ORDER BY
 	database_name`
 
-	return parse(query)
+	return d.parse(query)
 }

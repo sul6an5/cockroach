@@ -3,7 +3,10 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "bulk",
-    srcs = ["tracing_aggregator.go"],
+    srcs = [
+        "iterator.go",
+        "tracing_aggregator.go",
+    ],
     importpath = "github.com/cockroachdb/cockroach/pkg/util/bulk",
     visibility = ["//visibility:public"],
     deps = [
@@ -19,6 +22,8 @@ go_test(
     deps = [
         ":bulk",
         "//pkg/ccl/backupccl/backuppb",
+        "//pkg/kv/bulk/bulkpb",
+        "//pkg/roachpb",
         "//pkg/util/tracing",
         "//pkg/util/tracing/tracingpb",
         "@com_github_stretchr_testify//require",

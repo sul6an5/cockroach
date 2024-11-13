@@ -310,7 +310,9 @@ FROM system.namespace`
 		return nil, nil, nil, err
 	}
 
-	stmt = `SELECT id, status, payload, progress FROM system.jobs`
+	stmt = `
+SELECT id, status, payload, progress FROM "".crdb_internal.system_jobs
+`
 	jobsTable = make(doctor.JobsTable, 0)
 
 	if err := selectRowsMap(sqlConn, stmt, make([]driver.Value, 4), func(vals []driver.Value) error {
@@ -427,12 +429,17 @@ func fromZipDir(
 		last := len(fields) - 1
 		payloadBytes, err := hx.DecodeString(fields[last-1])
 		if err != nil {
+			// TODO(postamar): remove this check once payload redaction is improved
+			if fields[last-1] == "NULL" {
+				return nil
+			}
 			return errors.Wrapf(err, "job %d: failed to decode hex payload", id)
 		}
 		md.Payload = &jobspb.Payload{}
 		if err := protoutil.Unmarshal(payloadBytes, md.Payload); err != nil {
 			return errors.Wrap(err, "failed unmarshalling job payload")
 		}
+
 		progressBytes, err := hx.DecodeString(fields[last])
 		if err != nil {
 			return errors.Wrapf(err, "job %d: failed to decode hex progress", id)

@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -99,11 +99,6 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 		return
 	}
 	k1 := makePrintableKey(iter.UnsafeKey())
-	k2 := makePrintableKey(iter.Key())
-	if !k1.Equal(k2) {
-		fmt.Fprintf(b, "output: key: %s != %s\n", k1, k2)
-		return
-	}
 	engineKey, ok := DecodeEngineKey(iter.UnsafeRawKey())
 	if !ok {
 		fmt.Fprintf(b, "output: could not DecodeEngineKey: %x\n", iter.UnsafeRawKey())
@@ -143,11 +138,22 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 		}
 	}
 
-	v1 := iter.UnsafeValue()
-	v2 := iter.Value()
+	v1, err := iter.UnsafeValue()
+	if err != nil {
+		fmt.Fprintf(b, "output: unable to fetch value: %s\n", err.Error())
+		return
+	}
+	v2, err := iter.Value()
+	if err != nil {
+		fmt.Fprintf(b, "output: unable to fetch value: %s\n", err.Error())
+		return
+	}
 	if !bytes.Equal(v1, v2) {
 		fmt.Fprintf(b, "output: value: %x != %x\n", v1, v2)
 		return
+	}
+	if len(v1) != iter.ValueLen() {
+		fmt.Fprintf(b, "output: value len: %d != %d\n", len(v1), iter.ValueLen())
 	}
 	if k1.Timestamp.IsEmpty() {
 		var meta enginepb.MVCCMetadata
@@ -184,7 +190,7 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 
 // TestIntentInterleavingIter is a datadriven test consisting of two commands:
 //   - define: defines key-value pairs in the lock table and MVCC key spaces.
-//     Intents can be in both key spaces, and inline meta and MVCC values in
+//     Intents can only be in the lock table, and inline meta and MVCC values in
 //     the latter.
 //     meta k=<key> ts=<ts> txn=<txn>  defines an intent
 //     meta k=<key>                    defines an inline meta
@@ -202,10 +208,6 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 //   - starting with Y is interpreted as a local key starting immediately after
 //     the lock table key space. This is for testing edge cases wrt bounds.
 //   - a single Z is interpreted as LocalMax
-//
-// Note: This test still manually writes interleaved intents. Even though
-// we've removed codepaths to write interleaved intents, intentInterleavingIter
-// can still allows physically interleaved intents.
 func TestIntentInterleavingIter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -216,7 +218,7 @@ func TestIntentInterleavingIter(t *testing.T) {
 		}
 	}()
 
-	datadriven.Walk(t, testutils.TestDataPath(t, "intent_interleaving_iter"), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "intent_interleaving_iter"), func(t *testing.T, path string) {
 		if (util.RaceEnabled && strings.HasSuffix(path, "race_off")) ||
 			(!util.RaceEnabled && strings.HasSuffix(path, "race")) {
 			return
@@ -265,7 +267,10 @@ func TestIntentInterleavingIter(t *testing.T) {
 						// We don't bother populating most fields in the proto.
 						var meta enginepb.MVCCMetadata
 						var txnUUID uuid.UUID
-						if locksSection || d.HasArg("ts") {
+						if d.HasArg("ts") && !locksSection {
+							t.Fatalf("%s: cannot specify an intent in the mvcc section", d.Pos)
+						}
+						if locksSection {
 							var tsS string
 							d.ScanArgs(t, "ts", &tsS)
 							ts, err := hlc.ParseTimestamp(tsS)
@@ -469,9 +474,6 @@ type lockKeyValue struct {
 	// intentInterleavingIter, but test the underlying Pebble code, just in case
 	// there are any undiscovered bugs.
 	liveIntent bool
-	// When using intentInterleavingIter, there is a mix of interleaved and
-	// separated intents. This bool determines which kind of intent is written.
-	separated bool
 }
 
 func generateRandomData(
@@ -519,10 +521,9 @@ func generateRandomData(
 			}
 			val, err := protoutil.Marshal(&meta)
 			require.NoError(t, err)
-			isSeparated := rng.Int31n(2) == 0
 			ltKey := LockTableKey{Key: key, Strength: lock.Exclusive, TxnUUID: txnUUID[:]}
 			lkv = append(lkv, lockKeyValue{
-				key: ltKey, val: val, liveIntent: hasIntent && i == 0, separated: isSeparated})
+				key: ltKey, val: val, liveIntent: hasIntent && i == 0})
 			mvcckv = append(mvcckv, MVCCKeyValue{
 				Key:   MVCCKey{Key: key, Timestamp: hlc.Timestamp{WallTime: int64(ts)}},
 				Value: []byte("value"),
@@ -546,7 +547,7 @@ func writeRandomData(
 	// flushed, so both will be in the engine during iteration.
 	for i := len(lkv) - 1; i >= 0; i-- {
 		kv := lkv[i]
-		if interleave || !kv.separated {
+		if interleave {
 			require.NoError(t, batch.PutUnversioned(kv.key.Key, kv.val))
 			if !kv.liveIntent {
 				require.NoError(t, batch.ClearUnversioned(kv.key.Key))
@@ -728,6 +729,8 @@ func TestRandomizedIntentInterleavingIter(t *testing.T) {
 	defer eng2.Close()
 	writeRandomData(t, eng1, lockKV, mvccKV, false /* interleave */)
 	writeRandomData(t, eng1, localLockKV, localMvccKV, false /* interleave */)
+	// The interleav=true case physically interleaves the intent and then reads
+	// without using the intentInterleavingIter.
 	writeRandomData(t, eng2, lockKV, mvccKV, true /* interleave */)
 	writeRandomData(t, eng2, localLockKV, localMvccKV, true /* interleave */)
 	var ops []string
@@ -741,6 +744,11 @@ func TestRandomizedIntentInterleavingIter(t *testing.T) {
 		}
 	}
 	var out1, out2 strings.Builder
+	// The interleave bool specifies whether to logically interleave the intent.
+	// Since eng1 has physically separated intents, we pass true here to use
+	// intentInterleavingIter. Since eng2 has physically interleaved intents,
+	// there is nothing more to do to get logical interleaving, so we pass false
+	// here to use a non-interleaving iter.
 	doOps(t, ops, eng1, true /* interleave */, &out1)
 	doOps(t, ops, eng2, false /* interleave */, &out2)
 	require.Equal(t, out1.String(), out2.String(),
@@ -840,6 +848,7 @@ func BenchmarkIntentInterleavingIterNext(b *testing.B) {
 				} else {
 					iter = state.eng.NewMVCCIterator(MVCCKeyIterKind, opts)
 				}
+				defer iter.Close()
 				startKey := MVCCKey{Key: state.keyPrefix}
 				iter.SeekGE(startKey)
 				b.ResetTimer()
@@ -878,6 +887,7 @@ func BenchmarkIntentInterleavingIterPrev(b *testing.B) {
 				} else {
 					iter = state.eng.NewMVCCIterator(MVCCKeyIterKind, opts)
 				}
+				defer iter.Close()
 				iter.SeekLT(endKey)
 				b.ResetTimer()
 				var unsafeKey MVCCKey
@@ -920,6 +930,7 @@ func BenchmarkIntentInterleavingSeekGEAndIter(b *testing.B) {
 					} else {
 						iter = state.eng.NewMVCCIterator(MVCCKeyIterKind, opts)
 					}
+					defer iter.Close()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
 						j := i % len(seekKeys)

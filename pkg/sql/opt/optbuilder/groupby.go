@@ -251,8 +251,9 @@ func (a aggregateInfo) isOrderingSensitive() bool {
 		return true
 	}
 	switch a.def.Name {
-	case "array_agg", "concat_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
-		"st_makeline", "st_collect", "st_memcollect":
+	case "array_agg", "array_cat_agg", "concat_agg", "string_agg", "json_agg",
+		"jsonb_agg", "json_object_agg", "jsonb_object_agg", "st_makeline",
+		"st_collect", "st_memcollect":
 		return true
 	default:
 		return false
@@ -266,7 +267,7 @@ func (a aggregateInfo) isCommutative() bool {
 }
 
 // Eval is part of the tree.TypedExpr interface.
-func (a *aggregateInfo) Eval(_ tree.ExprEvaluator) (tree.Datum, error) {
+func (a *aggregateInfo) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("aggregateInfo must be replaced before evaluation"))
 }
 
@@ -723,7 +724,18 @@ func (b *Builder) buildAggregateFunction(
 	// If we have ORDER BY, add the ordering columns to the tempScope.
 	if f.OrderBy != nil {
 		for _, o := range f.OrderBy {
-			b.buildAggArg(o.Expr.(tree.TypedExpr), &info, tempScope, fromScope)
+			// ORDER BY (a, b) => ORDER BY a, b.
+			te := fromScope.resolveType(o.Expr, types.Any)
+			cols := flattenTuples([]tree.TypedExpr{te})
+
+			nullsDefaultOrder := b.hasDefaultNullsOrder(o)
+			for _, e := range cols {
+				if !nullsDefaultOrder {
+					expr := tree.NewTypedIsNullExpr(e)
+					b.buildAggArg(expr, &info, tempScope, fromScope)
+				}
+				b.buildAggArg(e, &info, tempScope, fromScope)
+			}
 		}
 	}
 
@@ -795,6 +807,8 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 	switch name {
 	case "array_agg":
 		return b.factory.ConstructArrayAgg(args[0])
+	case "array_cat_agg":
+		return b.factory.ConstructArrayCatAgg(args[0])
 	case "avg":
 		return b.factory.ConstructAvg(args[0])
 	case "bit_and":

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
@@ -40,7 +41,11 @@ import (
 // TODO(dan): The typechecking here should be run during plan construction, so
 // we can support placeholders.
 func valueEncodePartitionTuple(
-	typ tree.PartitionByType, evalCtx *eval.Context, maybeTuple tree.Expr, cols []catalog.Column,
+	ctx context.Context,
+	typ tree.PartitionByType,
+	evalCtx *eval.Context,
+	maybeTuple tree.Expr,
+	cols []catalog.Column,
 ) ([]byte, error) {
 	// Replace any occurrences of the MINVALUE/MAXVALUE pseudo-names
 	// into MinVal and MaxVal, to be recognized below.
@@ -96,7 +101,7 @@ func valueEncodePartitionTuple(
 		}
 
 		var semaCtx tree.SemaContext
-		typedExpr, err := schemaexpr.SanitizeVarFreeExpr(evalCtx.Context, expr, cols[i].GetType(), "partition",
+		typedExpr, err := schemaexpr.SanitizeVarFreeExpr(ctx, expr, cols[i].GetType(), "partition",
 			&semaCtx,
 			volatility.Immutable,
 			false, /*allowAssignmentCast*/
@@ -108,7 +113,7 @@ func valueEncodePartitionTuple(
 			return nil, pgerror.Newf(pgcode.Syntax,
 				"%s: partition values must be constant", typedExpr)
 		}
-		datum, err := eval.Expr(evalCtx, typedExpr)
+		datum, err := eval.Expr(ctx, evalCtx, typedExpr)
 		if err != nil {
 			return nil, errors.Wrapf(err, "evaluating %s", typedExpr)
 		}
@@ -199,6 +204,10 @@ func createPartitioningImpl(
 				"declared partition columns (%s) do not match first %d columns in index being partitioned (%s)",
 				partitioningString(), n, strings.Join(newIdxColumnNames[:n], ", "))
 		}
+		if col.GetType().Family() == types.ArrayFamily {
+			return partDesc, unimplemented.NewWithIssuef(91766, "partitioning by array column (%s) not supported",
+				col.GetName())
+		}
 	}
 
 	for _, l := range partBy.List {
@@ -207,7 +216,8 @@ func createPartitioningImpl(
 		}
 		for _, expr := range l.Exprs {
 			encodedTuple, err := valueEncodePartitionTuple(
-				tree.PartitionByList, evalCtx, expr, cols)
+				ctx, tree.PartitionByList, evalCtx, expr, cols,
+			)
 			if err != nil {
 				return partDesc, errors.Wrapf(err, "PARTITION %s", p.Name)
 			}
@@ -245,12 +255,14 @@ func createPartitioningImpl(
 		}
 		var err error
 		p.FromInclusive, err = valueEncodePartitionTuple(
-			tree.PartitionByRange, evalCtx, &tree.Tuple{Exprs: r.From}, cols)
+			ctx, tree.PartitionByRange, evalCtx, &tree.Tuple{Exprs: r.From}, cols,
+		)
 		if err != nil {
 			return partDesc, errors.Wrapf(err, "PARTITION %s", p.Name)
 		}
 		p.ToExclusive, err = valueEncodePartitionTuple(
-			tree.PartitionByRange, evalCtx, &tree.Tuple{Exprs: r.To}, cols)
+			ctx, tree.PartitionByRange, evalCtx, &tree.Tuple{Exprs: r.To}, cols,
+		)
 		if err != nil {
 			return partDesc, errors.Wrapf(err, "PARTITION %s", p.Name)
 		}
@@ -339,8 +351,7 @@ func createPartitioning(
 	allowedNewColumnNames []tree.Name,
 	allowImplicitPartitioning bool,
 ) (newImplicitCols []catalog.Column, newPartitioning catpb.PartitioningDescriptor, err error) {
-	org := sql.ClusterOrganization.Get(&st.SV)
-	if err := utilccl.CheckEnterpriseEnabled(st, evalCtx.ClusterID, org, "partitions"); err != nil {
+	if err := utilccl.CheckEnterpriseEnabled(st, evalCtx.ClusterID, "partitions"); err != nil {
 		return nil, newPartitioning, err
 	}
 

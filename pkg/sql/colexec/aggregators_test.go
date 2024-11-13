@@ -71,7 +71,7 @@ const (
 // aggType is a helper struct that allows tests to test both the ordered and
 // hash aggregators at the same time.
 type aggType struct {
-	new   func(*colexecagg.NewAggregatorArgs) colexecop.ResettableOperator
+	new   func(context.Context, *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator
 	name  string
 	order ordering
 }
@@ -80,8 +80,17 @@ var aggTypesWithPartial = []aggType{
 	{
 		// This is a wrapper around NewHashAggregator so its signature is
 		// compatible with NewOrderedAggregator.
-		new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
-			return NewHashAggregator(args, nil /* newSpillingQueueArgs */, testAllocator, testAllocator, math.MaxInt64)
+		new: func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+			return NewHashAggregator(
+				ctx,
+				&colexecagg.NewHashAggregatorArgs{
+					NewAggregatorArgs:        args,
+					HashTableAllocator:       testAllocator,
+					OutputUnlimitedAllocator: testAllocator,
+					MaxOutputBatchMemSize:    math.MaxInt64,
+				},
+				nil, /* newSpillingQueueArgs */
+			)
 		},
 		name:  "hash",
 		order: unordered,
@@ -94,8 +103,17 @@ var aggTypesWithPartial = []aggType{
 	{
 		// This is a wrapper around NewHashAggregator so its signature is
 		// compatible with NewOrderedAggregator.
-		new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
-			return NewHashAggregator(args, nil /* newSpillingQueueArgs */, testAllocator, testAllocator, math.MaxInt64)
+		new: func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+			return NewHashAggregator(
+				ctx,
+				&colexecagg.NewHashAggregatorArgs{
+					NewAggregatorArgs:        args,
+					HashTableAllocator:       testAllocator,
+					OutputUnlimitedAllocator: testAllocator,
+					MaxOutputBatchMemSize:    math.MaxInt64,
+				},
+				nil, /* newSpillingQueueArgs */
+			)
 		},
 		name:  "hash-partial-order",
 		order: partial,
@@ -786,7 +804,7 @@ func TestAggregators(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range aggregatorsTestCases {
 		constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-			&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+			ctx, &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 		)
 		require.NoError(t, err)
 		for _, agg := range aggTypes {
@@ -806,7 +824,7 @@ func TestAggregators(t *testing.T) {
 			}
 			colexectestutils.RunTestsWithTyps(t, testAllocator, []colexectestutils.Tuples{tc.input}, [][]*types.T{tc.typs}, tc.expected, verifier,
 				func(input []colexecop.Operator) (colexecop.Operator, error) {
-					return agg.new(&colexecagg.NewAggregatorArgs{
+					return agg.new(ctx, &colexecagg.NewAggregatorArgs{
 						Allocator:      testAllocator,
 						MemAccount:     testMemAcc,
 						Input:          input[0],
@@ -888,7 +906,7 @@ func TestAggregatorRandom(t *testing.T) {
 						// NULL values contribute to the row count, so we're updating
 						// the row counts outside of the if block.
 						expRowCounts[curGroup]++
-						if hasNulls && rng.Float64() < nullProbability {
+						if hasNulls && rng.Float64() < 0.1 {
 							aggColNulls.SetNull(i)
 						} else {
 							expNulls[curGroup] = false
@@ -930,10 +948,10 @@ func TestAggregatorRandom(t *testing.T) {
 					}
 					require.NoError(t, tc.init())
 					constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-						&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+						context.Background(), &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 					)
 					require.NoError(t, err)
-					a := agg.new(&colexecagg.NewAggregatorArgs{
+					a := agg.new(context.Background(), &colexecagg.NewAggregatorArgs{
 						Allocator:      testAllocator,
 						MemAccount:     testMemAcc,
 						Input:          source,
@@ -999,11 +1017,11 @@ func benchmarkAggregateFunction(
 			return
 		}
 	}
-	rng, _ := randutil.NewTestRand()
+	rng := randutil.NewTestRandWithSeed(17)
 	ctx := context.Background()
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
-	aggMemAcc := evalCtx.Mon.MakeBoundAccount()
+	aggMemAcc := evalCtx.TestingMon.MakeBoundAccount()
 	defer aggMemAcc.Close(ctx)
 	evalCtx.SingleDatumAggMemAccount = &aggMemAcc
 	const bytesFixedLength = 8
@@ -1093,7 +1111,7 @@ func benchmarkAggregateFunction(
 	}
 	require.NoError(b, tc.init())
 	constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-		&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+		ctx, &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 	)
 	require.NoError(b, err)
 	fName := execinfrapb.AggregatorSpec_Func_name[int32(aggFn)]
@@ -1132,7 +1150,7 @@ func benchmarkAggregateFunction(
 			b.SetBytes(int64(argumentsSize * numInputRows))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				a := agg.new(&colexecagg.NewAggregatorArgs{
+				a := agg.new(ctx, &colexecagg.NewAggregatorArgs{
 					Allocator:      testAllocator,
 					MemAccount:     testMemAcc,
 					Input:          source,

@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -27,6 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -131,11 +134,11 @@ func deleteTableData(
 	}
 	for _, droppedTable := range progress.Tables {
 		var table catalog.TableDescriptor
-		if err := sql.DescsTxn(ctx, cfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-			table, err = col.Direct().MustGetTableDescByID(ctx, txn, droppedTable.ID)
+		if err := sql.DescsTxn(ctx, cfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
+			table, err = col.ByID(txn.KV()).Get().Table(ctx, droppedTable.ID)
 			return err
 		}); err != nil {
-			if errors.Is(err, catalog.ErrDescriptorNotFound) {
+			if isMissingDescriptorError(err) {
 				// This can happen if another GC job created for the same table got to
 				// the table first. See #50344.
 				log.Warningf(ctx, "table descriptor %d not found while attempting to GC, skipping", droppedTable.ID)
@@ -305,8 +308,7 @@ func (r schemaChangeGCResumer) Resume(ctx context.Context, execCtx interface{}) 
 		return err
 	}
 
-	if details.Tenant != nil ||
-		!p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.UseDelRangeInGCJob) {
+	if !shouldUseDelRange(ctx, details, execCfg.Settings, execCfg.GCJobTestingKnobs) {
 		return r.legacyWaitAndClearTableData(ctx, execCfg, details, progress)
 	}
 	return r.deleteDataAndWaitForGC(ctx, execCfg, details, progress)
@@ -366,7 +368,12 @@ var EmptySpanPollInterval = settings.RegisterDurationSetting(
 )
 
 func waitForEmptyPrefix(
-	ctx context.Context, db *kv.DB, sv *settings.Values, skipWaiting bool, prefix roachpb.Key,
+	ctx context.Context,
+	db *kv.DB,
+	sv *settings.Values,
+	skipWaiting bool,
+	checkImmediately bool,
+	prefix roachpb.Key,
 ) error {
 	if skipWaiting {
 		log.Infof(ctx, "not waiting for MVCC GC in %v due to testing knob", prefix)
@@ -377,6 +384,13 @@ func waitForEmptyPrefix(
 	// TODO(ajwerner): Allow for settings watchers to be un-registered (#73830),
 	// then observe changes to the setting.
 	for {
+		if checkImmediately {
+			if empty, err := checkForEmptySpan(
+				ctx, db, prefix, prefix.PrefixEnd(),
+			); empty || err != nil {
+				return err
+			}
+		}
 		timer.Reset(EmptySpanPollInterval.Get(sv))
 		select {
 		case <-timer.C:
@@ -395,8 +409,8 @@ func waitForEmptyPrefix(
 func checkForEmptySpan(ctx context.Context, db *kv.DB, from, to roachpb.Key) (empty bool, _ error) {
 	var ba kv.Batch
 	ba.Header.MaxSpanRequestKeys = 1
-	ba.AddRawRequest(&roachpb.IsSpanEmptyRequest{
-		RequestHeader: roachpb.RequestHeader{
+	ba.AddRawRequest(&kvpb.IsSpanEmptyRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: from, EndKey: to,
 		},
 	})
@@ -419,10 +433,7 @@ func (r schemaChangeGCResumer) legacyWaitAndClearTableData(
 
 	// Now that we've registered to be notified, check to see if we raced
 	// with the new version becoming active.
-	//
-	// TODO(ajwerner): Adopt the DeleteRange protocol for tenant GC.
-	if details.Tenant == nil &&
-		execCfg.Settings.Version.IsActive(ctx, clusterversion.UseDelRangeInGCJob) {
+	if shouldUseDelRange(ctx, details, execCfg.Settings, execCfg.GCJobTestingKnobs) {
 		return r.deleteDataAndWaitForGC(ctx, execCfg, details, progress)
 	}
 
@@ -438,10 +449,9 @@ func (r schemaChangeGCResumer) legacyWaitAndClearTableData(
 		}
 		// We'll be notified if the new version becomes active, so check and
 		// see if it's now time to change to the new protocol.
-		//
-		// TODO(ajwerner): Adopt the DeleteRange protocol for tenant GC.
-		if details.Tenant == nil &&
-			execCfg.Settings.Version.IsActive(ctx, clusterversion.UseDelRangeInGCJob) {
+		if shouldUseDelRange(
+			ctx, details, execCfg.Settings, execCfg.GCJobTestingKnobs,
+		) {
 			return r.deleteDataAndWaitForGC(ctx, execCfg, details, progress)
 		}
 
@@ -488,6 +498,19 @@ func (r schemaChangeGCResumer) legacyWaitAndClearTableData(
 			timerDuration = MaxSQLGCInterval
 		}
 	}
+}
+
+func shouldUseDelRange(
+	ctx context.Context,
+	details *jobspb.SchemaChangeGCDetails,
+	s *cluster.Settings,
+	knobs *sql.GCJobTestingKnobs,
+) bool {
+	// TODO(ajwerner): Adopt the DeleteRange protocol for tenant GC.
+	return details.Tenant == nil &&
+		(storage.CanUseMVCCRangeTombstones(ctx, s) ||
+			// Allow this testing knob to override the storage setting, for convenience.
+			knobs.SkipWaitingForMVCCGC)
 }
 
 // waitForWork waits until there is work to do given the gossipUpDateC, the
@@ -542,6 +565,17 @@ func waitForWork(
 		wait()
 	}
 	return ctx.Err()
+}
+
+// isMissingDescriptorError checks whether the error has a code corresponding
+// to a missing descriptor or if there is a lower-level catalog error with
+// the same meaning.
+//
+// TODO(ajwerner,postamar): Nail down when we expect the lower-level error
+// and tighten up the collection.
+func isMissingDescriptorError(err error) bool {
+	return errors.Is(err, catalog.ErrDescriptorNotFound) ||
+		sqlerrors.IsMissingDescriptorError(err)
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.

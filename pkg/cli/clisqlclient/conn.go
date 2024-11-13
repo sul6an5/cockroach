@@ -80,6 +80,11 @@ type sqlConn struct {
 	clusterID           string
 	clusterOrganization string
 
+	// isSystemTenantUnderSecondaryTenants is true if the current
+	// connection is to the system tenant and there are secondary
+	// tenants defined.
+	isSystemTenantUnderSecondaryTenants bool
+
 	// infow and errw are the streams where informational, error and
 	// warning messages are printed.
 	// Echoed queries, if Echo is enabled, are printed to errw too.
@@ -271,6 +276,32 @@ func (c *sqlConn) tryEnableServerExecutionTimings(ctx context.Context) error {
 func (c *sqlConn) GetServerMetadata(
 	ctx context.Context,
 ) (nodeID int32, version, clusterID string, retErr error) {
+	c.isSystemTenantUnderSecondaryTenants = false
+	val, err := c.QueryRow(ctx, `
+	SELECT EXISTS (SELECT 1 FROM system.information_schema.tables WHERE table_name='tenants')`)
+	if c.conn.IsClosed() {
+		return 0, "", "", MarkWithConnectionClosed(err)
+	}
+	if err != nil {
+		return 0, "", "", err
+	}
+	// We use toString() instead of casting val[0] to string because we
+	// get either a go string or bool depending on the SQL driver in
+	// use.
+	if toString(val[0])[0] == 't' {
+		// There's always at least 1 row in the tenants table, for the
+		// system tenant.
+		val, err = c.QueryRow(ctx, `
+	SELECT (SELECT count(id) FROM system.public.tenants LIMIT 2)>1`)
+		if c.conn.IsClosed() {
+			return 0, "", "", MarkWithConnectionClosed(err)
+		}
+		if err != nil {
+			return 0, "", "", err
+		}
+		c.isSystemTenantUnderSecondaryTenants = toString(val[0])[0] == 't'
+	}
+
 	// Retrieve the node ID and server build info.
 	// Be careful to query against the empty database string, which avoids taking
 	// a lease against the current database (in case it's currently unavailable).
@@ -328,6 +359,7 @@ func (c *sqlConn) GetServerMetadata(
 		c.serverBuild = fmt.Sprintf("CockroachDB %s %s (%s, built %s, %s)",
 			v10fields[0], version, v10fields[2], v10fields[3], v10fields[4])
 	}
+
 	return nodeID, version, clusterID, nil
 }
 
@@ -395,6 +427,12 @@ func (c *sqlConn) checkServerMetadata(ctx context.Context) error {
 		fmt.Fprintf(c.errw, "warning: unable to retrieve the server's version: %s\n", err)
 	}
 
+	if c.isSystemTenantUnderSecondaryTenants {
+		fmt.Fprintln(c.infow, "#\n# ATTENTION: YOU ARE CONNECTED TO THE SYSTEM TENANT OF A MULTI-TENANT CLUSTER.\n"+
+			"# PROCEED WITH CAUTION. YOU ARE RESPONSIBLE FOR ENSURING THAT YOU DO NOT\n"+
+			"# PERFORM ANY OPERATIONS THAT COULD DAMAGE THE CLUSTER OR OTHER TENANTS.\n#")
+	}
+
 	// Report the server version only if it the revision has been
 	// fetched successfully, and the revision has changed since the last
 	// connection.
@@ -430,13 +468,13 @@ func (c *sqlConn) checkServerMetadata(ctx context.Context) error {
 	// Report the cluster ID only if it it could be fetched
 	// successfully, and it has changed since the last connection.
 	if old := c.clusterID; newClusterID != c.clusterID {
-		c.clusterID = newClusterID
+		label := ""
 		if old != "" {
-			return errors.Errorf("the cluster ID has changed!\nPrevious ID: %s\nNew ID: %s",
-				old, newClusterID)
+			label = "New "
+			fmt.Fprintf(c.errw, "\nwarning: the cluster ID has changed!\n# Previous ID: %s\n", old)
 		}
 		c.clusterID = newClusterID
-		fmt.Fprintln(c.infow, "# Cluster ID:", c.clusterID)
+		fmt.Fprintf(c.infow, "# %sCluster ID: %v\n", label, c.clusterID)
 		if c.clusterOrganization != "" {
 			fmt.Fprintln(c.infow, "# Organization:", c.clusterOrganization)
 		}
@@ -444,6 +482,15 @@ func (c *sqlConn) checkServerMetadata(ctx context.Context) error {
 	// Try to enable server execution timings for the CLI to display if
 	// supported by the server.
 	return c.tryEnableServerExecutionTimings(ctx)
+}
+
+// GetServerInfo returns a copy of the remote server details.
+func (c *sqlConn) GetServerInfo() ServerInfo {
+	return ServerInfo{
+		ServerExecutableVersion: c.serverBuild,
+		ClusterID:               c.clusterID,
+		Organization:            c.clusterOrganization,
+	}
 }
 
 // GetServerValue retrieves the first driverValue returned by the

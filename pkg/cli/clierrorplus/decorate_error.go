@@ -44,7 +44,8 @@ import (
 //	dial tcp <addr>: <syscall>: No connection could be made because the target machine actively refused it.
 //
 // So we look for the common bit.
-var reGRPCConnRefused = regexp.MustCompile(`Error while dialing dial tcp .*: connection.* refused`)
+// See: https://github.com/grpc/grpc-go/blob/master/internal/transport/http2_client.go#L216
+var reGRPCConnRefused = regexp.MustCompile(`[E|e]rror while dialing:? dial tcp .*: connection.* refused`)
 
 // reGRPCNoTLS is a regular expression that can be applied to the
 // details of a GRPC auth failure when the server is insecure.
@@ -120,7 +121,7 @@ func MaybeDecorateError(
 			return connInsecureHint()
 		}
 
-		if wErr := (*security.Error)(nil); errors.As(err, &wErr) {
+		if errors.Is(err, security.ErrCertManagement) {
 			// Avoid errors.Wrapf here so that we have more control over the
 			// formatting of the message with error text.
 			const format = "cannot load certificates.\n" +

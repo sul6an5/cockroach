@@ -18,11 +18,13 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -30,15 +32,79 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
-// Key value lengths take up 8 bytes (2 x Uint32).
-const kvLenSize = 8
-
 var maxItersBeforeSeek = util.ConstantWithMetamorphicTestRange(
 	"mvcc-max-iters-before-seek",
 	10, /* defaultValue */
 	0,  /* min */
 	3,  /* max */
 )
+
+// MVCCDecodingStrategy controls if and how the fetcher should decode MVCC
+// timestamps from returned KV's.
+type MVCCDecodingStrategy int
+
+const (
+	// MVCCDecodingNotRequired is used when timestamps aren't needed.
+	MVCCDecodingNotRequired MVCCDecodingStrategy = iota
+	// MVCCDecodingRequired is used when timestamps are needed.
+	MVCCDecodingRequired
+)
+
+// results abstracts away a result set where pebbleMVCCScanner put()'s KVs into.
+type results interface {
+	// clear clears the results so that its memory could be GCed.
+	clear()
+	// sizeInfo returns several pieces of information about the current size of
+	// the results:
+	// - the number of KVs currently in the results,
+	// - the current memory footprint of the results in bytes,
+	// - the increment for how much the memory footprint of the results will
+	//   increase (in bytes) if a KV (with the corresponding lengths of the key
+	//   and the value parts) is put into it.
+	//
+	// Note that we chose to squash all these things into a single method rather
+	// than defining a separate method for each parameter out of performance
+	// considerations.
+	sizeInfo(lenKey, lenValue int) (numKeys, numBytes, numBytesInc int64)
+	// put adds a KV into the results. An error is returned if the memory
+	// reservation is denied by the memory account.
+	put(_ context.Context, mvccKey []byte, value []byte, memAccount *mon.BoundAccount, maxNewSize int) error
+	// continuesFirstRow returns true if the given key belongs to the same SQL
+	// row as the first KV pair in the result. If the given key is not a valid
+	// SQL row key, returns false.
+	//
+	// This method is called _after_ having called put() with no error at least
+	// once, meaning that at least one key is in the results.
+	//
+	// Only called when wholeRows option is enabled.
+	continuesFirstRow(key roachpb.Key) bool
+	// maybeTrimPartialLastRow removes the last KV pairs from the result that
+	// are part of the same SQL row as the given key, returning the earliest key
+	// removed.
+	//
+	// pebbleMVCCScanner.getOne can call this method only _before_ calling
+	// put(). This constraint ensures that for the singleResults implementation
+	// of this interface, when this method is called, there is no buffered KV
+	// (i.e. there is no KV that has been `put` into the results but not yet
+	// returned on the NextKVer.NextKV call). This allows for the singleResults
+	// to synchronize with the colfetcher.cFetcher (via the
+	// storage.FirstKeyOfRowGetter) to obtain the first key of the SQL row if
+	// the given key belongs to that row.
+	//
+	// Only called when wholeRows option is enabled.
+	maybeTrimPartialLastRow(key roachpb.Key) (roachpb.Key, error)
+	// lastRowHasFinalColumnFamily returns true if the last key in the result is
+	// the maximum column family ID of the row. If so, we know that the row is
+	// complete. However, the inverse is not true: the final column families of
+	// the row may be omitted, in which case the caller has to scan to the next
+	// key to find out whether the row is complete.
+	//
+	// This method is called _after_ having called put() with no error at least
+	// once, meaning that at least one key is in the results.
+	//
+	// Only called when wholeRows option is enabled.
+	lastRowHasFinalColumnFamily(reverse bool) bool
+}
 
 // Struct to store MVCCScan / MVCCGet in the same binary format as that
 // expected by MVCCScanDecodeKeyValue.
@@ -75,10 +141,28 @@ type pebbleResults struct {
 	lastOffsetIdx      int
 }
 
+// clear implements the results interface.
 func (p *pebbleResults) clear() {
 	*p = pebbleResults{}
 }
 
+// Key value lengths take up 8 bytes (2 x Uint32).
+const pebbleResultsKVLenSize = 8
+
+func pebbleResultsKVSizeOf(lenKey, lenValue int) int {
+	return pebbleResultsKVLenSize + lenKey + lenValue
+}
+
+// sizeInfo implements the results interface.
+func (p *pebbleResults) sizeInfo(lenKey, lenValue int) (numKeys, numBytes, numBytesInc int64) {
+	numKeys = p.count
+	numBytes = p.bytes
+	numBytesInc = int64(pebbleResultsKVSizeOf(lenKey, lenValue))
+	return numKeys, numBytes, numBytesInc
+}
+
+// put implements the results interface.
+//
 // The repr that MVCCScan / MVCCGet expects to provide as output goes:
 // <valueLen:Uint32><keyLen:Uint32><Key><Value>
 // This function adds to repr in that format.
@@ -98,7 +182,7 @@ func (p *pebbleResults) put(
 	// needs capacity greater than maxSize, we allocate exactly the size needed.
 	lenKey := len(key)
 	lenValue := len(value)
-	lenToAdd := p.sizeOf(lenKey, lenValue)
+	lenToAdd := pebbleResultsKVSizeOf(lenKey, lenValue)
 	if len(p.repr)+lenToAdd > cap(p.repr) {
 		// Exponential increase by default, while ensuring that we respect
 		// - a hard lower bound of lenToAdd
@@ -146,8 +230,8 @@ func (p *pebbleResults) put(
 	p.repr = p.repr[:startIdx+lenToAdd]
 	binary.LittleEndian.PutUint32(p.repr[startIdx:], uint32(lenValue))
 	binary.LittleEndian.PutUint32(p.repr[startIdx+4:], uint32(lenKey))
-	copy(p.repr[startIdx+kvLenSize:], key)
-	copy(p.repr[startIdx+kvLenSize+lenKey:], value)
+	copy(p.repr[startIdx+pebbleResultsKVLenSize:], key)
+	copy(p.repr[startIdx+pebbleResultsKVLenSize+lenKey:], value)
 	p.count++
 	p.bytes += int64(lenToAdd)
 
@@ -165,13 +249,7 @@ func (p *pebbleResults) put(
 	return nil
 }
 
-func (p *pebbleResults) sizeOf(lenKey, lenValue int) int {
-	return kvLenSize + lenKey + lenValue
-}
-
-// continuesFirstRow returns true if the given key belongs to the same SQL row
-// as the first KV pair in the result (or if the result is empty). If either
-// key is not a valid SQL row key, returns false.
+// continuesFirstRow implements the results interface.
 func (p *pebbleResults) continuesFirstRow(key roachpb.Key) bool {
 	repr := p.repr
 	if len(p.bufs) > 0 {
@@ -188,33 +266,33 @@ func (p *pebbleResults) continuesFirstRow(key roachpb.Key) bool {
 	return bytes.Equal(rowPrefix, getRowPrefix(extractResultKey(repr)))
 }
 
-// lastRowHasFinalColumnFamily returns true if the last key in the result is the
-// maximum column family ID of the row (i.e. when it equals len(lastOffsets)-1).
-// If so, we know that the row is complete. However, the inverse is not true:
-// the final column families of the row may be omitted, in which case the caller
-// has to scan to the next key to find out whether the row is complete.
-func (p *pebbleResults) lastRowHasFinalColumnFamily() bool {
-	if !p.lastOffsetsEnabled || p.count == 0 {
+// keyHasFinalColumnFamily returns whether the given key corresponds to the last
+// column family in a SQL row. Returns false if the key is not a valid SQL key.
+func keyHasFinalColumnFamily(key roachpb.Key, maxFamilyID uint32, reverse bool) bool {
+	colFamilyID, err := keys.DecodeFamilyKey(key)
+	if err != nil {
 		return false
 	}
+	if reverse {
+		return colFamilyID == 0
+	}
+	return colFamilyID == maxFamilyID
+}
 
+// lastRowHasFinalColumnFamily implements the results interface.
+func (p *pebbleResults) lastRowHasFinalColumnFamily(reverse bool) bool {
 	lastOffsetIdx := p.lastOffsetIdx - 1 // p.lastOffsetIdx is where next offset would be stored
 	if lastOffsetIdx < 0 {
 		lastOffsetIdx = len(p.lastOffsets) - 1
 	}
 	lastOffset := p.lastOffsets[lastOffsetIdx]
-
 	key := extractResultKey(p.repr[lastOffset:])
-	colFamilyID, err := keys.DecodeFamilyKey(key)
-	if err != nil {
-		return false
-	}
-	return int(colFamilyID) == len(p.lastOffsets)-1
+	return keyHasFinalColumnFamily(key, uint32(len(p.lastOffsets)-1), reverse)
 }
 
-// maybeTrimPartialLastRow removes the last KV pairs from the result that are part
-// of the same SQL row as the given key, returning the earliest key removed. The
-// row cannot be made up of more KV pairs than given by len(lastOffsets),
+// maybeTrimPartialLastRow implements the results interface.
+//
+// The row cannot be made up of more KV pairs than given by len(lastOffsets),
 // otherwise an error is returned. Must be called before finish().
 func (p *pebbleResults) maybeTrimPartialLastRow(nextKey roachpb.Key) (roachpb.Key, error) {
 	if !p.lastOffsetsEnabled || len(p.repr) == 0 {
@@ -304,15 +382,9 @@ func extractResultKey(repr []byte) roachpb.Key {
 	return key.Key
 }
 
-// pebbleMVCCScanner handles MVCCScan / MVCCGet using a Pebble iterator. If any
-// MVCC range tombstones are encountered, it synthesizes MVCC point tombstones
-// by switching to a pointSynthesizingIter.
+// pebbleMVCCScanner handles MVCCScan / MVCCGet using a Pebble iterator.
 type pebbleMVCCScanner struct {
 	parent MVCCIterator
-	// pointIter is a point synthesizing iterator that wraps and replaces parent
-	// when an MVCC range tombstone is encountered. A separate reference to it is
-	// kept in order to release it back to its pool when the scanner is done.
-	pointIter *pointSynthesizingIter
 	// memAccount is used to account for the size of the scan results.
 	memAccount *mon.BoundAccount
 	// lockTable is used to determine whether keys are locked in the in-memory
@@ -335,9 +407,6 @@ type pebbleMVCCScanner struct {
 	// hitting a limit. Partial rows at the end of the result will be trimmed. If
 	// allowEmpty is false, and the partial row is the first row in the result,
 	// the row will instead be completed by fetching additional KV pairs.
-	//
-	// Requires init() to have been called with trackLastOffsets set to the
-	// maximum number of KV pairs in a row.
 	wholeRows bool
 	// Stop adding intents and abort scan once maxIntents threshold is reached.
 	// This limit is only applicable to consistent scans since they return
@@ -347,7 +416,7 @@ type pebbleMVCCScanner struct {
 	maxIntents int64
 	// Resume fields describe the resume span to return. resumeReason must be set
 	// to a non-zero value to return a resume span, the others are optional.
-	resumeReason    roachpb.ResumeReason
+	resumeReason    kvpb.ResumeReason
 	resumeKey       roachpb.Key // if unset, falls back to p.advanceKey()
 	resumeNextBytes int64       // set when targetBytes is exceeded
 	// Transaction epoch and sequence number.
@@ -366,18 +435,22 @@ type pebbleMVCCScanner struct {
 	skipLocked       bool
 	tombstones       bool
 	failOnMoreRecent bool
-	isGet            bool
 	keyBuf           []byte
 	savedBuf         []byte
+	lazyFetcherBuf   pebble.LazyFetcher
+	lazyValueBuf     []byte
 	// cur* variables store the "current" record we're pointing to. Updated in
 	// updateCurrent. Note that the timestamp can be clobbered in the case of
 	// adding an intent from the intent history but is otherwise meaningful.
-	curUnsafeKey   MVCCKey
-	curRawKey      []byte
-	curUnsafeValue MVCCValue
-	curRawValue    []byte
-	results        pebbleResults
-	intents        pebble.Batch
+	curUnsafeKey      MVCCKey
+	curRawKey         []byte
+	curUnsafeValue    MVCCValue
+	curRawValue       pebble.LazyValue
+	curRangeKeys      MVCCRangeKeyStack
+	savedRangeKeys    MVCCRangeKeyStack
+	savedRangeKeyVers MVCCRangeKeyVersion
+	results           results
+	intents           pebble.Batch
 	// mostRecentTS stores the largest timestamp observed that is equal to or
 	// above the scan timestamp. Only applicable if failOnMoreRecent is true. If
 	// set and no other error is hit, a WriteToOld error will be returned from
@@ -390,7 +463,55 @@ type pebbleMVCCScanner struct {
 	// Number of iterations to try before we do a Seek/SeekReverse. Stays within
 	// [0, maxItersBeforeSeek] and defaults to maxItersBeforeSeek/2 .
 	itersBeforeSeek int
+	// machine is the state machine for how the iterator should be advanced in
+	// order to handle scans and reverse scans.
+	machine struct {
+		// fn indicates the advance function that needs to be called next.
+		fn advanceFn
+		// origKey is a temporary buffer used to store the "original key" when
+		// advancing the iterator at the new key. It is backed by keyBuf.
+		origKey []byte
+	}
+	// alloc holds fields embedded within the scanner struct only to reduce
+	// allocations in common cases.
+	alloc struct {
+		// Typically pebbleMVCCScanner.results points to pebbleResults.
+		// Embedding the pebbleResults within the pebbleMVCCScanner avoids an
+		// extra allocation, at the cost of higher allocated bytes when we use a
+		// different implementation of the results interface.
+		pebbleResults pebbleResults
+	}
 }
+
+type advanceFn int
+
+const (
+	_ advanceFn = iota
+
+	// "Forward" advance states, used for non-reverse scans.
+	//
+	// advanceKeyForward indicates that the iterator needs to be advanced to the
+	// next key.
+	advanceKeyForward
+	// advanceKeyAtEndForward indicates that the iterator has reached the end in
+	// the forward direction.
+	advanceKeyAtEndForward
+	// advanceKeyAtNewKeyForward indicates that the iterator has just reached a
+	// new key.
+	advanceKeyAtNewKeyForward
+
+	// "Reverse" advance states, used for reverse scans.
+	//
+	// advanceKeyReverse indicates that the iterator needs to be advanced to the
+	// previous key.
+	advanceKeyReverse
+	// advanceKeyAtEndReverse indicates that the iterator has reached the end in
+	// the reverse direction.
+	advanceKeyAtEndReverse
+	// advanceKeyAtNewKeyReverse indicates that the iterator needs to be
+	// advanced to the key before the key that has just been reached.
+	advanceKeyAtNewKeyReverse
+)
 
 // Pool for allocating pebble MVCC Scanners.
 var pebbleMVCCScannerPool = sync.Pool{
@@ -400,12 +521,12 @@ var pebbleMVCCScannerPool = sync.Pool{
 }
 
 func (p *pebbleMVCCScanner) release() {
-	if p.pointIter != nil {
-		p.pointIter.release()
-	}
 	// Discard most memory references before placing in pool.
 	*p = pebbleMVCCScanner{
 		keyBuf: p.keyBuf,
+		// NB: This clears p.alloc.pebbleResults too, which should be maintained
+		// to avoid delaying GC of contained byte slices and avoid accidental
+		// misuse.
 	}
 	pebbleMVCCScannerPool.Put(p)
 }
@@ -413,13 +534,10 @@ func (p *pebbleMVCCScanner) release() {
 // init sets bounds on the underlying pebble iterator, and initializes other
 // fields not set by the calling method.
 func (p *pebbleMVCCScanner) init(
-	txn *roachpb.Transaction, ui uncertainty.Interval, trackLastOffsets int,
+	txn *roachpb.Transaction, ui uncertainty.Interval, results results,
 ) {
 	p.itersBeforeSeek = maxItersBeforeSeek / 2
-	if trackLastOffsets > 0 {
-		p.results.lastOffsetsEnabled = true
-		p.results.lastOffsets = make([]int, trackLastOffsets)
-	}
+	p.results = results
 
 	if txn != nil {
 		p.txn = txn
@@ -436,27 +554,93 @@ func (p *pebbleMVCCScanner) init(
 	p.checkUncertainty = p.ts.Less(p.uncertainty.GlobalLimit)
 }
 
-// get iterates exactly once and adds one KV to the result set.
+// get seeks to the start key exactly once and adds one KV to the result set.
 func (p *pebbleMVCCScanner) get(ctx context.Context) {
-	p.isGet = true
+	p.parent.SeekGE(MVCCKey{Key: p.start})
+	if !p.iterValid() {
+		return
+	}
 
-	// The iterator may already be positioned on a range key that SeekGE hits, in
-	// which case RangeKeyChanged() wouldn't fire, so we enable point synthesis
-	// here if needed. We check this before SeekGE, because in the typical case
-	// this will be a new, unpositioned iterator, which allows omitting the
-	// HasPointAndRange() call.
-	if ok, _ := p.parent.Valid(); ok {
+	// Unlike scans, if tombstones are enabled, we synthesize point tombstones
+	// for MVCC range tombstones even if there is no existing point key below
+	// it. These are often needed for e.g. conflict checks. However, both
+	// processRangeKeys and getOne may need to advance the iterator,
+	// moving away from range key we originally landed on. If we're in tombstone
+	// mode and there's a range key, save the most recent visible value so that
+	// we can use it to synthesize a tombstone if we fail to find a KV.
+	var hadMVCCRangeTombstone bool
+	if p.tombstones {
 		if _, hasRange := p.parent.HasPointAndRange(); hasRange {
-			p.enablePointSynthesis()
+			rangeKeys := p.parent.RangeKeys()
+			if rkv, ok := rangeKeys.FirstAtOrBelow(p.ts); ok {
+				hadMVCCRangeTombstone = true
+				rkv.CloneInto(&p.savedRangeKeyVers)
+			}
 		}
 	}
 
-	p.parent.SeekGE(MVCCKey{Key: p.start})
-	if !p.updateCurrent() {
-		return
+	var added bool
+	if p.processRangeKeys(true /* seeked */, false /* reverse */) {
+		if p.updateCurrent() {
+			_, added = p.getOne(ctx)
+		}
 	}
-	p.getAndAdvance(ctx)
 	p.maybeFailOnMoreRecent()
+
+	// In tombstone mode, if there was no existing point key we may need to
+	// synthesize a point tombstone if we saved a range key before
+	// Unlike scans, if tombstones are enabled, we synthesize point tombstones
+	// for MVCC range tombstones even if there is no existing point key below
+	// it. These are often needed for e.g. conflict checks.
+	if p.tombstones && hadMVCCRangeTombstone && !added && p.err == nil {
+		p.addSynthetic(ctx, p.start, p.savedRangeKeyVers)
+	}
+}
+
+// seekToStartOfScan positions the scanner at the initial key.
+func (p *pebbleMVCCScanner) seekToStartOfScan() (ok bool) {
+	if p.reverse {
+		if !p.iterSeekReverse(MVCCKey{Key: p.end}) {
+			p.maybeFailOnMoreRecent() // may have seen a conflicting range key
+			return false
+		}
+		p.machine.fn = advanceKeyReverse
+	} else {
+		if !p.iterSeek(MVCCKey{Key: p.start}) {
+			p.maybeFailOnMoreRecent() // may have seen a conflicting range key
+			return false
+		}
+		p.machine.fn = advanceKeyForward
+	}
+	return true
+}
+
+// advance advances the iterator according to the current state of the state
+// machine.
+func (p *pebbleMVCCScanner) advance() bool {
+	switch p.machine.fn {
+	case advanceKeyForward:
+		return p.advanceKeyForward()
+	case advanceKeyAtEndForward:
+		// We've reached the end of the iterator and there is
+		// nothing left to do.
+		return false
+	case advanceKeyAtNewKeyForward:
+		// We're already at the new key so there is nothing to do.
+		p.machine.fn = advanceKeyForward
+		return true
+	case advanceKeyReverse:
+		return p.advanceKeyReverse()
+	case advanceKeyAtEndReverse:
+		p.machine.fn = advanceKeyReverse
+		return p.advanceKeyAtEndReverse()
+	case advanceKeyAtNewKeyReverse:
+		p.machine.fn = advanceKeyReverse
+		return p.advanceKeyAtNewKeyReverse()
+	default:
+		p.err = errors.AssertionFailedf("unexpected advanceFn: %d", p.machine.fn)
+		return false
+	}
 }
 
 // scan iterates until a limit is exceeded, the underlying iterator is
@@ -464,35 +648,26 @@ func (p *pebbleMVCCScanner) get(ctx context.Context) {
 // resume span, resume reason, and for targetBytes the size of the next result.
 func (p *pebbleMVCCScanner) scan(
 	ctx context.Context,
-) (*roachpb.Span, roachpb.ResumeReason, int64, error) {
-	if p.wholeRows && !p.results.lastOffsetsEnabled {
+) (*roachpb.Span, kvpb.ResumeReason, int64, error) {
+	if p.wholeRows && !p.results.(*pebbleResults).lastOffsetsEnabled {
 		return nil, 0, 0, errors.AssertionFailedf("cannot use wholeRows without trackLastOffsets")
 	}
-	p.isGet = false
-
-	// The iterator may already be positioned on a range key that the seek hits,
-	// in which case RangeKeyChanged() wouldn't fire, so we enable point synthesis
-	// here if needed. We check this before seeking, because in the typical case
-	// this will be a new, unpositioned iterator, which allows omitting the
-	// HasPointAndRange() call.
-	if ok, _ := p.parent.Valid(); ok {
-		if _, hasRange := p.parent.HasPointAndRange(); hasRange {
-			p.enablePointSynthesis()
+	if !p.seekToStartOfScan() {
+		return nil, 0, 0, p.err
+	}
+	for ok := true; ok; {
+		ok, _ = p.getOne(ctx)
+		if ok {
+			ok = p.advance()
 		}
 	}
+	return p.afterScan()
+}
 
-	if p.reverse {
-		if !p.iterSeekReverse(MVCCKey{Key: p.end}) {
-			return nil, 0, 0, p.err
-		}
-	} else {
-		if !p.iterSeek(MVCCKey{Key: p.start}) {
-			return nil, 0, 0, p.err
-		}
-	}
-
-	for p.getAndAdvance(ctx) {
-	}
+// afterScan checks whether some limit was exceeded during the scan, and if so,
+// it returns a resume span, resume reason, and for targetBytes the size of the
+// next result.
+func (p *pebbleMVCCScanner) afterScan() (*roachpb.Span, kvpb.ResumeReason, int64, error) {
 	p.maybeFailOnMoreRecent()
 
 	if p.err != nil {
@@ -502,8 +677,14 @@ func (p *pebbleMVCCScanner) scan(
 	if p.resumeReason != 0 {
 		resumeKey := p.resumeKey
 		if len(resumeKey) == 0 {
-			if !p.advanceKey() {
-				return nil, 0, 0, nil // nothing to resume
+			if p.reverse {
+				if !p.advanceKeyReverse() {
+					return nil, 0, 0, nil // nothing to resume
+				}
+			} else {
+				if !p.advanceKeyForward() {
+					return nil, 0, 0, nil // nothing to resume
+				}
 			}
 			resumeKey = p.curUnsafeKey.Key
 		}
@@ -541,8 +722,13 @@ func (p *pebbleMVCCScanner) incrementItersBeforeSeek() {
 // Decrements itersBeforeSeek while ensuring it stays positive.
 func (p *pebbleMVCCScanner) decrementItersBeforeSeek() {
 	p.itersBeforeSeek--
-	if p.itersBeforeSeek < 0 {
-		p.itersBeforeSeek = 0
+	if p.itersBeforeSeek < 1 {
+		if maxItersBeforeSeek > 0 {
+			p.itersBeforeSeek = 1
+		} else if p.itersBeforeSeek < 0 {
+			// maxItersBeforeSeek == 0 && p.itersBeforeSeek < 0.
+			p.itersBeforeSeek = 0
+		}
 	}
 }
 
@@ -584,29 +770,54 @@ func (p *pebbleMVCCScanner) maybeFailOnMoreRecent() {
 	}
 	// The txn can't write at the existing timestamp, so we provide the error
 	// with the timestamp immediately after it.
-	p.err = roachpb.NewWriteTooOldError(p.ts, p.mostRecentTS.Next(), p.mostRecentKey)
+	p.err = kvpb.NewWriteTooOldError(p.ts, p.mostRecentTS.Next(), p.mostRecentKey)
 	p.results.clear()
 	p.intents.Reset()
 }
 
-// Returns an uncertainty error with the specified timestamp and p.txn.
-func (p *pebbleMVCCScanner) uncertaintyError(ts hlc.Timestamp) bool {
-	p.err = roachpb.NewReadWithinUncertaintyIntervalError(
-		p.ts, ts, p.uncertainty.LocalLimit.ToTimestamp(), p.txn)
+// Returns an uncertainty error with the specified value and local timestamps,
+// along with context about the reader.
+func (p *pebbleMVCCScanner) uncertaintyError(
+	valueTs hlc.Timestamp, localTs hlc.ClockTimestamp,
+) (ok bool) {
+	p.err = kvpb.NewReadWithinUncertaintyIntervalError(
+		p.ts, p.uncertainty.LocalLimit, p.txn, valueTs, localTs)
 	p.results.clear()
 	p.intents.Reset()
 	return false
 }
 
-// Emit a tuple and return true if we have reason to believe iteration can
-// continue.
-func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
+// Get one tuple into the result set. This method will make at most one
+// 'results.put' call regardless of whether 'put' returns an error or not.
+// - ok indicates whether the iteration should continue.
+// - added indicates whether a tuple was included into the result set.
+// (ok=true, added=false) indicates that the current key was skipped for some
+// reason, but the iteration should continue.
+// (ok=false, added=true) indicates that the KV was included into the result but
+// the iteration should stop.
+//
+// The scanner must be positioned on a point key, possibly with an overlapping
+// range key. Range keys are processed separately in processRangeKeys().
+func (p *pebbleMVCCScanner) getOne(ctx context.Context) (ok, added bool) {
 	if !p.curUnsafeKey.Timestamp.IsEmpty() {
-		if extended, valid := p.tryDecodeCurrentValueSimple(); !valid {
-			return false
+		// Range key where read ts >= range key ts >= point key ts. Synthesize a
+		// point tombstone for it. Range key conflict checks are done in
+		// processRangeKeys().
+		if rkv, ok := p.coveredByRangeKey(p.curUnsafeKey.Timestamp); ok {
+			return p.addSynthetic(ctx, p.curUnsafeKey.Key, rkv)
+		}
+
+		// We are eagerly fetching and decoding the value, even though it may be
+		// too recent. With some care, this could be optimized to be lazy.
+		v, valid := p.getFromLazyValue()
+		if !valid {
+			return false, false
+		}
+		if extended, valid := p.tryDecodeCurrentValueSimple(v); !valid {
+			return false, false
 		} else if extended {
-			if !p.decodeCurrentValueExtended() {
-				return false
+			if !p.decodeCurrentValueExtended(v) {
+				return false, false
 			}
 		}
 
@@ -614,7 +825,7 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 		if p.curUnsafeKey.Timestamp.Less(p.ts) {
 			// 1. Fast path: there is no intent and our read timestamp is newer
 			// than the most recent version's timestamp.
-			return p.addAndAdvance(ctx, p.curUnsafeKey.Key, p.curRawKey, p.curUnsafeValue.Value.RawBytes)
+			return p.add(ctx, p.curUnsafeKey.Key, p.curRawKey, p.curUnsafeValue.Value.RawBytes)
 		}
 
 		// ts == read_ts
@@ -626,12 +837,12 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 
 				if p.skipLocked {
 					if locked, ok := p.isKeyLockedByConflictingTxn(ctx, p.curRawKey); !ok {
-						return false
+						return false, false
 					} else if locked {
 						// 2a. the scanner was configured to skip locked keys, and
 						// this key was locked, so we can advance past it without
 						// raising the write too old error.
-						return p.advanceKey()
+						return true /* ok */, false
 					}
 				}
 
@@ -643,12 +854,12 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 				if len(p.mostRecentKey) == 0 {
 					p.mostRecentKey = append(p.mostRecentKey, p.curUnsafeKey.Key...)
 				}
-				return p.advanceKey()
+				return true /* ok */, false
 			}
 
 			// 3. There is no intent and our read timestamp is equal to the most
 			// recent version's timestamp.
-			return p.addAndAdvance(ctx, p.curUnsafeKey.Key, p.curRawKey, p.curUnsafeValue.Value.RawBytes)
+			return p.add(ctx, p.curUnsafeKey.Key, p.curRawKey, p.curUnsafeValue.Value.RawBytes)
 		}
 
 		// ts > read_ts
@@ -659,12 +870,12 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 
 			if p.skipLocked {
 				if locked, ok := p.isKeyLockedByConflictingTxn(ctx, p.curRawKey); !ok {
-					return false
+					return false, false
 				} else if locked {
 					// 4a. the scanner was configured to skip locked keys, and
 					// this key was locked, so we can advance past it without
 					// raising the write too old error.
-					return p.advanceKey()
+					return true /* ok */, false
 				}
 			}
 
@@ -676,7 +887,7 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 			if len(p.mostRecentKey) == 0 {
 				p.mostRecentKey = append(p.mostRecentKey, p.curUnsafeKey.Key...)
 			}
-			return p.advanceKey()
+			return true /* ok */, false
 		}
 
 		if p.checkUncertainty {
@@ -685,7 +896,7 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 			// errors.
 			localTS := p.curUnsafeValue.GetLocalTimestamp(p.curUnsafeKey.Timestamp)
 			if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp, localTS) {
-				return p.uncertaintyError(p.curUnsafeKey.Timestamp)
+				return p.uncertaintyError(p.curUnsafeKey.Timestamp, localTS), false
 			}
 
 			// This value is not within the reader's uncertainty window, but
@@ -703,16 +914,16 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 	}
 
 	if !p.decodeCurrentMetadata() {
-		return false
+		return false, false
 	}
 	if len(p.meta.RawBytes) != 0 {
 		// 7. Emit immediately if the value is inline.
-		return p.addAndAdvance(ctx, p.curUnsafeKey.Key, p.curRawKey, p.meta.RawBytes)
+		return p.add(ctx, p.curUnsafeKey.Key, p.curRawKey, p.meta.RawBytes)
 	}
 
 	if p.meta.Txn == nil {
 		p.err = errors.Errorf("intent without transaction")
-		return false
+		return false, false
 	}
 	metaTS := p.meta.Timestamp.ToTimestamp()
 
@@ -759,7 +970,7 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 			// chunks to amortize allocations. The memMonitor is under-counting here
 			// by only accounting for the key and value bytes.
 			if !p.addCurIntent(ctx) {
-				return false
+				return false, false
 			}
 			return p.seekVersion(ctx, prevTS, false)
 		}
@@ -773,10 +984,10 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 			// false when skipLocked in enabled.
 			if p.maxIntents == 0 || int64(p.intents.Count()) < p.maxIntents {
 				if !p.addCurIntent(ctx) {
-					return false
+					return false, false
 				}
 			}
-			return p.advanceKey()
+			return true /* ok */, false
 		}
 
 		// 11. The key contains an intent which was not written by our
@@ -791,14 +1002,14 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 		// continue scanning so that we can return all of the intents
 		// in the scan range.
 		if !p.addCurIntent(ctx) {
-			return false
+			return false, false
 		}
 		// Limit number of intents returned in write intent error.
 		if p.maxIntents > 0 && int64(p.intents.Count()) >= p.maxIntents {
-			p.resumeReason = roachpb.RESUME_INTENT_LIMIT
-			return false
+			p.resumeReason = kvpb.RESUME_INTENT_LIMIT
+			return false, false
 		}
-		return p.advanceKey()
+		return true /* ok */, false
 	}
 
 	if p.txnEpoch == p.meta.Txn.Epoch {
@@ -826,14 +1037,14 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 			//
 			// Note: this assumes that it is safe to corrupt curKey here because we're
 			// about to advance. If this proves to be a problem later, we can extend
-			// addAndAdvance to take an MVCCKey explicitly.
+			// add to take an MVCCKey explicitly.
 			p.curUnsafeKey.Timestamp = metaTS
 			p.keyBuf = EncodeMVCCKeyToBuf(p.keyBuf[:0], p.curUnsafeKey)
 			p.curUnsafeValue, p.err = DecodeMVCCValue(intentValueRaw)
 			if p.err != nil {
-				return false
+				return false, false
 			}
-			return p.addAndAdvance(ctx, p.curUnsafeKey.Key, p.keyBuf, p.curUnsafeValue.Value.RawBytes)
+			return p.add(ctx, p.curUnsafeKey.Key, p.keyBuf, p.curUnsafeValue.Value.RawBytes)
 		}
 		// 14. If no value in the intent history has a sequence number equal to
 		// or less than the read, we must ignore the intents laid down by the
@@ -850,7 +1061,7 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 		// this is some operation that was retried).
 		p.err = errors.Errorf("failed to read with epoch %d due to a write intent with epoch %d",
 			p.txnEpoch, p.meta.Txn.Epoch)
-		return false
+		return false, false
 	}
 
 	// 16. We're reading our own txn's intent but the current txn has a
@@ -863,27 +1074,23 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 
 // nextKey advances to the next user key.
 func (p *pebbleMVCCScanner) nextKey() bool {
-	p.keyBuf = append(p.keyBuf[:0], p.curUnsafeKey.Key...)
-
-	for i := 0; i < p.itersBeforeSeek; i++ {
+	if p.reverse && p.peeked {
+		// If the parent iterator is in reverse because we've peeked, then we
+		// can step the iterator once to land back onto the current key before
+		// we fallthrough to call NextKey.
 		if !p.iterNext() {
 			return false
 		}
-		if !bytes.Equal(p.curUnsafeKey.Key, p.keyBuf) {
-			p.incrementItersBeforeSeek()
-			return true
-		}
+		// Fallthrough to NextKey.
 	}
-
-	p.decrementItersBeforeSeek()
-	// We're pointed at a different version of the same key. Fall back to
-	// seeking to the next key. We append a NUL to account for the "next-key".
-	// Note that we cannot rely on curUnsafeKey.Key being unchanged even though
-	// we are at a different version of the same key -- the underlying
-	// MVCCIterator is free to mutate the backing for p.curUnsafeKey.Key
-	// arbitrarily. Therefore we use p.keyBuf here which we have handy.
-	p.keyBuf = append(p.keyBuf, 0)
-	return p.iterSeek(MVCCKey{Key: p.keyBuf})
+	p.parent.NextKey()
+	if !p.iterValid() {
+		return false
+	}
+	if !p.processRangeKeys(false /* seeked */, false /* reverse */) {
+		return false
+	}
+	return p.updateCurrent()
 }
 
 // backwardLatestVersion backs up the iterator to the latest version for the
@@ -895,12 +1102,14 @@ func (p *pebbleMVCCScanner) backwardLatestVersion(key []byte, i int) bool {
 	p.keyBuf = append(p.keyBuf[:0], key...)
 
 	for ; i < p.itersBeforeSeek; i++ {
-		peekedKey, ok := p.iterPeekPrev()
+		peekedKey, hasPoint, ok := p.iterPeekPrev()
 		if !ok {
 			// No previous entry exists, so we're at the latest version of key.
 			return true
 		}
-		if !bytes.Equal(peekedKey, p.keyBuf) {
+		// We may peek a bare range key with the same start bound as the point key,
+		// in which case we're also positioned on the latest point key version.
+		if !bytes.Equal(peekedKey, p.keyBuf) || !hasPoint {
 			p.incrementItersBeforeSeek()
 			return true
 		}
@@ -919,78 +1128,104 @@ func (p *pebbleMVCCScanner) backwardLatestVersion(key []byte, i int) bool {
 }
 
 // prevKey advances to the newest version of the user key preceding the
-// specified key. Assumes that the iterator is currently positioned at
-// key or 1 record after key.
+// specified key. Assumes that the iterator is currently positioned at key or 1
+// record after key and that the key is "safe" (i.e. it's a copy and not the
+// "current" key directly).
 func (p *pebbleMVCCScanner) prevKey(key []byte) bool {
-	p.keyBuf = append(p.keyBuf[:0], key...)
-
 	for i := 0; i < p.itersBeforeSeek; i++ {
-		peekedKey, ok := p.iterPeekPrev()
-		if !ok {
-			return false
-		}
-		if !bytes.Equal(peekedKey, p.keyBuf) {
-			return p.backwardLatestVersion(peekedKey, i+1)
-		}
 		if !p.iterPrev() {
 			return false
+		}
+		if !bytes.Equal(p.curUnsafeKey.Key, key) {
+			return p.backwardLatestVersion(p.curUnsafeKey.Key, i+1)
 		}
 	}
 
 	p.decrementItersBeforeSeek()
-	return p.iterSeekReverse(MVCCKey{Key: p.keyBuf})
+	return p.iterSeekReverse(MVCCKey{Key: key})
 }
 
-// advanceKey advances to the next key in the iterator's direction.
-func (p *pebbleMVCCScanner) advanceKey() bool {
-	if p.isGet {
-		return false
-	}
-	if p.reverse {
-		return p.prevKey(p.curUnsafeKey.Key)
-	}
+// advanceKeyForward advances to the next key in the forward direction.
+func (p *pebbleMVCCScanner) advanceKeyForward() bool {
 	return p.nextKey()
 }
 
-// advanceKeyAtEnd advances to the next key when the iterator's end has been
-// reached.
-func (p *pebbleMVCCScanner) advanceKeyAtEnd() bool {
-	if p.reverse {
-		// Iterating to the next key might have caused the iterator to reach the
-		// end of the key space. If that happens, back up to the very last key.
-		p.peeked = false
-		p.parent.SeekLT(MVCCKey{Key: p.end})
-		if !p.updateCurrent() {
-			return false
-		}
-		return p.advanceKey()
-	}
-	// We've reached the end of the iterator and there is nothing left to do.
-	return false
+// advanceKeyReverse advances to the next key in the reverse direction.
+func (p *pebbleMVCCScanner) advanceKeyReverse() bool {
+	// Make a copy to satisfy the contract of prevKey.
+	p.keyBuf = append(p.keyBuf[:0], p.curUnsafeKey.Key...)
+	return p.prevKey(p.keyBuf)
 }
 
-// advanceKeyAtNewKey advances to the key after the specified key, assuming we
-// have just reached the specified key.
-func (p *pebbleMVCCScanner) advanceKeyAtNewKey(key []byte) bool {
+// setAdvanceKeyAtEnd updates the machine to the corresponding "advance key at
+// end" state.
+func (p *pebbleMVCCScanner) setAdvanceKeyAtEnd() {
 	if p.reverse {
-		// We've advanced to the next key but need to move back to the previous
-		// key.
-		return p.prevKey(key)
+		p.machine.fn = advanceKeyAtEndReverse
+	} else {
+		p.machine.fn = advanceKeyAtEndForward
 	}
-	// We're already at the new key so there is nothing to do.
-	return true
 }
 
-// Adds the specified key and value to the result set, excluding tombstones unless
-// p.tombstones is true. Advances to the next key unless we've reached the max
-// results limit.
-func (p *pebbleMVCCScanner) addAndAdvance(
+// advanceKeyAtEndReverse advances to the next key when the iterator's end has
+// been reached in the reverse direction.
+func (p *pebbleMVCCScanner) advanceKeyAtEndReverse() bool {
+	// Iterating to the next key might have caused the iterator to reach the
+	// end of the key space. If that happens, back up to the very last key.
+	p.peeked = false
+	p.parent.SeekLT(MVCCKey{Key: p.end})
+	if !p.iterValid() {
+		return false
+	}
+	if !p.processRangeKeys(true /* seeked */, true /* reverse */) {
+		return false
+	}
+	if !p.updateCurrent() {
+		return false
+	}
+	return p.advanceKeyReverse()
+}
+
+// setAdvanceKeyAtNewKey updates the machine to the corresponding "advance key
+// at new key" state.
+func (p *pebbleMVCCScanner) setAdvanceKeyAtNewKey(origKey []byte) {
+	p.machine.origKey = origKey
+	if p.reverse {
+		p.machine.fn = advanceKeyAtNewKeyReverse
+	} else {
+		p.machine.fn = advanceKeyAtNewKeyForward
+	}
+}
+
+// advanceKeyAtNewKeyReverse advances to the key after the key stored in
+// p.machine.origKey in the reverse direction, assuming we have just reached the
+// key after p.machine.origKey in the forward direction.
+func (p *pebbleMVCCScanner) advanceKeyAtNewKeyReverse() bool {
+	// We've advanced to the next key but need to move back to the previous key.
+	// Note that we already made the copy in seekVersion, so we can just use the
+	// key as is.
+	return p.prevKey(p.machine.origKey)
+}
+
+// IncludeStartKeyIntoErr wraps with the given error to include the provided
+// start key of the scan as an additional detail.
+func IncludeStartKeyIntoErr(startKey roachpb.Key, err error) error {
+	return errors.Wrapf(err, "scan with start key %s", startKey)
+}
+
+// Adds the specified key and value to the result set, excluding tombstones
+// unless p.tombstones is true.
+//   - ok indicates whether the iteration should continue. This can be false
+//     because we hit an error or reached some limit.
+//   - added indicates whether the key and value were included into the result
+//     set.
+func (p *pebbleMVCCScanner) add(
 	ctx context.Context, key roachpb.Key, rawKey []byte, rawValue []byte,
-) bool {
+) (ok, added bool) {
 	// Don't include deleted versions len(val) == 0, unless we've been instructed
 	// to include tombstones in the results.
 	if len(rawValue) == 0 && !p.tombstones {
-		return p.advanceKey()
+		return true /* ok */, false
 	}
 
 	// If the scanner has been configured with the skipLocked option, don't
@@ -1000,19 +1235,21 @@ func (p *pebbleMVCCScanner) addAndAdvance(
 	// getAndAdvance.
 	if p.skipLocked {
 		if locked, ok := p.isKeyLockedByConflictingTxn(ctx, rawKey); !ok {
-			return false
+			return false, false
 		} else if locked {
-			return p.advanceKey()
+			return true /* ok */, false
 		}
 	}
 
-	// Check if adding the key would exceed a limit.
-	if p.targetBytes > 0 && p.results.bytes+int64(p.results.sizeOf(len(rawKey), len(rawValue))) > p.targetBytes {
-		p.resumeReason = roachpb.RESUME_BYTE_LIMIT
-		p.resumeNextBytes = int64(p.results.sizeOf(len(rawKey), len(rawValue)))
+	numKeys, numBytes, numBytesInc := p.results.sizeInfo(len(rawKey), len(rawValue))
 
-	} else if p.maxKeys > 0 && p.results.count >= p.maxKeys {
-		p.resumeReason = roachpb.RESUME_KEY_LIMIT
+	// Check if adding the key would exceed a limit.
+	if p.targetBytes > 0 && numBytes+numBytesInc > p.targetBytes {
+		p.resumeReason = kvpb.RESUME_BYTE_LIMIT
+		p.resumeNextBytes = numBytesInc
+
+	} else if p.maxKeys > 0 && numKeys >= p.maxKeys {
+		p.resumeReason = kvpb.RESUME_KEY_LIMIT
 	}
 
 	var mustPutKey bool
@@ -1021,7 +1258,7 @@ func (p *pebbleMVCCScanner) addAndAdvance(
 		// then make sure we include the first key in the result. If wholeRows is
 		// enabled, then also make sure we complete the first SQL row.
 		if !p.allowEmpty &&
-			(p.results.count == 0 || (p.wholeRows && p.results.continuesFirstRow(key))) {
+			(numKeys == 0 || (p.wholeRows && p.results.continuesFirstRow(key))) {
 			p.resumeReason = 0
 			p.resumeNextBytes = 0
 			mustPutKey = true
@@ -1033,13 +1270,13 @@ func (p *pebbleMVCCScanner) addAndAdvance(
 				trimmedKey, err := p.results.maybeTrimPartialLastRow(key)
 				if err != nil {
 					p.err = err
-					return false
+					return false, false
 				}
 				if trimmedKey != nil {
 					p.resumeKey = trimmedKey
 				}
 			}
-			return false
+			return false, false
 		}
 	}
 
@@ -1049,49 +1286,69 @@ func (p *pebbleMVCCScanner) addAndAdvance(
 	//
 	// For B we will never set maxNewSize.
 	// For A, we may set maxNewSize, but we already know that
-	//   p.targetBytes >= p.results.bytes + lenToAdd
+	//   p.targetBytes >= numBytes + numBytesInc
 	// so maxNewSize will be sufficient.
 	var maxNewSize int
-	if p.targetBytes > 0 && p.targetBytes > p.results.bytes && !mustPutKey {
+	if p.targetBytes > 0 && p.targetBytes > numBytes && !mustPutKey {
 		// INVARIANT: !mustPutKey => maxNewSize is sufficient for key-value
 		// pair.
-		maxNewSize = int(p.targetBytes - p.results.bytes)
+		maxNewSize = int(p.targetBytes - numBytes)
 	}
 	if err := p.results.put(ctx, rawKey, rawValue, p.memAccount, maxNewSize); err != nil {
-		p.err = errors.Wrapf(err, "scan with start key %s", p.start)
-		return false
+		p.err = IncludeStartKeyIntoErr(p.start, err)
+		return false, false
 	}
+	numKeys++
 
 	// Check if we hit the key limit just now to avoid scanning further before
 	// checking the key limit above on the next iteration. This has a small cost
 	// (~0.5% for large scans), but avoids the potentially large cost of scanning
 	// lots of garbage before the next key -- especially when maxKeys is small.
-	if p.maxKeys > 0 && p.results.count >= p.maxKeys {
+	if p.maxKeys > 0 && numKeys >= p.maxKeys {
 		// If we're not allowed to return partial SQL rows, check whether the last
 		// KV pair in the result has the maximum column family ID of the row. If so,
 		// we can return early. However, if it doesn't then we can't know yet
 		// whether the row is complete or not, because the final column families of
 		// the row may have been omitted (if they are all NULL values) -- to find
 		// out, we must continue scanning to the next key and handle it above.
-		if !p.wholeRows || p.results.lastRowHasFinalColumnFamily() {
-			p.resumeReason = roachpb.RESUME_KEY_LIMIT
-			return false
+		if !p.wholeRows || p.results.lastRowHasFinalColumnFamily(p.reverse) {
+			p.resumeReason = kvpb.RESUME_KEY_LIMIT
+			return false /* ok */, true /* added */
 		}
 	}
-	return p.advanceKey()
+	return true /* ok */, true /* added */
+}
+
+// addSynthetic adds a synthetic point key for the given range key version.
+func (p *pebbleMVCCScanner) addSynthetic(
+	ctx context.Context, key roachpb.Key, version MVCCRangeKeyVersion,
+) (ok, added bool) {
+	p.keyBuf = EncodeMVCCKeyToBuf(p.keyBuf[:0], MVCCKey{Key: key, Timestamp: version.Timestamp})
+	var value MVCCValue
+	var simple bool
+	value, simple, p.err = tryDecodeSimpleMVCCValue(version.Value)
+	if !simple && p.err == nil {
+		value, p.err = decodeExtendedMVCCValue(version.Value)
+	}
+	if p.err != nil {
+		return false, false
+	}
+	return p.add(ctx, key, p.keyBuf, value.Value.RawBytes)
 }
 
 // Seeks to the latest revision of the current key that's still less than or
-// equal to the specified timestamp, adds it to the result set, then moves onto
-// the next user key.
+// equal to the specified timestamp and adds it to the result set.
+//   - ok indicates whether the iteration should continue.
+//   - added indicates whether the key and value were included into the result
+//     set.
 func (p *pebbleMVCCScanner) seekVersion(
 	ctx context.Context, seekTS hlc.Timestamp, uncertaintyCheck bool,
-) bool {
+) (ok, added bool) {
 	if seekTS.IsEmpty() {
 		// If the seek timestamp is empty, we've already seen all versions of this
 		// key, so seek to the next key. Seeking to version zero of the current key
 		// would be incorrect, as version zero is stored before all other versions.
-		return p.advanceKey()
+		return true /* ok */, false
 	}
 
 	seekKey := MVCCKey{Key: p.curUnsafeKey.Key, Timestamp: seekTS}
@@ -1105,23 +1362,32 @@ func (p *pebbleMVCCScanner) seekVersion(
 
 	for i := 0; i < p.itersBeforeSeek; i++ {
 		if !p.iterNext() {
-			return p.advanceKeyAtEnd()
+			p.setAdvanceKeyAtEnd()
+			return true /* ok */, false
 		}
 		if !bytes.Equal(p.curUnsafeKey.Key, origKey) {
 			p.incrementItersBeforeSeek()
-			return p.advanceKeyAtNewKey(origKey)
+			p.setAdvanceKeyAtNewKey(origKey)
+			return true /* ok */, false
 		}
 		if p.curUnsafeKey.Timestamp.LessEq(seekTS) {
 			p.incrementItersBeforeSeek()
-			if extended, valid := p.tryDecodeCurrentValueSimple(); !valid {
-				return false
+			v, valid := p.getFromLazyValue()
+			if !valid {
+				return false, false
+			}
+			if extended, valid := p.tryDecodeCurrentValueSimple(v); !valid {
+				return false, false
 			} else if extended {
-				if !p.decodeCurrentValueExtended() {
-					return false
+				if !p.decodeCurrentValueExtended(v) {
+					return false, false
 				}
 			}
 			if !uncertaintyCheck || p.curUnsafeKey.Timestamp.LessEq(p.ts) {
-				return p.addAndAdvance(ctx, p.curUnsafeKey.Key, p.curRawKey, p.curUnsafeValue.Value.RawBytes)
+				if rkv, ok := p.coveredByRangeKey(p.curUnsafeKey.Timestamp); ok {
+					return p.addSynthetic(ctx, p.curUnsafeKey.Key, rkv)
+				}
+				return p.add(ctx, p.curUnsafeKey.Key, p.curRawKey, p.curUnsafeValue.Value.RawBytes)
 			}
 			// Iterate through uncertainty interval. Though we found a value in
 			// the interval, it may not be uncertainty. This is because seekTS
@@ -1133,38 +1399,170 @@ func (p *pebbleMVCCScanner) seekVersion(
 			// is uncertain.
 			localTS := p.curUnsafeValue.GetLocalTimestamp(p.curUnsafeKey.Timestamp)
 			if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp, localTS) {
-				return p.uncertaintyError(p.curUnsafeKey.Timestamp)
+				return p.uncertaintyError(p.curUnsafeKey.Timestamp, localTS), false
 			}
 		}
 	}
 
 	p.decrementItersBeforeSeek()
 	if !p.iterSeek(seekKey) {
-		return p.advanceKeyAtEnd()
+		p.setAdvanceKeyAtEnd()
+		return true /* ok */, false
 	}
 	for {
 		if !bytes.Equal(p.curUnsafeKey.Key, origKey) {
-			return p.advanceKeyAtNewKey(origKey)
+			p.setAdvanceKeyAtNewKey(origKey)
+			return true /* ok */, false
 		}
-		if extended, valid := p.tryDecodeCurrentValueSimple(); !valid {
-			return false
+		v, valid := p.getFromLazyValue()
+		if !valid {
+			return false, false
+		}
+		if extended, valid := p.tryDecodeCurrentValueSimple(v); !valid {
+			return false, false
 		} else if extended {
-			if !p.decodeCurrentValueExtended() {
-				return false
+			if !p.decodeCurrentValueExtended(v) {
+				return false, false
 			}
 		}
 		if !uncertaintyCheck || p.curUnsafeKey.Timestamp.LessEq(p.ts) {
-			return p.addAndAdvance(ctx, p.curUnsafeKey.Key, p.curRawKey, p.curUnsafeValue.Value.RawBytes)
+			if rkv, ok := p.coveredByRangeKey(p.curUnsafeKey.Timestamp); ok {
+				return p.addSynthetic(ctx, p.curUnsafeKey.Key, rkv)
+			}
+			return p.add(ctx, p.curUnsafeKey.Key, p.curRawKey, p.curUnsafeValue.Value.RawBytes)
 		}
 		// Iterate through uncertainty interval. See the comment above about why
 		// a value in this interval is not necessarily cause for an uncertainty
 		// error.
 		localTS := p.curUnsafeValue.GetLocalTimestamp(p.curUnsafeKey.Timestamp)
 		if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp, localTS) {
-			return p.uncertaintyError(p.curUnsafeKey.Timestamp)
+			return p.uncertaintyError(p.curUnsafeKey.Timestamp, localTS), false
 		}
 		if !p.iterNext() {
-			return p.advanceKeyAtEnd()
+			p.setAdvanceKeyAtEnd()
+			return true /* ok */, false
+		}
+	}
+}
+
+// coveredByRangeKey returns the topmost range key at the current position
+// between the given timestamp and the read timestamp p.ts, if any.
+//
+// gcassert:inline
+func (p *pebbleMVCCScanner) coveredByRangeKey(ts hlc.Timestamp) (rkv MVCCRangeKeyVersion, ok bool) {
+	// This code is a bit odd to fit it within the mid-stack inlining budget. We
+	// can't use p.curRangeKeys.IsEmpty(), nor early returns.
+	if len(p.curRangeKeys.Versions) > 0 {
+		rkv, ok = p.doCoveredByRangeKey(ts)
+	}
+	return rkv, ok
+}
+
+// doCoveredByRangeKey is a helper for coveredByRangeKey to allow mid-stack
+// inlining.  It is only called when there are range keys present.
+func (p *pebbleMVCCScanner) doCoveredByRangeKey(ts hlc.Timestamp) (MVCCRangeKeyVersion, bool) {
+	// In the common case when tombstones are disabled, range key masking will be
+	// enabled and so the point key will generally always be above the upper range
+	// key (unless we're reading in the past). We fast-path this here.
+	if p.tombstones || ts.LessEq(p.curRangeKeys.Newest()) {
+		if rkv, ok := p.curRangeKeys.FirstAtOrBelow(p.ts); ok && ts.LessEq(rkv.Timestamp) {
+			return rkv, true
+		}
+	}
+	return MVCCRangeKeyVersion{}, false
+}
+
+// processRangeKeys will check for any newly encountered MVCC range keys (as
+// determined by RangeKeyChanged), perform conflict checks for them, decode them
+// into p.curRangeKeys, and skip across bare range keys until positioned on a
+// point key or exhausted iterator. It must be called after every iterator
+// positioning operation, to make sure it sees the RangeKeyChanged signal.
+// Requires a valid iterator. Returns true if iteration can continue.
+//
+// seeked must be set to true following an iterator seek operation. In the
+// forward direction, bare range keys are only possible with RangeKeyChanged or
+// SeekGE, which allows omitting HasPointAndRange calls in the common Next case.
+// It's also required to handle the case where the scanner is given a used
+// iterator that may already be positioned on a range key such that the initial
+// seek won't trigger RangeKeyChanged.
+//
+// reverse must be set to true if the previous iterator operation was a reverse
+// operation (SeekLT or Prev). This determines the direction to skip in, and
+// also requires checking for bare range keys after every step, since we'll
+// land on them last.
+func (p *pebbleMVCCScanner) processRangeKeys(seeked bool, reverse bool) bool {
+
+	// Look for new range keys to process, and step across bare range keys until
+	// we land on a point key (or exhaust the iterator).
+	for {
+		// In the forward direction, we can only land on a bare range key when
+		// RangeKeyChanged fires (at its start bound) or when we SeekGE within it.
+		rangeKeyChanged := p.parent.RangeKeyChanged()
+		if !rangeKeyChanged && !reverse && !seeked {
+			return true
+		}
+
+		// We fast-path the common no-range-key case.
+		hasPoint, hasRange := p.parent.HasPointAndRange()
+		if !hasRange {
+			p.curRangeKeys = MVCCRangeKeyStack{}
+			return true
+		}
+
+		// Process new range keys. On the initial seek it's possible that we're
+		// given an iterator that's already positioned on a range key, so
+		// RangeKeyChanged won't fire -- we handle that case here as well.
+		if rangeKeyChanged || (seeked && p.curRangeKeys.IsEmpty()) {
+			p.curRangeKeys = p.parent.RangeKeys()
+
+			// Check for conflicts with range keys at or above the read timestamp.
+			// We don't need to handle e.g. skipLocked, because range keys don't
+			// currently have intents.
+			if p.failOnMoreRecent {
+				if key := p.parent.UnsafeKey(); !hasPoint || !key.Timestamp.IsEmpty() {
+					if newest := p.curRangeKeys.Newest(); p.ts.LessEq(newest) {
+						p.mostRecentTS.Forward(newest)
+						if len(p.mostRecentKey) == 0 {
+							p.mostRecentKey = append(p.mostRecentKey[:0], key.Key...)
+						}
+					}
+				}
+			}
+
+			// Check if any of the range keys are in the uncertainty interval.
+			if p.checkUncertainty {
+				for _, version := range p.curRangeKeys.Versions {
+					if version.Timestamp.LessEq(p.ts) {
+						break
+					}
+					var value MVCCValue
+					var simple bool
+					value, simple, p.err = tryDecodeSimpleMVCCValue(version.Value)
+					if !simple && p.err == nil {
+						value, p.err = decodeExtendedMVCCValue(version.Value)
+					}
+					if p.err != nil {
+						return false
+					}
+					localTS := value.GetLocalTimestamp(version.Timestamp)
+					if p.uncertainty.IsUncertain(version.Timestamp, localTS) {
+						return p.uncertaintyError(version.Timestamp, localTS)
+					}
+				}
+			}
+		}
+
+		// If we're on a point key we're done, otherwise keep stepping.
+		if hasPoint {
+			return true
+		}
+		if !reverse {
+			p.parent.Next()
+		} else {
+			p.parent.Prev()
+		}
+		if !p.iterValid() {
+			return false
 		}
 	}
 }
@@ -1172,11 +1570,9 @@ func (p *pebbleMVCCScanner) seekVersion(
 // Updates cur{RawKey, UnsafeKey, RawValue} to match record the iterator is
 // pointing to. Callers should call decodeCurrent{Metadata, Value} to decode
 // the raw value if they need it.
+//
+// Must only be called with a valid iterator.
 func (p *pebbleMVCCScanner) updateCurrent() bool {
-	if !p.iterValid() {
-		return false
-	}
-
 	p.curRawKey = p.parent.UnsafeRawMVCCKey()
 
 	var err error
@@ -1185,7 +1581,7 @@ func (p *pebbleMVCCScanner) updateCurrent() bool {
 		p.err = errors.Wrap(err, "unable to decode MVCCKey")
 		return false
 	}
-	p.curRawValue = p.parent.UnsafeValue()
+	p.curRawValue = p.parent.UnsafeLazyValue()
 
 	// Reset decoded value to avoid bugs.
 	if util.RaceEnabled {
@@ -1195,39 +1591,28 @@ func (p *pebbleMVCCScanner) updateCurrent() bool {
 	return true
 }
 
-// enablePointSynthesis wraps p.parent with a pointSynthesizingIter, which
-// synthesizes MVCC point tombstones for MVCC range tombstones and never emits
-// range keys itself. p.parent must be valid.
-//
-// gcassert:inline
-func (p *pebbleMVCCScanner) enablePointSynthesis() {
-	if util.RaceEnabled {
-		if ok, _ := p.parent.Valid(); !ok {
-			panic(errors.AssertionFailedf("enablePointSynthesis called with invalid iter"))
-		}
-		if p.pointIter != nil {
-			panic(errors.AssertionFailedf("enablePointSynthesis called when already enabled"))
-		}
-		if _, hasRange := p.parent.HasPointAndRange(); !hasRange {
-			panic(errors.AssertionFailedf("enablePointSynthesis called on non-range-key position %s",
-				p.parent.UnsafeKey()))
-		}
+func (p *pebbleMVCCScanner) getFromLazyValue() (v []byte, valid bool) {
+	v, callerOwned, err := p.curRawValue.Value(p.lazyValueBuf)
+	if err != nil {
+		p.err = err
+		return nil, false
 	}
-	p.pointIter = newPointSynthesizingIterAtParent(p.parent)
-	p.parent = p.pointIter
-	if util.RaceEnabled {
-		if ok, _ := p.parent.Valid(); !ok {
-			panic(errors.AssertionFailedf("invalid pointSynthesizingIter with valid iter"))
-		}
+	if callerOwned {
+		p.lazyValueBuf = v[:0]
 	}
+	return v, true
 }
 
 func (p *pebbleMVCCScanner) decodeCurrentMetadata() bool {
-	if len(p.curRawValue) == 0 {
+	val, valid := p.getFromLazyValue()
+	if !valid {
+		return false
+	}
+	if len(val) == 0 {
 		p.err = errors.Errorf("zero-length mvcc metadata")
 		return false
 	}
-	err := protoutil.Unmarshal(p.curRawValue, &p.meta)
+	err := protoutil.Unmarshal(val, &p.meta)
 	if err != nil {
 		p.err = errors.Wrap(err, "unable to decode MVCCMetadata")
 		return false
@@ -1236,15 +1621,15 @@ func (p *pebbleMVCCScanner) decodeCurrentMetadata() bool {
 }
 
 //gcassert:inline
-func (p *pebbleMVCCScanner) tryDecodeCurrentValueSimple() (extended, valid bool) {
+func (p *pebbleMVCCScanner) tryDecodeCurrentValueSimple(v []byte) (extended, valid bool) {
 	var simple bool
-	p.curUnsafeValue, simple, p.err = tryDecodeSimpleMVCCValue(p.curRawValue)
+	p.curUnsafeValue, simple, p.err = tryDecodeSimpleMVCCValue(v)
 	return !simple, p.err == nil
 }
 
 //gcassert:inline
-func (p *pebbleMVCCScanner) decodeCurrentValueExtended() bool {
-	p.curUnsafeValue, p.err = decodeExtendedMVCCValue(p.curRawValue)
+func (p *pebbleMVCCScanner) decodeCurrentValueExtended(v []byte) bool {
+	p.curUnsafeValue, p.err = decodeExtendedMVCCValue(v)
 	return p.err == nil
 }
 
@@ -1257,17 +1642,6 @@ func (p *pebbleMVCCScanner) iterValid() bool {
 		}
 		return false
 	}
-	// Since iterValid() is called after every iterator positioning operation, it
-	// is convenient to check for any range keys and enable point synthesis here.
-	if p.parent.RangeKeyChanged() {
-		p.enablePointSynthesis()
-	}
-	if util.RaceEnabled && p.pointIter == nil {
-		if _, hasRange := p.parent.HasPointAndRange(); hasRange {
-			panic(errors.AssertionFailedf("range key did not trigger point synthesis at %s",
-				p.parent.UnsafeKey()))
-		}
-	}
 	return true
 }
 
@@ -1275,6 +1649,12 @@ func (p *pebbleMVCCScanner) iterValid() bool {
 func (p *pebbleMVCCScanner) iterSeek(key MVCCKey) bool {
 	p.clearPeeked()
 	p.parent.SeekGE(key)
+	if !p.iterValid() {
+		return false
+	}
+	if !p.processRangeKeys(true /* seeked */, false /* reverse */) {
+		return false
+	}
 	return p.updateCurrent()
 }
 
@@ -1282,6 +1662,12 @@ func (p *pebbleMVCCScanner) iterSeek(key MVCCKey) bool {
 func (p *pebbleMVCCScanner) iterSeekReverse(key MVCCKey) bool {
 	p.clearPeeked()
 	p.parent.SeekLT(key)
+	if !p.iterValid() {
+		return false
+	}
+	if !p.processRangeKeys(true /* seeked */, true /* reverse */) {
+		return false
+	}
 	if !p.updateCurrent() {
 		// We have seeked to before the start key. Return.
 		return false
@@ -1300,24 +1686,27 @@ func (p *pebbleMVCCScanner) iterSeekReverse(key MVCCKey) bool {
 func (p *pebbleMVCCScanner) iterNext() bool {
 	if p.reverse && p.peeked {
 		// If we have peeked at the previous entry, we need to advance the iterator
-		// twice.
+		// to get back to the current entry. If we've peeked off the beginning,
+		// it's okay to Next: Pebble will reposition to the first visible key.
 		p.peeked = false
-		if !p.iterValid() {
-			// We were peeked off the beginning of iteration. Seek to the first
-			// entry, and then advance one step.
-			p.parent.SeekGE(MVCCKey{Key: p.start})
-			if !p.iterValid() {
-				return false
-			}
-			p.parent.Next()
-			return p.updateCurrent()
-		}
 		p.parent.Next()
+		// We don't need to process range key changes here, because curRangeKeys
+		// already contains the range keys at this position from before the peek.
+		if buildutil.CrdbTestBuild {
+			p.assertOwnedRangeKeys()
+		}
 		if !p.iterValid() {
 			return false
 		}
 	}
+	// Step forward from the current entry.
 	p.parent.Next()
+	if !p.iterValid() {
+		return false
+	}
+	if !p.processRangeKeys(false /* seeked */, false /* reverse */) {
+		return false
+	}
 	return p.updateCurrent()
 }
 
@@ -1325,28 +1714,50 @@ func (p *pebbleMVCCScanner) iterNext() bool {
 func (p *pebbleMVCCScanner) iterPrev() bool {
 	if p.peeked {
 		p.peeked = false
-		return p.updateCurrent()
+	} else {
+		p.parent.Prev()
 	}
-	p.parent.Prev()
+	if !p.iterValid() {
+		return false
+	}
+	if !p.processRangeKeys(false /* seeked */, true /* reverse */) {
+		return false
+	}
 	return p.updateCurrent()
 }
 
-// Peek the previous key and store the result in peekedKey. Note that this
-// moves the iterator backward, while leaving p.cur{key,value,rawKey} untouched
-// and therefore out of sync. iterPrev and iterNext take this into account.
-func (p *pebbleMVCCScanner) iterPeekPrev() ([]byte, bool) {
+// Peek the previous key and store the result in peekedKey, also returning
+// whether the peeked key had a point key or only a bare range key. Note that
+// this moves the iterator backward, while leaving p.cur{key,value,rawKey,RangeKeys}
+// untouched and therefore out of sync. iterPrev and iterNext take this into
+// account.
+//
+// NB: Unlike iterPrev() and iterNext(), iterPeekPrev() will not skip across
+// bare range keys: we have to do conflict checks on any new range keys when we
+// step onto them, which may happen on the next positioning operation. The
+// returned hasPoint value will indicate whether the peeked position is a bare
+// range key or not.
+func (p *pebbleMVCCScanner) iterPeekPrev() ([]byte, bool, bool) {
 	if !p.peeked {
 		p.peeked = true
 		// We need to save a copy of the current iterator key and value and adjust
 		// curRawKey, curKey and curValue to point to this saved data. We use a
 		// single buffer for this purpose: savedBuf.
 		p.savedBuf = append(p.savedBuf[:0], p.curRawKey...)
-		p.savedBuf = append(p.savedBuf, p.curRawValue...)
+		p.curRawValue, p.savedBuf = p.curRawValue.Clone(p.savedBuf, &p.lazyFetcherBuf)
 		p.curRawKey = p.savedBuf[:len(p.curRawKey)]
-		p.curRawValue = p.savedBuf[len(p.curRawKey):]
 		// The raw key is always a prefix of the encoded MVCC key. Take advantage of this to
 		// sub-slice the raw key directly, instead of calling SplitMVCCKey.
 		p.curUnsafeKey.Key = p.curRawKey[:len(p.curUnsafeKey.Key)]
+		// We need to save copies of the current range keys too, but we can avoid
+		// this if we already saved them previously (if cur and saved share memory).
+		if curStart := p.curRangeKeys.Bounds.Key; len(curStart) > 0 {
+			savedStart := p.savedRangeKeys.Bounds.Key
+			if len(curStart) != len(savedStart) || &curStart[0] != &savedStart[0] {
+				p.curRangeKeys.CloneInto(&p.savedRangeKeys)
+				p.curRangeKeys = p.savedRangeKeys
+			}
+		}
 
 		// With the current iterator state saved we can move the iterator to the
 		// previous entry.
@@ -1355,14 +1766,23 @@ func (p *pebbleMVCCScanner) iterPeekPrev() ([]byte, bool) {
 			// The iterator is now invalid, but note that this case is handled in
 			// both iterNext and iterPrev. In the former case, we'll position the
 			// iterator at the first entry, and in the latter iteration will be done.
-			return nil, false
+			return nil, false, false
 		}
 	} else if !p.iterValid() {
-		return nil, false
+		return nil, false, false
 	}
 
 	peekedKey := p.parent.UnsafeKey()
-	return peekedKey.Key, true
+
+	// We may land on a bare range key without RangeKeyChanged firing, but only at
+	// its start bound where the timestamp must be empty. HasPointAndRange() is
+	// not cheap, so we only check it when necessary.
+	hasPoint := true
+	if peekedKey.Timestamp.IsEmpty() {
+		hasPoint, _ = p.parent.HasPointAndRange()
+	}
+
+	return peekedKey.Key, hasPoint, true
 }
 
 // Clear the peeked flag. Call this before any iterator operations.
@@ -1390,9 +1810,10 @@ func (p *pebbleMVCCScanner) isKeyLockedByConflictingTxn(
 		strength = lock.Exclusive
 	}
 	if ok, txn := p.lockTable.IsKeyLockedByConflictingTxn(key, strength); ok {
-		// The key is locked, so ignore it. However, we return the lock holder
-		// separately if we have room; the caller may want to resolve it.
-		if p.maxIntents == 0 || int64(p.intents.Count()) < p.maxIntents {
+		// The key is locked or reserved, so ignore it.
+		if txn != nil && (p.maxIntents == 0 || int64(p.intents.Count()) < p.maxIntents) {
+			// However, if the key is locked, we return the lock holder separately
+			// (if we have room); the caller may want to resolve it.
 			if !p.addKeyAndMetaAsIntent(ctx, key, txn) {
 				return false, false
 			}
@@ -1405,7 +1826,11 @@ func (p *pebbleMVCCScanner) isKeyLockedByConflictingTxn(
 // addCurIntent adds the key-value pair that the scanner is currently
 // pointing to as an intent to the intents set.
 func (p *pebbleMVCCScanner) addCurIntent(ctx context.Context) bool {
-	return p.addRawIntent(ctx, p.curRawKey, p.curRawValue)
+	v, valid := p.getFromLazyValue()
+	if !valid {
+		return false
+	}
+	return p.addRawIntent(ctx, p.curRawKey, v)
 }
 
 // addKeyAndMetaAsIntent adds the key and transaction meta as an intent to
@@ -1413,6 +1838,10 @@ func (p *pebbleMVCCScanner) addCurIntent(ctx context.Context) bool {
 func (p *pebbleMVCCScanner) addKeyAndMetaAsIntent(
 	ctx context.Context, key roachpb.Key, txn *enginepb.TxnMeta,
 ) bool {
+	if txn == nil {
+		p.err = errors.AssertionFailedf("nil txn passed to addKeyAndMetaAsIntent")
+		return false
+	}
 	mvccKey := MakeMVCCMetadataKey(key)
 	mvccVal := enginepb.MVCCMetadata{Txn: txn}
 	encodedKey := EncodeMVCCKey(mvccKey)
@@ -1429,7 +1858,7 @@ func (p *pebbleMVCCScanner) addRawIntent(ctx context.Context, key, value []byte)
 	// chunks to amortize allocations. The memMonitor is under-counting here
 	// by only accounting for the key and value bytes.
 	if p.err = p.memAccount.Grow(ctx, int64(len(key)+len(value))); p.err != nil {
-		p.err = errors.Wrapf(p.err, "scan with start key %s", p.start)
+		p.err = IncludeStartKeyIntoErr(p.start, p.err)
 		return false
 	}
 	p.err = p.intents.Set(key, value, nil)
@@ -1441,4 +1870,17 @@ func (p *pebbleMVCCScanner) intentsRepr() []byte {
 		return nil
 	}
 	return p.intents.Repr()
+}
+
+// assertOwnedRangeKeys asserts that p.curRangeKeys is empty, or backed by
+// p.savedRangeKeys's buffers.
+func (p *pebbleMVCCScanner) assertOwnedRangeKeys() {
+	if p.curRangeKeys.IsEmpty() {
+		return
+	}
+	// NB: We compare on the EndKey in case the start key is /Min, the empty
+	// key.
+	if &p.curRangeKeys.Bounds.EndKey[0] != &p.savedRangeKeys.Bounds.EndKey[0] {
+		panic(errors.AssertionFailedf("current range keys are not scanner-owned"))
+	}
 }

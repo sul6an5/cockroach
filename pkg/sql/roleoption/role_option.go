@@ -11,10 +11,12 @@
 package roleoption
 
 import (
+	"context"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
 
@@ -27,11 +29,14 @@ type Option uint32
 type RoleOption struct {
 	Option
 	HasValue bool
-	// Need to resolve value in Exec for the case of placeholders.
-	Value func() (bool, string, error)
+	Value    func() (bool, string, error)
 }
 
 // KindList of role options.
+//
+// NOTE: Before adding a role option (especially a non-postgres one), consider
+// using a global privilege instead. Global privileges are inherited from role
+// to user, but role options are not.
 const (
 	_ Option = iota
 	CREATEROLE
@@ -67,40 +72,16 @@ const (
 	NOVIEWCLUSTERSETTING
 )
 
+// ControlChangefeedDeprecationNoticeMsg is a user friendly notice which should be shown when CONTROLCHANGEFEED is used
+//
+// TODO(#94757): remove CONTROLCHANGEFEED entirely
+const ControlChangefeedDeprecationNoticeMsg = "The role option CONTROLCHANGEFEED will be removed in a future release," +
+	" please switch to using the CHANGEFEED privilege for target tables instead:" +
+	" https://www.cockroachlabs.com/docs/stable/create-changefeed.html#required-privileges"
+
 // toSQLStmts is a map of Kind -> SQL statement string for applying the
 // option to the role.
 var toSQLStmts = map[Option]string{
-	CREATEROLE:             `INSERT INTO system.role_options (username, option) VALUES ($1, 'CREATEROLE') ON CONFLICT DO NOTHING`,
-	NOCREATEROLE:           `DELETE FROM system.role_options WHERE username = $1 AND option = 'CREATEROLE'`,
-	LOGIN:                  `DELETE FROM system.role_options WHERE username = $1 AND option = 'NOLOGIN'`,
-	NOLOGIN:                `INSERT INTO system.role_options (username, option) VALUES ($1, 'NOLOGIN') ON CONFLICT DO NOTHING`,
-	VALIDUNTIL:             `UPSERT INTO system.role_options (username, option, value) VALUES ($1, 'VALID UNTIL', $2::timestamptz::string)`,
-	CONTROLJOB:             `INSERT INTO system.role_options (username, option) VALUES ($1, 'CONTROLJOB') ON CONFLICT DO NOTHING`,
-	NOCONTROLJOB:           `DELETE FROM system.role_options WHERE username = $1 AND option = 'CONTROLJOB'`,
-	CONTROLCHANGEFEED:      `INSERT INTO system.role_options (username, option) VALUES ($1, 'CONTROLCHANGEFEED') ON CONFLICT DO NOTHING`,
-	NOCONTROLCHANGEFEED:    `DELETE FROM system.role_options WHERE username = $1 AND option = 'CONTROLCHANGEFEED'`,
-	CREATEDB:               `INSERT INTO system.role_options (username, option) VALUES ($1, 'CREATEDB') ON CONFLICT DO NOTHING`,
-	NOCREATEDB:             `DELETE FROM system.role_options WHERE username = $1 AND option = 'CREATEDB'`,
-	CREATELOGIN:            `INSERT INTO system.role_options (username, option) VALUES ($1, 'CREATELOGIN') ON CONFLICT DO NOTHING`,
-	NOCREATELOGIN:          `DELETE FROM system.role_options WHERE username = $1 AND option = 'CREATELOGIN'`,
-	VIEWACTIVITY:           `INSERT INTO system.role_options (username, option) VALUES ($1, 'VIEWACTIVITY') ON CONFLICT DO NOTHING`,
-	NOVIEWACTIVITY:         `DELETE FROM system.role_options WHERE username = $1 AND option = 'VIEWACTIVITY'`,
-	CANCELQUERY:            `INSERT INTO system.role_options (username, option) VALUES ($1, 'CANCELQUERY') ON CONFLICT DO NOTHING`,
-	NOCANCELQUERY:          `DELETE FROM system.role_options WHERE username = $1 AND option = 'CANCELQUERY'`,
-	MODIFYCLUSTERSETTING:   `INSERT INTO system.role_options (username, option) VALUES ($1, 'MODIFYCLUSTERSETTING') ON CONFLICT DO NOTHING`,
-	NOMODIFYCLUSTERSETTING: `DELETE FROM system.role_options WHERE username = $1 AND option = 'MODIFYCLUSTERSETTING'`,
-	SQLLOGIN:               `DELETE FROM system.role_options WHERE username = $1 AND option = 'NOSQLLOGIN'`,
-	NOSQLLOGIN:             `INSERT INTO system.role_options (username, option) VALUES ($1, 'NOSQLLOGIN') ON CONFLICT DO NOTHING`,
-	VIEWACTIVITYREDACTED:   `INSERT INTO system.role_options (username, option) VALUES ($1, 'VIEWACTIVITYREDACTED') ON CONFLICT DO NOTHING`,
-	NOVIEWACTIVITYREDACTED: `DELETE FROM system.role_options WHERE username = $1 AND option = 'VIEWACTIVITYREDACTED'`,
-	VIEWCLUSTERSETTING:     `INSERT INTO system.role_options (username, option) VALUES ($1, 'VIEWCLUSTERSETTING') ON CONFLICT DO NOTHING`,
-	NOVIEWCLUSTERSETTING:   `DELETE FROM system.role_options WHERE username = $1 AND option = 'VIEWCLUSTERSETTING'`,
-}
-
-// toSQLStmtsWithID is a map of Kind -> SQL statement string for applying the
-// option to the role.
-// toSQLStmtsWithID differs from toSQLStmts by including IDs.
-var toSQLStmtsWithID = map[Option]string{
 	CREATEROLE:             `INSERT INTO system.role_options (username, option, user_id) VALUES ($1, 'CREATEROLE', $2) ON CONFLICT DO NOTHING`,
 	NOCREATEROLE:           `DELETE FROM system.role_options WHERE username = $1 AND user_id = $2 AND option = 'CREATEROLE'`,
 	LOGIN:                  `DELETE FROM system.role_options WHERE username = $1 AND user_id = $2 AND option = 'NOLOGIN'`,
@@ -176,23 +157,65 @@ func ToOption(str string) (Option, error) {
 // List is a list of role options.
 type List []RoleOption
 
+// MakeListFromKVOptions converts KVOptions to a List using
+// typeAsString to convert exprs to strings.
+func MakeListFromKVOptions(
+	ctx context.Context,
+	o tree.KVOptions,
+	typeAsStringOrNull func(context.Context, tree.Expr) (func() (isNull bool, _ string, _ error), error),
+) (List, error) {
+	roleOptions := make(List, len(o))
+
+	for i, ro := range o {
+		// Role options are always stored as keywords in ro.Key by the
+		// parser.
+		option, err := ToOption(string(ro.Key))
+		if err != nil {
+			return nil, err
+		}
+
+		if ro.Value != nil {
+			if ro.Value == tree.DNull {
+				roleOptions[i] = RoleOption{
+					Option: option, HasValue: true, Value: func() (bool, string, error) {
+						return true, "", nil
+					},
+				}
+			} else {
+				strFn, err := typeAsStringOrNull(ctx, ro.Value)
+				if err != nil {
+					return nil, err
+				}
+				roleOptions[i] = RoleOption{
+					Option: option, Value: strFn, HasValue: true,
+				}
+			}
+		} else {
+			roleOptions[i] = RoleOption{
+				Option: option, HasValue: false,
+			}
+		}
+	}
+
+	return roleOptions, nil
+}
+
 // GetSQLStmts returns a map of SQL stmts to apply each role option.
 // Maps stmts to values (value of the role option).
-func (rol List) GetSQLStmts(
-	onRoleOption func(Option), withID bool,
-) (map[string]func() (bool, string, error), error) {
+func (rol List) GetSQLStmts(onRoleOption func(Option)) (map[string]*RoleOption, error) {
 	if len(rol) <= 0 {
 		return nil, nil
 	}
 
-	stmts := make(map[string]func() (bool, string, error), len(rol))
+	stmts := make(map[string]*RoleOption, len(rol))
 
 	err := rol.CheckRoleOptionConflicts()
 	if err != nil {
 		return stmts, err
 	}
 
-	for _, ro := range rol {
+	for i := range rol {
+		ro := &rol[i]
 		if onRoleOption != nil {
 			onRoleOption(ro.Option)
 		}
@@ -205,14 +228,7 @@ func (rol List) GetSQLStmts(
 		}
 
 		stmt := toSQLStmts[ro.Option]
-		if withID {
-			stmt = toSQLStmtsWithID[ro.Option]
-		}
-		if ro.HasValue {
-			stmts[stmt] = ro.Value
-		} else {
-			stmts[stmt] = nil
-		}
+		stmts[stmt] = ro
 	}
 
 	return stmts, nil

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -43,13 +44,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -57,6 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -272,9 +277,14 @@ func TestStatusEngineStatsJson(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	var engineStats serverpb.EngineStatsResponse
-	if err := getStatusJSONProto(s, "enginestats/local", &engineStats); err != nil {
-		t.Fatal(err)
-	}
+	// Using SucceedsSoon because we have seen in the wild that
+	// occasionally requests don't go through with error "transport:
+	// error while dialing: connection interrupted (did the remote node
+	// shut down or are there networking issues?)"
+	testutils.SucceedsSoon(t, func() error {
+		return getStatusJSONProto(s, "enginestats/local", &engineStats)
+	})
+
 	if len(engineStats.Stats) != 1 {
 		t.Fatal(errors.Errorf("expected one engine stats, got: %v", engineStats))
 	}
@@ -344,7 +354,7 @@ func startServer(t *testing.T) *TestServer {
 	// Make sure the node status is available. This is done by forcing stores to
 	// publish their status, synchronizing to the event feed with a canary
 	// event, and then forcing the server to write summaries immediately.
-	if err := ts.node.computePeriodicMetrics(context.Background(), 0); err != nil {
+	if err := ts.node.computeMetricsPeriodically(context.Background(), map[*kvserver.Store]*storage.MetricsForInterval{}, 0); err != nil {
 		t.Fatalf("error publishing store statuses: %s", err)
 	}
 
@@ -359,13 +369,14 @@ func newRPCTestContext(ctx context.Context, ts *TestServer, cfg *base.Config) *r
 	var c base.NodeIDContainer
 	ctx = logtags.AddTag(ctx, "n", &c)
 	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:  roachpb.SystemTenantID,
-		NodeID:    &c,
-		Config:    cfg,
-		Clock:     ts.Clock().WallClock(),
-		MaxOffset: ts.Clock().MaxOffset(),
-		Stopper:   ts.Stopper(),
-		Settings:  ts.ClusterSettings(),
+		TenantID:        roachpb.SystemTenantID,
+		NodeID:          &c,
+		Config:          cfg,
+		Clock:           ts.Clock().WallClock(),
+		ToleratedOffset: ts.Clock().ToleratedOffset(),
+		Stopper:         ts.Stopper(),
+		Settings:        ts.ClusterSettings(),
+		Knobs:           rpc.ContextTestingKnobs{NoLoopbackDialer: true},
 	})
 	// Ensure that the RPC client context validates the server cluster ID.
 	// This ensures that a test where the server is restarted will not let
@@ -418,7 +429,7 @@ func TestStatusGetFiles(t *testing.T) {
 		}
 
 		request := serverpb.GetFilesRequest{
-			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"*"}}
+			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"heap*"}}
 		response, err := client.GetFiles(context.Background(), &request)
 		if err != nil {
 			t.Fatal(err)
@@ -653,6 +664,124 @@ func TestStatusLocalLogs(t *testing.T) {
 	}
 }
 
+// TestStatusLocalLogsTenantFilter checks to ensure that local/logfiles,
+// local/logfiles/{filename} and local/log function correctly filter
+// logs by tenant ID.
+func TestStatusLocalLogsTenantFilter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	if log.V(3) {
+		skip.IgnoreLint(t, "Test only works with low verbosity levels")
+	}
+
+	s := log.ScopeWithoutShowLogs(t)
+	defer s.Close(t)
+
+	// This test cares about the number of output files. Ensure
+	// there's just one.
+	defer s.SetupSingleFileLogging()()
+
+	ts := startServer(t)
+	defer ts.Stopper().Stop(context.Background())
+
+	ctxSysTenant := context.Background()
+	ctxSysTenant = context.WithValue(ctxSysTenant, serverident.ServerIdentificationContextKey{}, &idProvider{
+		tenantID:  roachpb.SystemTenantID,
+		clusterID: &base.ClusterIDContainer{},
+		serverID:  &base.NodeIDContainer{},
+	})
+	appTenantID := roachpb.MustMakeTenantID(uint64(2))
+	ctxAppTenant := context.Background()
+	ctxAppTenant = context.WithValue(ctxAppTenant, serverident.ServerIdentificationContextKey{}, &idProvider{
+		tenantID:  appTenantID,
+		clusterID: &base.ClusterIDContainer{},
+		serverID:  &base.NodeIDContainer{},
+	})
+
+	// Log an error of each main type which we expect to be able to retrieve.
+	// The resolution of our log timestamps is such that it's possible to get
+	// two subsequent log messages with the same timestamp. This test will fail
+	// when that occurs. By adding a small sleep in here after each timestamp to
+	// ensures this isn't the case and that the log filtering doesn't filter out
+	// the log entires we're looking for. The value of 20 μs was chosen because
+	// the log timestamps have a fidelity of 10 μs and thus doubling that should
+	// be a sufficient buffer.
+	// See util/log/clog.go formatHeader() for more details.
+	const sleepBuffer = time.Microsecond * 20
+	log.Errorf(ctxSysTenant, "system tenant msg 1")
+	time.Sleep(sleepBuffer)
+	log.Errorf(ctxAppTenant, "app tenant msg 1")
+	time.Sleep(sleepBuffer)
+	log.Warningf(ctxSysTenant, "system tenant msg 2")
+	time.Sleep(sleepBuffer)
+	log.Warningf(ctxAppTenant, "app tenant msg 2")
+	time.Sleep(sleepBuffer)
+	log.Infof(ctxSysTenant, "system tenant msg 3")
+	time.Sleep(sleepBuffer)
+	log.Infof(ctxAppTenant, "app tenant msg 3")
+	timestampEnd := timeutil.Now().UnixNano()
+
+	var listFilesResp serverpb.LogFilesListResponse
+	if err := getStatusJSONProto(ts, "logfiles/local", &listFilesResp); err != nil {
+		t.Fatal(err)
+	}
+	require.Lenf(t, listFilesResp.Files, 1, "expected 1 log files; got %d", len(listFilesResp.Files))
+
+	testCases := []struct {
+		name     string
+		tenantID roachpb.TenantID
+	}{
+		{
+			name:     "logs for system tenant does not apply filter",
+			tenantID: roachpb.SystemTenantID,
+		},
+		{
+			name:     "logs for app tenant applies tenant ID filter",
+			tenantID: appTenantID,
+		},
+	}
+
+	for _, testCase := range testCases {
+		// Non-system tenant servers filter to the tenant that they belong to.
+		// Set the server tenant ID for this test case.
+		ts.rpcContext.TenantID = testCase.tenantID
+
+		var logfilesResp serverpb.LogEntriesResponse
+		if err := getStatusJSONProto(ts, "logfiles/local/"+listFilesResp.Files[0].Name, &logfilesResp); err != nil {
+			t.Fatal(err)
+		}
+		var logsResp serverpb.LogEntriesResponse
+		if err := getStatusJSONProto(ts, fmt.Sprintf("logs/local?end_time=%d", timestampEnd), &logsResp); err != nil {
+			t.Fatal(err)
+		}
+
+		// Run the same set of assertions against both responses, as they are both expected
+		// to contain the log entries we're looking for.
+		for _, response := range []serverpb.LogEntriesResponse{logfilesResp, logsResp} {
+			sysTenantFound, appTenantFound := false, false
+			for _, logEntry := range response.Entries {
+				if !strings.HasSuffix(logEntry.File, "status_test.go") {
+					continue
+				}
+
+				if testCase.tenantID != roachpb.SystemTenantID {
+					require.Equal(t, logEntry.TenantID, testCase.tenantID.String())
+				} else {
+					// Logs use the literal system tenant ID when tagging.
+					if logEntry.TenantID == fmt.Sprintf("%d", roachpb.SystemTenantID.InternalValue) {
+						sysTenantFound = true
+					} else if logEntry.TenantID == appTenantID.String() {
+						appTenantFound = true
+					}
+				}
+			}
+			if testCase.tenantID == roachpb.SystemTenantID {
+				require.True(t, sysTenantFound)
+				require.True(t, appTenantFound)
+			}
+		}
+	}
+}
+
 // TestStatusLogRedaction checks that the log file retrieval RPCs
 // honor the redaction flags.
 func TestStatusLogRedaction(t *testing.T) {
@@ -756,7 +885,8 @@ func TestStatusLogRedaction(t *testing.T) {
 						}
 
 						// Retrieve the log entries using the Logs() RPC.
-						logsURL := fmt.Sprintf("logs/local?redact=%v", tc.redact)
+						// Set a high `max` value to ensure we get the log line we're searching for.
+						logsURL := fmt.Sprintf("logs/local?redact=%v&max=5000", tc.redact)
 						var wrapper2 serverpb.LogEntriesResponse
 						if err := getStatusJSONProto(ts, logsURL, &wrapper2); err != nil {
 							t.Fatal(err)
@@ -901,6 +1031,7 @@ func TestMetricsMetadata(t *testing.T) {
 
 func TestHotRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 98619, "flaky test")
 	defer log.Scope(t).Close(t)
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
@@ -932,6 +1063,18 @@ func TestHotRangesResponse(t *testing.T) {
 				if r.Desc.RangeID == 0 || (len(r.Desc.StartKey) == 0 && len(r.Desc.EndKey) == 0) {
 					t.Errorf("unexpected empty/unpopulated range descriptor: %+v", r.Desc)
 				}
+				if r.QueriesPerSecond > 0 {
+					if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
+						t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
+							r.QueriesPerSecond, r.ReadsPerSecond, r.WritesPerSecond)
+					}
+					// If the architecture doesn't support sampling CPU, it
+					// will also be zero.
+					if grunning.Supported() && r.CPUTimePerSecond == 0 {
+						t.Errorf("qps %.2f > 0, expected cpu=%.2f to be non-zero",
+							r.QueriesPerSecond, r.CPUTimePerSecond)
+					}
+				}
 				if r.QueriesPerSecond > lastQPS {
 					t.Errorf("unexpected increase in qps between ranges; prev=%.2f, current=%.2f, desc=%v",
 						lastQPS, r.QueriesPerSecond, r.Desc)
@@ -945,6 +1088,7 @@ func TestHotRangesResponse(t *testing.T) {
 
 func TestHotRanges2Response(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 98619, "flaky test")
 	defer log.Scope(t).Close(t)
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
@@ -960,6 +1104,17 @@ func TestHotRanges2Response(t *testing.T) {
 	for _, r := range hotRangesResp.Ranges {
 		if r.RangeID == 0 {
 			t.Errorf("unexpected empty range id: %d", r.RangeID)
+		}
+		if r.QPS > 0 {
+			if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
+				t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
+					r.QPS, r.ReadsPerSecond, r.WritesPerSecond)
+			}
+			// If the architecture doesn't support sampling CPU, it
+			// will also be zero.
+			if grunning.Supported() && r.CPUTimePerSecond == 0 {
+				t.Errorf("qps %.2f > 0, expected cpu=%.2f to be non-zero", r.QPS, r.CPUTimePerSecond)
+			}
 		}
 		if r.QPS > lastQPS {
 			t.Errorf("unexpected increase in qps between ranges; prev=%.2f, current=%.2f", lastQPS, r.QPS)
@@ -984,14 +1139,14 @@ func TestHotRanges2ResponseWithViewActivityOptions(t *testing.T) {
 		}
 	}
 
-	// Grant VIEWACTIVITY and all test should work.
-	db.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
+	// Grant VIEWCLUSTERMETADATA and all test should work.
+	db.Exec(t, fmt.Sprintf("GRANT SYSTEM VIEWCLUSTERMETADATA TO %s", authenticatedUserNameNoAdmin().Normalized()))
 	if err := postStatusJSONProtoWithAdminOption(s, "v2/hotranges", req, &hotRangesResp, false); err != nil {
 		t.Fatal(err)
 	}
 
 	// Grant VIEWACTIVITYREDACTED and all test should get permission errors.
-	db.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITYREDACTED", authenticatedUserNameNoAdmin().Normalized()))
+	db.Exec(t, fmt.Sprintf("REVOKE SYSTEM  VIEWCLUSTERMETADATA FROM %s", authenticatedUserNameNoAdmin().Normalized()))
 	if err := postStatusJSONProtoWithAdminOption(s, "v2/hotranges", req, &hotRangesResp, false); err != nil {
 		if !testutils.IsError(err, "status: 403") {
 			t.Fatalf("expected privilege error, got %v", err)
@@ -1188,20 +1343,20 @@ func TestStatusVarsTxnMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_begin_count 1")) {
-		t.Errorf("expected `sql_txn_begin_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_begin_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_txn_begin_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_count 1")) {
-		t.Errorf("expected `sql_restart_savepoint_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count 1")) {
-		t.Errorf("expected `sql_restart_savepoint_release_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_release_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_commit_count 1")) {
-		t.Errorf("expected `sql_txn_commit_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_commit_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_txn_commit_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_rollback_count 0")) {
-		t.Errorf("expected `sql_txn_rollback_count 0`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_rollback_count{node_id=\"1\"} 0")) {
+		t.Errorf("expected `sql_txn_rollback_count{node_id=\"1\"} 0`, got: %s", body)
 	}
 }
 
@@ -1216,11 +1371,14 @@ func TestSpanStatsResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var response serverpb.SpanStatsResponse
-	request := serverpb.SpanStatsRequest{
-		NodeID:   "1",
-		StartKey: []byte(roachpb.RKeyMin),
-		EndKey:   []byte(roachpb.RKeyMax),
+	var response roachpb.SpanStatsResponse
+	span := roachpb.Span{
+		Key:    roachpb.RKeyMin.AsRawKey(),
+		EndKey: roachpb.RKeyMax.AsRawKey(),
+	}
+	request := roachpb.SpanStatsRequest{
+		NodeID: "1",
+		Spans:  []roachpb.Span{span},
 	}
 
 	url := ts.AdminURL() + statusPrefix + "span"
@@ -1231,7 +1389,8 @@ func TestSpanStatsResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := int(response.RangeCount), initialRanges; a != e {
+	responseSpanStats := response.SpanToStats[span.String()]
+	if a, e := int(responseSpanStats.RangeCount), initialRanges; a != e {
 		t.Errorf("expected %d ranges, found %d", e, a)
 	}
 }
@@ -1246,10 +1405,13 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	rpcStopper := stop.NewStopper()
 	defer rpcStopper.Stop(ctx)
 	rpcContext := newRPCTestContext(ctx, ts, ts.RPCContext().Config)
-	request := serverpb.SpanStatsRequest{
-		NodeID:   "1",
-		StartKey: []byte(roachpb.RKeyMin),
-		EndKey:   []byte(roachpb.RKeyMax),
+	span := roachpb.Span{
+		Key:    roachpb.RKeyMin.AsRawKey(),
+		EndKey: roachpb.RKeyMax.AsRawKey(),
+	}
+	request := roachpb.SpanStatsRequest{
+		NodeID: "1",
+		Spans:  []roachpb.Span{span},
 	}
 
 	url := ts.ServingRPCAddr()
@@ -1268,7 +1430,8 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := int(response.RangeCount), initialRanges; a != e {
+	responseSpanStats := response.SpanToStats[span.String()]
+	if a, e := int(responseSpanStats.RangeCount), initialRanges; a != e {
 		t.Fatalf("expected %d ranges, found %d", e, a)
 	}
 }
@@ -1497,7 +1660,7 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 	}
 
 	// Construct a map of all the statement fingerprint IDs.
-	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
+	statementFingerprintIDs := make(map[appstatspb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
 		statementFingerprintIDs[respStatement.ID] = true
 	}
@@ -1632,7 +1795,7 @@ func TestStatusAPITransactions(t *testing.T) {
 	}
 
 	// Construct a map of all the statement fingerprint IDs.
-	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
+	statementFingerprintIDs := make(map[appstatspb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
 		statementFingerprintIDs[respStatement.ID] = true
 	}
@@ -1818,10 +1981,6 @@ func TestStatusAPIStatements(t *testing.T) {
 				// Ignore the ALTER USER ... VIEWACTIVITY statement.
 				continue
 			}
-			if len(respStatement.Stats.SensitiveInfo.MostRecentPlanDescription.Name) == 0 {
-				// Ensure that we populate the explain plan.
-				t.Fatal("expected MostRecentPlanDescription to be populated")
-			}
 			statementsInResponse = append(statementsInResponse, respStatement.Key.KeyData.Query)
 		}
 
@@ -1911,7 +2070,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 		t.Fatalf("expected privilege error, got %v", err)
 	}
 
-	testPath := func(path string, expectedStmts []string) {
+	verifyStmts := func(path string, expectedStmts []string, hasTxns bool, t *testing.T) {
 		// Hit query endpoint.
 		if err := getStatusJSONProtoWithAdminOption(firstServerProto, path, &resp, false); err != nil {
 			t.Fatal(err)
@@ -1919,6 +2078,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 
 		// See if the statements returned are what we executed.
 		var statementsInResponse []string
+		expectedTxnFingerprints := map[appstatspb.TransactionFingerprintID]struct{}{}
 		for _, respStatement := range resp.Statements {
 			if respStatement.Key.KeyData.Failed {
 				// We ignore failed statements here as the INSERT statement can fail and
@@ -1934,20 +2094,29 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 				continue
 			}
 
-			if len(respStatement.Stats.SensitiveInfo.MostRecentPlanDescription.Name) == 0 {
-				// Ensure that we populate the explain plan.
-				t.Fatal("expected MostRecentPlanDescription to be populated")
-			}
-
 			statementsInResponse = append(statementsInResponse, respStatement.Key.KeyData.Query)
+			for _, txnFingerprintID := range respStatement.TxnFingerprintIDs {
+				expectedTxnFingerprints[txnFingerprintID] = struct{}{}
+			}
+		}
+
+		for _, respTxn := range resp.Transactions {
+			delete(expectedTxnFingerprints, respTxn.StatsData.TransactionFingerprintID)
 		}
 
 		sort.Strings(expectedStmts)
 		sort.Strings(statementsInResponse)
 
 		if !reflect.DeepEqual(expectedStmts, statementsInResponse) {
-			t.Fatalf("expected queries\n\n%v\n\ngot queries\n\n%v\n%s",
-				expectedStmts, statementsInResponse, pretty.Sprint(resp))
+			t.Fatalf("expected queries\n\n%v\n\ngot queries\n\n%v\n%s\n path: %s",
+				expectedStmts, statementsInResponse, pretty.Sprint(resp), path)
+		}
+		if hasTxns {
+			// We expect that expectedTxnFingerprints is now empty since
+			// we should have removed them all.
+			assert.Empty(t, expectedTxnFingerprints)
+		} else {
+			assert.Empty(t, resp.Transactions)
 		}
 	}
 
@@ -1960,33 +2129,65 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 		expectedStatements = append(expectedStatements, expectedStmt)
 	}
 
-	// Grant VIEWACTIVITY.
-	thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
-
-	// Test with no query params.
-	testPath("combinedstmts", expectedStatements)
-
 	oneMinAfterAggregatedTs := aggregatedTs + 60
-	// Test with end = 1 min after aggregatedTs; should give the same results as get all.
-	testPath(fmt.Sprintf("combinedstmts?end=%d", oneMinAfterAggregatedTs), expectedStatements)
-	// Test with start = 1 hour before aggregatedTs  end = 1 min after aggregatedTs; should give same results as get all.
-	testPath(fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs), expectedStatements)
-	// Test with start = 1 min after aggregatedTs; should give no results
-	testPath(fmt.Sprintf("combinedstmts?start=%d", oneMinAfterAggregatedTs), nil)
 
-	// Remove VIEWACTIVITY so we can test with just the VIEWACTIVITYREDACTED role.
-	thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s NOVIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
-	// Grant VIEWACTIVITYREDACTED.
-	thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITYREDACTED", authenticatedUserNameNoAdmin().Normalized()))
+	t.Run("fetch_mode=combined, VIEWACTIVITY", func(t *testing.T) {
+		// Grant VIEWACTIVITY.
+		thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
 
-	// Test with no query params.
-	testPath("combinedstmts", expectedStatements)
-	// Test with end = 1 min after aggregatedTs; should give the same results as get all.
-	testPath(fmt.Sprintf("combinedstmts?end=%d", oneMinAfterAggregatedTs), expectedStatements)
-	// Test with start = 1 hour before aggregatedTs  end = 1 min after aggregatedTs; should give same results as get all.
-	testPath(fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs), expectedStatements)
-	// Test with start = 1 min after aggregatedTs; should give no results
-	testPath(fmt.Sprintf("combinedstmts?start=%d", oneMinAfterAggregatedTs), nil)
+		// Test with no query params.
+		verifyStmts("combinedstmts", expectedStatements, true, t)
+		// Test with end = 1 min after aggregatedTs; should give the same results as get all.
+		verifyStmts(fmt.Sprintf("combinedstmts?end=%d", oneMinAfterAggregatedTs), expectedStatements, true, t)
+		// Test with start = 1 hour before aggregatedTs  end = 1 min after aggregatedTs; should give same results as get all.
+		verifyStmts(fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs),
+			expectedStatements, true, t)
+		// Test with start = 1 min after aggregatedTs; should give no results
+		verifyStmts(fmt.Sprintf("combinedstmts?start=%d", oneMinAfterAggregatedTs), nil, true, t)
+	})
+
+	t.Run("fetch_mode=combined, VIEWACTIVITYREDACTED", func(t *testing.T) {
+		// Remove VIEWACTIVITY so we can test with just the VIEWACTIVITYREDACTED role.
+		thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s NOVIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
+		// Grant VIEWACTIVITYREDACTED.
+		thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITYREDACTED", authenticatedUserNameNoAdmin().Normalized()))
+
+		// Test with no query params.
+		verifyStmts("combinedstmts", expectedStatements, true, t)
+		// Test with end = 1 min after aggregatedTs; should give the same results as get all.
+		verifyStmts(fmt.Sprintf("combinedstmts?end=%d", oneMinAfterAggregatedTs), expectedStatements, true, t)
+		// Test with start = 1 hour before aggregatedTs  end = 1 min after aggregatedTs; should give same results as get all.
+		verifyStmts(fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs), expectedStatements, true, t)
+		// Test with start = 1 min after aggregatedTs; should give no results
+		verifyStmts(fmt.Sprintf("combinedstmts?start=%d", oneMinAfterAggregatedTs), nil, true, t)
+	})
+
+	t.Run("fetch_mode=StmtsOnly", func(t *testing.T) {
+		verifyStmts("combinedstmts?fetch_mode.stats_type=0", expectedStatements, false, t)
+	})
+
+	t.Run("fetch_mode=TxnsOnly with limit", func(t *testing.T) {
+		// Verify that we only return stmts for the txns in the response.
+		// We'll add a limit in a later commit to help verify this behaviour.
+		if err := getStatusJSONProtoWithAdminOption(firstServerProto, "combinedstmts?fetch_mode.stats_type=1&limit=2",
+			&resp, false); err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, 2, len(resp.Transactions))
+		stmtFingerprintIDs := map[appstatspb.StmtFingerprintID]struct{}{}
+		for _, txn := range resp.Transactions {
+			for _, stmtFingerprint := range txn.StatsData.StatementFingerprintIDs {
+				stmtFingerprintIDs[stmtFingerprint] = struct{}{}
+			}
+		}
+
+		for _, stmt := range resp.Statements {
+			if _, ok := stmtFingerprintIDs[stmt.ID]; !ok {
+				t.Fatalf("unexpected stmt; stmt unrelated to a txn int he response: %s", stmt.Key.KeyData.Query)
+			}
+		}
+	})
 }
 
 func TestStatusAPIStatementDetails(t *testing.T) {
@@ -2029,8 +2230,9 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	for _, stmt := range statements {
 		thirdServerSQL.Exec(t, stmt)
 	}
+
 	query := `INSERT INTO posts VALUES (_, '_')`
-	fingerprintID := roachpb.ConstructStatementFingerprintID(query,
+	fingerprintID := appstatspb.ConstructStatementFingerprintID(query,
 		false, true, `roachblog`)
 	path := fmt.Sprintf(`stmtdetails/%v`, fingerprintID)
 
@@ -2224,7 +2426,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	}
 
 	selectQuery := "SELECT _, _, _, _"
-	fingerprintID = roachpb.ConstructStatementFingerprintID(selectQuery, false,
+	fingerprintID = appstatspb.ConstructStatementFingerprintID(selectQuery, false,
 		true, "defaultdb")
 
 	testPath(
@@ -3568,7 +3770,7 @@ func TestTransactionContentionEvents(t *testing.T) {
 				WHERE length(contending_key) > 0`,
 				)
 				if tc.testName == "nopermission" {
-					require.Contains(t, err.Error(), "requires VIEWACTIVITY")
+					require.Contains(t, err.Error(), "does not have VIEWACTIVITY")
 				} else {
 					require.NoError(t, err)
 					visibleContendingKeysCount := tree.MustBeDInt(row[0])
@@ -3596,6 +3798,9 @@ func TestTransactionContentionEvents(t *testing.T) {
 				}
 
 				for _, event := range resp.Events {
+					require.NotEqual(t, event.WaitingStmtFingerprintID, 0)
+					require.NotEqual(t, event.WaitingStmtID.String(), clusterunique.ID{}.String())
+
 					require.Equal(t, tc.canViewContendingKey, len(event.BlockingEvent.Key) > 0,
 						"expected to %s, but the contending key has length of %d",
 						expectationStr,

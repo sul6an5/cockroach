@@ -34,9 +34,9 @@ export const selectSessionsData = createSelector(
 );
 
 export const selectSessions = createSelector(
-  (state: AppState) => state.adminUI.sessions,
+  (state: AppState) => state.adminUI?.sessions,
   (state: SessionsState) => {
-    if (!state.data) {
+    if (!state?.data) {
       return null;
     }
     return state.data.sessions.map(session => {
@@ -46,9 +46,9 @@ export const selectSessions = createSelector(
 );
 
 export const selectAppName = createSelector(
-  (state: AppState) => state.adminUI.sessions,
+  (state: AppState) => state.adminUI?.sessions,
   (state: SessionsState) => {
-    if (!state.data) {
+    if (!state?.data) {
       return null;
     }
     return state.data.internal_app_name_prefix;
@@ -56,7 +56,7 @@ export const selectAppName = createSelector(
 );
 
 export const selectSortSetting = createSelector(
-  (state: AppState) => state.adminUI.localStorage,
+  (state: AppState) => state.adminUI?.localStorage,
   localStorage => localStorage["sortSetting/SessionsPage"],
 );
 
@@ -64,7 +64,7 @@ export const selectColumns = createSelector(
   localStorageSelector,
   localStorage =>
     localStorage["showColumns/SessionsPage"]
-      ? localStorage["showColumns/SessionsPage"].split(",")
+      ? localStorage["showColumns/SessionsPage"]?.split(",")
       : null,
 );
 
@@ -78,7 +78,7 @@ export const SessionsPageConnected = withRouter(
     (state: AppState, props: RouteComponentProps) => ({
       sessions: selectSessions(state),
       internalAppNamePrefix: selectAppName(state),
-      sessionsError: state.adminUI.sessions.lastError,
+      sessionsError: state.adminUI?.sessions.lastError,
       sortSetting: selectSortSetting(state),
       columns: selectColumns(state),
       filters: selectFilters(state),
@@ -134,7 +134,7 @@ export const SessionsPageConnected = withRouter(
           analyticsActions.track({
             name: "Filter Clicked",
             page: "Sessions",
-            filterName: "app",
+            filterName: "filters",
             value: value.toString(),
           }),
         );

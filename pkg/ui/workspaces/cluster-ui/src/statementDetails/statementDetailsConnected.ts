@@ -24,11 +24,9 @@ import {
 import {
   selectIsTenant,
   selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
 } from "../store/uiConfig";
-import {
-  nodeDisplayNameByIDSelector,
-  nodeRegionsByIDSelector,
-} from "../store/nodes";
+import { nodeRegionsByIDSelector } from "../store/nodes";
 import { actions as sqlDetailsStatsActions } from "src/store/statementDetails";
 import { actions as sqlStatsActions } from "src/store/sqlStats";
 import {
@@ -39,48 +37,49 @@ import { actions as analyticsActions } from "src/store/analytics";
 import { actions as localStorageActions } from "src/store/localStorage";
 import { actions as nodesActions } from "../store/nodes";
 import { actions as nodeLivenessActions } from "../store/liveness";
-import { selectTimeScale } from "../statementsPage/statementsPage.selectors";
-import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
-import { StatementDetailsRequest } from "../api";
+import { selectTimeScale } from "../store/utils/selectors";
+import {
+  actions as statementFingerprintInsightActions,
+  selectStatementFingerprintInsights,
+} from "src/store/insights/statementFingerprintInsights";
+import {
+  StmtInsightsReq,
+  InsertStmtDiagnosticRequest,
+  StatementDetailsRequest,
+  StatementDiagnosticsReport,
+} from "src/api";
 import { TimeScale } from "../timeScaleDropdown";
-import { getMatchParamByName, statementAttr } from "../util";
-type IDuration = google.protobuf.IDuration;
-type IStatementDiagnosticsReport =
-  cockroach.server.serverpb.IStatementDiagnosticsReport;
-
-const CreateStatementDiagnosticsReportRequest =
-  cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
-
-const CancelStatementDiagnosticsReportRequest =
-  cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest;
+import { getMatchParamByName, statementAttr } from "src/util";
 
 // For tenant cases, we don't show information about node, regions and
 // diagnostics.
 const mapStateToProps = (state: AppState, props: RouteComponentProps) => {
-  const { statementDetails, isLoading, lastError } = selectStatementDetails(
-    state,
-    props,
-  );
+  const { statementDetails, isLoading, lastError, lastUpdated } =
+    selectStatementDetails(state, props);
+  const statementFingerprint = statementDetails?.statement.metadata.query;
   return {
     statementFingerprintID: getMatchParamByName(props.match, statementAttr),
     statementDetails,
     isLoading: isLoading,
-    latestQuery: state.adminUI.sqlDetailsStats.latestQuery,
-    latestFormattedQuery: state.adminUI.sqlDetailsStats.latestFormattedQuery,
     statementsError: lastError,
+    lastUpdated: lastUpdated,
     timeScale: selectTimeScale(state),
-    nodeNames: selectIsTenant(state) ? {} : nodeDisplayNameByIDSelector(state),
-    nodeRegions: selectIsTenant(state) ? {} : nodeRegionsByIDSelector(state),
+    nodeRegions: nodeRegionsByIDSelector(state),
     diagnosticsReports:
       selectIsTenant(state) || selectHasViewActivityRedactedRole(state)
         ? []
         : selectDiagnosticsReportsByStatementFingerprint(
             state,
-            state.adminUI.sqlDetailsStats.latestQuery,
+            statementFingerprint,
           ),
     uiConfig: selectStatementDetailsUiConfig(state),
     isTenant: selectIsTenant(state),
     hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+    hasAdminRole: selectHasAdminRole(state),
+    statementFingerprintInsights: selectStatementFingerprintInsights(
+      state,
+      props,
+    ),
   };
 };
 
@@ -94,10 +93,19 @@ const mapDispatchToProps = (
   refreshNodes: () => dispatch(nodesActions.refresh()),
   refreshNodesLiveness: () => dispatch(nodeLivenessActions.refresh()),
   refreshUserSQLRoles: () => dispatch(uiConfigActions.refreshUserSQLRoles()),
+  refreshStatementFingerprintInsights: (req: StmtInsightsReq) =>
+    dispatch(statementFingerprintInsightActions.refresh(req)),
   onTimeScaleChange: (ts: TimeScale) => {
     dispatch(
       sqlStatsActions.updateTimeScale({
         ts: ts,
+      }),
+    );
+    dispatch(
+      analyticsActions.track({
+        name: "TimeScale changed",
+        page: "Statement Details",
+        value: ts.key,
       }),
     );
   },
@@ -109,18 +117,10 @@ const mapDispatchToProps = (
       }),
     ),
   createStatementDiagnosticsReport: (
-    statementFingerprint: string,
-    minExecLatency: IDuration,
-    expiresAfter: IDuration,
+    insertStmtDiagnosticsRequest: InsertStmtDiagnosticRequest,
   ) => {
     dispatch(
-      statementDiagnosticsActions.createReport(
-        new CreateStatementDiagnosticsReportRequest({
-          statement_fingerprint: statementFingerprint,
-          min_execution_latency: minExecLatency,
-          expires_after: expiresAfter,
-        }),
-      ),
+      statementDiagnosticsActions.createReport(insertStmtDiagnosticsRequest),
     );
     dispatch(
       analyticsActions.track({
@@ -146,13 +146,11 @@ const mapDispatchToProps = (
         action: "Downloaded",
       }),
     ),
-  onDiagnosticCancelRequest: (report: IStatementDiagnosticsReport) => {
+  onDiagnosticCancelRequest: (report: StatementDiagnosticsReport) => {
     dispatch(
-      statementDiagnosticsActions.cancelReport(
-        new CancelStatementDiagnosticsReportRequest({
-          request_id: report.id,
-        }),
-      ),
+      statementDiagnosticsActions.cancelReport({
+        requestId: report.id,
+      }),
     );
     dispatch(
       analyticsActions.track({
@@ -160,14 +158,6 @@ const mapDispatchToProps = (
         page: "Statement Details",
         action: "Cancelled",
       }),
-    );
-  },
-  onStatementDetailsQueryChange: (latestQuery: string) => {
-    dispatch(sqlDetailsStatsActions.setLatestQuery(latestQuery));
-  },
-  onStatementDetailsFormattedQueryChange: (latestFormattedQuery: string) => {
-    dispatch(
-      sqlDetailsStatsActions.setLatestFormattedQuery(latestFormattedQuery),
     );
   },
   onSortingChange: (tableName, columnName) =>

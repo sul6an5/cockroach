@@ -270,12 +270,14 @@ func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*N
 		Insecure: true,
 	}
 	rpcCtx := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:  roachpb.SystemTenantID,
-		Config:    baseCtx,
-		Clock:     &timeutil.DefaultTimeSource{},
-		MaxOffset: 0,
-		Stopper:   c.stopper,
-		Settings:  cluster.MakeTestingClusterSettings(),
+		TenantID:        roachpb.SystemTenantID,
+		Config:          baseCtx,
+		Clock:           &timeutil.DefaultTimeSource{},
+		ToleratedOffset: 0,
+		Stopper:         c.stopper,
+		Settings:        cluster.MakeTestingClusterSettings(),
+
+		ClientOnly: true,
 	})
 
 	n := &Node{
@@ -480,7 +482,7 @@ func (n *Node) Alive() bool {
 }
 
 // StatusClient returns a StatusClient set up to talk to this node.
-func (n *Node) StatusClient() serverpb.StatusClient {
+func (n *Node) StatusClient(ctx context.Context) serverpb.StatusClient {
 	n.Lock()
 	existingClient := n.statusClient
 	n.Unlock()
@@ -489,7 +491,7 @@ func (n *Node) StatusClient() serverpb.StatusClient {
 		return existingClient
 	}
 
-	conn, _, err := n.rpcCtx.GRPCDialRaw(n.RPCAddr())
+	conn, err := n.rpcCtx.GRPCUnvalidatedDial(n.RPCAddr()).Connect(ctx)
 	if err != nil {
 		log.Fatalf(context.Background(), "failed to initialize status client: %s", err)
 	}

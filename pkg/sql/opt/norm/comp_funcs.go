@@ -34,6 +34,22 @@ func (c *CustomFuncs) CommuteInequality(
 	return c.f.DynamicConstruct(op, right, left).(opt.ScalarExpr)
 }
 
+// ArithmeticErrorsOnOverflow returns true if addition or subtraction with the
+// given types will cause an error when the value overflows or underflows.
+func (c *CustomFuncs) ArithmeticErrorsOnOverflow(left, right *types.T) bool {
+	switch left.Family() {
+	case types.IntFamily, types.FloatFamily, types.DecimalFamily:
+	default:
+		return false
+	}
+	switch right.Family() {
+	case types.IntFamily, types.FloatFamily, types.DecimalFamily:
+	default:
+		return false
+	}
+	return true
+}
+
 // NormalizeTupleEquality remaps the elements of two tuples compared for
 // equality, like this:
 //

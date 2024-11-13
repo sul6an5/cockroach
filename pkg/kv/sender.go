@@ -13,9 +13,11 @@ package kv
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/redact"
 )
 
 // TxnType specifies whether a transaction is the root (parent)
@@ -63,7 +65,7 @@ type Sender interface {
 	// concurrent requests, it waits for all of them before returning,
 	// even in error cases.
 	//
-	// Once the request reaches the `transport` module, anothern
+	// Once the request reaches the `transport` module, another
 	// restriction applies (particularly relevant for the case when the
 	// node that the transport is talking to is local, and so there's
 	// not gRPC marshaling/unmarshaling):
@@ -86,7 +88,7 @@ type Sender interface {
 	// about what the client should update, as opposed to a full txn
 	// that the client is expected to diff with its copy and apply all
 	// the updates.
-	Send(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error)
+	Send(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
 }
 
 // TxnSender is the interface used to call into a CockroachDB instance
@@ -110,7 +112,7 @@ type TxnSender interface {
 
 	// UpdateRootWithLeafFinalState updates a RootTxn using the final
 	// state of a LeafTxn.
-	UpdateRootWithLeafFinalState(context.Context, *roachpb.LeafTxnFinalState)
+	UpdateRootWithLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) error
 
 	// SetUserPriority sets the txn's priority.
 	SetUserPriority(roachpb.UserPriority) error
@@ -181,7 +183,7 @@ type TxnSender interface {
 
 	// UpdateStateOnRemoteRetryableErr updates the txn in response to an
 	// error encountered when running a request through the txn.
-	UpdateStateOnRemoteRetryableErr(context.Context, *roachpb.Error) *roachpb.Error
+	UpdateStateOnRemoteRetryableErr(context.Context, *kvpb.Error) *kvpb.Error
 
 	// DisablePipelining instructs the TxnSender not to pipeline
 	// requests. It should rarely be necessary to call this method. It
@@ -255,7 +257,7 @@ type TxnSender interface {
 	// PrepareRetryableError generates a
 	// TransactionRetryWithProtoRefreshError with a payload initialized
 	// from this txn.
-	PrepareRetryableError(ctx context.Context, msg string) error
+	PrepareRetryableError(ctx context.Context, msg redact.RedactableString) error
 
 	// TestingCloneTxn returns a clone of the transaction's current
 	// proto. This is for use by tests only. Use
@@ -321,7 +323,7 @@ type TxnSender interface {
 	// otherwise nil. In this state Send() always fails with the same retryable
 	// error. ClearTxnRetryableErr can be called to clear this error and make
 	// TxnSender usable again.
-	GetTxnRetryableErr(ctx context.Context) *roachpb.TransactionRetryWithProtoRefreshError
+	GetTxnRetryableErr(ctx context.Context) *kvpb.TransactionRetryWithProtoRefreshError
 
 	// ClearTxnRetryableErr clears the retryable error, if any.
 	ClearTxnRetryableErr(ctx context.Context)
@@ -394,12 +396,12 @@ type TxnSenderFactory interface {
 
 // SenderFunc is an adapter to allow the use of ordinary functions as
 // Senders.
-type SenderFunc func(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error)
+type SenderFunc func(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
 
 // Send calls f(ctx, c).
 func (f SenderFunc) Send(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	return f(ctx, ba)
 }
 
@@ -434,9 +436,9 @@ func (f NonTransactionalFactoryFunc) NonTransactionalSender() Sender {
 // returns the unwrapped response or an error. It's valid to pass a
 // `nil` context; an empty one is used in that case.
 func SendWrappedWith(
-	ctx context.Context, sender Sender, h roachpb.Header, args roachpb.Request,
-) (roachpb.Response, *roachpb.Error) {
-	return SendWrappedWithAdmission(ctx, sender, h, roachpb.AdmissionHeader{}, args)
+	ctx context.Context, sender Sender, h kvpb.Header, args kvpb.Request,
+) (kvpb.Response, *kvpb.Error) {
+	return SendWrappedWithAdmission(ctx, sender, h, kvpb.AdmissionHeader{}, args)
 }
 
 // SendWrappedWithAdmission is a convenience function which wraps the request
@@ -444,13 +446,9 @@ func SendWrappedWith(
 // unwrapped response or an error. It's valid to pass a `nil` context; an
 // empty one is used in that case.
 func SendWrappedWithAdmission(
-	ctx context.Context,
-	sender Sender,
-	h roachpb.Header,
-	ah roachpb.AdmissionHeader,
-	args roachpb.Request,
-) (roachpb.Response, *roachpb.Error) {
-	ba := roachpb.BatchRequest{}
+	ctx context.Context, sender Sender, h kvpb.Header, ah kvpb.AdmissionHeader, args kvpb.Request,
+) (kvpb.Response, *kvpb.Error) {
+	ba := &kvpb.BatchRequest{}
 	ba.Header = h
 	ba.AdmissionHeader = ah
 	ba.Add(args)
@@ -470,15 +468,15 @@ func SendWrappedWithAdmission(
 // TODO(tschottdorf): should move this to testutils and merge with
 // other helpers which are used, for example, in `storage`.
 func SendWrapped(
-	ctx context.Context, sender Sender, args roachpb.Request,
-) (roachpb.Response, *roachpb.Error) {
-	return SendWrappedWith(ctx, sender, roachpb.Header{}, args)
+	ctx context.Context, sender Sender, args kvpb.Request,
+) (kvpb.Response, *kvpb.Error) {
+	return SendWrappedWith(ctx, sender, kvpb.Header{}, args)
 }
 
 // Wrap returns a Sender which applies the given function before delegating to
 // the supplied Sender.
-func Wrap(sender Sender, f func(roachpb.BatchRequest) roachpb.BatchRequest) Sender {
-	return SenderFunc(func(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+func Wrap(sender Sender, f func(*kvpb.BatchRequest) *kvpb.BatchRequest) Sender {
+	return SenderFunc(func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 		return sender.Send(ctx, f(ba))
 	})
 }

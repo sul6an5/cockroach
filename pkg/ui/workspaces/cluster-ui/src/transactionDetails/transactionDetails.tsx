@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React from "react";
+import React, { useContext } from "react";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import classNames from "classnames/bind";
 import _ from "lodash";
@@ -31,7 +31,6 @@ import { tableClasses } from "../transactionsTable/transactionsTableClasses";
 import { SqlBox } from "../sql";
 import {
   aggregateStatements,
-  getStatementsByFingerprintId,
   statementFingerprintIdsToText,
 } from "../transactionsPage/utils";
 import { Loading } from "../loading";
@@ -39,11 +38,13 @@ import { SummaryCard, SummaryCardItem } from "../summaryCard";
 import {
   Bytes,
   calculateTotalWorkload,
+  FixFingerprintHexValue,
   Duration,
   formatNumberForDisplay,
+  unset,
 } from "src/util";
 import { UIConfigState } from "../store";
-import SQLActivityError from "../sqlActivity/errorComponent";
+import LoadingError from "../sqlActivity/errorComponent";
 
 import summaryCardStyles from "../summaryCard/summaryCard.module.scss";
 import transactionDetailsStyles from "./transactionDetails.modules.scss";
@@ -59,20 +60,40 @@ import {
 } from "src/statementsTable/statementsTable";
 import { Transaction } from "src/transactionsTable";
 import Long from "long";
-import { StatementsRequest } from "../api";
+import {
+  createCombinedStmtsRequest,
+  InsightRecommendation,
+  StatementsRequest,
+  TxnInsightsRequest,
+} from "../api";
+import {
+  getTxnInsightRecommendations,
+  InsightType,
+  TxnInsightEvent,
+} from "../insights";
 import {
   getValidOption,
   TimeScale,
   timeScale1hMinOptions,
   TimeScaleDropdown,
-  timeScaleToString,
-  toDateRange,
+  timeScaleRangeToObj,
+  toRoundedDateRange,
 } from "../timeScaleDropdown";
-import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
+import moment from "moment-timezone";
 
+import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
+import insightTableStyles from "../insightsTable/insightsTable.module.scss";
+import {
+  InsightsSortedTable,
+  makeInsightsColumns,
+} from "../insightsTable/insightsTable";
+import { CockroachCloudContext } from "../contexts";
+import { SqlStatsSortType } from "src/api/statementsApi";
+import { FormattedTimescale } from "../timeScaleDropdown/formattedTimeScale";
 const { containerClass } = tableClasses;
 const cx = classNames.bind(statementsStyles);
 const timeScaleStylesCx = classNames.bind(timeScaleStyles);
+const insightsTableCx = classNames.bind(insightTableStyles);
 
 type Statement =
   protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
@@ -82,6 +103,8 @@ const transactionDetailsStylesCx = classNames.bind(transactionDetailsStyles);
 
 export interface TransactionDetailsStateProps {
   timeScale: TimeScale;
+  limit: number;
+  reqSortSetting: SqlStatsSortType;
   error?: Error | null;
   isTenant: UIConfigState["isTenant"];
   hasViewActivityRedactedRole?: UIConfigState["hasViewActivityRedactedRole"];
@@ -90,11 +113,17 @@ export interface TransactionDetailsStateProps {
   transaction: Transaction;
   transactionFingerprintId: string;
   isLoading: boolean;
+  lastUpdated: moment.Moment | null;
+  transactionInsights: TxnInsightEvent[];
+  hasAdminRole?: UIConfigState["hasAdminRole"];
+  isDataValid: boolean;
 }
 
 export interface TransactionDetailsDispatchProps {
   refreshData: (req?: StatementsRequest) => void;
+  refreshNodes: () => void;
   refreshUserSQLRoles: () => void;
+  refreshTransactionInsights: (req: TxnInsightsRequest) => void;
   onTimeScaleChange: (ts: TimeScale) => void;
 }
 
@@ -110,12 +139,13 @@ interface TState {
 
 function statementsRequestFromProps(
   props: TransactionDetailsProps,
-): protos.cockroach.server.serverpb.StatementsRequest {
-  const [start, end] = toDateRange(props.timeScale);
-  return new protos.cockroach.server.serverpb.StatementsRequest({
-    combined: true,
-    start: Long.fromNumber(start.unix()),
-    end: Long.fromNumber(end.unix()),
+): StatementsRequest {
+  const [start, end] = toRoundedDateRange(props.timeScale);
+  return createCombinedStmtsRequest({
+    start,
+    end,
+    limit: props.limit,
+    sort: props.reqSortSetting,
   });
 }
 
@@ -135,7 +165,7 @@ export class TransactionDetails extends React.Component<
         pageSize: 10,
         current: 1,
       },
-      latestTransactionText: "",
+      latestTransactionText: this.getTxnQueryString(),
     };
 
     // In case the user selected a option not available on this page,
@@ -143,61 +173,81 @@ export class TransactionDetails extends React.Component<
     // where the value 10/30 min is selected on the Metrics page.
     const ts = getValidOption(this.props.timeScale, timeScale1hMinOptions);
     if (ts !== this.props.timeScale) {
-      this.props.onTimeScaleChange(ts);
+      this.changeTimeScale(ts);
     }
   }
 
-  static defaultProps: Partial<TransactionDetailsProps> = {
-    isTenant: false,
-    hasViewActivityRedactedRole: false,
-  };
-
-  getTransactionStateInfo = (prevTransactionFingerprintId: string): void => {
-    const { transaction, transactionFingerprintId } = this.props;
+  getTxnQueryString = (): string => {
+    const { transaction } = this.props;
 
     const statementFingerprintIds =
       transaction?.stats_data?.statement_fingerprint_ids;
 
-    const transactionText =
+    return (
       (statementFingerprintIds &&
         statementFingerprintIdsToText(
           statementFingerprintIds,
           this.getStatementsForTransaction(),
-        )) ||
-      "";
+        )) ??
+      ""
+    );
+  };
+
+  setTxnQueryString = (): void => {
+    const transactionText = this.getTxnQueryString();
 
     // If a new, non-empty-string transaction text is available (derived from the time-frame-specific endpoint
     // response), cache the text.
     if (
       transactionText &&
-      transactionText != this.state.latestTransactionText
+      transactionText !== this.state.latestTransactionText
     ) {
       this.setState({
         latestTransactionText: transactionText,
       });
     }
+  };
 
-    // If the transactionFingerprintId (derived from the URL) changes, invalidate the cached transaction text
-    if (prevTransactionFingerprintId != transactionFingerprintId) {
-      this.setState({
-        latestTransactionText: "",
-      });
+  changeTimeScale = (ts: TimeScale): void => {
+    if (this.props.onTimeScaleChange) {
+      this.props.onTimeScaleChange(ts);
     }
   };
 
-  refreshData = (prevTransactionFingerprintId: string): void => {
+  refreshData = (): void => {
+    const insightsReq = timeScaleRangeToObj(this.props.timeScale);
+    this.props.refreshTransactionInsights(insightsReq);
     const req = statementsRequestFromProps(this.props);
     this.props.refreshData(req);
-    this.getTransactionStateInfo(prevTransactionFingerprintId);
   };
 
   componentDidMount(): void {
-    this.refreshData("");
+    if (!this.props.transaction || !this.props.isDataValid) {
+      this.refreshData();
+    }
     this.props.refreshUserSQLRoles();
+    if (!this.props.isTenant) {
+      this.props.refreshNodes();
+    }
   }
 
   componentDidUpdate(prevProps: TransactionDetailsProps): void {
-    this.getTransactionStateInfo(prevProps.transactionFingerprintId);
+    if (!this.props.isTenant) {
+      this.props.refreshNodes();
+    }
+
+    if (
+      prevProps.transactionFingerprintId !==
+        this.props.transactionFingerprintId ||
+      prevProps.statements !== this.props.statements
+    ) {
+      this.setTxnQueryString();
+    }
+
+    if (this.props.timeScale !== prevProps.timeScale) {
+      // Refresh the data if the time range changes.
+      this.refreshData();
+    }
   }
 
   onChangeSortSetting = (ss: SortSetting): void => {
@@ -220,20 +270,16 @@ export class TransactionDetails extends React.Component<
 
     const statementFingerprintIds =
       transaction?.stats_data?.statement_fingerprint_ids;
-
     if (!statementFingerprintIds) {
       return [];
     }
 
-    // Get all the stmts matching the transaction's fingerprint ID. Then we filter
-    // by those statements actually associated with the current transaction.
-    return getStatementsByFingerprintId(
-      statementFingerprintIds,
-      statements,
-    ).filter(
-      s =>
-        s.key.key_data.transaction_fingerprint_id.toString() ===
-        this.props.transactionFingerprintId,
+    return (
+      statements?.filter(
+        s =>
+          s.key.key_data.transaction_fingerprint_id.toString() ===
+          this.props.transactionFingerprintId,
+      ) ?? []
     );
   };
 
@@ -242,7 +288,7 @@ export class TransactionDetails extends React.Component<
     const { latestTransactionText } = this.state;
     const statementsForTransaction = this.getStatementsForTransaction();
     const transactionStats = transaction?.stats_data?.stats;
-    const period = timeScaleToString(this.props.timeScale);
+    const period = <FormattedTimescale ts={this.props.timeScale} />;
 
     return (
       <div>
@@ -265,7 +311,7 @@ export class TransactionDetails extends React.Component<
             <TimeScaleDropdown
               options={timeScale1hMinOptions}
               currentScale={this.props.timeScale}
-              setTimeScale={this.props.onTimeScaleChange}
+              setTimeScale={this.changeTimeScale}
             />
           </PageConfigItem>
         </PageConfig>
@@ -292,6 +338,7 @@ export class TransactionDetails extends React.Component<
                         <SqlBox
                           value={latestTransactionText}
                           className={transactionDetailsStylesCx("summary-card")}
+                          format={true}
                         />
                       </Col>
                     </Row>
@@ -304,17 +351,17 @@ export class TransactionDetails extends React.Component<
               );
             }
 
-            const { isTenant, hasViewActivityRedactedRole } = this.props;
+            const {
+              isTenant,
+              hasViewActivityRedactedRole,
+              transactionInsights,
+            } = this.props;
             const { sortSetting, pagination } = this.state;
 
             const aggregatedStatements = aggregateStatements(
               statementsForTransaction,
             );
-            populateRegionNodeForStatements(
-              aggregatedStatements,
-              nodeRegions,
-              isTenant,
-            );
+            populateRegionNodeForStatements(aggregatedStatements, nodeRegions);
             const duration = (v: number) => Duration(v * 1e9);
 
             const transactionSampled =
@@ -333,6 +380,16 @@ export class TransactionDetails extends React.Component<
               >
                 <span className={cx("tooltip-info")}>unavailable</span>
               </Tooltip>
+            );
+            const meanIdleLatency = transactionSampled ? (
+              <Text>
+                {formatNumberForDisplay(
+                  _.get(transactionStats, "idle_lat.mean", 0),
+                  duration,
+                )}
+              </Text>
+            ) : (
+              unavailableTooltip
             );
             const meansRows = `${formatNumberForDisplay(
               transactionStats.rows_read.mean,
@@ -370,6 +427,27 @@ export class TransactionDetails extends React.Component<
               unavailableTooltip
             );
 
+            const isCockroachCloud = useContext(CockroachCloudContext);
+            const insightsColumns = makeInsightsColumns(
+              isCockroachCloud,
+              this.props.hasAdminRole,
+              true,
+              true,
+            );
+            const tableData: InsightRecommendation[] = [];
+            if (transactionInsights) {
+              const tableDataTypes = new Set<InsightType>();
+              transactionInsights.forEach(transaction => {
+                const rec = getTxnInsightRecommendations(transaction);
+                rec.forEach(entry => {
+                  if (!tableDataTypes.has(entry.type)) {
+                    tableData.push(entry);
+                    tableDataTypes.add(entry.type);
+                  }
+                });
+              });
+            }
+
             return (
               <React.Fragment>
                 <section className={containerClass}>
@@ -381,6 +459,7 @@ export class TransactionDetails extends React.Component<
                       <SqlBox
                         value={latestTransactionText}
                         className={transactionDetailsStylesCx("summary-card")}
+                        format={true}
                       />
                     </Col>
                     <Col span={8}>
@@ -392,6 +471,22 @@ export class TransactionDetails extends React.Component<
                           value={formatNumberForDisplay(
                             transactionStats?.service_lat.mean,
                             duration,
+                          )}
+                        />
+                        <SummaryCardItem
+                          label="Application name"
+                          value={
+                            transaction?.stats_data?.app?.length > 0
+                              ? transaction?.stats_data?.app
+                              : unset
+                          }
+                        />
+                        <SummaryCardItem
+                          label="Fingerprint ID"
+                          value={FixFingerprintHexValue(
+                            transaction?.stats_data.transaction_fingerprint_id.toString(
+                              16,
+                            ),
                           )}
                         />
                         <p
@@ -406,6 +501,10 @@ export class TransactionDetails extends React.Component<
                             Transaction resource usage
                           </Heading>
                         </div>
+                        <SummaryCardItem
+                          label="Idle latency"
+                          value={meanIdleLatency}
+                        />
                         <SummaryCardItem
                           label="Mean rows/bytes read"
                           value={meansRows}
@@ -432,6 +531,31 @@ export class TransactionDetails extends React.Component<
                       </SummaryCard>
                     </Col>
                   </Row>
+                  {tableData?.length > 0 && (
+                    <>
+                      <p
+                        className={summaryCardStylesCx(
+                          "summary--card__divider--large",
+                        )}
+                      />
+                      <Row gutter={24}>
+                        <Col className="gutter-row" span={24}>
+                          <InsightsSortedTable
+                            columns={insightsColumns}
+                            data={tableData}
+                            tableWrapperClassName={insightsTableCx(
+                              "sorted-table",
+                            )}
+                          />
+                        </Col>
+                      </Row>
+                    </>
+                  )}
+                  <p
+                    className={summaryCardStylesCx(
+                      "summary--card__divider--large",
+                    )}
+                  />
                   <TableStatistics
                     pagination={pagination}
                     totalCount={aggregatedStatements.length}
@@ -447,7 +571,6 @@ export class TransactionDetails extends React.Component<
                         aggregatedStatements,
                         [],
                         calculateTotalWorkload(aggregatedStatements),
-                        nodeRegions,
                         "transactionDetails",
                         isTenant,
                         hasViewActivityRedactedRole,
@@ -455,6 +578,7 @@ export class TransactionDetails extends React.Component<
                       className={cx("statements-table")}
                       sortSetting={sortSetting}
                       onChangeSortSetting={this.onChangeSortSetting}
+                      pagination={pagination}
                     />
                   </div>
                 </section>
@@ -468,7 +592,7 @@ export class TransactionDetails extends React.Component<
             );
           }}
           renderError={() =>
-            SQLActivityError({
+            LoadingError({
               statsType: "transactions",
             })
           }

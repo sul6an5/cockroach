@@ -79,32 +79,34 @@ func newMemBuffer(
 		metrics:  metrics,
 		sv:       sv,
 	}
+	b.mu.queue = &bufferEventChunkQueue{}
+
+	// Quota pool notifies out of quota events through notifyOutOfQuota
+	quota := &memQuota{acc: acc, notifyOutOfQuota: b.notifyOutOfQuota}
 
 	opts := []quotapool.Option{
 		quotapool.OnSlowAcquisition(slowAcquisitionThreshold, logSlowAcquisition(slowAcquisitionThreshold)),
+		// OnWaitStart invoked once by quota pool when request cannot acquire quota.
 		quotapool.OnWaitStart(func(ctx context.Context, poolName string, r quotapool.Request) {
 			if onWaitStart != nil {
 				onWaitStart(ctx, poolName, r)
 			}
-			b.mu.Lock()
-			b.mu.numBlocked++
-			b.mu.Unlock()
+			b.producerBlocked()
 		}),
+		// Similarly, this function is invoked by quota pool once, when the quota
+		// have been obtained *after* OnWaitStart
 		quotapool.OnWaitFinish(
 			func(ctx context.Context, poolName string, r quotapool.Request, start time.Time) {
 				metrics.BufferPushbackNanos.Inc(timeutil.Since(start).Nanoseconds())
-				b.mu.Lock()
-				b.mu.numBlocked--
-				b.mu.Unlock()
+				b.quotaAcquiredAfterWait()
 			},
 		),
 	}
-	quota := &memQuota{acc: acc, notifyOutOfQuota: b.notifyOutOfQuota}
+
 	b.qp = allocPool{
 		AbstractPool: quotapool.New("changefeed", quota, opts...),
 		metrics:      metrics,
 	}
-	b.mu.queue = &bufferEventChunkQueue{}
 
 	return b
 }
@@ -119,8 +121,7 @@ func (b *blockingBuffer) pop() (e Event, ok bool, err error) {
 	}
 
 	e, ok = b.mu.queue.dequeue()
-
-	if !ok && b.mu.numBlocked > 0 && b.mu.canFlush {
+	if !ok && b.mu.canFlush {
 		// Here, we know that we are blocked, waiting for memory; yet we have nothing queued up
 		// (and thus, no resources that could be released by draining the queue).
 		// This means that all the previously added entries have been read by the consumer,
@@ -151,10 +152,38 @@ func (b *blockingBuffer) notifyOutOfQuota(canFlush bool) {
 	b.mu.canFlush = canFlush
 	b.mu.Unlock()
 
-	select {
-	case b.signalCh <- struct{}{}:
-	default:
+	if canFlush {
+		select {
+		case b.signalCh <- struct{}{}:
+		default:
+		}
 	}
+}
+
+// producerBlocked in invoked by quota pool to notify blocking buffer
+// that producer is blocked.
+func (b *blockingBuffer) producerBlocked() {
+	b.mu.Lock()
+	b.mu.numBlocked++
+	b.mu.Unlock()
+}
+
+// quotaAcquiredAfterWait is invoked by quota pool to notify blocking buffer
+// that quota has been acquired after being blocked.
+// NB: always called after producerBlocked
+func (b *blockingBuffer) quotaAcquiredAfterWait() {
+	b.mu.Lock()
+	if b.mu.numBlocked > 0 {
+		b.mu.numBlocked--
+	} else {
+		logcrash.ReportOrPanic(context.Background(), b.sv,
+			"quotaAcquiredAfterWait called with 0 blocked consumers")
+	}
+	if b.mu.numBlocked == 0 {
+		// Clear out canFlush since we know that producers no longer blocked.
+		b.mu.canFlush = false
+	}
+	b.mu.Unlock()
 }
 
 // Get implements kvevent.Reader interface.
@@ -198,32 +227,45 @@ func (b *blockingBuffer) enqueue(ctx context.Context, e Event) (err error) {
 	return nil
 }
 
-// Add implements Writer interface.
-func (b *blockingBuffer) Add(ctx context.Context, e Event) error {
-	if e.alloc.ap != nil {
-		// Use allocation associated with the event itself.
-		return b.enqueue(ctx, e)
+// AcquireMemory acquires specified number of bytes form the memory monitor,
+// blocking acquisition if needed.
+func (b *blockingBuffer) AcquireMemory(ctx context.Context, n int64) (alloc Alloc, _ error) {
+	if l := changefeedbase.PerChangefeedMemLimit.Get(b.sv); n > l {
+		return alloc, errors.Newf("event size %d exceeds per changefeed limit %d", alloc, l)
 	}
-
-	// Acquire the quota first.
-	alloc := int64(changefeedbase.EventMemoryMultiplier.Get(b.sv) * float64(e.ApproximateSize()))
-	if l := changefeedbase.PerChangefeedMemLimit.Get(b.sv); alloc > l {
-		return errors.Newf("event size %d exceeds per changefeed limit %d", alloc, l)
-	}
-	e.alloc.init(alloc, &b.qp)
-	e.bufferAddTimestamp = timeutil.Now()
+	alloc.init(n, &b.qp)
 	if err := func() error {
 		b.req.Lock()
 		defer b.req.Unlock()
-		b.req.memRequest = memRequest(alloc)
+		b.req.memRequest = memRequest(n)
 		if err := b.qp.Acquire(ctx, &b.req); err != nil {
 			return err
 		}
 		return nil
 	}(); err != nil {
+		return alloc, err
+	}
+	b.metrics.BufferEntriesMemAcquired.Inc(n)
+	return alloc, nil
+}
+
+// Add implements Writer interface.
+func (b *blockingBuffer) Add(ctx context.Context, e Event) error {
+	// Immediately enqueue event if it already has allocation,
+	// or if it's a Flush request -- which has no allocations.
+	// Such events happen when we switch from backfill to rangefeed mode.
+	if e.alloc.ap != nil || e.et == TypeFlush {
+		return b.enqueue(ctx, e)
+	}
+
+	// Acquire the quota first.
+	n := int64(changefeedbase.EventMemoryMultiplier.Get(b.sv) * float64(e.ApproximateSize()))
+	e.bufferAddTimestamp = timeutil.Now()
+	alloc, err := b.AcquireMemory(ctx, n)
+	if err != nil {
 		return err
 	}
-	b.metrics.BufferEntriesMemAcquired.Inc(alloc)
+	e.alloc = alloc
 	return b.enqueue(ctx, e)
 }
 
@@ -354,7 +396,6 @@ func (r *memRequest) Acquire(
 		canFlush := quota.allocated == 0 || quota.canAllocateBelow > 0
 		quota.notifyOutOfQuota(canFlush)
 	}
-
 	return fulfilled, tryAgainAfter
 }
 

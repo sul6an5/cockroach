@@ -16,7 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/storage/pebbleiter"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
@@ -46,7 +46,7 @@ type pebbleBatch struct {
 	prefixEngineIter pebbleIterator
 	normalEngineIter pebbleIterator
 
-	iter      *pebble.Iterator
+	iter      pebbleiter.Iterator
 	iterUsed  bool // avoids cloning after PinEngineStateForIterators()
 	writeOnly bool
 	closed    bool
@@ -55,6 +55,7 @@ type pebbleBatch struct {
 	// scratch space for wrappedIntentWriter.
 	scratch []byte
 
+	statsReporter                    statsReporter
 	settings                         *cluster.Settings
 	shouldWriteLocalTimestamps       bool
 	shouldWriteLocalTimestampsCached bool
@@ -70,7 +71,11 @@ var pebbleBatchPool = sync.Pool{
 
 // Instantiates a new pebbleBatch.
 func newPebbleBatch(
-	db *pebble.DB, batch *pebble.Batch, writeOnly bool, settings *cluster.Settings,
+	db *pebble.DB,
+	batch *pebble.Batch,
+	writeOnly bool,
+	settings *cluster.Settings,
+	statsReporter statsReporter,
 ) *pebbleBatch {
 	pb := pebbleBatchPool.Get().(*pebbleBatch)
 	*pb = pebbleBatch{
@@ -97,8 +102,9 @@ func newPebbleBatch(
 			upperBoundBuf: pb.normalEngineIter.upperBoundBuf,
 			reusable:      true,
 		},
-		writeOnly: writeOnly,
-		settings:  settings,
+		writeOnly:     writeOnly,
+		statsReporter: statsReporter,
+		settings:      settings,
 	}
 	pb.wrappedIntentWriter = wrapIntentWriter(pb)
 	return pb
@@ -135,47 +141,6 @@ func (p *pebbleBatch) Close() {
 // Closed implements the Batch interface.
 func (p *pebbleBatch) Closed() bool {
 	return p.closed
-}
-
-// Get implements the Batch interface.
-func (p *pebbleBatch) MVCCGet(key MVCCKey) ([]byte, error) {
-	if len(key.Key) == 0 {
-		return nil, emptyKeyError()
-	}
-	r := wrapReader(p)
-	// Doing defer r.Free() does not inline.
-	v, err := r.MVCCGet(key)
-	r.Free()
-	return v, err
-}
-
-func (p *pebbleBatch) rawMVCCGet(key []byte) ([]byte, error) {
-	r := pebble.Reader(p.batch)
-	if p.writeOnly {
-		panic("write-only batch")
-	}
-	if !p.batch.Indexed() {
-		r = p.db
-	}
-
-	ret, closer, err := r.Get(key)
-	if closer != nil {
-		retCopy := make([]byte, len(ret))
-		copy(retCopy, ret)
-		ret = retCopy
-		closer.Close()
-	}
-	if errors.Is(err, pebble.ErrNotFound) || len(ret) == 0 {
-		return nil, nil
-	}
-	return ret, err
-}
-
-// MVCCGetProto implements the Batch interface.
-func (p *pebbleBatch) MVCCGetProto(
-	key MVCCKey, msg protoutil.Message,
-) (ok bool, keyBytes, valBytes int64, err error) {
-	return pebbleGetProto(p, key, msg)
 }
 
 // MVCCIterate implements the Batch interface.
@@ -218,14 +183,16 @@ func (p *pebbleBatch) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) M
 		handle = p.db
 	}
 	if iter.inuse {
-		return newPebbleIteratorByCloning(p.iter, opts, StandardDurability, p.SupportsRangeKeys())
+		return newPebbleIteratorByCloning(CloneContext{
+			rawIter:       p.iter,
+			statsReporter: p.statsReporter,
+		}, opts, StandardDurability)
 	}
 
 	if iter.iter != nil {
 		iter.setOptions(opts, StandardDurability)
 	} else {
-		iter.initReuseOrCreate(
-			handle, p.iter, p.iterUsed, opts, StandardDurability, p.SupportsRangeKeys())
+		iter.initReuseOrCreate(handle, p.iter, p.iterUsed, opts, StandardDurability, p.statsReporter)
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
@@ -252,14 +219,16 @@ func (p *pebbleBatch) NewEngineIterator(opts IterOptions) EngineIterator {
 		handle = p.db
 	}
 	if iter.inuse {
-		return newPebbleIteratorByCloning(p.iter, opts, StandardDurability, p.SupportsRangeKeys())
+		return newPebbleIteratorByCloning(CloneContext{
+			rawIter:       p.iter,
+			statsReporter: p.statsReporter,
+		}, opts, StandardDurability)
 	}
 
 	if iter.iter != nil {
 		iter.setOptions(opts, StandardDurability)
 	} else {
-		iter.initReuseOrCreate(
-			handle, p.iter, p.iterUsed, opts, StandardDurability, p.SupportsRangeKeys())
+		iter.initReuseOrCreate(handle, p.iter, p.iterUsed, opts, StandardDurability, p.statsReporter)
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
@@ -276,18 +245,13 @@ func (p *pebbleBatch) ConsistentIterators() bool {
 	return true
 }
 
-// SupportsRangeKeys implements the Batch interface.
-func (p *pebbleBatch) SupportsRangeKeys() bool {
-	return p.db.FormatMajorVersion() >= pebble.FormatRangeKeys
-}
-
 // PinEngineStateForIterators implements the Batch interface.
 func (p *pebbleBatch) PinEngineStateForIterators() error {
 	if p.iter == nil {
 		if p.batch.Indexed() {
-			p.iter = p.batch.NewIter(nil)
+			p.iter = pebbleiter.MaybeWrap(p.batch.NewIter(nil))
 		} else {
-			p.iter = p.db.NewIter(nil)
+			p.iter = pebbleiter.MaybeWrap(p.db.NewIter(nil))
 		}
 		// NB: p.iterUsed == false avoids cloning this in NewMVCCIterator(). We've
 		// just created it, so cloning it would just be overhead.
@@ -364,7 +328,7 @@ func (p *pebbleBatch) ClearRawRange(start, end roachpb.Key, pointKeys, rangeKeys
 			return err
 		}
 	}
-	if rangeKeys && p.SupportsRangeKeys() {
+	if rangeKeys {
 		if err := p.batch.RangeKeyDelete(p.buf, endRaw, pebble.Sync); err != nil {
 			return err
 		}
@@ -462,6 +426,11 @@ func (p *pebbleBatch) ClearMVCCRangeKey(rangeKey MVCCRangeKey) error {
 		rangeKey.StartKey, rangeKey.EndKey, EncodeMVCCTimestampSuffix(rangeKey.Timestamp))
 }
 
+// BufferedSize implements the Engine interface.
+func (p *pebbleBatch) BufferedSize() int {
+	return p.Len()
+}
+
 // PutMVCCRangeKey implements the Batch interface.
 func (p *pebbleBatch) PutMVCCRangeKey(rangeKey MVCCRangeKey, value MVCCValue) error {
 	// NB: all MVCC APIs currently assume all range keys are range tombstones.
@@ -486,19 +455,12 @@ func (p *pebbleBatch) PutRawMVCCRangeKey(rangeKey MVCCRangeKey, value []byte) er
 
 // PutEngineRangeKey implements the Engine interface.
 func (p *pebbleBatch) PutEngineRangeKey(start, end roachpb.Key, suffix, value []byte) error {
-	if !p.SupportsRangeKeys() {
-		return errors.Errorf("range keys not supported by Pebble database version %s",
-			p.db.FormatMajorVersion())
-	}
 	return p.batch.RangeKeySet(
 		EngineKey{Key: start}.Encode(), EngineKey{Key: end}.Encode(), suffix, value, nil)
 }
 
 // ClearEngineRangeKey implements the Engine interface.
 func (p *pebbleBatch) ClearEngineRangeKey(start, end roachpb.Key, suffix []byte) error {
-	if !p.SupportsRangeKeys() {
-		return nil // noop
-	}
 	return p.batch.RangeKeyUnset(
 		EngineKey{Key: start}.Encode(), EngineKey{Key: end}.Encode(), suffix, nil)
 }
@@ -586,6 +548,51 @@ func (p *pebbleBatch) Commit(sync bool) error {
 	}
 	err := p.batch.Commit(opts)
 	if err != nil {
+		// TODO(storage): ensure that these errors are only ever due to invariant
+		// violations and never due to unrecoverable Pebble states. Then switch to
+		// returning the error instead of panicking.
+		//
+		// Once we do that, document on the storage.Batch interface the meaning of
+		// an error returned from this method and the guarantees that callers have
+		// or don't have after they receive an error from this method.
+		panic(err)
+	}
+	return err
+}
+
+// CommitNoSyncWait implements the Batch interface.
+func (p *pebbleBatch) CommitNoSyncWait() error {
+	if p.batch == nil {
+		panic("called with nil batch")
+	}
+	err := p.db.ApplyNoSyncWait(p.batch, pebble.Sync)
+	if err != nil {
+		// TODO(storage): ensure that these errors are only ever due to invariant
+		// violations and never due to unrecoverable Pebble states. Then switch to
+		// returning the error instead of panicking.
+		//
+		// Once we do that, document on the storage.Batch interface the meaning of
+		// an error returned from this method and the guarantees that callers have
+		// or don't have after they receive an error from this method.
+		panic(err)
+	}
+	return err
+}
+
+// SyncWait implements the Batch interface.
+func (p *pebbleBatch) SyncWait() error {
+	if p.batch == nil {
+		panic("called with nil batch")
+	}
+	err := p.batch.SyncWait()
+	if err != nil {
+		// TODO(storage): ensure that these errors are only ever due to invariant
+		// violations and never due to unrecoverable Pebble states. Then switch to
+		// returning the error instead of panicking.
+		//
+		// Once we do that, document on the storage.Batch interface the meaning of
+		// an error returned from this method and the guarantees that callers have
+		// or don't have after they receive an error from this method.
 		panic(err)
 	}
 	return err

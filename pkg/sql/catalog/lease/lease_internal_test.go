@@ -24,16 +24,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
@@ -550,7 +555,9 @@ CREATE TABLE t.%s (k CHAR PRIMARY KEY, v CHAR);
 	tracker := removalTracker.TrackRemoval(lease.Descriptor)
 
 	// Acquire another lease.
-	if _, err := acquireNodeLease(context.Background(), leaseManager, tableDesc.GetID()); err != nil {
+	if _, err := acquireNodeLease(
+		context.Background(), leaseManager, tableDesc.GetID(), AcquireBlock,
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -833,9 +840,6 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	skip.WithIssue(t, 51798, "fails in the presence of migrations requiring backfill, "+
-		"but cannot import startupmigrations")
-
 	// Result is a struct for moving results to the main result routine.
 	type Result struct {
 		table LeasedDescriptor
@@ -851,7 +855,9 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 		return res
 	}
 
-	descID := descpb.ID(keys.LeaseTableID)
+	var descID atomic.Value
+	descID.Store(descpb.ID(0))
+	getDescID := func() descpb.ID { return descID.Load().(descpb.ID) }
 
 	// acquireBlock calls Acquire.
 	acquireBlock := func(
@@ -859,7 +865,7 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 		m *Manager,
 		acquireChan chan Result,
 	) {
-		acquireChan <- mkResult(m.Acquire(ctx, m.storage.clock.Now(), descID))
+		acquireChan <- mkResult(m.Acquire(ctx, m.storage.clock.Now(), getDescID()))
 	}
 
 	testCases := []struct {
@@ -909,10 +915,20 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 			removalTracker := NewLeaseRemovalTracker()
 			testingKnobs := base.TestingKnobs{
 				SQLLeaseManager: &ManagerTestingKnobs{
+					TestingDescriptorUpdateEvent: func(descriptor *descpb.Descriptor) error {
+						// Ignore the update to the table in question.
+						if id, _, _, _, _ := descpb.GetDescriptorMetadata(descriptor); id == getDescID() {
+							return errors.New("boom")
+						}
+						return nil
+					},
 					LeaseStoreTestingKnobs: StorageTestingKnobs{
 						RemoveOnceDereferenced: true,
 						LeaseReleasedEvent:     removalTracker.LeaseRemovedNotification,
-						LeaseAcquireResultBlockEvent: func(leaseBlockType AcquireBlockType, _ descpb.ID) {
+						LeaseAcquireResultBlockEvent: func(leaseBlockType AcquireType, id descpb.ID) {
+							if id != getDescID() {
+								return
+							}
 							if leaseBlockType == AcquireBlock {
 								if count := atomic.LoadInt32(&acquireArrivals); (count < 1 && test.isSecondCallAcquireFreshest) ||
 									(count < 2 && !test.isSecondCallAcquireFreshest) {
@@ -928,7 +944,10 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 								}
 							}
 						},
-						LeaseAcquiredEvent: func(_ catalog.Descriptor, _ error) {
+						LeaseAcquiredEvent: func(desc catalog.Descriptor, err error) {
+							if desc.GetID() != getDescID() {
+								return
+							}
 							atomic.AddInt32(&leasesAcquiredCount, 1)
 							<-acquisitionBlock
 						},
@@ -936,7 +955,10 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 				},
 			}
 
-			serverArgs := base.TestServerArgs{Knobs: testingKnobs}
+			serverArgs := base.TestServerArgs{
+				Knobs:    testingKnobs,
+				Settings: cluster.MakeTestingClusterSettings(),
+			}
 
 			// The LeaseJitterFraction is zero so leases will have
 			// monotonically increasing expiration. This prevents two leases
@@ -944,9 +966,18 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 			// leases are checked for having a different expiration.
 			LeaseJitterFraction.Override(ctx, &serverArgs.SV, 0)
 
-			s, _, _ := serverutils.StartServer(
+			s, sqlDB, _ := serverutils.StartServer(
 				t, serverArgs)
 			defer s.Stopper().Stop(context.Background())
+			tdb := sqlutils.MakeSQLRunner(sqlDB)
+			tdb.Exec(t, "CREATE TABLE t (i INT PRIMARY KEY)")
+			{
+				var tableID descpb.ID
+				tdb.QueryRow(
+					t, "SELECT id FROM system.namespace WHERE name = $1", "t",
+				).Scan(&tableID)
+				descID.Store(tableID)
+			}
 			leaseManager := s.LeaseManager().(*Manager)
 
 			acquireResultChan := make(chan Result)
@@ -956,11 +987,11 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 			go acquireBlock(ctx, leaseManager, acquireResultChan)
 			if test.isSecondCallAcquireFreshest {
 				go func(ctx context.Context, m *Manager, acquireChan chan Result) {
-					if err := m.AcquireFreshestFromStore(ctx, descID); err != nil {
+					if err := m.AcquireFreshestFromStore(ctx, getDescID()); err != nil {
 						acquireChan <- mkResult(nil, err)
 						return
 					}
-					acquireChan <- mkResult(m.Acquire(ctx, s.Clock().Now(), descID))
+					acquireChan <- mkResult(m.Acquire(ctx, s.Clock().Now(), getDescID()))
 				}(ctx, leaseManager, acquireResultChan)
 
 			} else {
@@ -1449,4 +1480,56 @@ func TestLeasedDescriptorByteSizeBaseline(t *testing.T) {
 				"%d does not exceed the baseline", desc.GetID())
 		})
 	}
+}
+
+// TODO(adityamaru): We do not set SplitMidKey to true for ExportRequests sent
+// in getDescriptorsFromStoreForInterval. This disallows the elastic CPU limiter
+// from preempting the ExportRequest unless we are on a key boundary. In this
+// test we are only exporting revisions of the same key so we should never be
+// allowed to paginate because of exhausted CPU tokens. Once we do add support
+// for SplitMidKey, we should change the test to verify the correctness of our
+// pagination logic.
+//
+// For now, assert that all revisions are fetched in a single ExportRequest even
+// though we are always OverLimit according to the elastic CPU limiter.
+func TestGetDescriptorsFromStoreForIntervalCPULimiterPagination(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	var numRequests int
+	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
+			TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
+				for _, ru := range request.Requests {
+					if _, ok := ru.GetInner().(*kvpb.ExportRequest); ok {
+						numRequests++
+						h := admission.ElasticCPUWorkHandleFromContext(ctx)
+						if h == nil {
+							t.Fatalf("expected context to have CPU work handle")
+						}
+						h.TestingOverrideOverLimit(func() (bool, time.Duration) {
+							return true, 0
+						})
+					}
+				}
+				return nil
+			},
+		}},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	beforeCreate := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+	sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `ALTER TABLE foo RENAME TO bar`)
+	sqlDB.Exec(t, `ALTER TABLE bar RENAME TO baz`)
+	afterCreate := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+	var tableID int
+	sqlDB.QueryRow(t, `SELECT id FROM system.namespace WHERE name = 'baz'`).Scan(&tableID)
+	descs, err := getDescriptorsFromStoreForInterval(ctx, kvDB, s.Codec(), descpb.ID(tableID),
+		beforeCreate, afterCreate)
+	require.NoError(t, err)
+	require.Len(t, descs, 3)
+	require.Equal(t, numRequests, 1)
 }

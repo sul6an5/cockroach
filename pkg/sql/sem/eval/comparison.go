@@ -11,6 +11,8 @@
 package eval
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -19,9 +21,9 @@ import (
 )
 
 // ComparisonExprWithSubOperator evaluates a comparison expression that has
-// sub-operator.
+// sub-operator (which are ANY, SOME, and ALL).
 func ComparisonExprWithSubOperator(
-	ctx *Context, expr *tree.ComparisonExpr, left, right tree.Datum,
+	ctx context.Context, evalCtx *Context, expr *tree.ComparisonExpr, left, right tree.Datum,
 ) (tree.Datum, error) {
 	var datums tree.Datums
 	// Right is either a tuple or an array of Datums.
@@ -34,11 +36,11 @@ func ComparisonExprWithSubOperator(
 	} else {
 		return nil, errors.AssertionFailedf("unhandled right expression %s", right)
 	}
-	return evalDatumsCmp(ctx, expr.Operator, expr.SubOperator, expr.Op, left, datums)
+	return evalDatumsCmp(ctx, evalCtx, expr.Operator, expr.SubOperator, expr.Op, left, datums)
 }
 
 func evalComparison(
-	ctx *Context, op treecmp.ComparisonOperator, left, right tree.Datum,
+	ctx context.Context, evalCtx *Context, op treecmp.ComparisonOperator, left, right tree.Datum,
 ) (tree.Datum, error) {
 	if left == tree.DNull || right == tree.DNull {
 		return tree.DNull, nil
@@ -46,7 +48,7 @@ func evalComparison(
 	ltype := left.ResolvedType()
 	rtype := right.ResolvedType()
 	if fn, ok := tree.CmpOps[op.Symbol].LookupImpl(ltype, rtype); ok {
-		return BinaryOp(ctx, fn.EvalOp, left, right)
+		return BinaryOp(ctx, evalCtx, fn.EvalOp, left, right)
 	}
 	return nil, pgerror.Newf(
 		pgcode.UndefinedFunction, "unsupported comparison operator: <%s> %s <%s>", ltype, op, rtype)
@@ -71,7 +73,8 @@ func evalComparison(
 //
 //	evalDatumsCmp(ctx, LT, Any, CmpOp(LT, leftType, rightParamType), leftDatum, rightArray.Array).
 func evalDatumsCmp(
-	ctx *Context,
+	ctx context.Context,
+	evalCtx *Context,
 	op, subOp treecmp.ComparisonOperator,
 	fn *tree.CmpOp,
 	left tree.Datum,
@@ -81,13 +84,13 @@ func evalDatumsCmp(
 	any := !all
 	sawNull := false
 	for _, elem := range right {
-		if elem == tree.DNull {
+		if left == tree.DNull || elem == tree.DNull {
 			sawNull = true
 			continue
 		}
 
-		_, newLeft, newRight, _, not := tree.FoldComparisonExpr(subOp, left, elem)
-		d, err := BinaryOp(ctx, fn.EvalOp, newLeft.(tree.Datum), newRight.(tree.Datum))
+		_, newLeft, newRight, _, not := tree.FoldComparisonExprWithDatums(subOp, left, elem)
+		d, err := BinaryOp(ctx, evalCtx, fn.EvalOp, newLeft, newRight)
 		if err != nil {
 			return nil, err
 		}
@@ -134,7 +137,7 @@ func boolFromCmp(cmp int, op treecmp.ComparisonOperator) *tree.DBool {
 
 func cmpOpTupleFn(
 	ctx tree.CompareContext, left, right tree.DTuple, op treecmp.ComparisonOperator,
-) tree.Datum {
+) (tree.Datum, error) {
 	cmp := 0
 	sawNull := false
 	for i, leftElem := range left.D {
@@ -154,7 +157,7 @@ func cmpOpTupleFn(
 			case treecmp.IsNotDistinctFrom:
 				// For IS NOT DISTINCT FROM, NULLs are "equal".
 				if leftElem != tree.DNull || rightElem != tree.DNull {
-					return tree.DBoolFalse
+					return tree.DBoolFalse, nil
 				}
 
 			default:
@@ -163,10 +166,14 @@ func cmpOpTupleFn(
 				// NULL. This is because NULL is thought of as "unknown" and tuple
 				// inequality is defined lexicographically, so once a NULL comparison is
 				// seen, the result of the entire tuple comparison is unknown.
-				return tree.DNull
+				return tree.DNull, nil
 			}
 		} else {
-			cmp = leftElem.Compare(ctx, rightElem)
+			var err error
+			cmp, err = leftElem.CompareError(ctx, rightElem)
+			if err != nil {
+				return tree.DNull, err
+			}
 			if cmp != 0 {
 				break
 			}
@@ -177,7 +184,7 @@ func cmpOpTupleFn(
 		// The op is EQ and all non-NULL elements are equal, but we saw at least
 		// one NULL element. Since NULL comparisons are treated as unknown, the
 		// result of the comparison becomes unknown (NULL).
-		return tree.DNull
+		return tree.DNull, nil
 	}
-	return b
+	return b, nil
 }

@@ -88,6 +88,11 @@ func (p *planner) AlterTableSetSchema(
 		}
 	}
 
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
+		return nil, err
+	}
+
 	return &alterTableSetSchemaNode{
 		newSchema: string(n.Schema),
 		prefix:    prefix,
@@ -124,7 +129,7 @@ func (n *alterTableSetSchemaNode) startExec(params runParams) error {
 		return nil
 	}
 
-	objectID, err := p.Descriptors().Direct().LookupObjectID(
+	objectID, err := p.Descriptors().LookupObjectID(
 		ctx, p.txn, tableDesc.GetParentID(), desiredSchemaID, tableDesc.GetName(),
 	)
 	if err == nil && objectID != descpb.InvalidID {
@@ -138,7 +143,9 @@ func (n *alterTableSetSchemaNode) startExec(params runParams) error {
 	tableDesc.SetParentSchemaID(desiredSchemaID)
 
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, tableDesc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, tableDesc); err != nil {
+		return err
+	}
 
 	if err := p.writeSchemaChange(
 		ctx, tableDesc, descpb.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),

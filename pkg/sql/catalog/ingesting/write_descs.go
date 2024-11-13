@@ -15,14 +15,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -53,6 +54,7 @@ func WriteDescriptors(
 	schemas []catalog.SchemaDescriptor,
 	tables []catalog.TableDescriptor,
 	types []catalog.TypeDescriptor,
+	functions []catalog.FunctionDescriptor,
 	descCoverage tree.DescriptorCoverage,
 	extra []roachpb.KeyValue,
 	inheritParentName string,
@@ -63,6 +65,7 @@ func WriteDescriptors(
 		err = errors.Wrapf(err, "restoring table desc and namespace entries")
 	}()
 
+	const kvTrace = false
 	b := txn.NewBatch()
 	// wroteDBs contains the database descriptors that are being published as part
 	// of this restore.
@@ -95,16 +98,20 @@ func WriteDescriptors(
 			wroteDBs[desc.GetID()] = desc
 		}
 		if err := descsCol.WriteDescToBatch(
-			ctx, false /* kvTrace */, desc.(catalog.MutableDescriptor), b,
+			ctx, kvTrace, desc.(catalog.MutableDescriptor), b,
 		); err != nil {
 			return err
 		}
-		b.CPut(catalogkeys.EncodeNameKey(codec, desc), desc.GetID(), nil)
+		if err := descsCol.InsertNamespaceEntryToBatch(ctx, kvTrace, desc, b); err != nil {
+			return err
+		}
 
 		// We also have to put a system.namespace entry for the public schema
 		// if the database does not have a public schema backed by a descriptor.
 		if !desc.HasPublicSchemaWithDescriptor() {
-			b.CPut(catalogkeys.MakeSchemaNameKey(codec, desc.GetID(), tree.PublicSchema), keys.PublicSchemaID, nil)
+			if err := descsCol.InsertDescriptorlessPublicSchemaToBatch(ctx, kvTrace, desc, b); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -128,11 +135,13 @@ func WriteDescriptors(
 			wroteSchemas[sc.GetID()] = sc
 		}
 		if err := descsCol.WriteDescToBatch(
-			ctx, false /* kvTrace */, sc.(catalog.MutableDescriptor), b,
+			ctx, kvTrace, sc.(catalog.MutableDescriptor), b,
 		); err != nil {
 			return err
 		}
-		b.CPut(catalogkeys.EncodeNameKey(codec, sc), sc.GetID(), nil)
+		if err := descsCol.InsertNamespaceEntryToBatch(ctx, kvTrace, sc, b); err != nil {
+			return err
+		}
 	}
 
 	for i := range tables {
@@ -158,11 +167,13 @@ func WriteDescriptors(
 		}
 
 		if err := descsCol.WriteDescToBatch(
-			ctx, false /* kvTrace */, tables[i].(catalog.MutableDescriptor), b,
+			ctx, kvTrace, tables[i].(catalog.MutableDescriptor), b,
 		); err != nil {
 			return err
 		}
-		b.CPut(catalogkeys.EncodeNameKey(codec, table), table.GetID(), nil)
+		if err := descsCol.InsertNamespaceEntryToBatch(ctx, kvTrace, table, b); err != nil {
+			return err
+		}
 	}
 
 	// Write all type descriptors -- create namespace entries and write to
@@ -183,18 +194,42 @@ func WriteDescriptors(
 			}
 		}
 		if err := descsCol.WriteDescToBatch(
-			ctx, false /* kvTrace */, typ.(catalog.MutableDescriptor), b,
+			ctx, kvTrace, typ.(catalog.MutableDescriptor), b,
 		); err != nil {
 			return err
 		}
-		b.CPut(catalogkeys.EncodeNameKey(codec, typ), typ.GetID(), nil)
+		if err := descsCol.InsertNamespaceEntryToBatch(ctx, kvTrace, typ, b); err != nil {
+			return err
+		}
+	}
+
+	for _, fn := range functions {
+		updatedPrivileges, err := GetIngestingDescriptorPrivileges(
+			ctx, txn, descsCol, fn, user, wroteDBs, wroteSchemas, descCoverage,
+		)
+		if err != nil {
+			return err
+		}
+		if updatedPrivileges != nil {
+			if mut, ok := fn.(*funcdesc.Mutable); ok {
+				mut.Privileges = updatedPrivileges
+			} else {
+				log.Fatalf(ctx, "wrong type for function %d, %T, expected Mutable", fn.GetID(), fn)
+			}
+		}
+		if err := descsCol.WriteDescToBatch(
+			ctx, kvTrace, fn.(catalog.MutableDescriptor), b,
+		); err != nil {
+			return err
+		}
+		// Function does not have namespace entry.
 	}
 
 	for _, kv := range extra {
 		b.InitPut(kv.Key, &kv.Value, false)
 	}
 	if err := txn.Run(ctx, b); err != nil {
-		if errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
+		if errors.HasType(err, (*kvpb.ConditionFailedError)(nil)) {
 			return pgerror.Newf(pgcode.DuplicateObject, "table already exists")
 		}
 		return err
@@ -205,12 +240,7 @@ func WriteDescriptors(
 func processTableForMultiRegion(
 	ctx context.Context, txn *kv.Txn, descsCol *descs.Collection, table catalog.TableDescriptor,
 ) error {
-	_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
-		ctx, txn, table.GetParentID(), tree.DatabaseLookupFlags{
-			Required:       true,
-			AvoidLeased:    true,
-			IncludeOffline: true,
-		})
+	dbDesc, err := descsCol.ByID(txn).WithoutDropped().Get().Database(ctx, table.GetParentID())
 	if err != nil {
 		return err
 	}

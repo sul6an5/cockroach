@@ -1046,6 +1046,7 @@ func TestHashJoiner(t *testing.T) {
 				out := &distsqlutils.RowBuffer{}
 				flowCtx := execinfra.FlowCtx{
 					EvalCtx: &evalCtx,
+					Mon:     evalCtx.TestingMon,
 					Cfg: &execinfra.ServerConfig{
 						Settings:    st,
 						TempStorage: tempEngine,
@@ -1063,7 +1064,7 @@ func TestHashJoiner(t *testing.T) {
 					OnExpr:         c.onExpr,
 				}
 				h, err := newHashJoiner(
-					&flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post, out,
+					ctx, &flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post,
 				)
 				if err != nil {
 					return err
@@ -1072,7 +1073,7 @@ func TestHashJoiner(t *testing.T) {
 				if hjSetup != nil {
 					hjSetup(h)
 				}
-				h.Run(ctx)
+				h.Run(ctx, out)
 
 				if !out.ProducerClosed() {
 					return errors.New("output RowReceiver not closed")
@@ -1130,6 +1131,7 @@ func TestHashJoinerError(t *testing.T) {
 			out := &distsqlutils.RowBuffer{}
 			flowCtx := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 				Cfg: &execinfra.ServerConfig{
 					Settings:    st,
 					TempStorage: tempEngine,
@@ -1145,13 +1147,13 @@ func TestHashJoinerError(t *testing.T) {
 				OnExpr:         c.onExpr,
 			}
 			h, err := newHashJoiner(
-				&flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post, out,
+				ctx, &flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post,
 			)
 			if err != nil {
 				return err
 			}
 			outTypes := h.OutputTypes()
-			h.Run(ctx)
+			h.Run(ctx, out)
 
 			if !out.ProducerClosed() {
 				return errors.New("output RowReceiver not closed")
@@ -1278,18 +1280,19 @@ func TestHashJoinerDrain(t *testing.T) {
 		},
 		DiskMonitor: diskMonitor,
 		EvalCtx:     &evalCtx,
+		Mon:         evalCtx.TestingMon,
 	}
 
 	post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: outCols}
 	h, err := newHashJoiner(
-		&flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out,
+		ctx, &flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	out.ConsumerDone()
-	h.Run(ctx)
+	h.Run(ctx, out)
 
 	if !out.ProducerClosed() {
 		t.Fatalf("output RowReceiver not closed")
@@ -1410,17 +1413,18 @@ func TestHashJoinerDrainAfterBuildPhaseError(t *testing.T) {
 		},
 		DiskMonitor: diskMonitor,
 		EvalCtx:     &evalCtx,
+		Mon:         evalCtx.TestingMon,
 	}
 
 	post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: outCols}
 	h, err := newHashJoiner(
-		&flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out,
+		ctx, &flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	h.Run(ctx)
+	h.Run(ctx, out)
 
 	if !out.ProducerClosed() {
 		t.Fatalf("output RowReceiver not closed")
@@ -1460,6 +1464,7 @@ func BenchmarkHashJoiner(b *testing.B) {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -1500,12 +1505,12 @@ func BenchmarkHashJoiner(b *testing.B) {
 						// TODO(asubiotto): Get rid of uncleared state between
 						// hashJoiner Run()s to omit instantiation time from benchmarks.
 						h, err := newHashJoiner(
-							flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, &rowDisposer{},
+							ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post,
 						)
 						if err != nil {
 							b.Fatal(err)
 						}
-						h.Run(ctx)
+						h.Run(ctx, &rowDisposer{})
 						leftInput.Reset()
 						rightInput.Reset()
 					}

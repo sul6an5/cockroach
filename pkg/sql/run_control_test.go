@@ -18,15 +18,19 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -37,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/petermattis/goid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -62,7 +67,7 @@ func TestCancelDistSQLQuery(t *testing.T) {
 				UseDatabase: "test",
 				Knobs: base.TestingKnobs{
 					SQLExecutor: &sql.ExecutorTestingKnobs{
-						BeforeExecute: func(_ context.Context, stmt string) {
+						BeforeExecute: func(_ context.Context, stmt string, descriptors *descs.Collection) {
 							if strings.HasPrefix(stmt, queryToCancel) {
 								// Wait for the race to start.
 								<-sem
@@ -400,6 +405,18 @@ func TestCancelIfExists(t *testing.T) {
 	}
 }
 
+func TestCancelWithSubquery(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	params, _ := tests.CreateTestServerParams()
+	s, conn, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+
+	_, err := conn.Exec("CANCEL SESSION (SELECT session_id FROM [SHOW session_id]);")
+	require.EqualError(t, err, "driver: bad connection")
+}
+
 func TestIdleInSessionTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -543,6 +560,87 @@ func TestIdleInTransactionSessionTimeout(t *testing.T) {
 		t.Fatal("expected the connection to be killed " +
 			"but the connection is still alive")
 	}
+}
+
+func TestTransactionTimeout(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	numNodes := 1
+	tc := serverutils.StartNewTestCluster(t, numNodes,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+		})
+	defer tc.Stopper().Stop(ctx)
+
+	defer tc.ServerConn(0).Close()
+
+	var TransactionStatus string
+
+	conn, err := tc.ServerConn(0).Conn(ctx)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `SET transaction_timeout = '1s'`)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `BEGIN`)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `select pg_sleep(0.1);`)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `select pg_sleep(10);`)
+	require.Regexp(t, "pq: query execution canceled due to transaction timeout", err)
+
+	err = conn.QueryRowContext(ctx, `SHOW TRANSACTION STATUS`).Scan(&TransactionStatus)
+	require.NoError(t, err)
+
+	require.Equal(t, "Aborted", TransactionStatus)
+
+	_, err = conn.ExecContext(ctx, `SELECT 1;`)
+	require.Regexp(t, "current transaction is aborted", err)
+
+	_, err = conn.ExecContext(ctx, `ROLLBACK`)
+	require.NoError(t, err)
+
+	// Ensure the transaction times out when transaction is open and no statement
+	// is executed.
+	_, err = conn.ExecContext(ctx, `BEGIN`)
+	require.NoError(t, err)
+
+	time.Sleep(1010 * time.Millisecond)
+
+	_, err = conn.ExecContext(ctx, `SELECT 1;`)
+	require.Regexp(t, "pq: query execution canceled due to transaction timeout", err)
+
+	err = conn.QueryRowContext(ctx, `SHOW TRANSACTION STATUS`).Scan(&TransactionStatus)
+	require.NoError(t, err)
+
+	require.Equal(t, "Aborted", TransactionStatus)
+
+	_, err = conn.ExecContext(ctx, `ROLLBACK`)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `SET transaction_timeout = '10s'`)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `BEGIN`)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `select pg_sleep(0.1);`)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `SELECT 1;`)
+	require.NoError(t, err)
+
+	err = conn.QueryRowContext(ctx, `SHOW TRANSACTION STATUS`).Scan(&TransactionStatus)
+	require.NoError(t, err)
+
+	require.Equal(t, "Open", TransactionStatus)
+
+	_, err = conn.ExecContext(ctx, `COMMIT`)
+	require.NoError(t, err)
 }
 
 func TestIdleInTransactionSessionTimeoutAbortedState(t *testing.T) {
@@ -740,7 +838,6 @@ func getUserConn(t *testing.T, username string, server serverutils.TestServerInt
 // main statement with a timeout is blocked.
 func TestTenantStatementTimeoutAdmissionQueueCancelation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 78494, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	skip.UnderStress(t, "times out under stress")
@@ -749,8 +846,9 @@ func TestTenantStatementTimeoutAdmissionQueueCancelation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tenantID := serverutils.TestTenantID()
-
+	var hitMainQuery uint64
 	numBlockers := 4
+	var matches int64
 
 	// We can't get the tableID programmatically here, checked below with assert.
 	const tableID = 104
@@ -766,12 +864,15 @@ func TestTenantStatementTimeoutAdmissionQueueCancelation(t *testing.T) {
 	// client goroutine finish.
 	wg.Add(numBlockers + 1)
 
-	matchBatch := func(ctx context.Context, req *roachpb.BatchRequest) bool {
-		tid, ok := roachpb.TenantFromContext(ctx)
+	matchBatch := func(ctx context.Context, req *kvpb.BatchRequest) bool {
+		tid, ok := roachpb.ClientTenantFromContext(ctx)
 		if ok && tid == tenantID && len(req.Requests) > 0 {
-			scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
-			if ok && tableSpan.ContainsKey(scan.Key) {
-				return true
+			scan, ok := req.Requests[0].GetInner().(*kvpb.GetRequest)
+			if ok {
+				if tableSpan.ContainsKey(scan.Key) {
+					log.Infof(ctx, "matchBatch %d", goid.Get())
+					return true
+				}
 			}
 		}
 		return false
@@ -787,20 +888,32 @@ func TestTenantStatementTimeoutAdmissionQueueCancelation(t *testing.T) {
 				TestingDisableSkipEnforcement: true,
 			},
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(ctx context.Context, req roachpb.BatchRequest) *roachpb.Error {
-					if matchBatch(ctx, &req) {
+				TestingRequestFilter: func(ctx context.Context, req *kvpb.BatchRequest) *kvpb.Error {
+					if matchBatch(ctx, req) {
+						m := atomic.AddInt64(&matches, 1)
+						// If any of the blockers get retried just ignore.
+						if m > int64(numBlockers) {
+							log.Infof(ctx, "ignoring extra blocker %d", goid.Get())
+							return nil
+						}
 						// Notify we're blocking.
+						log.Infof(ctx, "blocking %d", goid.Get())
 						unblockClientCh <- struct{}{}
 						<-qBlockersCh
 					}
 					return nil
 				},
-				TestingResponseErrorEvent: func(ctx context.Context, req *roachpb.BatchRequest, err error) {
-					if matchBatch(ctx, req) {
-						scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
-						if ok && tableSpan.ContainsKey(scan.Key) {
-							cancel()
-							wg.Done()
+				TestingResponseErrorEvent: func(ctx context.Context, req *kvpb.BatchRequest, err error) {
+					tid, ok := roachpb.ClientTenantFromContext(ctx)
+					if ok && tid == tenantID && len(req.Requests) > 0 {
+						scan, ok := req.Requests[0].GetInner().(*kvpb.ScanRequest)
+						log.Infof(ctx, "%s %d", scan, goid.Get())
+						if ok {
+							if tableSpan.ContainsKey(scan.Key) && atomic.CompareAndSwapUint64(&hitMainQuery, 0, 1) {
+								log.Infof(ctx, "got scan request error %d", goid.Get())
+								cancel()
+								wg.Done()
+							}
 						}
 					}
 				},
@@ -815,8 +928,8 @@ func TestTenantStatementTimeoutAdmissionQueueCancelation(t *testing.T) {
 	defer db.Close()
 
 	r1 := sqlutils.MakeSQLRunner(db)
-	r1.Exec(t, `CREATE TABLE foo (t int)`)
-
+	r1.Exec(t, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled=false`)
+	r1.Exec(t, `CREATE TABLE foo (t int PRIMARY KEY)`)
 	row := r1.QueryRow(t, `SELECT id FROM system.namespace WHERE name = 'foo'`)
 	var id int64
 	row.Scan(&id)
@@ -835,18 +948,25 @@ func TestTenantStatementTimeoutAdmissionQueueCancelation(t *testing.T) {
 	for _, r := range blockers {
 		go func(r *sqlutils.SQLRunner) {
 			defer wg.Done()
-			r.Exec(t, `SELECT * FROM foo`)
+			r.Exec(t, `SELECT * FROM foo WHERE t = 1234`)
 		}(r)
 	}
 	// Wait till all blockers are parked.
 	for i := 0; i < numBlockers; i++ {
 		<-unblockClientCh
 	}
-	client.ExpectErr(t, "timeout", `SELECT * FROM foo`)
-	// Unblock the blockers.
+	log.Infof(ctx, "blockers parked")
+	// Because we don't know when statement timeout will happen we have to repeat
+	// till we get one into the KV layer.
+	for atomic.LoadUint64(&hitMainQuery) == 0 {
+		_, err := client.DB.ExecContext(context.Background(), `SELECT * FROM foo`)
+		require.Error(t, err)
+		log.Infof(ctx, "main req finished: %v", err)
+	}
 	for i := 0; i < numBlockers; i++ {
 		qBlockersCh <- struct{}{}
 	}
+	log.Infof(ctx, "unblocked blockers")
 	wg.Wait()
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 }

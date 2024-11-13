@@ -13,7 +13,9 @@ package state
 import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/workload"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 // ReplicaLoad defines the methods a datastructure is required to perform in
@@ -27,6 +29,9 @@ type ReplicaLoad interface {
 	// Split halves the load of the ReplicaLoad this method is called on and
 	// assigns the other half to a new ReplicaLoad that is returned i.e. 50/50.
 	Split() ReplicaLoad
+	// ResetLoad resets the load of the ReplicaLoad. This only affects rated
+	// counters.
+	ResetLoad()
 }
 
 // LoadEventQPS returns the QPS for a given workload event.
@@ -45,7 +50,16 @@ type ReplicaLoadCounter struct {
 	WriteBytes int64
 	ReadKeys   int64
 	ReadBytes  int64
-	QPS        float64
+	clock      *ManualSimClock
+	loadStats  *load.ReplicaLoad
+}
+
+// NewReplicaLoadCounter returns a new replica load counter.
+func NewReplicaLoadCounter(clock *ManualSimClock) *ReplicaLoadCounter {
+	return &ReplicaLoadCounter{
+		clock:     clock,
+		loadStats: load.NewReplicaLoad(hlc.NewClockForTesting(clock), nil),
+	}
 }
 
 // ApplyLoad applies a load event onto a replica load counter.
@@ -54,17 +68,31 @@ func (rl *ReplicaLoadCounter) ApplyLoad(le workload.LoadEvent) {
 	rl.ReadKeys += le.Reads
 	rl.WriteBytes += le.WriteSize
 	rl.WriteKeys += le.Writes
-	rl.QPS += LoadEventQPS(le)
+
+	rl.loadStats.RecordBatchRequests(LoadEventQPS(le), 0)
+	// TODO(kvoli): Recording the load on every load counter is horribly
+	// inefficient at the moment. It multiplies the time taken per test almost
+	// linearly by the number of load stats counters we bump. The other load
+	// stats are not used currently, re-enable them when perf is fixed and they
+	// are used.
 }
 
 // Load translates the recorded key accesses and size into range usage
 // information.
 func (rl *ReplicaLoadCounter) Load() allocator.RangeUsageInfo {
+	stats := rl.loadStats.Stats()
+
 	return allocator.RangeUsageInfo{
 		LogicalBytes:     rl.WriteBytes,
-		QueriesPerSecond: rl.QPS,
+		QueriesPerSecond: stats.QueriesPerSecond,
 		WritesPerSecond:  float64(rl.WriteKeys),
 	}
+}
+
+// ResetLoad resets the load of the ReplicaLoad. This only affects rated
+// counters.
+func (rl *ReplicaLoadCounter) ResetLoad() {
+	rl.loadStats.Reset()
 }
 
 // Split halves the load of the ReplicaLoad this method is called on and
@@ -74,14 +102,17 @@ func (rl *ReplicaLoadCounter) Split() ReplicaLoad {
 	rl.WriteBytes /= 2
 	rl.ReadKeys /= 2
 	rl.ReadBytes /= 2
-	rl.QPS /= 2
+
+	otherLoadStats := load.NewReplicaLoad(hlc.NewClockForTesting(rl.clock), nil)
+	rl.loadStats.Split(otherLoadStats)
 
 	return &ReplicaLoadCounter{
 		WriteKeys:  rl.WriteKeys,
 		WriteBytes: rl.WriteBytes,
 		ReadKeys:   rl.ReadKeys,
 		ReadBytes:  rl.ReadBytes,
-		QPS:        rl.QPS,
+		clock:      rl.clock,
+		loadStats:  otherLoadStats,
 	}
 }
 
@@ -92,22 +123,20 @@ func Capacity(state State, storeID StoreID) roachpb.StoreCapacity {
 	// the following missing fields: capacity, available, used, l0sublevels,
 	// bytesperreplica, writesperreplica.
 	capacity := roachpb.StoreCapacity{}
-	store, ok := state.Store(storeID)
-	if !ok {
-		return capacity
-	}
 
-	for rangeID, replicaID := range store.Replicas() {
+	for _, repl := range state.Replicas(storeID) {
+		rangeID := repl.Range()
+		replicaID := repl.ReplicaID()
 		rng, _ := state.Range(rangeID)
 		if rng.Leaseholder() == replicaID {
 			// TODO(kvoli): We currently only consider load on the leaseholder
 			// replica for a range. The other replicas have an estimate that is
-			// calculated within the allocation algorithm.
-			usage := state.UsageInfo(rng.RangeID())
+			// calculated within the allocation algorithm. Adapt this to
+			// support follower reads, when added to the workload generator.
+			usage := state.ReplicaLoad(rng.RangeID(), storeID).Load()
 			capacity.QueriesPerSecond += usage.QueriesPerSecond
 			capacity.WritesPerSecond += usage.WritesPerSecond
 			capacity.LogicalBytes += usage.LogicalBytes
-
 			capacity.LeaseCount++
 		}
 
@@ -118,20 +147,22 @@ func Capacity(state State, storeID StoreID) roachpb.StoreCapacity {
 
 // StoreUsageInfo contains the load on a single store.
 type StoreUsageInfo struct {
-	WriteKeys  int64
-	WriteBytes int64
-	ReadKeys   int64
-	ReadBytes  int64
+	WriteKeys          int64
+	WriteBytes         int64
+	ReadKeys           int64
+	ReadBytes          int64
+	LeaseTransfers     int64
+	Rebalances         int64
+	RebalanceSentBytes int64
+	RebalanceRcvdBytes int64
+	RangeSplits        int64
 }
 
 // ClusterUsageInfo contains the load and state of the cluster. Using this we
 // can answer questions such as how balanced the load is, and how much data got
 // rebalanced.
 type ClusterUsageInfo struct {
-	LeaseTransfers  int64
-	Rebalances      int64
-	BytesRebalanced int64
-	StoreUsage      map[StoreID]*StoreUsageInfo
+	StoreUsage map[StoreID]*StoreUsageInfo
 }
 
 func newClusterUsageInfo() *ClusterUsageInfo {
@@ -140,15 +171,20 @@ func newClusterUsageInfo() *ClusterUsageInfo {
 	}
 }
 
+func (u *ClusterUsageInfo) storeRef(storeID StoreID) *StoreUsageInfo {
+	var s *StoreUsageInfo
+	var ok bool
+	if s, ok = u.StoreUsage[storeID]; !ok {
+		s = &StoreUsageInfo{}
+		u.StoreUsage[storeID] = s
+	}
+	return s
+}
+
 // ApplyLoad applies the load event on the right stores.
 func (u *ClusterUsageInfo) ApplyLoad(r *rng, le workload.LoadEvent) {
 	for _, rep := range r.replicas {
-		s, ok := u.StoreUsage[rep.storeID]
-		if !ok {
-			// First time we see this store ID, add it.
-			s = &StoreUsageInfo{}
-			u.StoreUsage[rep.storeID] = s
-		}
+		s := u.storeRef(rep.storeID)
 		// Writes are added to all replicas, reads are added to the leaseholder
 		// only.
 		// Note that the accounting here is different from ReplicaLoadCounter above:

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -31,18 +32,20 @@ import (
 // transaction stats.
 type Writer interface {
 	// RecordStatement records statistics for a statement.
-	RecordStatement(ctx context.Context, key roachpb.StatementStatisticsKey, value RecordedStmtStats) (roachpb.StmtFingerprintID, error)
+	RecordStatement(ctx context.Context, key appstatspb.StatementStatisticsKey, value RecordedStmtStats) (appstatspb.StmtFingerprintID, error)
 
 	// RecordStatementExecStats records execution statistics for a statement.
 	// This is sampled and not recorded for every single statement.
-	RecordStatementExecStats(key roachpb.StatementStatisticsKey, stats execstats.QueryLevelStats) error
+	RecordStatementExecStats(key appstatspb.StatementStatisticsKey, stats execstats.QueryLevelStats) error
 
-	// ShouldSaveLogicalPlanDesc returns whether we should save the logical plan
-	// description for a given combination of statement metadata.
-	ShouldSaveLogicalPlanDesc(fingerprint string, implicitTxn bool, database string) bool
+	// ShouldSample returns two booleans, the first one indicates whether we
+	// ever sampled (i.e. collected statistics for) the given combination of
+	// statement metadata, and the second one whether we should save the logical
+	// plan description for it.
+	ShouldSample(fingerprint string, implicitTxn bool, database string) (previouslySampled, savePlanForStats bool)
 
 	// RecordTransaction records statistics for a transaction.
-	RecordTransaction(ctx context.Context, key roachpb.TransactionFingerprintID, value RecordedTxnStats) error
+	RecordTransaction(ctx context.Context, key appstatspb.TransactionFingerprintID, value RecordedTxnStats) error
 }
 
 // Reader provides methods to retrieve transaction/statement statistics from
@@ -80,7 +83,7 @@ type ApplicationStats interface {
 	MergeApplicationStatementStats(
 		ctx context.Context,
 		other ApplicationStats,
-		transformer func(statistics *roachpb.CollectedStatementStatistics),
+		transformer func(statistics *appstatspb.CollectedStatementStatistics),
 	) uint64
 
 	// MergeApplicationTransactionStats merges the other application's transaction
@@ -119,18 +122,18 @@ type IteratorOptions struct {
 // StatementVisitor is the callback that is invoked when caller iterate through
 // all statement statistics using IterateStatementStats(). If an error is
 // encountered when calling the visitor, the iteration is aborted.
-type StatementVisitor func(context.Context, *roachpb.CollectedStatementStatistics) error
+type StatementVisitor func(context.Context, *appstatspb.CollectedStatementStatistics) error
 
 // TransactionVisitor is the callback that is invoked when caller iterate through
 // all transaction statistics using IterateTransactionStats(). If an error is
 // encountered when calling the visitor, the iteration is aborted.
-type TransactionVisitor func(context.Context, *roachpb.CollectedTransactionStatistics) error
+type TransactionVisitor func(context.Context, *appstatspb.CollectedTransactionStatistics) error
 
 // AggregatedTransactionVisitor is the callback invoked when iterate through
 // transaction statistics collected at the application level using
 // IterateAggregatedTransactionStats(). If an error is encountered when calling
 // the visitor, the iteration is aborted.
-type AggregatedTransactionVisitor func(appName string, statistics *roachpb.TxnStats) error
+type AggregatedTransactionVisitor func(appName string, statistics *appstatspb.TxnStats) error
 
 // StatsCollector is an interface that collects statistics for transactions and
 // statements for the entire lifetime of a session.
@@ -157,7 +160,7 @@ type StatsCollector interface {
 	// fingerprint ID is now available. StatsCollector will now go back to update
 	// the transaction fingerprint ID field of all the statement statistics for that
 	// txn.
-	EndTransaction(ctx context.Context, transactionFingerprintID roachpb.TransactionFingerprintID)
+	EndTransaction(ctx context.Context, transactionFingerprintID appstatspb.TransactionFingerprintID)
 
 	// UpgradeImplicitTxn informs the StatsCollector that the current txn has been
 	// upgraded to an explicit transaction, thus all previously recorded statements
@@ -175,7 +178,7 @@ type Storage interface {
 
 	// GetApplicationStats returns an ApplicationStats instance for the given
 	// application name.
-	GetApplicationStats(appName string) ApplicationStats
+	GetApplicationStats(appName string, internal bool) ApplicationStats
 
 	// Reset resets all the statistics stored in-memory in the current Storage.
 	Reset(context.Context) error
@@ -196,6 +199,7 @@ type RecordedStmtStats struct {
 	AutoRetryCount       int
 	AutoRetryReason      error
 	RowsAffected         int
+	IdleLatency          float64
 	ParseLatency         float64
 	PlanLatency          float64
 	RunLatency           float64
@@ -205,8 +209,9 @@ type RecordedStmtStats struct {
 	RowsRead             int64
 	RowsWritten          int64
 	Nodes                []int64
+	Regions              []string
 	StatementType        tree.StatementType
-	Plan                 *roachpb.ExplainTreePlanNode
+	Plan                 *appstatspb.ExplainTreePlanNode
 	PlanGist             string
 	StatementError       error
 	IndexRecommendations []string
@@ -214,8 +219,9 @@ type RecordedStmtStats struct {
 	StartTime            time.Time
 	EndTime              time.Time
 	FullScan             bool
-	SessionData          *sessiondata.SessionData
 	ExecStats            *execstats.QueryLevelStats
+	Indexes              []string
+	Database             string
 }
 
 // RecordedTxnStats stores the statistics of a transaction to be recorded.
@@ -223,13 +229,17 @@ type RecordedTxnStats struct {
 	SessionID               clusterunique.ID
 	TransactionID           uuid.UUID
 	TransactionTimeSec      float64
+	StartTime               time.Time
+	EndTime                 time.Time
 	Committed               bool
 	ImplicitTxn             bool
 	RetryCount              int64
-	StatementFingerprintIDs []roachpb.StmtFingerprintID
+	AutoRetryReason         error
+	StatementFingerprintIDs []appstatspb.StmtFingerprintID
 	ServiceLatency          time.Duration
 	RetryLatency            time.Duration
 	CommitLatency           time.Duration
+	IdleLatency             time.Duration
 	RowsAffected            int
 	CollectedExecStats      bool
 	ExecStats               execstats.QueryLevelStats
@@ -237,4 +247,5 @@ type RecordedTxnStats struct {
 	RowsWritten             int64
 	BytesRead               int64
 	Priority                roachpb.UserPriority
+	SessionData             *sessiondata.SessionData
 }

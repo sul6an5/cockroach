@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -22,21 +23,56 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// constraintToUpdateForTest implements the catalog.ConstraintToUpdate interface.
+// constraintToUpdateForTest implements the catalog.Constraint interface.
 // It's only used for testing
 type constraintToUpdateForTest struct {
-	catalog.ConstraintToUpdate
+	catalog.Constraint
 	desc *descpb.ConstraintToUpdate
 }
 
-// IsCheck returns true iff this is an update for a check constraint.
-func (c constraintToUpdateForTest) IsCheck() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_CHECK
+var _ catalog.CheckConstraint = (*constraintToUpdateForTest)(nil)
+
+// AsCheck implements the catalog.Constraint interface.
+func (c constraintToUpdateForTest) AsCheck() catalog.CheckConstraint {
+	if c.desc.ConstraintType != descpb.ConstraintToUpdate_CHECK {
+		return nil
+	}
+	return c
 }
 
-// Check returns the underlying check constraint, if there is one.
-func (c constraintToUpdateForTest) Check() descpb.TableDescriptor_CheckConstraint {
-	return c.desc.Check
+// CheckDesc implements the catalog.CheckConstraint interface.
+func (c constraintToUpdateForTest) CheckDesc() *descpb.TableDescriptor_CheckConstraint {
+	return &c.desc.Check
+}
+
+// GetExpr implements the catalog.CheckConstraint interface.
+func (c constraintToUpdateForTest) GetExpr() string {
+	return c.desc.Check.Expr
+}
+
+// NumReferencedColumns implements the catalog.CheckConstraint interface.
+func (c constraintToUpdateForTest) NumReferencedColumns() int {
+	return len(c.desc.Check.ColumnIDs)
+}
+
+// GetReferencedColumnID implements the catalog.CheckConstraint interface.
+func (c constraintToUpdateForTest) GetReferencedColumnID(columnOrdinal int) descpb.ColumnID {
+	return c.desc.Check.ColumnIDs[columnOrdinal]
+}
+
+// CollectReferencedColumnIDs implements the catalog.CheckConstraint interface.
+func (c constraintToUpdateForTest) CollectReferencedColumnIDs() catalog.TableColSet {
+	return catalog.MakeTableColSet(c.desc.Check.ColumnIDs...)
+}
+
+// IsHashShardingConstraint implements the catalog.CheckConstraint interface.
+func (c constraintToUpdateForTest) IsHashShardingConstraint() bool {
+	return c.desc.Check.FromHashShardedColumn
+}
+
+// IsNotNullColumnConstraint implements the catalog.CheckConstraint interface.
+func (c constraintToUpdateForTest) IsNotNullColumnConstraint() bool {
+	return c.desc.NotNullColumn != 0
 }
 
 func TestShouldSkipConstraintValidation(t *testing.T) {
@@ -57,8 +93,8 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 		PrimaryIndex: descpb.IndexDescriptor{
 			ID: 1, Name: "pri", KeyColumnIDs: []descpb.ColumnID{1},
 			KeyColumnNames:      []string{"c1"},
-			KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC},
-			EncodingType:        descpb.PrimaryIndexEncoding,
+			KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+			EncodingType:        catenumpb.PrimaryIndexEncoding,
 			Version:             descpb.LatestIndexDescriptorVersion,
 		},
 		Mutations: []descpb.DescriptorMutation{
@@ -67,11 +103,11 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 					Index: &descpb.IndexDescriptor{
 						ID: 2, Name: "new_hash_index", KeyColumnIDs: []descpb.ColumnID{2, 3},
 						KeyColumnNames: []string{"c2", "c3"},
-						KeyColumnDirections: []catpb.IndexColumn_Direction{
-							catpb.IndexColumn_ASC,
-							catpb.IndexColumn_ASC,
+						KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+							catenumpb.IndexColumn_ASC,
+							catenumpb.IndexColumn_ASC,
 						},
-						EncodingType: descpb.PrimaryIndexEncoding,
+						EncodingType: catenumpb.PrimaryIndexEncoding,
 						Version:      descpb.LatestIndexDescriptorVersion,
 						Sharded: catpb.ShardedDescriptor{
 							IsSharded:    true,
@@ -119,11 +155,11 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 				desc: &descpb.ConstraintToUpdate{
 					ConstraintType: descpb.ConstraintToUpdate_CHECK,
 					Check: descpb.TableDescriptor_CheckConstraint{
-						Expr:      "some fake expr",
-						Name:      "some fake name",
-						Validity:  descpb.ConstraintValidity_Validating,
-						ColumnIDs: []descpb.ColumnID{3},
-						Hidden:    true,
+						Expr:                  "some fake expr",
+						Name:                  "some fake name",
+						Validity:              descpb.ConstraintValidity_Validating,
+						ColumnIDs:             []descpb.ColumnID{3},
+						FromHashShardedColumn: true,
 					},
 				},
 			},
@@ -135,11 +171,11 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 				desc: &descpb.ConstraintToUpdate{
 					ConstraintType: descpb.ConstraintToUpdate_CHECK,
 					Check: descpb.TableDescriptor_CheckConstraint{
-						Expr:      "some fake expr",
-						Name:      "some fake name",
-						Validity:  descpb.ConstraintValidity_Validating,
-						ColumnIDs: []descpb.ColumnID{2},
-						Hidden:    false,
+						Expr:                  "some fake expr",
+						Name:                  "some fake name",
+						Validity:              descpb.ConstraintValidity_Validating,
+						ColumnIDs:             []descpb.ColumnID{2},
+						FromHashShardedColumn: false,
 					},
 				},
 			},
@@ -151,11 +187,11 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 				desc: &descpb.ConstraintToUpdate{
 					ConstraintType: descpb.ConstraintToUpdate_CHECK,
 					Check: descpb.TableDescriptor_CheckConstraint{
-						Expr:      "some fake expr",
-						Name:      "some fake name",
-						Validity:  descpb.ConstraintValidity_Validating,
-						ColumnIDs: []descpb.ColumnID{2, 3},
-						Hidden:    false,
+						Expr:                  "some fake expr",
+						Name:                  "some fake name",
+						Validity:              descpb.ConstraintValidity_Validating,
+						ColumnIDs:             []descpb.ColumnID{2, 3},
+						FromHashShardedColumn: false,
 					},
 				},
 			},

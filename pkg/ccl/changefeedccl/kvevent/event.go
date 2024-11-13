@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -63,6 +64,11 @@ type Writer interface {
 	CloseWithReason(ctx context.Context, reason error) error
 }
 
+// MemAllocator is an interface for acquiring memory.
+type MemAllocator interface {
+	AcquireMemory(ctx context.Context, n int64) (Alloc, error)
+}
+
 // Type indicates the type of the event.
 // Different types indicate which methods will be meaningful.
 // Events are implemented this way rather than as an interface to remove the
@@ -96,7 +102,7 @@ const (
 // Event represents an event emitted by a kvfeed. It is either a KV or a
 // resolved timestamp.
 type Event struct {
-	ev                 *roachpb.RangeFeedEvent
+	ev                 *kvpb.RangeFeedEvent
 	et                 Type
 	backfillTimestamp  hlc.Timestamp
 	bufferAddTimestamp time.Time
@@ -115,6 +121,9 @@ func (e *Event) Type() Type {
 
 // ApproximateSize returns events approximate size in bytes.
 func (e *Event) ApproximateSize() int {
+	if e.et == TypeFlush {
+		return 0
+	}
 	return e.ev.Size() + int(unsafe.Sizeof(Event{}))
 }
 
@@ -231,7 +240,7 @@ func getTypeForBoundary(bt jobspb.ResolvedSpan_BoundaryType) Type {
 
 // MakeResolvedEvent returns resolved event constructed from existing RangeFeedEvent.
 func MakeResolvedEvent(
-	ev *roachpb.RangeFeedEvent, boundaryType jobspb.ResolvedSpan_BoundaryType,
+	ev *kvpb.RangeFeedEvent, boundaryType jobspb.ResolvedSpan_BoundaryType,
 ) Event {
 	if ev.Checkpoint == nil {
 		panic("expected initialized RangeFeedCheckpoint")
@@ -244,8 +253,8 @@ func MakeResolvedEvent(
 func NewBackfillResolvedEvent(
 	span roachpb.Span, ts hlc.Timestamp, boundaryType jobspb.ResolvedSpan_BoundaryType,
 ) Event {
-	rfe := &roachpb.RangeFeedEvent{
-		Checkpoint: &roachpb.RangeFeedCheckpoint{
+	rfe := &kvpb.RangeFeedEvent{
+		Checkpoint: &kvpb.RangeFeedCheckpoint{
 			Span:       span,
 			ResolvedTS: ts,
 		},
@@ -254,7 +263,7 @@ func NewBackfillResolvedEvent(
 }
 
 // MakeKVEvent returns KV event constructed from existing RangeFeedEvent.
-func MakeKVEvent(ev *roachpb.RangeFeedEvent) Event {
+func MakeKVEvent(ev *kvpb.RangeFeedEvent) Event {
 	if ev.Val == nil {
 		panic("expected initialized RangeFeedValue")
 	}
@@ -266,8 +275,8 @@ func MakeKVEvent(ev *roachpb.RangeFeedEvent) Event {
 func NewBackfillKVEvent(
 	key []byte, ts hlc.Timestamp, val []byte, withDiff bool, backfillTS hlc.Timestamp,
 ) Event {
-	rfe := &roachpb.RangeFeedEvent{
-		Val: &roachpb.RangeFeedValue{
+	rfe := &kvpb.RangeFeedEvent{
+		Val: &kvpb.RangeFeedValue{
 			Key: key,
 			Value: roachpb.Value{
 				RawBytes:  val,

@@ -14,12 +14,17 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/rel"
@@ -31,11 +36,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
@@ -44,11 +51,11 @@ import (
 func TestBuildDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
 	ctx := context.Background()
 
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		for _, depsType := range []struct {
 			name                string
 			dependenciesWrapper func(*testing.T, serverutils.TestServerInterface, *sqlutils.SQLRunner, func(scbuild.Dependencies))
@@ -67,6 +74,15 @@ func TestBuildDataDriven(t *testing.T) {
 					// test cluster, here the SQLRunner is only used to populate the mocked
 					// catalog state.
 					descriptorCatalog := sctestdeps.ReadDescriptorsFromDB(ctx, t, tdb).Catalog
+
+					// Set up a reference provider factory for the purpose of proper
+					// dependency resolution.
+					execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+					refFactory, cleanup := sql.NewReferenceProviderFactoryForTest(
+						"test" /* opName */, kv.NewTxn(context.Background(), s.DB(), s.NodeID()), username.RootUserName(), &execCfg, "defaultdb",
+					)
+					defer cleanup()
+
 					fn(
 						sctestdeps.NewTestDependencies(
 							sctestdeps.WithDescriptors(descriptorCatalog),
@@ -81,11 +97,18 @@ func TestBuildDataDriven(t *testing.T) {
 										// changer will allow non-fully implemented operations.
 										sd.NewSchemaChangerMode = sessiondatapb.UseNewSchemaChangerUnsafe
 										sd.ApplicationName = ""
+										sd.EnableUniqueWithoutIndexConstraints = true
 									},
 								),
 							),
 							sctestdeps.WithComments(sctestdeps.ReadCommentsFromDB(t, tdb)),
 							sctestdeps.WithZoneConfigs(sctestdeps.ReadZoneConfigsFromDB(t, tdb, descriptorCatalog)),
+							// Though we want to mock up data for this test setting, it's hard
+							// to mimic the ID generator and optimizer (resolve all
+							// dependencies in functions and views). So we need these pieces
+							// to be similar as sql dependencies.
+							sctestdeps.WithIDGenerator(s),
+							sctestdeps.WithReferenceProviderFactory(refFactory),
 						),
 					)
 				},
@@ -114,6 +137,7 @@ func run(
 	tdb *sqlutils.SQLRunner,
 	withDependencies func(*testing.T, serverutils.TestServerInterface, *sqlutils.SQLRunner, func(scbuild.Dependencies)),
 ) string {
+	sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
 	switch d.Cmd {
 	case "setup":
 		stmts, err := parser.Parse(d.Input)
@@ -144,7 +168,7 @@ func run(
 			stmts, err := parser.Parse(d.Input)
 			require.NoError(t, err)
 			for i := range stmts {
-				output, err = scbuild.Build(ctx, deps, output, stmts[i].AST)
+				output, err = scbuild.Build(ctx, deps, output, stmts[i].AST, nil /* memAcc */)
 				require.NoErrorf(t, err, "%s: %s", d.Pos, stmts[i].SQL)
 			}
 		})
@@ -157,7 +181,7 @@ func run(
 			require.NotEmpty(t, stmts)
 
 			for _, stmt := range stmts {
-				_, err = scbuild.Build(ctx, deps, scpb.CurrentState{}, stmt.AST)
+				_, err = scbuild.Build(ctx, deps, scpb.CurrentState{}, stmt.AST, nil /* memAcc */)
 				expected := scerrors.NotImplementedError(nil)
 				require.Errorf(t, err, "%s: expected %T instead of success for", stmt.SQL, expected)
 				require.Truef(t, scerrors.HasNotImplemented(err), "%s: expected %T instead of %v", stmt.SQL, expected, err)
@@ -234,9 +258,7 @@ func (n nodeEntries) Swap(i, j int) { n[i], n[j] = n[j], n[i] }
 var _ sort.Interface = nodeEntries{}
 
 func formatElementForDisplay(t *testing.T, e scpb.Element) []byte {
-	marshaled, err := sctestutils.ProtoToYAML(
-		e, false /* emitDefaults */, nil, /* rewrites */
-	)
+	marshaled, err := sctestutils.ProtoToYAML(e, false /* emitDefaults */)
 	require.NoError(t, err)
 	dec := yaml.NewDecoder(strings.NewReader(marshaled))
 	dec.KnownFields(true)
@@ -257,4 +279,39 @@ func walkYaml(root *yaml.Node, f func(node *yaml.Node)) {
 		}
 	}
 	walk(root)
+}
+
+// TestBuildIsMemoryMonitored tests that the build function is properly
+// memory monitored.
+// Such monitoring is important to prevent OOM in the builder as it can
+// take up a lot of memory for certain DDL statement (e.g. dropping a
+// database with tens of thousands of tables in it).
+func TestBuildIsMemoryMonitored(t *testing.T) {
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+	tdb := sqlutils.MakeSQLRunner(db)
+	tdb.Exec(t, `use defaultdb;`)
+	tdb.Exec(t, `select crdb_internal.generate_test_objects('test',  5000);`)
+	tdb.Exec(t, `use system;`)
+
+	monitor := mon.NewMonitor(
+		"test-sc-build-mon",
+		mon.MemoryResource,
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment */
+		math.MaxInt64, /* noteworthy */
+		cluster.MakeTestingClusterSettings(),
+	)
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(5*1024*1024 /* 5MiB */))
+	memAcc := monitor.MakeBoundAccount()
+	sctestutils.WithBuilderDependenciesFromTestServer(s, func(dependencies scbuild.Dependencies) {
+		stmt, err := parser.ParseOne(`DROP DATABASE defaultdb CASCADE`)
+		require.NoError(t, err)
+		_, err = scbuild.Build(ctx, dependencies, scpb.CurrentState{}, stmt.AST, &memAcc)
+		require.ErrorContainsf(t, err, `test-sc-build-mon: memory budget exceeded:`, "got a memory usage of: %d", memAcc.Allocated())
+	})
+
 }

@@ -74,7 +74,7 @@ func (b *defaultBuiltinFuncOperator) Next() coldata.Batch {
 					res = tree.DNull
 				} else {
 					res, err = b.funcExpr.ResolvedOverload().
-						Fn.(eval.FnOverload)(b.evalCtx, b.row)
+						Fn.(eval.FnOverload)(b.Ctx, b.evalCtx, b.row)
 					if err != nil {
 						colexecerror.ExpectedError(b.funcExpr.MaybeWrapError(err))
 					}
@@ -103,6 +103,12 @@ func (b *defaultBuiltinFuncOperator) Release() {
 	b.toDatumConverter.Release()
 }
 
+// errFnWithExprsNotSupported is returned from NewBuiltinFunctionOperator
+// when the function in question uses FnWithExprs, which is not supported.
+var errFnWithExprsNotSupported = errors.New(
+	"builtins with FnWithExprs are not supported in the vectorized engine",
+)
+
 // NewBuiltinFunctionOperator returns an operator that applies builtin functions.
 func NewBuiltinFunctionOperator(
 	allocator *colmem.Allocator,
@@ -115,7 +121,7 @@ func NewBuiltinFunctionOperator(
 ) (colexecop.Operator, error) {
 	overload := funcExpr.ResolvedOverload()
 	if overload.FnWithExprs != nil {
-		return nil, errors.New("builtins with FnWithExprs are not supported in the vectorized engine")
+		return nil, errFnWithExprsNotSupported
 	}
 	outputType := funcExpr.ResolvedType()
 	input = colexecutils.NewVectorTypeEnforcer(allocator, input, outputType, outputIdx)

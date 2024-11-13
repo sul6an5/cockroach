@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -184,8 +184,9 @@ type mutationBuilder struct {
 
 	// extraAccessibleCols stores all the columns that are available to the
 	// mutation that are not part of the target table. This is useful for
-	// UPDATE ... FROM queries, as the columns from the FROM tables must be
-	// made accessible to the RETURNING clause.
+	// UPDATE ... FROM queries and DELETE ... USING queries, as the columns
+	// from the FROM and USING tables must be made accessible to the
+	// RETURNING clause, respectively.
 	extraAccessibleCols []scopeColumn
 
 	// fkCheckHelper is used to prevent allocating the helper separately.
@@ -346,29 +347,18 @@ func (mb *mutationBuilder) buildInputForUpdate(
 
 	mb.outScope = projectionsScope
 
-	// Build a distinct on to ensure there is at most one row in the joined output
-	// for every row in the table.
+	// Build a distinct-on operator on the primary key columns to ensure there
+	// is at most one row in the joined output for every row in the target
+	// table.
 	if fromClausePresent {
 		var pkCols opt.ColSet
-
-		// We need to ensure that the join has a maximum of one row for every row
-		// in the table and we ensure this by constructing a distinct on the primary
-		// key columns.
 		primaryIndex := mb.tab.Index(cat.PrimaryIndex)
 		for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
-			// If the primary key column is hidden, then we don't need to use it
-			// for the distinct on.
-			// TODO(radu): this logic seems fragile, is it assuming that only an
-			// implicit `rowid` column can be a hidden PK column?
-			if col := primaryIndex.Column(i); col.Visibility() != cat.Hidden {
-				pkCols.Add(mb.fetchColIDs[col.Ordinal()])
-			}
+			col := primaryIndex.Column(i)
+			pkCols.Add(mb.fetchColIDs[col.Ordinal()])
 		}
-
-		if !pkCols.Empty() {
-			mb.outScope = mb.b.buildDistinctOn(
-				pkCols, mb.outScope, false /* nullsAreDistinct */, "" /* errorOnDup */)
-		}
+		mb.outScope = mb.b.buildDistinctOn(
+			pkCols, mb.outScope, false /* nullsAreDistinct */, "" /* errorOnDup */)
 	}
 }
 
@@ -376,7 +366,7 @@ func (mb *mutationBuilder) buildInputForUpdate(
 // the Delete operator, similar to this:
 //
 //	SELECT <cols>
-//	FROM <table>
+//	FROM <table> [, <using-tables>]
 //	WHERE <where>
 //	ORDER BY <order-by>
 //	LIMIT <limit>
@@ -384,7 +374,12 @@ func (mb *mutationBuilder) buildInputForUpdate(
 // All columns from the table to update are added to fetchColList.
 // TODO(andyk): Do needed column analysis to project fewer columns if possible.
 func (mb *mutationBuilder) buildInputForDelete(
-	inScope *scope, texpr tree.TableExpr, where *tree.Where, limit *tree.Limit, orderBy tree.OrderBy,
+	inScope *scope,
+	texpr tree.TableExpr,
+	where *tree.Where,
+	using tree.TableExprs,
+	limit *tree.Limit,
+	orderBy tree.OrderBy,
 ) {
 	var indexFlags *tree.IndexFlags
 	if source, ok := texpr.(*tree.AliasedTableExpr); ok && source.IndexFlags != nil {
@@ -413,7 +408,39 @@ func (mb *mutationBuilder) buildInputForDelete(
 		inScope,
 		false, /* disableNotVisibleIndex */
 	)
-	mb.outScope = mb.fetchScope
+
+	// Set list of columns that will be fetched by the input expression.
+	mb.setFetchColIDs(mb.fetchScope.cols)
+
+	// USING
+	usingClausePresent := len(using) > 0
+	if usingClausePresent {
+		usingScope := mb.b.buildFromTables(using, noRowLocking, inScope)
+
+		// Check that the same table name is not used multiple times
+		mb.b.validateJoinTableNames(mb.fetchScope, usingScope)
+
+		// The USING table columns can be accessed by the RETURNING clause of the
+		// query and so we have to make them accessible.
+		mb.extraAccessibleCols = usingScope.cols
+
+		// Add the columns to the USING scope.
+		// We create a new scope so that fetchScope is not modified
+		// as fetchScope contains the set of columns from the target
+		// table specified by USING. This will be used later with partial
+		// index predicate expressions and will prevent ambiguities with
+		// column names in the USING clause.
+		mb.outScope = mb.fetchScope.replace()
+		mb.outScope.appendColumnsFromScope(mb.fetchScope)
+		mb.outScope.appendColumnsFromScope(usingScope)
+
+		left := mb.fetchScope.expr
+		right := usingScope.expr
+
+		mb.outScope.expr = mb.b.factory.ConstructInnerJoin(left, right, memo.TrueFilter, memo.EmptyJoinPrivate)
+	} else {
+		mb.outScope = mb.fetchScope
+	}
 
 	// WHERE
 	mb.b.buildWhere(where, mb.outScope)
@@ -432,8 +459,23 @@ func (mb *mutationBuilder) buildInputForDelete(
 
 	mb.outScope = projectionsScope
 
-	// Set list of columns that will be fetched by the input expression.
-	mb.setFetchColIDs(mb.outScope.cols)
+	// Build a distinct on to ensure there is at most one row in the joined output
+	// for every row in the table
+	if usingClausePresent {
+		var pkCols opt.ColSet
+
+		// We need to ensure that the join has a maximum of one row for every row
+		// in the table and we ensure this by constructing a distinct on the primary
+		// key columns.
+		primaryIndex := mb.tab.Index(cat.PrimaryIndex)
+		for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
+			col := primaryIndex.Column(i)
+			pkCols.Add(mb.fetchColIDs[col.Ordinal()])
+		}
+
+		mb.outScope = mb.b.buildDistinctOn(
+			pkCols, mb.outScope, false /* nullsAreDistinct */, "" /* errorOnDup */)
+	}
 }
 
 // addTargetColsByName adds one target column for each of the names in the given
@@ -520,7 +562,7 @@ func (mb *mutationBuilder) extractValuesInput(inputRows *tree.Select) *tree.Valu
 // or just the unchanged input expression if there are no DEFAULT values.
 func (mb *mutationBuilder) replaceDefaultExprs(inRows *tree.Select) (outRows *tree.Select) {
 	values := mb.extractValuesInput(inRows)
-	if values == nil {
+	if values == nil || len(values.Rows) == 0 {
 		return inRows
 	}
 
@@ -977,7 +1019,7 @@ func (mb *mutationBuilder) mapToReturnColID(tabOrd int) opt.ColumnID {
 
 // buildReturning wraps the input expression with a Project operator that
 // projects the given RETURNING expressions.
-func (mb *mutationBuilder) buildReturning(returning tree.ReturningExprs) {
+func (mb *mutationBuilder) buildReturning(returning *tree.ReturningExprs) {
 	// Handle case of no RETURNING clause.
 	if returning == nil {
 		expr := mb.outScope.expr
@@ -1001,8 +1043,9 @@ func (mb *mutationBuilder) buildReturning(returning tree.ReturningExprs) {
 
 	// extraAccessibleCols contains all the columns that the RETURNING
 	// clause can refer to in addition to the table columns. This is useful for
-	// UPDATE ... FROM statements, where all columns from tables in the FROM clause
-	// are in scope for the RETURNING clause.
+	// UPDATE ... FROM and DELETE ... USING statements, where all columns from
+	// tables in the FROM clause and USING clause are in scope for the RETURNING
+	// clause, respectively.
 	inScope.appendColumns(mb.extraAccessibleCols)
 
 	// Construct the Project operator that projects the RETURNING expressions.
@@ -1171,8 +1214,8 @@ func (mb *mutationBuilder) parseUniqueConstraintPredicateExpr(uniq cat.UniqueOrd
 // getIndexLaxKeyOrdinals returns the ordinals of all lax key columns in the
 // given index. A column's ordinal is the ordered position of that column in the
 // owning table.
-func getIndexLaxKeyOrdinals(index cat.Index) util.FastIntSet {
-	var keyOrds util.FastIntSet
+func getIndexLaxKeyOrdinals(index cat.Index) intsets.Fast {
+	var keyOrds intsets.Fast
 	for i, n := 0, index.LaxKeyColumnCount(); i < n; i++ {
 		keyOrds.Add(index.Column(i).Ordinal())
 	}
@@ -1182,8 +1225,8 @@ func getIndexLaxKeyOrdinals(index cat.Index) util.FastIntSet {
 // getUniqueConstraintOrdinals returns the ordinals of all columns in the given
 // unique constraint. A column's ordinal is the ordered position of that column
 // in the owning table.
-func getUniqueConstraintOrdinals(tab cat.Table, uc cat.UniqueConstraint) util.FastIntSet {
-	var ucOrds util.FastIntSet
+func getUniqueConstraintOrdinals(tab cat.Table, uc cat.UniqueConstraint) intsets.Fast {
+	var ucOrds intsets.Fast
 	for i, n := 0, uc.ColumnCount(); i < n; i++ {
 		ucOrds.Add(uc.ColumnOrdinal(tab, i))
 	}
@@ -1193,10 +1236,10 @@ func getUniqueConstraintOrdinals(tab cat.Table, uc cat.UniqueConstraint) util.Fa
 // getExplicitPrimaryKeyOrdinals returns the ordinals of the primary key
 // columns, excluding any implicit partitioning or hash-shard columns in the
 // primary index.
-func getExplicitPrimaryKeyOrdinals(tab cat.Table) util.FastIntSet {
+func getExplicitPrimaryKeyOrdinals(tab cat.Table) intsets.Fast {
 	index := tab.Index(cat.PrimaryIndex)
 	skipCols := index.ImplicitColumnCount()
-	var keyOrds util.FastIntSet
+	var keyOrds intsets.Fast
 	for i, n := skipCols, index.LaxKeyColumnCount(); i < n; i++ {
 		keyOrds.Add(index.Column(i).Ordinal())
 	}

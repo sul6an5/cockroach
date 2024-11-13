@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/errors"
 )
@@ -29,18 +30,14 @@ import (
 var sqlAlchemyResultRegex = regexp.MustCompile(`^(?P<test>test.*::.*::[^ \[\]]*(?:\[.*])?) (?P<result>\w+)\s+\[.+]$`)
 var sqlAlchemyReleaseTagRegex = regexp.MustCompile(`^rel_(?P<major>\d+)_(?P<minor>\d+)_(?P<point>\d+)$`)
 
-// TODO(arul): Investigate why we need this and can't install sql alchemy using
-//
-//	pip.
-var supportedSQLAlchemyTag = "rel_1_4_26"
+var supportedSQLAlchemyTag = "2.0.2"
 
 // This test runs the SQLAlchemy dialect test suite against a single Cockroach
 // node.
-
 func registerSQLAlchemy(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    "sqlalchemy",
-		Owner:   registry.OwnerSQLExperience,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
 		Tags:    []string{`default`, `orm`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -72,7 +69,7 @@ func runSQLAlchemy(ctx context.Context, t test.Test, c cluster.Cluster) {
 	}
 
 	if err := repeatRunE(ctx, t, c, node, "install dependencies", `
-		sudo apt-get -qq install make python3.7 libpq-dev python3.7-dev gcc python3-setuptools python-setuptools build-essential python3.7-distutils
+		sudo apt-get -qq install make python3.7 libpq-dev python3.7-dev gcc python3-setuptools python-setuptools build-essential python3.7-distutils python3-virtualenv
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -91,9 +88,16 @@ func runSQLAlchemy(ctx context.Context, t test.Test, c cluster.Cluster) {
 		t.Fatal(err)
 	}
 
-	if err := repeatRunE(ctx, t, c, node, "install pytest", `
-		sudo pip3 install --upgrade --force-reinstall setuptools pytest==6.0.1 pytest-xdist psycopg2 alembic
-	`); err != nil {
+	if err := repeatRunE(
+		ctx, t, c, node, "create virtualenv", `virtualenv --clear venv`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repeatRunE(ctx, t, c, node, "install pytest", fmt.Sprintf(`
+		source venv/bin/activate &&
+			pip3 install --upgrade --force-reinstall setuptools pytest==7.2.1 pytest-xdist psycopg2 alembic sqlalchemy==%s`,
+		supportedSQLAlchemyTag)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,26 +115,7 @@ func runSQLAlchemy(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 	t.Status("installing sqlalchemy-cockroachdb")
 	if err := repeatRunE(ctx, t, c, node, "installing sqlalchemy=cockroachdb", `
-		cd /mnt/data1/sqlalchemy-cockroachdb && sudo pip3 install .
-	`); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := repeatRunE(ctx, t, c, node, "remove old sqlalchemy", `
-		sudo rm -rf /mnt/data1/sqlalchemy
-	`); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := repeatGitCloneE(ctx, t, c,
-		"https://github.com/sqlalchemy/sqlalchemy.git", "/mnt/data1/sqlalchemy",
-		supportedSQLAlchemyTag, node); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Status("building sqlalchemy")
-	if err := repeatRunE(ctx, t, c, node, "building sqlalchemy", `
-		cd /mnt/data1/sqlalchemy && python3 setup.py build
+		source venv/bin/activate && cd /mnt/data1/sqlalchemy-cockroachdb && pip3 install .
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -150,10 +135,8 @@ func runSQLAlchemy(ctx context.Context, t test.Test, c cluster.Cluster) {
 		t.Fatal(err)
 	}
 
-	blocklistName, expectedFailures, ignoredlistName, ignoredlist := sqlAlchemyBlocklists.getLists(version)
-	if expectedFailures == nil {
-		t.Fatalf("No sqlalchemy blocklist defined for cockroach version %s", version)
-	}
+	blocklistName, expectedFailures := "sqlAlchemyBlocklist", sqlAlchemyBlocklist
+	ignoredlistName, ignoredlist := "sqlAlchemyIgnoreList", sqlAlchemyIgnoreList
 	t.L().Printf("Running cockroach version %s, using blocklist %s, using ignoredlist %s",
 		version, blocklistName, ignoredlistName)
 
@@ -161,21 +144,15 @@ func runSQLAlchemy(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// Note that this is expected to return an error, since the test suite
 	// will fail. And it is safe to swallow it here.
 	result, err := c.RunWithDetailsSingleNode(ctx, t.L(), node,
-		`cd /mnt/data1/sqlalchemy-cockroachdb/ && pytest --maxfail=0 \
+		`source venv/bin/activate && cd /mnt/data1/sqlalchemy-cockroachdb/ && pytest --maxfail=0 \
 		--dburi='cockroachdb://root@localhost:26257/defaultdb?sslmode=disable&disable_cockroachdb_telemetry=true' \
 		test/test_suite_sqlalchemy.py
 	`)
 
-	// Expected to fail but we should still scan the error to check if
-	// there's an SSH/roachprod error.
-	if err != nil {
-		// install.NonZeroExitCode includes unrelated to SSH errors ("255")
-		// or roachprod errors, so we call t.Fatal if the error is not an
-		// install.NonZeroExitCode error
-		commandError := (*install.NonZeroExitCode)(nil)
-		if !errors.As(err, &commandError) {
-			t.Fatal(err)
-		}
+	// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+	// Proceed for any other (command) errors
+	if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+		t.Fatal(err)
 	}
 
 	rawResults := []byte(result.Stdout + result.Stderr)

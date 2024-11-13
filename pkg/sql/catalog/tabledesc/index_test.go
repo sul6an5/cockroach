@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -36,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -98,7 +98,7 @@ func TestIndexInterface(t *testing.T) {
 	// are in the correct order.
 	indexes := make([]catalog.Index, len(indexNames))
 	for i, name := range indexNames {
-		idx, err := tableI.FindIndexWithName(name)
+		idx, err := catalog.MustFindIndexByName(tableI, name)
 		require.NoError(t, err)
 		require.Equal(t, name, idx.GetName())
 		require.Equal(t, i, idx.Ordinal())
@@ -118,7 +118,7 @@ func TestIndexInterface(t *testing.T) {
 	require.Equal(t, pk.GetID(), tableI.GetPrimaryIndexID())
 	require.True(t, pk.Primary())
 	require.True(t, pk.Public())
-	require.Equal(t, descpb.PrimaryIndexEncoding, pk.GetEncodingType())
+	require.Equal(t, catenumpb.PrimaryIndexEncoding, pk.GetEncodingType())
 	require.Equal(t, descpb.PrimaryIndexWithStoredColumnsVersion, pk.GetVersion())
 
 	// Check that ActiveIndexes returns the same indexes in the same order.
@@ -129,7 +129,7 @@ func TestIndexInterface(t *testing.T) {
 	for _, idx := range tableI.PublicNonPrimaryIndexes() {
 		require.False(t, idx.Primary())
 		require.True(t, idx.Public())
-		require.Equal(t, descpb.SecondaryIndexEncoding, idx.GetEncodingType())
+		require.Equal(t, catenumpb.SecondaryIndexEncoding, idx.GetEncodingType())
 		require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, idx.GetVersion())
 	}
 
@@ -235,7 +235,7 @@ func TestIndexInterface(t *testing.T) {
 
 	// Check that finding indexes by ID is correct.
 	for _, idx := range indexes {
-		found, err := tableI.FindIndexWithID(idx.GetID())
+		found, err := catalog.MustFindIndexByID(tableI, idx.GetID())
 		require.NoError(t, err)
 		require.Equalf(t, idx.GetID(), found.GetID(),
 			"mismatched IDs for index '%s'", idx.GetName())
@@ -297,7 +297,7 @@ func TestIndexInterface(t *testing.T) {
 		colIDs.UnionWith(idx.CollectKeySuffixColumnIDs())
 		for j := range actualColNames {
 			actualColNames[j] = idx.GetKeyColumnName(j)
-			require.Equalf(t, idx == s1, idx.GetKeyColumnDirection(j) == catpb.IndexColumn_DESC,
+			require.Equalf(t, idx == s1, idx.GetKeyColumnDirection(j) == catenumpb.IndexColumn_DESC,
 				"mismatched column directions for index '%s'", idx.GetName())
 			require.True(t, colIDs.Contains(idx.GetKeyColumnID(j)),
 				"column ID resolution failure for column '%s' in index '%s'", idx.GetKeyColumnName(j), idx.GetName())
@@ -429,6 +429,8 @@ func TestLatestIndexDescriptorVersionValues(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 
+	// Test relies on legacy schema changer testing knobs.
+	tdb.Exec(t, "SET use_declarative_schema_changer = 'off'")
 	// Populate the test cluster with all manner of indexes and index mutations.
 	tdb.Exec(t, "CREATE SEQUENCE s")
 	tdb.Exec(t, "CREATE MATERIALIZED VIEW v AS SELECT 1 AS e, 2 AS f")
@@ -436,9 +438,8 @@ func TestLatestIndexDescriptorVersionValues(t *testing.T) {
 	tdb.Exec(t, "CREATE TABLE t (a INT NOT NULL PRIMARY KEY, b INT, c INT, d INT NOT NULL, INDEX tsec (b), UNIQUE (c))")
 	// Wait for schema changes to complete.
 	q := fmt.Sprintf(
-		`SELECT count(*) FROM [SHOW JOBS] WHERE job_type IN ('%s', '%s') AND status <> 'succeeded'`,
+		`SELECT count(*) FROM [SHOW JOBS] WHERE job_type = '%s' AND status <> 'succeeded'`,
 		jobspb.TypeSchemaChange,
-		jobspb.TypeNewSchemaChange,
 	)
 	tdb.CheckQueryResultsRetry(t, q, [][]string{{"0"}})
 	// Hang on ALTER PRIMARY KEY finalization.
@@ -451,10 +452,10 @@ func TestLatestIndexDescriptorVersionValues(t *testing.T) {
 	<-swapNotification
 
 	test := func(desc catalog.TableDescriptor) {
-		require.Equal(t, descpb.PrimaryIndexEncoding, desc.GetPrimaryIndex().GetEncodingType())
+		require.Equal(t, catenumpb.PrimaryIndexEncoding, desc.GetPrimaryIndex().GetEncodingType())
 		require.Equal(t, descpb.PrimaryIndexWithStoredColumnsVersion, desc.GetPrimaryIndex().GetVersion())
 		for _, index := range desc.PublicNonPrimaryIndexes() {
-			require.Equal(t, descpb.SecondaryIndexEncoding, index.GetEncodingType())
+			require.Equal(t, catenumpb.SecondaryIndexEncoding, index.GetEncodingType())
 		}
 		nonPrimaries := desc.DeletableNonPrimaryIndexes()
 
@@ -474,48 +475,48 @@ func TestLatestIndexDescriptorVersionValues(t *testing.T) {
 
 				case "t_a_key":
 					require.True(t, np.IsMutation())
-					require.Equal(t, descpb.SecondaryIndexEncoding, np.GetEncodingType())
+					require.Equal(t, catenumpb.SecondaryIndexEncoding, np.GetEncodingType())
 					require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, np.GetVersion())
 
 				case "new_primary_key":
 					require.True(t, np.IsMutation())
-					require.Equal(t, descpb.PrimaryIndexEncoding, np.GetEncodingType())
+					require.Equal(t, catenumpb.PrimaryIndexEncoding, np.GetEncodingType())
 					require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, np.GetVersion())
 
 				case "tsec_rewrite_for_primary_key_change":
 					require.True(t, np.IsMutation())
-					require.Equal(t, descpb.SecondaryIndexEncoding, np.GetEncodingType())
+					require.Equal(t, catenumpb.SecondaryIndexEncoding, np.GetEncodingType())
 					require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, np.GetVersion())
 
 				case "t_c_key_rewrite_for_primary_key_change":
 					require.True(t, np.IsMutation())
 					require.True(t, np.IsUnique())
-					require.Equal(t, descpb.SecondaryIndexEncoding, np.GetEncodingType())
+					require.Equal(t, catenumpb.SecondaryIndexEncoding, np.GetEncodingType())
 					require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, np.GetVersion())
 
 				case "t_a_crdb_internal_dpe_key":
 					// Temporary index for new index based on old primary index (t_a_key)
 					require.True(t, np.IsMutation())
-					require.Equal(t, descpb.SecondaryIndexEncoding, np.GetEncodingType())
+					require.Equal(t, catenumpb.SecondaryIndexEncoding, np.GetEncodingType())
 					require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, np.GetVersion())
 
 				case "t_b_crdb_internal_dpe_idx":
 					// Temporary index for tsec_rewrite_for_primary_key_change
 					require.True(t, np.IsMutation())
-					require.Equal(t, descpb.SecondaryIndexEncoding, np.GetEncodingType())
+					require.Equal(t, catenumpb.SecondaryIndexEncoding, np.GetEncodingType())
 					require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, np.GetVersion())
 
 				case "t_c_crdb_internal_dpe_key":
 					// Temporary index for t_c_key_rewrite_for_primary_key_change
 					require.True(t, np.IsMutation())
 					require.True(t, np.IsUnique())
-					require.Equal(t, descpb.SecondaryIndexEncoding, np.GetEncodingType())
+					require.Equal(t, catenumpb.SecondaryIndexEncoding, np.GetEncodingType())
 					require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, np.GetVersion())
 
 				case "t_d_crdb_internal_dpe_key":
 					// Temporary index for new_primary_key
 					require.True(t, np.IsMutation())
-					require.Equal(t, descpb.PrimaryIndexEncoding, np.GetEncodingType())
+					require.Equal(t, catenumpb.PrimaryIndexEncoding, np.GetEncodingType())
 					require.Equal(t, descpb.StrictIndexColumnIDGuaranteesVersion, np.GetVersion())
 
 				default:
@@ -546,9 +547,10 @@ func TestLatestIndexDescriptorVersionValues(t *testing.T) {
 		require.NotEmpty(t, row)
 		bytes, err := hex.DecodeString(row[0])
 		require.NoError(t, err)
-		var descProto descpb.Descriptor
-		require.NoError(t, protoutil.Unmarshal(bytes, &descProto))
-		b := descbuilder.NewBuilderWithMVCCTimestamp(&descProto, hlc.Timestamp{WallTime: 1})
+		b, err := descbuilder.FromBytesAndMVCCTimestamp(bytes, hlc.Timestamp{WallTime: 1})
+		require.NoError(t, err)
+		require.NotNil(t, b)
+		require.Equal(t, catalog.Table, b.DescriptorType())
 		desc := b.BuildImmutable().(catalog.TableDescriptor)
 		test(desc)
 	}
@@ -588,17 +590,17 @@ func TestSecKeyLatestIndexDescriptorVersion(t *testing.T) {
 		},
 		PrimaryIndex: descpb.IndexDescriptor{
 			ID: 1, Name: "foo_pkey", KeyColumnIDs: []descpb.ColumnID{1}, KeyColumnNames: []string{"c1"},
-			KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC},
-			EncodingType:        descpb.PrimaryIndexEncoding,
+			KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+			EncodingType:        catenumpb.PrimaryIndexEncoding,
 		},
 		Indexes: []descpb.IndexDescriptor{
 			{ID: 2, Name: "sec", KeyColumnIDs: []descpb.ColumnID{2},
 				KeyColumnNames:      []string{"c2"},
-				KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
 				StoreColumnNames:    []string{"c2"},
 				StoreColumnIDs:      []descpb.ColumnID{2},
 				Version:             descpb.EmptyArraysInInvertedIndexesVersion,
-				EncodingType:        descpb.SecondaryIndexEncoding,
+				EncodingType:        catenumpb.SecondaryIndexEncoding,
 			},
 		},
 		Mutations: []descpb.DescriptorMutation{
@@ -610,9 +612,9 @@ func TestSecKeyLatestIndexDescriptorVersion(t *testing.T) {
 						Unique:              true,
 						KeyColumnIDs:        []descpb.ColumnID{3},
 						KeyColumnNames:      []string{"c3"},
-						KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC},
+						KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
 						Version:             descpb.EmptyArraysInInvertedIndexesVersion,
-						EncodingType:        descpb.SecondaryIndexEncoding,
+						EncodingType:        catenumpb.SecondaryIndexEncoding,
 						ConstraintID:        1,
 					},
 				},

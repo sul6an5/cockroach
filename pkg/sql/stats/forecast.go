@@ -44,58 +44,45 @@ const minObservationsForForecast = 3
 // predictive models in a forecast must have for us to use the forecast.
 const minGoodnessOfFit = 0.95
 
-// maxForecastDistance is the farthest into the future we can forecast from the
-// latest observed statistics.
-const maxForecastDistance = time.Hour * 24 * 7
-
 // ForecastTableStatistics produces zero or more statistics forecasts based on
 // the given observed statistics. The observed statistics must be ordered by
-// collection time descending, with the latest collected statistics first. The
+// collection time descending, with the latest observed statistics first. The
 // observed statistics may be a mixture of statistics for different sets of
-// columns, but should not contain statistics for any old nonexistent columns.
+// columns. Partial statistics will be skipped.
 //
 // Whether a forecast is produced for a set of columns depends on how well the
 // observed statistics for that set of columns fit a linear regression model.
 // This means a forecast will not necessarily be produced for every set of
 // columns in the table. Any forecasts produced will have the same CreatedAt
-// time, which will be up to a week after the latest observed statistics (and
-// could be in the past, present, or future relative to the current time). Any
-// forecasts produced will not necessarily have the same RowCount or be
-// consistent with the other forecasts produced. (For example, DistinctCount in
-// the forecast for columns {a, b} could very well end up less than
-// DistinctCount in the forecast for column {a}.)
+// time, which will be after the latest observed statistics (and could be in the
+// past, present, or future relative to the current time). Any forecasts
+// produced will not necessarily have the same RowCount or be consistent with
+// the other forecasts produced. (For example, DistinctCount in the forecast for
+// columns {a, b} could very well end up less than DistinctCount in the forecast
+// for column {a}.)
 //
 // ForecastTableStatistics is deterministic: given the same observations it will
 // return the same forecasts.
 func ForecastTableStatistics(ctx context.Context, observed []*TableStatistic) []*TableStatistic {
-	// Early sanity check. We'll check this again in forecastColumnStatistics.
-	if len(observed) < minObservationsForForecast {
-		return nil
-	}
-
-	// To make forecasts deterministic, we must choose a time to forecast at based
-	// on only the observed statistics. We choose the time of the latest
-	// statistics + the average time between automatic stats collections, which
-	// should be roughly when the next automatic stats collection will occur. To
-	// avoid wildly futuristic predictions we cap this at maxForecastDistance.
-	latest := observed[0].CreatedAt
-	horizon := latest.Add(maxForecastDistance)
-	at := latest.Add(avgRefreshTime(observed))
-	if at.After(horizon) {
-		at = horizon
-	}
-
-	// Group observed statistics by column set, and remove statistics with
-	// inverted histograms.
+	// Group observed statistics by column set, skipping over partial statistics
+	// and statistics with inverted histograms.
+	var latest time.Time
 	var forecastCols []string
 	observedByCols := make(map[string][]*TableStatistic)
 	for _, stat := range observed {
+		if stat.IsPartial() {
+			continue
+		}
 		// We don't have a good way to detect inverted statistics right now, so skip
 		// all statistics with histograms of type BYTES. This means we cannot
 		// forecast statistics for normal BYTES columns.
 		// TODO(michae2): Improve this when issue #50655 is fixed.
-		if stat.HistogramData != nil && stat.HistogramData.ColumnType.Family() == types.BytesFamily {
+		if stat.HistogramData != nil && stat.HistogramData.ColumnType != nil &&
+			stat.HistogramData.ColumnType.Family() == types.BytesFamily {
 			continue
+		}
+		if latest.IsZero() {
+			latest = stat.CreatedAt
 		}
 		colKey := MakeSortedColStatKey(stat.ColumnIDs)
 		obs, ok := observedByCols[colKey]
@@ -104,6 +91,16 @@ func ForecastTableStatistics(ctx context.Context, observed []*TableStatistic) []
 		}
 		observedByCols[colKey] = append(obs, stat)
 	}
+
+	// To make forecasts deterministic, we must choose a time to forecast at based
+	// on only the observed statistics. We choose the time of the latest full
+	// statistics + the average time between automatic stats collections, which
+	// should be roughly when the next automatic stats collection will occur.
+	if latest.IsZero() {
+		// No suitable stats.
+		return nil
+	}
+	at := latest.Add(avgFullRefreshTime(observed))
 
 	forecasts := make([]*TableStatistic, 0, len(forecastCols))
 	for _, colKey := range forecastCols {
@@ -122,10 +119,11 @@ func ForecastTableStatistics(ctx context.Context, observed []*TableStatistic) []
 
 // forecastColumnStatistics produces a statistics forecast at the given time,
 // based on the given observed statistics. The observed statistics must all be
-// for the same set of columns, must not contain any inverted histograms, must
-// have a single observation per collection time, and must be ordered by
-// collection time descending with the latest collected statistics first. The
-// given time to forecast at can be in the past, present, or future.
+// for the same set of columns, must all be full statistics, must not contain
+// any inverted histograms, must have a single observation per collection time,
+// and must be ordered by collection time descending with the latest observed
+// statistics first. The given time to forecast at can be in the past, present,
+// or future.
 //
 // To create a forecast, we construct a linear regression model over time for
 // each statistic (row count, null count, distinct count, average row size, and
@@ -261,7 +259,7 @@ func forecastColumnStatistics(
 	// stats. If we cannot predict a histogram, we will use the latest observed
 	// histogram. NOTE: If any of the observed histograms were for inverted
 	// indexes this will produce an incorrect histogram.
-	if observed[0].HistogramData != nil {
+	if observed[0].HistogramData != nil && observed[0].HistogramData.ColumnType != nil {
 		hist, err := predictHistogram(ctx, observed, forecastAt, minRequiredFit, nonNullRowCount)
 		if err != nil {
 			// If we did not successfully predict a histogram then copy the latest
@@ -276,7 +274,7 @@ func forecastColumnStatistics(
 		// Now adjust for consistency. We don't use any session data for operations
 		// on upper bounds, so a nil *eval.Context works as our tree.CompareContext.
 		var compareCtx *eval.Context
-		hist.adjustCounts(compareCtx, nonNullRowCount, nonNullDistinctCount)
+		hist.adjustCounts(compareCtx, observed[0].HistogramData.ColumnType, nonNullRowCount, nonNullDistinctCount)
 
 		// Finally, convert back to HistogramData.
 		histData, err := hist.toHistogramData(observed[0].HistogramData.ColumnType)
@@ -298,7 +296,7 @@ func predictHistogram(
 	minRequiredFit float64,
 	nonNullRowCount float64,
 ) (histogram, error) {
-	if observed[0].HistogramData == nil {
+	if observed[0].HistogramData == nil || observed[0].HistogramData.ColumnType == nil {
 		return histogram{}, errors.New("latest observed stat missing histogram")
 	}
 
@@ -320,7 +318,7 @@ func predictHistogram(
 		if stat.HistogramData == nil {
 			continue
 		}
-		if !stat.HistogramData.ColumnType.Equivalent(colType) {
+		if stat.HistogramData.ColumnType == nil || !stat.HistogramData.ColumnType.Equivalent(colType) {
 			continue
 		}
 		if !canMakeQuantile(stat.HistogramData.Version, stat.HistogramData.ColumnType) {

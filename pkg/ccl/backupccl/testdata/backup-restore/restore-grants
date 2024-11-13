@@ -1,14 +1,26 @@
-skip issue-num=87129
-----
-
 # Ensure that non-cluster restores appropriately wipes the grants on the
 # restored descriptors. Since we're not restoring the users, the users that
 # the restoring descriptors reference may not be the same users as they
 # referenced in the backed up cluster.
 
+# TODO(DisasterRecovery): this test currently hangs when run within a tenant
+# (see https://github.com/cockroachdb/cockroach/issues/90444), and should be refactored
+# to run smoothly in a tenant.
+
 # We allow implicit access to non-admin users so that we can test
 # with nodelocal.
-new-server name=s1 allow-implicit-access
+new-cluster name=s1 allow-implicit-access disable-tenant
+----
+
+# TODO(ssd): We reset the closed timestamp configurables to avoid schema
+# change transactions entering a retry loop with the lease acquisition
+# transactions. See https://github.com/cockroachdb/cockroach/issues/89900
+exec-sql
+SET CLUSTER SETTING kv.closed_timestamp.target_duration = '3s';
+----
+
+exec-sql
+SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval= '200ms';
 ----
 
 # First, let's create some users, a database, a couple of types, some tables,
@@ -144,18 +156,18 @@ testdb public testtable_greeting_owner testuser ALL true
 
 # Let's take a backup of this cluster.
 exec-sql
-BACKUP INTO 'nodelocal://0/test/'
+BACKUP INTO 'nodelocal://1/test/'
 ----
 
 # Let's try a cluster restore and expect all of the same privileges that we had
 # above.
 subtest cluster-restore
 
-new-server name=s2 share-io-dir=s1 allow-implicit-access
+new-cluster name=s2 share-io-dir=s1 allow-implicit-access disable-tenant
 ----
 
 exec-sql
-RESTORE FROM LATEST IN 'nodelocal://0/test/';
+RESTORE FROM LATEST IN 'nodelocal://1/test/';
 ----
 
 exec-sql
@@ -252,13 +264,13 @@ GRANT CREATE ON DATABASE testuser_db TO testuser;
 exec-sql user=testuser
 RESTORE testdb.sc.othertable FROM LATEST IN 'nodelocal://1/test' WITH into_db='testuser_db';
 ----
-NOTICE: The existing privileges are being deprecated in favour of a fine-grained privilege model explained here <link>. In a future release, to run RESTORE TABLE, user testuser will exclusively require the RESTORE privilege on databases testuser_db
+NOTICE: The existing privileges are being deprecated in favour of a fine-grained privilege model explained here https://www.cockroachlabs.com/docs/stable/restore.html#required-privileges. In a future release, to run RESTORE TABLE, user testuser will exclusively require the RESTORE privilege on databases testuser_db
 
 # Restore a table where only `testuser` had privileges.
 exec-sql user=testuser
 RESTORE testdb.testtable_greeting_usage FROM LATEST IN 'nodelocal://1/test' WITH into_db='testuser_db';
 ----
-NOTICE: The existing privileges are being deprecated in favour of a fine-grained privilege model explained here <link>. In a future release, to run RESTORE TABLE, user testuser will exclusively require the RESTORE privilege on databases testuser_db
+NOTICE: The existing privileges are being deprecated in favour of a fine-grained privilege model explained here https://www.cockroachlabs.com/docs/stable/restore.html#required-privileges. In a future release, to run RESTORE TABLE, user testuser will exclusively require the RESTORE privilege on databases testuser_db
 
 exec-sql
 USE testuser_db
@@ -421,7 +433,7 @@ DROP DATABASE testdb CASCADE;
 ----
 
 exec-sql
-RESTORE DATABASE testdb FROM LATEST IN 'nodelocal://0/test/';
+RESTORE DATABASE testdb FROM LATEST IN 'nodelocal://1/test/';
 ----
 
 exec-sql
@@ -451,6 +463,8 @@ query-sql
 SHOW GRANTS ON SCHEMA testdb.public
 ----
 testdb public admin ALL true
+testdb public public CREATE false
+testdb public public USAGE false
 testdb public root ALL true
 
 query-sql
@@ -508,9 +522,9 @@ ALTER USER testuser CREATEDB;
 subtest restore-database-as-non-admin
 
 exec-sql user=testuser
-RESTORE DATABASE testdb FROM LATEST IN 'nodelocal://0/test/';
+RESTORE DATABASE testdb FROM LATEST IN 'nodelocal://1/test/';
 ----
-NOTICE: The existing privileges are being deprecated in favour of a fine-grained privilege model explained here <link>. In a future release, to run RESTORE DATABASE, user testuser will exclusively require the RESTORE system privilege.
+NOTICE: The existing privileges are being deprecated in favour of a fine-grained privilege model explained here https://www.cockroachlabs.com/docs/stable/restore.html#required-privileges. In a future release, to run RESTORE DATABASE, user testuser will exclusively require the RESTORE system privilege.
 
 exec-sql
 USE testdb
@@ -542,8 +556,9 @@ query-sql
 SHOW GRANTS ON SCHEMA testdb.public
 ----
 testdb public admin ALL true
+testdb public public CREATE false
+testdb public public USAGE false
 testdb public root ALL true
-testdb public testuser ALL true
 
 query-sql
 SHOW GRANTS ON testdb.sc.othertable
@@ -591,10 +606,13 @@ SELECT owner FROM [SHOW SCHEMAS] WHERE schema_name = 'sc'
 ----
 testuser
 
+# In postgres, the user "postgres" is the owner of the public schema in a
+# newly created db. In CockroachDB, admin is our substitute for the postgres
+# user.
 query-sql
 SELECT owner FROM [SHOW SCHEMAS] WHERE schema_name = 'public'
 ----
-testuser
+admin
 
 # Ensure that testuser is the owner of the type.
 query-sql

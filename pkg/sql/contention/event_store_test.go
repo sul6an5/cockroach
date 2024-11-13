@@ -20,8 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -89,11 +90,11 @@ func TestEventStore(t *testing.T) {
 					"be at least %s, but it is %s",
 					expectedEvent.CollectionTs.String(), actual.CollectionTs.String())
 			}
-			if actual.BlockingTxnFingerprintID != roachpb.InvalidTransactionFingerprintID {
+			if actual.BlockingTxnFingerprintID != appstatspb.InvalidTransactionFingerprintID {
 				return errors.Newf("expect blocking txn fingerprint id to be invalid, "+
 					"but it is %d", actual.BlockingTxnFingerprintID)
 			}
-			if actual.WaitingTxnFingerprintID != roachpb.InvalidTransactionFingerprintID {
+			if actual.WaitingTxnFingerprintID != appstatspb.InvalidTransactionFingerprintID {
 				return errors.Newf("expect waiting txn fingerprint id to be invalid, "+
 					"but it is %d", actual.WaitingTxnFingerprintID)
 			}
@@ -145,7 +146,7 @@ func TestCollectionThreshold(t *testing.T) {
 
 	input := []contentionpb.ExtendedContentionEvent{
 		{
-			BlockingEvent: roachpb.ContentionEvent{
+			BlockingEvent: kvpb.ContentionEvent{
 				TxnMeta: enginepb.TxnMeta{
 					ID: uuid.FastMakeV4(),
 				},
@@ -153,7 +154,7 @@ func TestCollectionThreshold(t *testing.T) {
 			},
 		},
 		{
-			BlockingEvent: roachpb.ContentionEvent{
+			BlockingEvent: kvpb.ContentionEvent{
 				TxnMeta: enginepb.TxnMeta{
 					ID: uuid.FastMakeV4(),
 				},
@@ -198,7 +199,7 @@ func BenchmarkEventStoreIntake(b *testing.B) {
 	statusServer := newFakeStatusServerCluster()
 	metrics := NewMetrics()
 
-	e := roachpb.ContentionEvent{}
+	e := kvpb.ContentionEvent{}
 	b.SetBytes(int64(e.Size()))
 
 	run := func(b *testing.B, store *eventStore, numOfConcurrentWriter int) {
@@ -271,11 +272,11 @@ func randomlyGenerateTestData(testSize int, numOfCoordinator int) []testData {
 		tcs = append(tcs, testData{
 			blockingTxn: contentionpb.ResolvedTxnID{
 				TxnID:            uuid.FastMakeV4(),
-				TxnFingerprintID: roachpb.TransactionFingerprintID(math.MaxUint64 - uint64(i)),
+				TxnFingerprintID: appstatspb.TransactionFingerprintID(math.MaxUint64 - uint64(i)),
 			},
 			waitingTxn: contentionpb.ResolvedTxnID{
 				TxnID:            uuid.FastMakeV4(),
-				TxnFingerprintID: roachpb.TransactionFingerprintID(math.MaxUint64/2 - uint64(i)),
+				TxnFingerprintID: appstatspb.TransactionFingerprintID(math.MaxUint64/2 - uint64(i)),
 			},
 			coordinatorNodeID: strconv.Itoa(rand.Intn(numOfCoordinator)),
 		})

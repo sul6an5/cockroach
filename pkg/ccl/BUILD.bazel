@@ -7,12 +7,15 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/base",
         "//pkg/ccl/backupccl",
         "//pkg/ccl/buildccl",
         "//pkg/ccl/changefeedccl",
         "//pkg/ccl/cliccl",
         "//pkg/ccl/gssapiccl",
+        "//pkg/ccl/jwtauthccl",
         "//pkg/ccl/kvccl",
+        "//pkg/ccl/kvccl/kvtenantccl",
         "//pkg/ccl/multiregionccl",
         "//pkg/ccl/multitenantccl",
         "//pkg/ccl/oidcccl",
@@ -23,6 +26,7 @@ go_library(
         "//pkg/ccl/streamingccl/streamproducer",
         "//pkg/ccl/utilccl",
         "//pkg/ccl/workloadccl",
+        "//pkg/server",
     ],
 )
 

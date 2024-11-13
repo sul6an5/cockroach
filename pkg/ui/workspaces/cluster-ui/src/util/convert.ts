@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
+import moment from "moment-timezone";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { fromNumber } from "long";
 
@@ -161,4 +161,9 @@ export function makeTimestamp(unixTs: number): Timestamp {
   return new protos.google.protobuf.Timestamp({
     seconds: fromNumber(unixTs),
   });
+}
+
+export function stringToTimestamp(t: string): Timestamp {
+  const unix = new Date(t).getTime() / 1000;
+  return makeTimestamp(unix);
 }

@@ -19,8 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/errors"
 )
@@ -39,7 +40,7 @@ type mergeJoiner struct {
 	leftIdx, rightIdx       int
 	trackMatchedRight       bool
 	emitUnmatchedRight      bool
-	matchedRight            util.FastIntSet
+	matchedRight            intsets.Fast
 	matchedRightCount       int
 
 	streamMerger streamMerger
@@ -52,13 +53,13 @@ var _ execopnode.OpNode = &mergeJoiner{}
 const mergeJoinerProcName = "merge joiner"
 
 func newMergeJoiner(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.MergeJoinerSpec,
 	leftSource execinfra.RowSource,
 	rightSource execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*mergeJoiner, error) {
 	m := &mergeJoiner{
 		leftSource:        leftSource,
@@ -66,16 +67,15 @@ func newMergeJoiner(
 		trackMatchedRight: shouldEmitUnmatchedRow(rightSide, spec.Type) || spec.Type == descpb.RightSemiJoin,
 	}
 
-	if execstats.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx.CollectStats) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		m.leftSource = newInputStatCollector(m.leftSource)
 		m.rightSource = newInputStatCollector(m.rightSource)
 		m.ExecStatsForTrace = m.execStatsForTrace
 	}
 
 	if err := m.joinerBase.init(
-		m /* self */, flowCtx, processorID, leftSource.OutputTypes(), rightSource.OutputTypes(),
-		spec.Type, spec.OnExpr, false, /* outputContinuationColumn */
-		post, output,
+		ctx, m /* self */, flowCtx, processorID, leftSource.OutputTypes(), rightSource.OutputTypes(),
+		spec.Type, spec.OnExpr, false /* outputContinuationColumn */, post,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{leftSource, rightSource},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -87,7 +87,7 @@ func newMergeJoiner(
 		return nil, err
 	}
 
-	m.MemMonitor = execinfra.NewMonitor(flowCtx.EvalCtx.Ctx(), flowCtx.EvalCtx.Mon, "mergejoiner-mem")
+	m.MemMonitor = execinfra.NewMonitor(ctx, flowCtx.Mon, "mergejoiner-mem")
 
 	var err error
 	m.streamMerger, err = makeStreamMerger(
@@ -109,7 +109,7 @@ func newMergeJoiner(
 func (m *mergeJoiner) Start(ctx context.Context) {
 	ctx = m.StartInternal(ctx, mergeJoinerProcName)
 	m.streamMerger.start(ctx)
-	m.cancelChecker.Reset(ctx)
+	m.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 }
 
 // Next is part of the Processor interface.
@@ -232,7 +232,7 @@ func (m *mergeJoiner) nextRow() (rowenc.EncDatumRow, *execinfrapb.ProducerMetada
 		// TODO(paul): Investigate (with benchmarks) whether or not it's
 		// worthwhile to only buffer one row from the right stream per batch
 		// for semi-joins.
-		m.leftRows, m.rightRows, meta = m.streamMerger.NextBatch(m.Ctx, m.EvalCtx)
+		m.leftRows, m.rightRows, meta = m.streamMerger.NextBatch(m.Ctx(), m.EvalCtx)
 		if meta != nil {
 			return nil, meta
 		}
@@ -244,15 +244,15 @@ func (m *mergeJoiner) nextRow() (rowenc.EncDatumRow, *execinfrapb.ProducerMetada
 		m.emitUnmatchedRight = shouldEmitUnmatchedRow(rightSide, m.joinType)
 		m.leftIdx, m.rightIdx = 0, 0
 		if m.trackMatchedRight {
-			m.matchedRight = util.FastIntSet{}
+			m.matchedRight = intsets.Fast{}
 		}
 	}
 }
 
 func (m *mergeJoiner) close() {
 	if m.InternalClose() {
-		m.streamMerger.close(m.Ctx)
-		m.MemMonitor.Stop(m.Ctx)
+		m.streamMerger.close(m.Ctx())
+		m.MemMonitor.Stop(m.Ctx())
 	}
 }
 

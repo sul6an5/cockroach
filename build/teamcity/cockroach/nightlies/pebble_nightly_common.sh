@@ -26,9 +26,6 @@ chmod o+rwx "${artifacts}"
 mkdir -p "$PWD/bin"
 chmod o+rwx "$PWD/bin"
 
-build_tag=$(git describe --abbrev=0 --tags --match=v[0-9]*)
-export build_tag
-
 # Build the roachtest binary.
 bazel build //pkg/cmd/roachtest --config ci -c opt
 BAZEL_BIN=$(bazel info bazel-bin --config ci -c opt)
@@ -40,7 +37,7 @@ chmod a+w bin/roachtest
 # latest version of the module, and then running `mirror` to update `DEPS.bzl`
 # accordingly.
 bazel run @go_sdk//:bin/go get github.com/cockroachdb/pebble@latest
-NEW_DEPS_BZL_CONTENT=$(bazel run //pkg/cmd/mirror)
+NEW_DEPS_BZL_CONTENT=$(bazel run //pkg/cmd/mirror/go:mirror)
 echo "$NEW_DEPS_BZL_CONTENT" > DEPS.bzl
 bazel build @com_github_cockroachdb_pebble//cmd/pebble --config ci -c opt
 BAZEL_BIN=$(bazel info bazel-bin --config ci -c opt)
@@ -58,10 +55,10 @@ function prepare_datadir() {
   # Each roachtest's artifacts are zip'd. Unzip them all and remove the .zips.
   find "$artifacts" -name '*.zip' -execdir unzip {} \;
   find "$artifacts" -name '*.zip' -execdir rm {} \;
-  
+
   # mkbench expects artifacts to be gzip compressed.
   find "$artifacts" -name '*.log' | xargs gzip -9
-  
+
   # mkbench expects the benchmark data to be stored in data/YYYYMMDD.
   mkdir data
   ln -sf "$PWD/artifacts" "data/$(date +"%Y%m%d")"

@@ -10,50 +10,47 @@
 
 import React from "react";
 import { Link } from "react-router-dom";
-import moment from "moment";
 import classnames from "classnames/bind";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { Button, Icon } from "@cockroachlabs/ui-components";
 import { Button as CancelButton } from "src/button";
-import { Text, TextTypes } from "src/text";
-import { Table, ColumnsConfig } from "src/table";
 import { SummaryCard } from "src/summaryCard";
 import {
   ActivateDiagnosticsModalRef,
   DiagnosticStatusBadge,
 } from "src/statementsDiagnostics";
 import emptyListResultsImg from "src/assets/emptyState/empty-list-results.svg";
-import {
-  getDiagnosticsStatus,
-  sortByCompletedField,
-  sortByRequestedAtField,
-} from "./diagnosticsUtils";
+import { filterByTimeScale, getDiagnosticsStatus } from "./diagnosticsUtils";
 import { EmptyTable } from "src/empty";
 import styles from "./diagnosticsView.module.scss";
-import { getBasePath } from "../../api";
-import { DATE_FORMAT_24_UTC } from "../../util";
-
-type IStatementDiagnosticsReport =
-  cockroach.server.serverpb.IStatementDiagnosticsReport;
+import { getBasePath, StatementDiagnosticsReport } from "../../api";
+import {
+  TimeScale,
+  timeScale1hMinOptions,
+  TimeScaleDropdown,
+} from "src/timeScaleDropdown";
+import { ColumnDescriptor, SortedTable, SortSetting } from "src/sortedtable";
+import { DATE_FORMAT_24_TZ } from "../../util";
+import { Timestamp } from "../../timestamp";
+import moment from "moment-timezone";
 
 export interface DiagnosticsViewStateProps {
   hasData: boolean;
-  diagnosticsReports: cockroach.server.serverpb.IStatementDiagnosticsReport[];
+  diagnosticsReports: StatementDiagnosticsReport[];
   showDiagnosticsViewLink?: boolean;
   activateDiagnosticsRef: React.RefObject<ActivateDiagnosticsModalRef>;
+  currentScale: TimeScale;
 }
 
 export interface DiagnosticsViewDispatchProps {
   dismissAlertMessage: () => void;
   onDownloadDiagnosticBundleClick?: (statementFingerprint: string) => void;
-  onDiagnosticCancelRequestClick?: (
-    report: IStatementDiagnosticsReport,
-  ) => void;
+  onDiagnosticCancelRequestClick?: (report: StatementDiagnosticsReport) => void;
   onSortingChange?: (
     name: string,
     columnTitle: string,
     ascending: boolean,
   ) => void;
+  onChangeTimeScale: (ts: TimeScale) => void;
 }
 
 export interface DiagnosticsViewOwnProps {
@@ -65,9 +62,7 @@ export type DiagnosticsViewProps = DiagnosticsViewOwnProps &
   DiagnosticsViewDispatchProps;
 
 interface DiagnosticsViewState {
-  traces: {
-    [diagnosticsId: string]: string;
-  };
+  sortSetting: SortSetting;
 }
 
 const cx = classnames.bind(styles);
@@ -117,27 +112,34 @@ export class DiagnosticsView extends React.Component<
   DiagnosticsViewProps,
   DiagnosticsViewState
 > {
-  static defaultProps: Partial<DiagnosticsViewProps> = {
-    showDiagnosticsViewLink: true,
-  };
-  columns: ColumnsConfig<IStatementDiagnosticsReport> = [
-    {
-      key: "activatedOn",
-      title: "Activated on",
-      sorter: sortByRequestedAtField,
-      defaultSortOrder: "descend",
-      render: (_text, record) => {
-        const timestamp = record.requested_at.seconds.toNumber() * 1000;
-        return moment.utc(timestamp).format(DATE_FORMAT_24_UTC);
+  constructor(props: DiagnosticsViewProps) {
+    super(props);
+    this.state = {
+      sortSetting: {
+        ascending: true,
+        columnTitle: "activatedOn",
       },
+    };
+  }
+
+  columns: ColumnDescriptor<StatementDiagnosticsReport>[] = [
+    {
+      name: "activatedOn",
+      title: "Activated on",
+      hideTitleUnderline: true,
+      cell: (diagnostic: StatementDiagnosticsReport) => (
+        <Timestamp time={diagnostic.requested_at} format={DATE_FORMAT_24_TZ} />
+      ),
+      sort: (diagnostic: StatementDiagnosticsReport) =>
+        moment(diagnostic.requested_at)?.unix(),
     },
     {
-      key: "status",
+      name: "status",
       title: "Status",
-      sorter: sortByCompletedField,
-      width: "160px",
-      render: (_text, record) => {
-        const status = getDiagnosticsStatus(record);
+      hideTitleUnderline: true,
+      className: cx("column-size-small"),
+      cell: (diagnostic: StatementDiagnosticsReport) => {
+        const status = getDiagnosticsStatus(diagnostic);
         return (
           <DiagnosticStatusBadge
             status={status}
@@ -145,64 +147,60 @@ export class DiagnosticsView extends React.Component<
           />
         );
       },
+      sort: (diagnostic: StatementDiagnosticsReport) =>
+        String(diagnostic.completed),
     },
     {
-      key: "actions",
+      name: "actions",
       title: "",
-      sorter: false,
-      width: "160px",
-      render: (() => {
-        const {
-          onDownloadDiagnosticBundleClick,
-          onDiagnosticCancelRequestClick,
-        } = this.props;
-        return (_text: string, record: IStatementDiagnosticsReport) => {
-          if (record.completed) {
-            return (
-              <div
-                className={cx(
-                  "crl-statements-diagnostics-view__actions-column",
-                )}
-              >
-                <Button
-                  as="a"
-                  size="small"
-                  intent="tertiary"
-                  href={`${getBasePath()}/_admin/v1/stmtbundle/${
-                    record.statement_diagnostics_id
-                  }`}
-                  onClick={() =>
-                    onDownloadDiagnosticBundleClick &&
-                    onDownloadDiagnosticBundleClick(
-                      record.statement_fingerprint,
-                    )
-                  }
-                  className={cx("download-bundle-button")}
-                >
-                  <Icon iconName="Download" />
-                  Bundle (.zip)
-                </Button>
-              </div>
-            );
-          }
+      hideTitleUnderline: true,
+      className: cx("column-size-medium"),
+      cell: (diagnostic: StatementDiagnosticsReport) => {
+        if (diagnostic.completed) {
           return (
             <div
               className={cx("crl-statements-diagnostics-view__actions-column")}
             >
-              <CancelButton
+              <Button
+                as="a"
                 size="small"
-                type="secondary"
+                intent="tertiary"
+                href={`${getBasePath()}/_admin/v1/stmtbundle/${
+                  diagnostic.statement_diagnostics_id
+                }`}
                 onClick={() =>
-                  onDiagnosticCancelRequestClick &&
-                  onDiagnosticCancelRequestClick(record)
+                  this.props.onDownloadDiagnosticBundleClick &&
+                  this.props.onDownloadDiagnosticBundleClick(
+                    diagnostic.statement_fingerprint,
+                  )
                 }
+                className={cx("download-bundle-button")}
               >
-                Cancel request
-              </CancelButton>
+                <Icon iconName="Download" />
+                Bundle (.zip)
+              </Button>
             </div>
           );
-        };
-      })(),
+        }
+        return (
+          <div
+            className={cx("crl-statements-diagnostics-view__actions-column")}
+          >
+            <CancelButton
+              size="small"
+              type="secondary"
+              onClick={() =>
+                this.props.onDiagnosticCancelRequestClick &&
+                this.props.onDiagnosticCancelRequestClick(diagnostic)
+              }
+            >
+              Cancel request
+            </CancelButton>
+          </div>
+        );
+      },
+      sort: (diagnostic: StatementDiagnosticsReport) =>
+        String(diagnostic.completed),
     },
   ];
 
@@ -210,10 +208,16 @@ export class DiagnosticsView extends React.Component<
     this.props.dismissAlertMessage();
   }
 
-  onSortingChange = (columnName: string, ascending: boolean): void => {
+  onSortingChange = (ss: SortSetting): void => {
     if (this.props.onSortingChange) {
-      this.props.onSortingChange("Diagnostics", columnName, ascending);
+      this.props.onSortingChange("Diagnostics", ss.columnTitle, ss.ascending);
     }
+    this.setState({
+      sortSetting: {
+        ascending: ss.ascending,
+        columnTitle: ss.columnTitle,
+      },
+    });
   };
 
   render(): React.ReactElement {
@@ -223,29 +227,47 @@ export class DiagnosticsView extends React.Component<
       showDiagnosticsViewLink,
       statementFingerprint,
       activateDiagnosticsRef,
+      currentScale,
+      onChangeTimeScale,
     } = this.props;
 
     const readyToRequestDiagnostics = diagnosticsReports.every(
       diagnostic => diagnostic.completed,
     );
 
-    const dataSource = diagnosticsReports.map((diagnosticsReport, idx) => ({
-      ...diagnosticsReport,
-      key: idx,
-    }));
+    const dataSource = filterByTimeScale(
+      diagnosticsReports.map((diagnosticsReport, idx) => ({
+        ...diagnosticsReport,
+        key: idx,
+      })),
+      currentScale,
+    );
 
     if (!hasData) {
       return (
-        <SummaryCard>
-          <EmptyDiagnosticsView {...this.props} />
-        </SummaryCard>
+        <>
+          <TimeScaleDropdown
+            options={timeScale1hMinOptions}
+            currentScale={currentScale}
+            setTimeScale={onChangeTimeScale}
+            className={cx("timescale-small", "margin-bottom")}
+          />
+          <SummaryCard>
+            <EmptyDiagnosticsView {...this.props} />
+          </SummaryCard>
+        </>
       );
     }
 
     return (
-      <SummaryCard>
-        <div className={cx("crl-statements-diagnostics-view__title")}>
-          <Text textType={TextTypes.Heading3}>Statement diagnostics</Text>
+      <>
+        <div className={cx("crl-statements-diagnostics-view__header")}>
+          <TimeScaleDropdown
+            options={timeScale1hMinOptions}
+            currentScale={currentScale}
+            setTimeScale={onChangeTimeScale}
+            className={cx("timescale-small")}
+          />
           {readyToRequestDiagnostics && (
             <Button
               onClick={() =>
@@ -260,10 +282,13 @@ export class DiagnosticsView extends React.Component<
             </Button>
           )}
         </div>
-        <Table
-          dataSource={dataSource}
+        <SortedTable
+          data={dataSource}
           columns={this.columns}
-          onSortingChange={this.onSortingChange}
+          className={cx("jobs-table")}
+          sortSetting={this.state.sortSetting}
+          onChangeSortSetting={this.onSortingChange}
+          tableWrapperClassName={cx("sorted-table")}
         />
         {showDiagnosticsViewLink && (
           <div className={cx("crl-statements-diagnostics-view__footer")}>
@@ -275,7 +300,7 @@ export class DiagnosticsView extends React.Component<
             </Link>
           </div>
         )}
-      </SummaryCard>
+      </>
     );
   }
 }

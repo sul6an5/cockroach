@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/normalize"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -160,7 +161,7 @@ func Eval(
 				if err != nil {
 					return eval.AsOfSystemTime{}, err
 				}
-				nearestOnlyEval, err := eval.Expr(evalCtx, nearestOnlyExpr)
+				nearestOnlyEval, err := eval.Expr(ctx, evalCtx, nearestOnlyExpr)
 				if err != nil {
 					return eval.AsOfSystemTime{}, err
 				}
@@ -192,23 +193,44 @@ func Eval(
 			return eval.AsOfSystemTime{}, newInvalidExprError()
 		}
 	}
-
-	d, err := eval.Expr(evalCtx, te)
+	var err error
+	if te, err = normalize.Expr(ctx, evalCtx, te); err != nil {
+		return eval.AsOfSystemTime{}, err
+	}
+	d, err := eval.Expr(ctx, evalCtx, te)
 	if err != nil {
 		return eval.AsOfSystemTime{}, err
 	}
 
 	stmtTimestamp := evalCtx.GetStmtTimestamp()
-	ret.Timestamp, err = DatumToHLC(evalCtx, stmtTimestamp, d)
+	ret.Timestamp, err = DatumToHLC(evalCtx, stmtTimestamp, d, AsOf)
 	if err != nil {
 		return eval.AsOfSystemTime{}, errors.Wrap(err, "AS OF SYSTEM TIME")
 	}
 	return ret, nil
 }
 
+// DatumToHLCUsage specifies which statement DatumToHLC() is used for.
+type DatumToHLCUsage int64
+
+const (
+	// AsOf is when the DatumToHLC() is used for an AS OF SYSTEM TIME statement.
+	// In this case, if the interval is not synthetic, its value has to be negative
+	// and last longer than a nanosecond.
+	AsOf DatumToHLCUsage = iota
+	// Split is when the DatumToHLC() is used for a SPLIT statement.
+	// In this case, if the interval is not synthetic, its value has to be positive
+	// and last longer than a nanosecond.
+	Split
+
+	// ReplicationCutover is when the DatumToHLC() is used for an
+	// ALTER TENANT ... COMPLETE REPLICATION statement.
+	ReplicationCutover
+)
+
 // DatumToHLC performs the conversion from a Datum to an HLC timestamp.
 func DatumToHLC(
-	evalCtx *eval.Context, stmtTimestamp time.Time, d tree.Datum,
+	evalCtx *eval.Context, stmtTimestamp time.Time, d tree.Datum, usage DatumToHLCUsage,
 ) (hlc.Timestamp, error) {
 	ts := hlc.Timestamp{}
 	var convErr error
@@ -237,6 +259,12 @@ func DatumToHLC(
 		if iv, err := tree.ParseDInterval(evalCtx.GetIntervalStyle(), s); err == nil {
 			if (iv.Duration == duration.Duration{}) {
 				convErr = errors.Errorf("interval value %v too small, absolute value must be >= %v", d, time.Microsecond)
+			} else if (usage == AsOf && iv.Duration.Compare(duration.Duration{}) > 0 && !syn) {
+				convErr = errors.Errorf("interval value %v too large, AS OF interval must be <= -%v", d, time.Microsecond)
+			} else if (usage == Split && iv.Duration.Compare(duration.Duration{}) < 0) {
+				// Do we need to consider if the timestamp is synthetic (see
+				// hlc.Timestamp.Synthetic), as for AS OF stmt?
+				convErr = errors.Errorf("interval value %v too small, SPLIT AT interval must be >= %v", d, time.Microsecond)
 			}
 			ts.WallTime = duration.Add(stmtTimestamp, iv.Duration).UnixNano()
 			ts.Synthetic = syn
@@ -252,6 +280,11 @@ func DatumToHLC(
 	case *tree.DDecimal:
 		ts, convErr = hlc.DecimalToHLC(&d.Decimal)
 	case *tree.DInterval:
+		if (usage == AsOf && d.Duration.Compare(duration.Duration{}) > 0) {
+			convErr = errors.Errorf("interval value %v too large, AS OF interval must be <= -%v", d, time.Microsecond)
+		} else if (usage == Split && d.Duration.Compare(duration.Duration{}) < 0) {
+			convErr = errors.Errorf("interval value %v too small, SPLIT interval must be >= %v", d, time.Microsecond)
+		}
 		ts.WallTime = duration.Add(stmtTimestamp, d.Duration).UnixNano()
 	default:
 		convErr = errors.WithSafeDetails(

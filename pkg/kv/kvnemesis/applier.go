@@ -16,6 +16,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
+	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -76,6 +78,37 @@ func (a *Applier) getNextDBRoundRobin() (*kv.DB, int32) {
 	return a.dbs[dbIdx], int32(dbIdx)
 }
 
+// Sentinel errors.
+var (
+	errOmitted                                      = errors.New("omitted")
+	errClosureTxnRollback                           = errors.New("rollback")
+	errDelRangeUsingTombstoneStraddlesRangeBoundary = errors.New("DeleteRangeUsingTombstone can not straddle range boundary")
+)
+
+func exceptOmitted(err error) bool { // true if errOmitted
+	return errors.Is(err, errOmitted)
+}
+
+func exceptRollback(err error) bool { // true if intentional txn rollback
+	return errors.Is(err, errClosureTxnRollback)
+}
+
+func exceptRetry(err error) bool { // true if retry error
+	return errors.HasInterface(err, (*kvpb.ClientVisibleRetryError)(nil))
+}
+
+func exceptUnhandledRetry(err error) bool {
+	return errors.HasType(err, (*kvpb.UnhandledRetryableError)(nil))
+}
+
+func exceptAmbiguous(err error) bool { // true if ambiguous result
+	return errors.HasInterface(err, (*kvpb.ClientVisibleAmbiguousError)(nil))
+}
+
+func exceptDelRangeUsingTombstoneStraddlesRangeBoundary(err error) bool {
+	return errors.Is(err, errDelRangeUsingTombstoneStraddlesRangeBoundary)
+}
+
 func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 	switch o := op.GetValue().(type) {
 	case *GetOperation,
@@ -83,25 +116,26 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 		*ScanOperation,
 		*BatchOperation,
 		*DeleteOperation,
-		*DeleteRangeOperation:
-		applyClientOp(ctx, db, op, false /* inTxn */)
+		*DeleteRangeOperation,
+		*DeleteRangeUsingTombstoneOperation,
+		*AddSSTableOperation:
+		applyClientOp(ctx, db, op, false)
 	case *SplitOperation:
 		err := db.AdminSplit(ctx, o.Key, hlc.MaxTimestamp)
-		o.Result = resultError(ctx, err)
+		o.Result = resultInit(ctx, err)
 	case *MergeOperation:
 		err := db.AdminMerge(ctx, o.Key)
-		o.Result = resultError(ctx, err)
+		o.Result = resultInit(ctx, err)
 	case *ChangeReplicasOperation:
 		desc := getRangeDesc(ctx, o.Key, db)
 		_, err := db.AdminChangeReplicas(ctx, o.Key, desc, o.Changes)
-		// TODO(dan): Save returned desc?
-		o.Result = resultError(ctx, err)
+		o.Result = resultInit(ctx, err)
 	case *TransferLeaseOperation:
 		err := db.AdminTransferLease(ctx, o.Key, o.Target)
-		o.Result = resultError(ctx, err)
+		o.Result = resultInit(ctx, err)
 	case *ChangeZoneOperation:
 		err := updateZoneConfigInEnv(ctx, env, o.Type)
-		o.Result = resultError(ctx, err)
+		o.Result = resultInit(ctx, err)
 	case *ClosureTxnOperation:
 		// Use a backoff loop to avoid thrashing on txn aborts. Don't wait between
 		// epochs of the same transaction to avoid waiting while holding locks.
@@ -117,17 +151,32 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 				retryOnAbort.Next()
 			}
 			savedTxn = txn
-			for i := range o.Ops {
-				op := &o.Ops[i]
-				applyClientOp(ctx, txn, op, true /* inTxn */)
-				// The KV api disallows use of a txn after an operation on it errors.
-				if r := op.Result(); r.Type == ResultType_Error {
-					return errors.DecodeError(ctx, *r.Err)
+			{
+				var err error
+				for i := range o.Ops {
+					op := &o.Ops[i]
+					op.Result().Reset() // in case we're a retry
+					if err != nil {
+						// If a previous op failed, mark this op as never invoked. We need
+						// to do this because we want, as an invariant, to have marked all
+						// operations as either failed or succeeded.
+						*op.Result() = resultInit(ctx, errOmitted)
+						continue
+					}
+
+					applyClientOp(ctx, txn, op, true)
+					// The KV api disallows use of a txn after an operation on it errors.
+					if r := op.Result(); r.Type == ResultType_Error {
+						err = errors.DecodeError(ctx, *r.Err)
+					}
+				}
+				if err != nil {
+					return err
 				}
 			}
 			if o.CommitInBatch != nil {
 				b := txn.NewBatch()
-				applyBatchOp(ctx, b, txn.CommitInBatch, o.CommitInBatch, true)
+				applyBatchOp(ctx, b, txn.CommitInBatch, o.CommitInBatch)
 				// The KV api disallows use of a txn after an operation on it errors.
 				if r := o.CommitInBatch.Result; r.Type == ResultType_Error {
 					return errors.DecodeError(ctx, *r.Err)
@@ -137,21 +186,27 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 			case ClosureTxnType_Commit:
 				return nil
 			case ClosureTxnType_Rollback:
-				return errors.New("rollback")
+				return errClosureTxnRollback
 			default:
 				panic(errors.AssertionFailedf(`unknown closure txn type: %s`, o.Type))
 			}
 		})
-		o.Result = resultError(ctx, txnErr)
+		o.Result = resultInit(ctx, txnErr)
 		if txnErr == nil {
 			o.Txn = savedTxn.TestingCloneTxn()
+			o.Result.OptionalTimestamp = o.Txn.WriteTimestamp
 		}
 	default:
 		panic(errors.AssertionFailedf(`unknown operation type: %T %v`, o, o))
 	}
 }
 
+type dbRunI interface {
+	Run(context.Context, *kv.Batch) error
+}
+
 type clientI interface {
+	dbRunI
 	Get(context.Context, interface{}) (kv.KeyValue, error)
 	GetForUpdate(context.Context, interface{}) (kv.KeyValue, error)
 	Put(context.Context, interface{}, interface{}) error
@@ -161,91 +216,178 @@ type clientI interface {
 	ReverseScanForUpdate(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
 	Del(context.Context, ...interface{}) ([]roachpb.Key, error)
 	DelRange(context.Context, interface{}, interface{}, bool) ([]roachpb.Key, error)
-	Run(context.Context, *kv.Batch) error
+}
+
+func dbRunWithResultAndTimestamp(
+	ctx context.Context, db dbRunI, ops ...func(b *kv.Batch),
+) ([]kv.Result, hlc.Timestamp, error) {
+	b := &kv.Batch{}
+	for _, op := range ops {
+		op(b)
+	}
+	ts, err := batchRun(ctx, db.Run, b)
+	if err != nil {
+		return nil, hlc.Timestamp{}, err
+	}
+	return b.Results, ts, nil
+}
+
+func batchRun(
+	ctx context.Context, run func(context.Context, *kv.Batch) error, b *kv.Batch,
+) (hlc.Timestamp, error) {
+	if err := run(ctx, b); err != nil {
+		return hlc.Timestamp{}, err
+	}
+	var ts hlc.Timestamp
+	if rr := b.RawResponse(); rr != nil {
+		ts = rr.Timestamp
+	}
+	return ts, nil
 }
 
 func applyClientOp(ctx context.Context, db clientI, op *Operation, inTxn bool) {
 	switch o := op.GetValue().(type) {
 	case *GetOperation:
-		fn := db.Get
+		fn := (*kv.Batch).Get
 		if o.ForUpdate {
-			fn = db.GetForUpdate
+			fn = (*kv.Batch).GetForUpdate
 		}
-		kv, err := fn(ctx, o.Key)
+		res, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			fn(b, o.Key)
+		})
+		o.Result = resultInit(ctx, err)
 		if err != nil {
-			o.Result = resultError(ctx, err)
+			return
+		}
+		o.Result.Type = ResultType_Value
+		o.Result.OptionalTimestamp = ts
+		kv := res[0].Rows[0]
+		if kv.Value != nil {
+			o.Result.Value = kv.Value.RawBytes
 		} else {
-			o.Result.Type = ResultType_Value
-			if kv.Value != nil {
-				o.Result.Value = kv.Value.RawBytes
-			} else {
-				o.Result.Value = nil
-			}
+			o.Result.Value = nil
 		}
 	case *PutOperation:
-		err := db.Put(ctx, o.Key, o.Value)
-		o.Result = resultError(ctx, err)
-	case *ScanOperation:
-		fn := db.Scan
-		if o.Reverse && o.ForUpdate {
-			fn = db.ReverseScanForUpdate
-		} else if o.Reverse {
-			fn = db.ReverseScan
-		} else if o.ForUpdate {
-			fn = db.ScanForUpdate
-		}
-		kvs, err := fn(ctx, o.Key, o.EndKey, 0 /* maxRows */)
+		_, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			b.Put(o.Key, o.Value())
+			setLastReqSeq(b, o.Seq)
+		})
+		o.Result = resultInit(ctx, err)
 		if err != nil {
-			o.Result = resultError(ctx, err)
-		} else {
-			o.Result.Type = ResultType_Values
-			o.Result.Values = make([]KeyValue, len(kvs))
-			for i, kv := range kvs {
-				o.Result.Values[i] = KeyValue{
-					Key:   []byte(kv.Key),
-					Value: kv.Value.RawBytes,
-				}
+			return
+		}
+		o.Result.OptionalTimestamp = ts
+	case *ScanOperation:
+		fn := (*kv.Batch).Scan
+		if o.Reverse && o.ForUpdate {
+			fn = (*kv.Batch).ReverseScanForUpdate
+		} else if o.Reverse {
+			fn = (*kv.Batch).ReverseScan
+		} else if o.ForUpdate {
+			fn = (*kv.Batch).ScanForUpdate
+		}
+		res, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			fn(b, o.Key, o.EndKey)
+		})
+		o.Result = resultInit(ctx, err)
+		if err != nil {
+			return
+		}
+		kvs := res[0].Rows
+		o.Result.OptionalTimestamp = ts
+		o.Result.Type = ResultType_Values
+		o.Result.Values = make([]KeyValue, len(kvs))
+		for i, kv := range kvs {
+			o.Result.Values[i] = KeyValue{
+				Key:   kv.Key,
+				Value: kv.Value.RawBytes,
 			}
 		}
 	case *DeleteOperation:
-		deletedKeys, err := db.Del(ctx, o.Key)
+		res, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			b.Del(o.Key)
+			setLastReqSeq(b, o.Seq)
+		})
+		o.Result = resultInit(ctx, err)
 		if err != nil {
-			o.Result = resultError(ctx, err)
-		} else {
-			o.Result.Type = ResultType_Keys
-			o.Result.Keys = make([][]byte, len(deletedKeys))
-			for i, deletedKey := range deletedKeys {
-				o.Result.Keys[i] = deletedKey
-			}
+			return
+		}
+		deletedKeys := res[0].Keys
+		o.Result.OptionalTimestamp = ts
+		o.Result.Type = ResultType_Keys
+		o.Result.Keys = make([][]byte, len(deletedKeys))
+		for i, deletedKey := range deletedKeys {
+			o.Result.Keys[i] = deletedKey
 		}
 	case *DeleteRangeOperation:
-		if !inTxn {
-			panic(errors.AssertionFailedf(`non-transactional DelRange operations currently unsupported`))
-		}
-		deletedKeys, err := db.DelRange(ctx, o.Key, o.EndKey, true /* returnKeys */)
+		res, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			b.DelRange(o.Key, o.EndKey, true /* returnKeys */)
+			setLastReqSeq(b, o.Seq)
+		})
+		o.Result = resultInit(ctx, err)
 		if err != nil {
-			o.Result = resultError(ctx, err)
-		} else {
-			o.Result.Type = ResultType_Keys
-			o.Result.Keys = make([][]byte, len(deletedKeys))
-			for i, deletedKey := range deletedKeys {
-				o.Result.Keys[i] = deletedKey
-			}
+			return
 		}
+		deletedKeys := res[0].Keys
+		o.Result.OptionalTimestamp = ts
+		o.Result.Type = ResultType_Keys
+		o.Result.Keys = make([][]byte, len(deletedKeys))
+		for i, deletedKey := range deletedKeys {
+			o.Result.Keys[i] = deletedKey
+		}
+	case *DeleteRangeUsingTombstoneOperation:
+		_, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			b.DelRangeUsingTombstone(o.Key, o.EndKey)
+			setLastReqSeq(b, o.Seq)
+		})
+		o.Result = resultInit(ctx, err)
+		if err != nil {
+			return
+		}
+		o.Result.OptionalTimestamp = ts
+	case *AddSSTableOperation:
+		if inTxn {
+			panic(errors.AssertionFailedf(`AddSSTable cannot be used in transactions`))
+		}
+		_, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			// Unlike other write operations, AddSSTable sends raw MVCC values
+			// directly through to storage, including an MVCCValueHeader already
+			// tagged with the sequence number. We therefore don't need to pass the
+			// sequence number via the RequestHeader here.
+			b.AddRawRequest(&kvpb.AddSSTableRequest{
+				RequestHeader: kvpb.RequestHeader{
+					Key:    o.Span.Key,
+					EndKey: o.Span.EndKey,
+				},
+				Data:                           o.Data,
+				SSTTimestampToRequestTimestamp: o.SSTTimestamp,
+				DisallowConflicts:              true,
+				IngestAsWrites:                 o.AsWrites,
+			})
+		})
+		o.Result = resultInit(ctx, err)
+		if err != nil {
+			return
+		}
+		o.Result.OptionalTimestamp = ts
 	case *BatchOperation:
 		b := &kv.Batch{}
-		applyBatchOp(ctx, b, db.Run, o, inTxn)
+		applyBatchOp(ctx, b, db.Run, o)
 	default:
 		panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, o, o))
 	}
 }
 
+func setLastReqSeq(b *kv.Batch, seq kvnemesisutil.Seq) {
+	sl := b.Requests()
+	req := sl[len(sl)-1].GetInner()
+	h := req.Header()
+	h.KVNemesisSeq.Set(seq)
+	req.SetHeader(h)
+}
+
 func applyBatchOp(
-	ctx context.Context,
-	b *kv.Batch,
-	runFn func(context.Context, *kv.Batch) error,
-	o *BatchOperation,
-	inTxn bool,
+	ctx context.Context, b *kv.Batch, run func(context.Context, *kv.Batch) error, o *BatchOperation,
 ) {
 	for i := range o.Ops {
 		switch subO := o.Ops[i].GetValue().(type) {
@@ -256,7 +398,8 @@ func applyBatchOp(
 				b.Get(subO.Key)
 			}
 		case *PutOperation:
-			b.Put(subO.Key, subO.Value)
+			b.Put(subO.Key, subO.Value())
+			setLastReqSeq(b, subO.Seq)
 		case *ScanOperation:
 			if subO.Reverse && subO.ForUpdate {
 				b.ReverseScanForUpdate(subO.Key, subO.EndKey)
@@ -269,22 +412,30 @@ func applyBatchOp(
 			}
 		case *DeleteOperation:
 			b.Del(subO.Key)
+			setLastReqSeq(b, subO.Seq)
 		case *DeleteRangeOperation:
-			if !inTxn {
-				panic(errors.AssertionFailedf(`non-transactional batch DelRange operations currently unsupported`))
-			}
 			b.DelRange(subO.Key, subO.EndKey, true /* returnKeys */)
+			setLastReqSeq(b, subO.Seq)
+		case *DeleteRangeUsingTombstoneOperation:
+			b.DelRangeUsingTombstone(subO.Key, subO.EndKey)
+			setLastReqSeq(b, subO.Seq)
+		case *AddSSTableOperation:
+			panic(errors.AssertionFailedf(`AddSSTable cannot be used in batches`))
 		default:
 			panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, subO, subO))
 		}
 	}
-	runErr := runFn(ctx, b)
-	o.Result = resultError(ctx, runErr)
+	ts, err := batchRun(ctx, run, b)
+	o.Result = resultInit(ctx, err)
+	// NB: we intentionally fall through; the batch propagates the error
+	// to each result.
+	err = nil
+	o.Result.OptionalTimestamp = ts
 	for i := range o.Ops {
 		switch subO := o.Ops[i].GetValue().(type) {
 		case *GetOperation:
 			if b.Results[i].Err != nil {
-				subO.Result = resultError(ctx, b.Results[i].Err)
+				subO.Result = resultInit(ctx, b.Results[i].Err)
 			} else {
 				subO.Result.Type = ResultType_Value
 				result := b.Results[i].Rows[0]
@@ -296,11 +447,11 @@ func applyBatchOp(
 			}
 		case *PutOperation:
 			err := b.Results[i].Err
-			subO.Result = resultError(ctx, err)
+			subO.Result = resultInit(ctx, err)
 		case *ScanOperation:
 			kvs, err := b.Results[i].Rows, b.Results[i].Err
 			if err != nil {
-				subO.Result = resultError(ctx, err)
+				subO.Result = resultInit(ctx, err)
 			} else {
 				subO.Result.Type = ResultType_Values
 				subO.Result.Values = make([]KeyValue, len(kvs))
@@ -313,11 +464,11 @@ func applyBatchOp(
 			}
 		case *DeleteOperation:
 			err := b.Results[i].Err
-			subO.Result = resultError(ctx, err)
+			subO.Result = resultInit(ctx, err)
 		case *DeleteRangeOperation:
 			keys, err := b.Results[i].Keys, b.Results[i].Err
 			if err != nil {
-				subO.Result = resultError(ctx, err)
+				subO.Result = resultInit(ctx, err)
 			} else {
 				subO.Result.Type = ResultType_Keys
 				subO.Result.Keys = make([][]byte, len(keys))
@@ -325,13 +476,17 @@ func applyBatchOp(
 					subO.Result.Keys[j] = key
 				}
 			}
+		case *DeleteRangeUsingTombstoneOperation:
+			subO.Result = resultInit(ctx, err)
+		case *AddSSTableOperation:
+			panic(errors.AssertionFailedf(`AddSSTable cannot be used in batches`))
 		default:
 			panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, subO, subO))
 		}
 	}
 }
 
-func resultError(ctx context.Context, err error) Result {
+func resultInit(ctx context.Context, err error) Result {
 	if err == nil {
 		return Result{Type: ResultType_NoError}
 	}
@@ -347,7 +502,7 @@ func getRangeDesc(ctx context.Context, key roachpb.Key, dbs ...*kv.DB) roachpb.R
 	var opts = retry.Options{}
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); dbIdx = (dbIdx + 1) % len(dbs) {
 		sender := dbs[dbIdx].NonTransactionalSender()
-		descs, _, err := kv.RangeLookup(ctx, sender, key, roachpb.CONSISTENT, 0, false)
+		descs, _, err := kv.RangeLookup(ctx, sender, key, kvpb.CONSISTENT, 0, false)
 		if err != nil {
 			log.Infof(ctx, "looking up descriptor for %s: %+v", key, err)
 			continue

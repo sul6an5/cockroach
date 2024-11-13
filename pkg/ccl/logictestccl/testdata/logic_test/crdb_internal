@@ -35,6 +35,7 @@ CREATE table t2 (a STRING PRIMARY KEY) PARTITION BY LIST (a) (
 
 # Since there are no zone configurations on any of these partitions, tables,
 # or databases, these partitions inherit directly from the default config.
+skipif backup-restore
 query IITTITTTII
 SELECT * FROM crdb_internal.partitions ORDER BY table_id, index_id, name
 ----
@@ -64,6 +65,7 @@ CREATE TABLE t4 (a INT PRIMARY KEY, b INT); CREATE INDEX myt4index ON t4 (b); AL
 
 user testuser
 
+skipif backup-restore
 query IT
 SELECT zone_id, target FROM crdb_internal.zones ORDER BY 1
 ----
@@ -78,37 +80,37 @@ query TT
 SELECT * FROM [SHOW ALL ZONE CONFIGURATIONS] ORDER BY 1
 ----
 INDEX test.public.t4@myt4index  ALTER INDEX test.public.t4@myt4index CONFIGURE ZONE USING
-                                num_replicas = 5
+                                  num_replicas = 5
 RANGE default                   ALTER RANGE default CONFIGURE ZONE USING
-                                range_min_bytes = 134217728,
-                                range_max_bytes = 536870912,
-                                gc.ttlseconds = 90000,
-                                num_replicas = 3,
-                                constraints = '[]',
-                                lease_preferences = '[]'
+                                  range_min_bytes = 134217728,
+                                  range_max_bytes = 536870912,
+                                  gc.ttlseconds = 14400,
+                                  num_replicas = 3,
+                                  constraints = '[]',
+                                  lease_preferences = '[]'
 RANGE liveness                  ALTER RANGE liveness CONFIGURE ZONE USING
-                                range_min_bytes = 134217728,
-                                range_max_bytes = 536870912,
-                                gc.ttlseconds = 600,
-                                num_replicas = 5,
-                                constraints = '[]',
-                                lease_preferences = '[]'
+                                  range_min_bytes = 134217728,
+                                  range_max_bytes = 536870912,
+                                  gc.ttlseconds = 600,
+                                  num_replicas = 5,
+                                  constraints = '[]',
+                                  lease_preferences = '[]'
 RANGE meta                      ALTER RANGE meta CONFIGURE ZONE USING
-                                range_min_bytes = 134217728,
-                                range_max_bytes = 536870912,
-                                gc.ttlseconds = 3600,
-                                num_replicas = 5,
-                                constraints = '[]',
-                                lease_preferences = '[]'
+                                  range_min_bytes = 134217728,
+                                  range_max_bytes = 536870912,
+                                  gc.ttlseconds = 3600,
+                                  num_replicas = 5,
+                                  constraints = '[]',
+                                  lease_preferences = '[]'
 RANGE system                    ALTER RANGE system CONFIGURE ZONE USING
-                                range_min_bytes = 134217728,
-                                range_max_bytes = 536870912,
-                                gc.ttlseconds = 90000,
-                                num_replicas = 5,
-                                constraints = '[]',
-                                lease_preferences = '[]'
+                                  range_min_bytes = 134217728,
+                                  range_max_bytes = 536870912,
+                                  gc.ttlseconds = 14400,
+                                  num_replicas = 5,
+                                  constraints = '[]',
+                                  lease_preferences = '[]'
 TABLE test.public.t4            ALTER TABLE test.public.t4 CONFIGURE ZONE USING
-                                num_replicas = 7
+                                  num_replicas = 7
 
 query error pq: user testuser has no privileges on database db2
 SHOW ZONE CONFIGURATION FOR DATABASE db2
@@ -126,34 +128,34 @@ query TT
 SHOW ZONE CONFIGURATION FOR INDEX myt4index
 ----
 INDEX test.public.t4@myt4index  ALTER INDEX test.public.t4@myt4index CONFIGURE ZONE USING
-                                range_min_bytes = 134217728,
-                                range_max_bytes = 536870912,
-                                gc.ttlseconds = 90000,
-                                num_replicas = 5,
-                                constraints = '[]',
-                                lease_preferences = '[]'
+                                  range_min_bytes = 134217728,
+                                  range_max_bytes = 536870912,
+                                  gc.ttlseconds = 14400,
+                                  num_replicas = 5,
+                                  constraints = '[]',
+                                  lease_preferences = '[]'
 
 query TT
 SHOW ZONE CONFIGURATION FOR TABLE t4
 ----
 TABLE t4  ALTER TABLE t4 CONFIGURE ZONE USING
-          range_min_bytes = 134217728,
-          range_max_bytes = 536870912,
-          gc.ttlseconds = 90000,
-          num_replicas = 7,
-          constraints = '[]',
-          lease_preferences = '[]'
+            range_min_bytes = 134217728,
+            range_max_bytes = 536870912,
+            gc.ttlseconds = 14400,
+            num_replicas = 7,
+            constraints = '[]',
+            lease_preferences = '[]'
 
 query TT
 SHOW ZONE CONFIGURATION FOR RANGE default
 ----
 RANGE default  ALTER RANGE default CONFIGURE ZONE USING
-               range_min_bytes = 134217728,
-               range_max_bytes = 536870912,
-               gc.ttlseconds = 90000,
-               num_replicas = 3,
-               constraints = '[]',
-               lease_preferences = '[]'
+                 range_min_bytes = 134217728,
+                 range_max_bytes = 536870912,
+                 gc.ttlseconds = 14400,
+                 num_replicas = 3,
+                 constraints = '[]',
+                 lease_preferences = '[]'
 
 # This test checks that generator backed tables do not concurrently
 # access transactions. It does this by scanning two virtual tables at a time.
@@ -164,18 +166,45 @@ SELECT a.* FROM crdb_internal.partitions AS a JOIN crdb_internal.partitions AS b
 
 subtest replication-builtins
 
-user testuser
-
-query error pq: crdb_internal\.stream_ingestion_stats_json\(\): replication restricted to ADMIN role
-SELECT crdb_internal.stream_ingestion_stats_json(unique_rowid());
-
 user root
-
-query error pq: crdb_internal\.stream_ingestion_stats_json\(\): job.*does not exist
-SELECT crdb_internal.stream_ingestion_stats_json(unique_rowid());
-
-query error pq: crdb_internal\.stream_ingestion_stats_json\(\): job.*is not a stream ingestion job
-SELECT crdb_internal.stream_ingestion_stats_json(id) FROM (SELECT id FROM system.jobs LIMIT 1);
 
 query error pq: crdb_internal\.replication_stream_spec\(\): job.*is not a replication stream job
 SELECT crdb_internal.replication_stream_spec(crdb_internal.create_sql_schema_telemetry_job())
+
+query error pq: crdb_internal\.stream_ingestion_stats_json\(\): unimplemented
+SELECT crdb_internal.stream_ingestion_stats_json(1);
+
+query error pq: crdb_internal\.stream_ingestion_stats_pb\(\): unimplemented
+SELECT crdb_internal.stream_ingestion_stats_pb(1);
+
+subtest node_tenant_capabilities_cache
+
+user testuser
+
+statement error only users with the admin role are allowed to node_tenant_capabilities_cache
+SELECT * FROM crdb_internal.node_tenant_capabilities_cache
+
+user root
+
+statement ok
+SELECT crdb_internal.create_tenant(5)
+
+# Use retry because source data is eventually consistent.
+query ITT colnames,retry
+SELECT * FROM crdb_internal.node_tenant_capabilities_cache WHERE capability_name = 'can_admin_split'
+----
+tenant_id  capability_name    capability_value
+1          can_admin_split  true
+
+statement ok
+ALTER TENANT [5] GRANT CAPABILITY can_admin_split
+
+# Use retry because source data is eventually consistent.
+query ITT colnames,retry
+SELECT * FROM crdb_internal.node_tenant_capabilities_cache WHERE capability_name = 'can_admin_split'
+----
+tenant_id  capability_name    capability_value
+1          can_admin_split  true
+5          can_admin_split  true
+
+subtest end

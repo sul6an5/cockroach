@@ -49,13 +49,16 @@ import (
 func TestExternalSortMemoryAccounting(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	skip.UnderStress(t, "the test is very memory-intensive and is likely to OOM under stress")
+
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -109,7 +112,9 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 		queueCfg, sem, &monitorRegistry,
 	)
 	require.NoError(t, err)
-	require.Equal(t, 1, len(closers))
+	// We expect the disk spiller as well as the external sorter to be included
+	// into the set of closers.
+	require.Equal(t, 2, len(closers))
 
 	sorter.Init(ctx)
 	for b := sorter.Next(); b.Length() > 0; b = sorter.Next() {
@@ -130,12 +135,14 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 	// numInMemoryBufferedBatches (first merge = 2x, second merge = 3x, third
 	// merge 4x, etc, so we expect 2*numNewPartitions-1 partitions).
 	expMaxTotalPartitionsCreated := 2*numNewPartitions - 1
-	// Because of the fact that we are creating partitions slightly larger than
-	// memoryLimit in size and because of our "after the fact" memory
-	// accounting, we might create less partitions than maximum defined above
-	// (e.g., if numNewPartitions is 4, then we will create 3 partitions when
-	// batch size is 3).
-	expMinTotalPartitionsCreated := numNewPartitions - 1
+	// Since we are creating partitions slightly larger than memoryLimit in size
+	// and because of our "after the fact" memory accounting, we might create
+	// fewer partitions than the target (e.g., if numNewPartitions is 4, then we
+	// will create 3 partitions when batch size is 3). However, we might not
+	// even create numNewPartitions-1 in edge cases (due to how we grow
+	// coldata.Bytes.buffer when setting values), so we opt for a sanity check
+	// that at least two partitions were created that must always be true.
+	expMinTotalPartitionsCreated := 2
 	require.GreaterOrEqualf(t, numPartitionsCreated, expMinTotalPartitionsCreated,
 		"didn't create enough partitions: actual %d, min expected %d",
 		numPartitionsCreated, expMinTotalPartitionsCreated,
@@ -162,7 +169,20 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 	}
 	// We cannot guarantee a fixed value, so we use an allowed range.
 	expMin := memoryLimit
-	expMax := int64(float64(memoryLimit) * 1.8)
+	// The factor of 2.8 is necessary due to the following setup:
+	// - 0.8x is used by the limited monitor of the in-memory sorter
+	// - 0.8x is used by the unlimited monitor that "supports" the limited
+	//      monitor of the in-memory sorter. This part is needed since we
+	//      perform the accounting after the fact. See
+	//      colmem.NewLimitedAllocator for details.
+	// - 1x is used by the unlimited monitor of the external sort.
+	//
+	// 0.8 is the fraction of the memory limit that we give to the spooler while
+	// keeping the remaining 0.2 for the output batch (which is never utilized).
+	// This logic lives in createDiskBackedSorter in execplan.go.
+	//
+	// To allow some drift we add another 0.2.
+	expMax := int64(float64(memoryLimit) * 2.8)
 	require.GreaterOrEqualf(t, totalMaxMemUsage, expMin, "minimum memory bound not satisfied: "+
 		"actual %d, expected min %d", totalMaxMemUsage, expMin)
 	require.GreaterOrEqualf(t, expMax, totalMaxMemUsage, "maximum memory bound not satisfied: "+

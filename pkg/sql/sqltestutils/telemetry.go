@@ -22,10 +22,10 @@ import (
 	"text/tabwriter"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -175,9 +175,8 @@ func (tt *telemetryTest) Start(t *testing.T, serverArgs []base.TestServerArgs) {
 	tt.prepareCluster(tt.serverDB)
 
 	tt.tenant, tt.tenantDB = serverutils.StartTenant(tt.t, tt.server, base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		AllowSettingClusterSettings: true,
-		TestingKnobs:                mapServerArgs[0].Knobs,
+		TenantID:     serverutils.TestTenantID(),
+		TestingKnobs: mapServerArgs[0].Knobs,
 	})
 	tt.prepareCluster(tt.tenantDB)
 }
@@ -367,8 +366,8 @@ func formatTableDescriptor(desc *descpb.TableDescriptor) string {
 	return tp.String()
 }
 
-func formatSQLStats(stats []roachpb.CollectedStatementStatistics) string {
-	bucketByApp := make(map[string][]roachpb.CollectedStatementStatistics)
+func formatSQLStats(stats []appstatspb.CollectedStatementStatistics) string {
+	bucketByApp := make(map[string][]appstatspb.CollectedStatementStatistics)
 	for i := range stats {
 		s := &stats[i]
 

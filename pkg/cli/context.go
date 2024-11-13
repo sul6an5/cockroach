@@ -18,18 +18,17 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl"
 	"github.com/cockroachdb/cockroach/pkg/cli/clicfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlshell"
 	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -46,10 +45,9 @@ import (
 // configuration defaults. It is suitable for calling between tests of
 // the CLI utilities inside a single testing process.
 func initCLIDefaults() {
-	setServerContextDefaults()
 	// We don't reset the pointers (because they are tied into the
 	// flags), but instead overwrite the existing structs' values.
-	baseCfg.InitDefaults()
+	setServerContextDefaults()
 	setCliContextDefaults()
 	setSQLConnContextDefaults()
 	setSQLExecContextDefaults()
@@ -66,8 +64,6 @@ func initCLIDefaults() {
 	setStmtDiagContextDefaults()
 	setAuthContextDefaults()
 	setImportContextDefaults()
-	setProxyContextDefaults()
-	setTestDirectorySvrContextDefaults()
 	setUserfileContextDefaults()
 	setCertContextDefaults()
 	setDebugRecoverContextDefaults()
@@ -104,24 +100,9 @@ var serverCfg = func() server.Config {
 // function is called by initCLIDefaults() and thus re-called in every
 // test that exercises command-line parsing.
 func setServerContextDefaults() {
-	serverCfg.BaseConfig.DefaultZoneConfig = zonepb.DefaultZoneConfig()
-
-	serverCfg.ClockDevicePath = ""
-	serverCfg.ExternalIODirConfig = base.ExternalIODirConfig{}
-	serverCfg.GoroutineDumpDirName = ""
-	serverCfg.HeapProfileDirName = ""
-	serverCfg.CPUProfileDirName = ""
-	serverCfg.InflightTraceDirName = ""
-
-	serverCfg.AutoInitializeCluster = false
-	serverCfg.KVConfig.ReadyFn = nil
-	serverCfg.KVConfig.DelayedBootstrapFn = nil
-	serverCfg.KVConfig.JoinList = nil
-	serverCfg.KVConfig.JoinPreferSRVRecords = false
-	serverCfg.KVConfig.DefaultSystemZoneConfig = zonepb.DefaultSystemZoneConfig()
-	// Reset the store list.
-	storeSpec, _ := base.NewStoreSpec(server.DefaultStorePath)
-	serverCfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{storeSpec}}
+	st := cluster.MakeClusterSettings()
+	logcrash.SetGlobalSettings(&st.SV)
+	serverCfg.SetDefaults(context.Background(), st)
 
 	serverCfg.TenantKVAddrs = []string{"127.0.0.1:26257"}
 
@@ -188,10 +169,9 @@ type cliContext struct {
 	// before exiting the process. This may block until all buffered log sinks
 	// are shutdown, if any are enabled, or until a timeout is triggered.
 	logShutdownFn func()
-	// deprecatedLogOverrides is the legacy pre-v21.1 discrete flag
-	// overrides for the logging configuration.
-	// TODO(knz): Deprecated in v21.1. Remove this.
-	deprecatedLogOverrides *logConfigFlags
+	// logOverrides encodes discrete flag overrides for the logging
+	// configuration. They are provided for convenience.
+	logOverrides *logConfigFlags
 	// ambiguousLogDir is populated during setupLogging() to indicate
 	// that no log directory was specified and there were multiple
 	// on-disk stores.
@@ -204,9 +184,8 @@ type cliContext struct {
 // cliCtx captures the command-line parameters common to most CLI utilities.
 // See below for defaults.
 var cliCtx = cliContext{
-	Config: baseCfg,
-	// TODO(knz): Deprecated in v21.1. Remove this.
-	deprecatedLogOverrides: newLogConfigOverrides(),
+	Config:       baseCfg,
+	logOverrides: newLogConfigOverrides(),
 }
 
 // setCliContextDefaults set the default values in cliCtx.  This
@@ -231,8 +210,7 @@ func setCliContextDefaults() {
 	cliCtx.logConfig = logconfig.Config{}
 	cliCtx.logShutdownFn = func() {}
 	cliCtx.ambiguousLogDir = false
-	// TODO(knz): Deprecated in v21.1. Remove this.
-	cliCtx.deprecatedLogOverrides.reset()
+	cliCtx.logOverrides.reset()
 	cliCtx.showVersionUsingOnlyBuildTag = false
 }
 
@@ -271,6 +249,10 @@ var certCtx struct {
 	// scoped to. By creating a tenant-scoped certicate, the usage of that certificate
 	// is restricted to a specific tenant.
 	tenantScope []roachpb.TenantID
+
+	// disableUsernameValidation removes the username syntax check on
+	// the input.
+	disableUsernameValidation bool
 }
 
 func setCertContextDefaults() {
@@ -282,8 +264,22 @@ func setCertContextDefaults() {
 	certCtx.allowCAKeyReuse = false
 	certCtx.overwriteFiles = false
 	certCtx.generatePKCS8Key = false
+	certCtx.disableUsernameValidation = false
 	certCtx.certPrincipalMap = nil
-	certCtx.tenantScope = []roachpb.TenantID{roachpb.SystemTenantID}
+	// Note: we set tenantScope to nil so that by default, client certs
+	// are not scoped to a specific tenant and can be used to connect to
+	// any tenant.
+	//
+	// Note that the scoping is generally useful for security, and it is
+	// used in CockroachCloud. However, CockroachCloud does not use our
+	// CLI code to generate certs and sets its tenant scopes on its own.
+	//
+	// Given that our CLI code is provided for convenience and developer
+	// productivity, and we don't expect certs generated here to be used
+	// in multi-tenant deployments where tenants are adversarial to each
+	// other, defaulting to certs that are valid on every tenant is a
+	// good choice.
+	certCtx.tenantScope = nil
 }
 
 var sqlExecCtx = clisqlexec.Context{
@@ -338,9 +334,15 @@ var zipCtx zipContext
 type zipContext struct {
 	nodes nodeSelection
 
-	// redactLogs indicates whether log files should be redacted
-	// server-side during retrieval.
+	// DEPRECATED: redactLogs indicates whether log files should be
+	// redacted server-side during retrieval. This flag is deprecated
+	// in favor of redact.
 	redactLogs bool
+
+	// redact indicates whether the entirety of debug zip should
+	// be redacted server-side during retrieval, except for
+	// range key data, which is necessary to support CockroachDB.
+	redact bool
 
 	// Duration (in seconds) to run CPU profile for.
 	cpuProfDuration time.Duration
@@ -348,6 +350,11 @@ type zipContext struct {
 	// How much concurrency to use during the collection. The code
 	// attempts to access multiple nodes concurrently by default.
 	concurrency int
+
+	// includeRangeInfo includes information about each individual range in
+	// individual nodes/*/ranges/*.json files. For large clusters, this can
+	// dramatically increase debug zip size/file count.
+	includeRangeInfo bool
 
 	// The log/heap/etc files to include.
 	files fileSelection
@@ -360,6 +367,8 @@ func setZipContextDefaults() {
 	zipCtx.nodes = nodeSelection{}
 	zipCtx.files = fileSelection{}
 	zipCtx.redactLogs = false
+	zipCtx.redact = false
+	zipCtx.includeRangeInfo = false // we omit range info by default to keep lightweight debug zips
 	zipCtx.cpuProfDuration = 5 * time.Second
 	zipCtx.concurrency = 15
 
@@ -482,6 +491,15 @@ var startCtx struct {
 
 	// geoLibsDir is used to specify locations of the GEOS library.
 	geoLibsDir string
+
+	// These configuration handles are flag.Value instances that allow
+	// configuring other variables using either a percentage or a
+	// humanized size value.
+	cacheSizeValue           bytesOrPercentageValue
+	sqlSizeValue             bytesOrPercentageValue
+	goMemLimitValue          bytesOrPercentageValue
+	diskTempStorageSizeValue bytesOrPercentageValue
+	tsdbSizeValue            bytesOrPercentageValue
 }
 
 // setStartContextDefaults set the default values in startCtx.  This
@@ -502,6 +520,11 @@ func setStartContextDefaults() {
 	startCtx.pidFile = ""
 	startCtx.inBackground = false
 	startCtx.geoLibsDir = "/usr/local/lib/cockroach"
+	startCtx.cacheSizeValue = makeBytesOrPercentageValue(&serverCfg.CacheSize, memoryPercentResolver)
+	startCtx.sqlSizeValue = makeBytesOrPercentageValue(&serverCfg.MemoryPoolSize, memoryPercentResolver)
+	startCtx.goMemLimitValue = makeBytesOrPercentageValue(&goMemLimit, memoryPercentResolver)
+	startCtx.diskTempStorageSizeValue = makeBytesOrPercentageValue(nil /* v */, nil /* percentResolver */)
+	startCtx.tsdbSizeValue = makeBytesOrPercentageValue(&serverCfg.TimeSeriesServerConfig.QueryMemoryMax, memoryPercentResolver)
 }
 
 // drainCtx captures the command-line parameters of the `node drain`
@@ -529,6 +552,8 @@ func setDrainContextDefaults() {
 var nodeCtx struct {
 	nodeDecommissionWait   nodeDecommissionWaitType
 	nodeDecommissionSelf   bool
+	nodeDecommissionChecks nodeDecommissionCheckMode
+	nodeDecommissionDryRun bool
 	statusShowRanges       bool
 	statusShowStats        bool
 	statusShowDecommission bool
@@ -541,6 +566,8 @@ var nodeCtx struct {
 func setNodeContextDefaults() {
 	nodeCtx.nodeDecommissionWait = nodeDecommissionWaitAll
 	nodeCtx.nodeDecommissionSelf = false
+	nodeCtx.nodeDecommissionChecks = nodeDecommissionChecksEnabled
+	nodeCtx.nodeDecommissionDryRun = false
 	nodeCtx.statusShowRanges = false
 	nodeCtx.statusShowStats = false
 	nodeCtx.statusShowAll = false
@@ -587,6 +614,10 @@ func setConvContextDefaults() {
 var demoCtx = struct {
 	democluster.Context
 	disableEnterpriseFeatures bool
+	pidFile                   string
+
+	demoNodeCacheSizeValue  bytesOrPercentageValue
+	demoNodeSQLMemSizeValue bytesOrPercentageValue
 }{
 	Context: democluster.Context{
 		CliCtx: &cliCtx.Context,
@@ -600,12 +631,11 @@ func setDemoContextDefaults() {
 	demoCtx.NumNodes = 1
 	demoCtx.SQLPoolMemorySize = 128 << 20 // 128MB, chosen to fit 9 nodes on 2GB machine.
 	demoCtx.CacheSize = 64 << 20          // 64MB, chosen to fit 9 nodes on 2GB machine.
-	demoCtx.NoExampleDatabase = false
+	demoCtx.UseEmptyDatabase = false
 	demoCtx.SimulateLatency = false
 	demoCtx.RunWorkload = false
 	demoCtx.Localities = nil
 	demoCtx.GeoPartitionedReplicas = false
-	demoCtx.DisableTelemetry = false
 	demoCtx.DefaultKeySize = defaultKeySize
 	demoCtx.DefaultCALifetime = defaultCALifetime
 	demoCtx.DefaultCertLifetime = defaultCertLifetime
@@ -613,10 +643,22 @@ func setDemoContextDefaults() {
 	demoCtx.SQLPort, _ = strconv.Atoi(base.DefaultPort)
 	demoCtx.HTTPPort, _ = strconv.Atoi(base.DefaultHTTPPort)
 	demoCtx.WorkloadMaxQPS = 25
-	demoCtx.Multitenant = true
+	demoCtx.Multitenant = false
+	demoCtx.DisableServerController = false
 	demoCtx.DefaultEnableRangefeeds = true
+	demoCtx.AutoConfigProvider = acprovider.NoTaskProvider{}
 
+	demoCtx.pidFile = ""
 	demoCtx.disableEnterpriseFeatures = false
+
+	demoCtx.demoNodeCacheSizeValue = makeBytesOrPercentageValue(
+		&demoCtx.CacheSize,
+		memoryPercentResolver,
+	)
+	demoCtx.demoNodeSQLMemSizeValue = makeBytesOrPercentageValue(
+		&demoCtx.SQLPoolMemorySize,
+		memoryPercentResolver,
+	)
 }
 
 // stmtDiagCtx captures the command-line parameters of the 'statement-diag'
@@ -644,37 +686,6 @@ func setImportContextDefaults() {
 	importCtx.ignoreUnsupported = false
 	importCtx.ignoreUnsupportedLog = ""
 	importCtx.rowLimit = 0
-}
-
-// proxyContext captures the command-line parameters of the `mt start-proxy` command.
-var proxyContext sqlproxyccl.ProxyOptions
-
-func setProxyContextDefaults() {
-	proxyContext.Denylist = ""
-	proxyContext.ListenAddr = "127.0.0.1:46257"
-	proxyContext.ListenCert = ""
-	proxyContext.ListenKey = ""
-	proxyContext.MetricsAddress = "0.0.0.0:8080"
-	proxyContext.RoutingRule = ""
-	proxyContext.DirectoryAddr = ""
-	proxyContext.SkipVerify = false
-	proxyContext.Insecure = false
-	proxyContext.RatelimitBaseDelay = 50 * time.Millisecond
-	proxyContext.ValidateAccessInterval = 30 * time.Second
-	proxyContext.PollConfigInterval = 30 * time.Second
-	proxyContext.ThrottleBaseDelay = time.Second
-	proxyContext.DisableConnectionRebalancing = false
-}
-
-var testDirectorySvrContext struct {
-	port          int
-	certsDir      string
-	kvAddrs       string
-	tenantBaseDir string
-}
-
-func setTestDirectorySvrContextDefaults() {
-	testDirectorySvrContext.port = 36257
 }
 
 // userfileCtx captures the command-line parameters of the

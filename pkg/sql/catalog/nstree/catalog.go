@@ -13,61 +13,177 @@ package nstree
 import (
 	"context"
 	"strings"
-	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/errors"
 )
 
 // Catalog is used to store an in-memory copy of the whole catalog, or a portion
-// thereof.
+// thereof, as well as metadata like comment and zone configs.
 type Catalog struct {
-	underlying NameMap
-	byteSize   int64
+	byID     byIDMap
+	byName   byNameMap
+	byteSize int64
 }
 
-// ForEachDescriptorEntry iterates over all descriptor table entries in an
+// CommentCatalog is a limited interface wrapper, which is used for partial
+// immutable catalogs that are incomeplete and only contain comment information.
+type CommentCatalog interface {
+	ForEachComment(fn func(key catalogkeys.CommentKey, cmt string) error) error
+	ForEachCommentOnDescriptor(
+		id descpb.ID, fn func(key catalogkeys.CommentKey, cmt string) error) error
+	LookupComment(key catalogkeys.CommentKey) (_ string, found bool)
+}
+
+// Sanity: Catalog implements a comment catalog.
+var _ CommentCatalog = Catalog{}
+
+// ForEachDescriptor iterates over all descriptor table entries in an
 // ordered fashion.
-func (c Catalog) ForEachDescriptorEntry(fn func(desc catalog.Descriptor) error) error {
+func (c Catalog) ForEachDescriptor(fn func(desc catalog.Descriptor) error) error {
 	if !c.IsInitialized() {
 		return nil
 	}
-	return c.underlying.byID.ascend(func(e catalog.NameEntry) error {
-		return fn(e.(catalog.Descriptor))
+	return c.byID.ascend(func(entry catalog.NameEntry) error {
+		if d := entry.(*byIDEntry).desc; d != nil {
+			return fn(d)
+		}
+		return nil
 	})
 }
 
-// ForEachNamespaceEntry iterates over all namespace table entries in an ordered
-// fashion.
-func (c Catalog) ForEachNamespaceEntry(fn func(e catalog.NameEntry) error) error {
+// ForEachComment iterates through all descriptor comments in the same
+// order as in system.comments.
+func (c Catalog) ForEachComment(fn func(key catalogkeys.CommentKey, cmt string) error) error {
 	if !c.IsInitialized() {
 		return nil
 	}
-	return c.underlying.byName.ascend(fn)
+	return c.byID.ascend(func(entry catalog.NameEntry) error {
+		return entry.(*byIDEntry).forEachComment(fn)
+	})
 }
 
-// LookupDescriptorEntry looks up a descriptor by ID.
-func (c Catalog) LookupDescriptorEntry(id descpb.ID) catalog.Descriptor {
-	if !c.IsInitialized() || id == descpb.InvalidID {
+// ForEachCommentOnDescriptor iterates through all comments on a specific
+// descriptor in the same order as in system.comments.
+func (c Catalog) ForEachCommentOnDescriptor(
+	id descpb.ID, fn func(key catalogkeys.CommentKey, cmt string) error,
+) error {
+	if !c.IsInitialized() {
 		return nil
 	}
-	e := c.underlying.byID.get(id)
+	e := c.byID.get(id)
 	if e == nil {
 		return nil
 	}
-	return e.(catalog.Descriptor)
+	return e.(*byIDEntry).forEachComment(fn)
+}
+
+// ForEachZoneConfig iterates over all zone config table entries in an
+// ordered fashion.
+func (c Catalog) ForEachZoneConfig(fn func(id descpb.ID, zc catalog.ZoneConfig) error) error {
+	if !c.IsInitialized() {
+		return nil
+	}
+	return c.byID.ascend(func(entry catalog.NameEntry) error {
+		if zc := entry.(*byIDEntry).zc; zc != nil {
+			return fn(entry.GetID(), zc)
+		}
+		return nil
+	})
+}
+
+// ForEachNamespaceEntry iterates over all name -> ID mappings in the same
+// order as in system.namespace.
+func (c Catalog) ForEachNamespaceEntry(fn func(e NamespaceEntry) error) error {
+	if !c.IsInitialized() {
+		return nil
+	}
+	return c.byName.ascend(func(entry catalog.NameEntry) error {
+		return fn(entry.(NamespaceEntry))
+	})
+}
+
+// ForEachDatabaseNamespaceEntry iterates over all database name -> ID mappings
+// in the same order as in system.namespace.
+func (c Catalog) ForEachDatabaseNamespaceEntry(fn func(e NamespaceEntry) error) error {
+	if !c.IsInitialized() {
+		return nil
+	}
+	return c.byName.ascendDatabases(func(entry catalog.NameEntry) error {
+		return fn(entry.(NamespaceEntry))
+	})
+}
+
+// ForEachSchemaNamespaceEntryInDatabase iterates over all schema name -> ID
+// mappings in the same order as in system.namespace for the mappings
+// corresponding to schemas in the requested database.
+func (c Catalog) ForEachSchemaNamespaceEntryInDatabase(
+	dbID descpb.ID, fn func(e NamespaceEntry) error,
+) error {
+	if !c.IsInitialized() {
+		return nil
+	}
+	return c.byName.ascendSchemasForDatabase(dbID, func(entry catalog.NameEntry) error {
+		return fn(entry.(NamespaceEntry))
+	})
+}
+
+// LookupDescriptor looks up a descriptor by ID.
+func (c Catalog) LookupDescriptor(id descpb.ID) catalog.Descriptor {
+	if !c.IsInitialized() || id == descpb.InvalidID {
+		return nil
+	}
+	e := c.byID.get(id)
+	if e == nil {
+		return nil
+	}
+	return e.(*byIDEntry).desc
+}
+
+// LookupComment looks up a comment by (CommentType, ID, SubID).
+func (c Catalog) LookupComment(key catalogkeys.CommentKey) (_ string, found bool) {
+	if !c.IsInitialized() {
+		return "", false
+	}
+	e := c.byID.get(descpb.ID(key.ObjectID))
+	if e == nil {
+		return "", false
+	}
+	cbt := &e.(*byIDEntry).comments[key.CommentType]
+	ordinal, ok := cbt.subObjectOrdinals.Get(int(key.SubID))
+	if !ok {
+		return "", false
+	}
+	return cbt.comments[ordinal], true
+}
+
+// LookupZoneConfig looks up a zone config by ID.
+func (c Catalog) LookupZoneConfig(id descpb.ID) catalog.ZoneConfig {
+	if !c.IsInitialized() {
+		return nil
+	}
+	e := c.byID.get(id)
+	if e == nil {
+		return nil
+	}
+	return e.(*byIDEntry).zc
 }
 
 // LookupNamespaceEntry looks up a descriptor ID by name.
-func (c Catalog) LookupNamespaceEntry(key catalog.NameKey) catalog.NameEntry {
+func (c Catalog) LookupNamespaceEntry(key catalog.NameKey) NamespaceEntry {
 	if !c.IsInitialized() || key == nil {
 		return nil
 	}
-	return c.underlying.byName.getByName(key.GetParentID(), key.GetParentSchemaID(), key.GetName())
+	e := c.byName.getByName(key.GetParentID(), key.GetParentSchemaID(), key.GetName())
+	if e == nil {
+		return nil
+	}
+	return e.(NamespaceEntry)
 }
 
 // OrderedDescriptors returns the descriptors in an ordered fashion.
@@ -75,8 +191,8 @@ func (c Catalog) OrderedDescriptors() []catalog.Descriptor {
 	if !c.IsInitialized() {
 		return nil
 	}
-	ret := make([]catalog.Descriptor, 0, c.underlying.byID.t.Len())
-	_ = c.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+	ret := make([]catalog.Descriptor, 0, c.byID.t.Len())
+	_ = c.ForEachDescriptor(func(desc catalog.Descriptor) error {
 		ret = append(ret, desc)
 		return nil
 	})
@@ -88,8 +204,8 @@ func (c Catalog) OrderedDescriptorIDs() []descpb.ID {
 	if !c.IsInitialized() {
 		return nil
 	}
-	ret := make([]descpb.ID, 0, c.underlying.byName.t.Len())
-	_ = c.ForEachNamespaceEntry(func(e catalog.NameEntry) error {
+	ret := make([]descpb.ID, 0, c.byName.t.Len())
+	_ = c.ForEachNamespaceEntry(func(e NamespaceEntry) error {
 		ret = append(ret, e.GetID())
 		return nil
 	})
@@ -99,11 +215,10 @@ func (c Catalog) OrderedDescriptorIDs() []descpb.ID {
 // IsInitialized returns false if the underlying map has not yet been
 // initialized. Initialization is done lazily when
 func (c Catalog) IsInitialized() bool {
-	return c.underlying.initialized()
+	return c.byID.initialized() && c.byName.initialized()
 }
 
 var _ validate.ValidationDereferencer = Catalog{}
-var _ validate.ValidationDereferencer = MutableCatalog{}
 
 // DereferenceDescriptors implements the validate.ValidationDereferencer
 // interface.
@@ -112,7 +227,7 @@ func (c Catalog) DereferenceDescriptors(
 ) ([]catalog.Descriptor, error) {
 	ret := make([]catalog.Descriptor, len(reqs))
 	for i, id := range reqs {
-		ret[i] = c.LookupDescriptorEntry(id)
+		ret[i] = c.LookupDescriptor(id)
 	}
 	return ret, nil
 }
@@ -149,14 +264,14 @@ func (c Catalog) Validate(
 func (c Catalog) ValidateNamespaceEntry(key catalog.NameKey) error {
 	ne := c.LookupNamespaceEntry(key)
 	if ne == nil {
-		return errors.New("invalid descriptor ID")
+		return errors.AssertionFailedf("invalid namespace entry")
 	}
 	// Handle special cases.
 	switch ne.GetID() {
 	case descpb.InvalidID:
 		return errors.New("invalid descriptor ID")
-	case keys.PublicSchemaID:
-		// The public schema doesn't have a descriptor.
+	case keys.SystemPublicSchemaID:
+		// The public schema for the system database doesn't have a descriptor.
 		return nil
 	default:
 		isSchema := ne.GetParentID() != keys.RootNamespaceID && ne.GetParentSchemaID() == keys.RootNamespaceID
@@ -166,21 +281,19 @@ func (c Catalog) ValidateNamespaceEntry(key catalog.NameKey) error {
 		}
 	}
 	// Compare the namespace entry with the referenced descriptor.
-	desc := c.LookupDescriptorEntry(ne.GetID())
+	desc := c.LookupDescriptor(ne.GetID())
 	if desc == nil {
-		return catalog.ErrDescriptorNotFound
+		return catalog.ErrReferencedDescriptorNotFound
 	}
 	if desc.Dropped() {
-		return errors.Newf("no matching name info in draining names of dropped %s",
-			desc.DescriptorType())
+		return catalog.ErrDescriptorDropped
 	}
 	if ne.GetParentID() == desc.GetParentID() &&
 		ne.GetParentSchemaID() == desc.GetParentSchemaID() &&
 		ne.GetName() == desc.GetName() {
 		return nil
 	}
-	return errors.Newf("no matching name info found in non-dropped %s %q",
-		desc.DescriptorType(), desc.GetName())
+	return errors.Newf("mismatched name %q in %s descriptor", desc.GetName(), desc.DescriptorType())
 }
 
 // ValidateWithRecover is like Validate but which recovers from panics.
@@ -207,83 +320,62 @@ func (c Catalog) ByteSize() int64 {
 	return c.byteSize
 }
 
-// MutableCatalog is like Catalog but mutable.
-type MutableCatalog struct {
-	Catalog
+// FilterByIDs returns a subset of the catalog only for the desired IDs.
+func (c Catalog) FilterByIDs(ids []descpb.ID) Catalog {
+	var ret MutableCatalog
+	ret.addByIDEntries(c, ids)
+	if !ret.IsInitialized() {
+		return Catalog{}
+	}
+	_ = c.byName.ascend(func(found catalog.NameEntry) error {
+		if ret.byID.get(found.GetID()) == nil {
+			return nil
+		}
+		e := ret.ensureForName(found)
+		*e = *found.(*byNameEntry)
+		return nil
+	})
+	return ret.Catalog
 }
 
-// UpsertDescriptorEntry adds a descriptor to the MutableCatalog.
-func (mc *MutableCatalog) UpsertDescriptorEntry(desc catalog.Descriptor) {
-	if desc == nil || desc.GetID() == descpb.InvalidID {
+// FilterByIDsExclusive is like FilterByIDs but without any by-name entries.
+func (c Catalog) FilterByIDsExclusive(ids []descpb.ID) Catalog {
+	var ret MutableCatalog
+	ret.addByIDEntries(c, ids)
+	return ret.Catalog
+}
+
+func (mc *MutableCatalog) addByIDEntries(c Catalog, ids []descpb.ID) {
+	if !c.IsInitialized() {
 		return
 	}
-	mc.underlying.maybeInitialize()
-	if replaced := mc.underlying.byID.upsert(desc); replaced != nil {
-		mc.byteSize -= replaced.(catalog.Descriptor).ByteSize()
-	}
-	mc.byteSize += desc.ByteSize()
-}
-
-// DeleteDescriptorEntry removes a descriptor from the MutableCatalog.
-func (mc *MutableCatalog) DeleteDescriptorEntry(id descpb.ID) {
-	if id == descpb.InvalidID || !mc.IsInitialized() {
-		return
-	}
-	mc.underlying.maybeInitialize()
-	if removed := mc.underlying.byID.delete(id); removed != nil {
-		mc.byteSize -= removed.(catalog.Descriptor).ByteSize()
+	for _, id := range ids {
+		found := c.byID.get(id)
+		if found == nil {
+			continue
+		}
+		e := mc.ensureForID(id)
+		*e = *found.(*byIDEntry)
 	}
 }
 
-// UpsertNamespaceEntry adds a name -> id mapping to the MutableCatalog.
-func (mc *MutableCatalog) UpsertNamespaceEntry(key catalog.NameKey, id descpb.ID) {
-	if key == nil || id == descpb.InvalidID {
-		return
+// FilterByNames returns a subset of the catalog only for the desired names.
+func (c Catalog) FilterByNames(nameInfos []descpb.NameInfo) Catalog {
+	if !c.IsInitialized() {
+		return Catalog{}
 	}
-	mc.underlying.maybeInitialize()
-	nsEntry := &namespaceEntry{
-		NameInfo: descpb.NameInfo{
-			ParentID:       key.GetParentID(),
-			ParentSchemaID: key.GetParentSchemaID(),
-			Name:           key.GetName(),
-		},
-		ID: id,
+	var ret MutableCatalog
+	for _, ni := range nameInfos {
+		found := c.byName.getByName(ni.ParentID, ni.ParentSchemaID, ni.Name)
+		if found == nil {
+			continue
+		}
+		e := ret.ensureForName(&ni)
+		*e = *found.(*byNameEntry)
+		if foundByID := c.byID.get(e.id); foundByID != nil {
+			e := ret.ensureForID(e.id)
+			*e = *foundByID.(*byIDEntry)
+		}
 	}
-	if replaced := mc.underlying.byName.upsert(nsEntry); replaced != nil {
-		mc.byteSize -= replaced.(*namespaceEntry).ByteSize()
-	}
-	mc.byteSize += nsEntry.ByteSize()
-}
-
-// DeleteNamespaceEntry removes a name -> id mapping from the MutableCatalog.
-func (mc *MutableCatalog) DeleteNamespaceEntry(key catalog.NameKey) {
-	if key == nil || !mc.IsInitialized() {
-		return
-	}
-	mc.underlying.maybeInitialize()
-	if removed := mc.underlying.byName.delete(key); removed != nil {
-		mc.byteSize -= removed.(*namespaceEntry).ByteSize()
-	}
-}
-
-// Clear empties the MutableCatalog.
-func (mc *MutableCatalog) Clear() {
-	mc.underlying.Clear()
-}
-
-type namespaceEntry struct {
-	descpb.NameInfo
-	descpb.ID
-}
-
-var _ catalog.NameEntry = namespaceEntry{}
-
-// GetID implements the catalog.NameEntry interface.
-func (e namespaceEntry) GetID() descpb.ID {
-	return e.ID
-}
-
-// ByteSize returns the number of bytes a namespaceEntry object takes.
-func (e namespaceEntry) ByteSize() int64 {
-	return int64(e.NameInfo.Size()) + int64(unsafe.Sizeof(e.ID))
+	return ret.Catalog
 }

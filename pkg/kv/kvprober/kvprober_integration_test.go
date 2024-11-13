@@ -20,6 +20,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvprober"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -87,11 +89,11 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 	t.Run("a single range is unavailable for all KV ops", func(t *testing.T) {
 		s, _, p, cleanup := initTestProber(t, base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(i context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(i context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 					for _, ru := range ba.Requests {
 						key := ru.GetInner().Header().Key
 						if bytes.HasPrefix(key, keys.TimeseriesPrefix) {
-							return roachpb.NewError(fmt.Errorf("boom"))
+							return kvpb.NewError(fmt.Errorf("boom"))
 						}
 					}
 					return nil
@@ -129,11 +131,11 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 
 		s, _, p, cleanup := initTestProber(t, base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(i context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(i context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 					if !dbIsAvailable.Get() {
 						for _, ru := range ba.Requests {
 							if ru.GetGet() != nil {
-								return roachpb.NewError(fmt.Errorf("boom"))
+								return kvpb.NewError(fmt.Errorf("boom"))
 							}
 						}
 						return nil
@@ -174,11 +176,11 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 
 		s, _, p, cleanup := initTestProber(t, base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(i context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(i context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 					if !dbIsAvailable.Get() {
 						for _, ru := range ba.Requests {
 							if ru.GetPut() != nil {
-								return roachpb.NewError(fmt.Errorf("boom"))
+								return kvpb.NewError(fmt.Errorf("boom"))
 							}
 						}
 						return nil
@@ -256,7 +258,10 @@ func TestPlannerMakesPlansCoveringAllRanges(t *testing.T) {
 	skip.UnderShort(t)
 
 	ctx := context.Background()
-	_, sqlDB, p, cleanup := initTestProber(t, base.TestingKnobs{})
+	// Disable split and merge queue just in case.
+	_, sqlDB, p, cleanup := initTestProber(t, base.TestingKnobs{
+		Store: &kvserver.StoreTestingKnobs{DisableSplitQueue: true, DisableMergeQueue: true},
+	})
 	defer cleanup()
 
 	rangeIDToTimesWouldBeProbed := make(map[int64]int)
@@ -290,10 +295,58 @@ func TestPlannerMakesPlansCoveringAllRanges(t *testing.T) {
 				}
 			}
 			return true
-		}, time.Second, time.Millisecond)
+		}, testutils.DefaultSucceedsSoonDuration, 20*time.Millisecond)
 	}
 	for i := 0; i < 20; i++ {
 		test(i)
+	}
+}
+
+func TestProberOpsValidatesProbeKey(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, _, _, cleanup := initTestProber(t, base.TestingKnobs{})
+	defer cleanup()
+
+	var ops kvprober.ProberOps
+	probeOps := []struct {
+		name string
+		op   func(roachpb.Key) func(context.Context, *kv.Txn) error
+	}{
+		{"Read", ops.Read},
+		{"Write", ops.Write},
+	}
+
+	probeKeys := []struct {
+		key   roachpb.Key
+		valid bool
+	}{
+		// Global key.
+		{roachpb.Key("a"), false},
+		// Incorrect range local key.
+		{keys.RangeDescriptorKey(roachpb.RKey("a")), false},
+		// Incorrect range-ID local key.
+		{keys.RangeLeaseKey(1), false},
+		// Correct range local probe key.
+		{keys.RangeProbeKey(roachpb.RKey("a")), true},
+	}
+
+	for _, op := range probeOps {
+		t.Run(op.name, func(t *testing.T) {
+			for _, key := range probeKeys {
+				t.Run(key.key.String(), func(t *testing.T) {
+					err := s.DB().Txn(ctx, op.op(key.key))
+					if key.valid {
+						require.NoError(t, err)
+					} else {
+						require.Error(t, err)
+						require.True(t, errors.IsAssertionFailure(err))
+					}
+				})
+			}
+		})
 	}
 }
 

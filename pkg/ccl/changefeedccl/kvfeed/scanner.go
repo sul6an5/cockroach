@@ -20,15 +20,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -38,6 +41,7 @@ type scanConfig struct {
 	Timestamp hlc.Timestamp
 	WithDiff  bool
 	Knobs     TestingKnobs
+	Boundary  jobspb.ResolvedSpan_BoundaryType
 }
 
 type kvScanner interface {
@@ -102,7 +106,13 @@ func (p *scanRequestScanner) Scan(ctx context.Context, sink kvevent.Writer, cfg 
 
 		g.GoCtx(func(ctx context.Context) error {
 			defer limAlloc.Release()
-			err := p.exportSpan(ctx, span, cfg.Timestamp, cfg.WithDiff, sink, cfg.Knobs)
+			spanAlloc, err := p.tryAcquireMemory(ctx, sink)
+			if err != nil {
+				return err
+			}
+			defer spanAlloc.Release(ctx)
+
+			err = p.exportSpan(ctx, span, cfg.Timestamp, cfg.Boundary, cfg.WithDiff, sink, cfg.Knobs)
 			finished := atomic.AddInt64(&atomicFinished, 1)
 			if backfillDec != nil {
 				backfillDec()
@@ -116,10 +126,52 @@ func (p *scanRequestScanner) Scan(ctx context.Context, sink kvevent.Writer, cfg 
 	return g.Wait()
 }
 
+var logMemAcquireEvery = log.Every(5 * time.Second)
+
+// tryAcquireMemory attempts to acquire memory for span export.
+func (p *scanRequestScanner) tryAcquireMemory(
+	ctx context.Context, sink kvevent.Writer,
+) (alloc kvevent.Alloc, err error) {
+	allocator, ok := sink.(kvevent.MemAllocator)
+	if !ok {
+		// Not an allocator -- can't acquire memory.
+		return alloc, nil
+	}
+
+	// Begin by attempting to acquire memory for the request we're about to issue.
+	alloc, err = allocator.AcquireMemory(ctx, changefeedbase.ScanRequestSize.Get(&p.settings.SV))
+	if err == nil {
+		return alloc, nil
+	}
+
+	retryOpts := retry.Options{
+		InitialBackoff: 500 * time.Millisecond,
+		MaxBackoff:     10 * time.Second,
+	}
+
+	// We failed to acquire memory for this export.  Begin retry loop -- we may succeed
+	// in the future, once somebody releases memory.
+	for attempt := retry.StartWithCtx(ctx, retryOpts); attempt.Next(); {
+		// Sink implements memory allocator interface, so acquire
+		// memory needed to hold scan reply.
+		if logMemAcquireEvery.ShouldLog() {
+			log.Errorf(ctx, "Failed to acquire memory for export span: %s (attempt %d)",
+				err, attempt.CurrentAttempt()+1)
+		}
+		alloc, err = allocator.AcquireMemory(ctx, changefeedbase.ScanRequestSize.Get(&p.settings.SV))
+		if err == nil {
+			return alloc, nil
+		}
+	}
+
+	return alloc, ctx.Err()
+}
+
 func (p *scanRequestScanner) exportSpan(
 	ctx context.Context,
 	span roachpb.Span,
 	ts hlc.Timestamp,
+	boundaryType jobspb.ResolvedSpan_BoundaryType,
 	withDiff bool,
 	sink kvevent.Writer,
 	knobs TestingKnobs,
@@ -137,9 +189,22 @@ func (p *scanRequestScanner) exportSpan(
 	for remaining := &span; remaining != nil; {
 		start := timeutil.Now()
 		b := txn.NewBatch()
-		r := roachpb.NewScan(remaining.Key, remaining.EndKey, false /* forUpdate */).(*roachpb.ScanRequest)
-		r.ScanFormat = roachpb.BATCH_RESPONSE
+		r := kvpb.NewScan(remaining.Key, remaining.EndKey, false /* forUpdate */).(*kvpb.ScanRequest)
+		r.ScanFormat = kvpb.BATCH_RESPONSE
 		b.Header.TargetBytes = targetBytesPerScan
+		b.AdmissionHeader = kvpb.AdmissionHeader{
+			// TODO(irfansharif): Make this configurable if we want system table
+			// scanners or support "high priority" changefeeds to run at higher
+			// priorities. We use higher AC priorities for system-internal
+			// rangefeeds listening in on system table changes.
+			Priority: int32(admissionpb.BulkNormalPri),
+			// We specify a creation time for each batch (as opposed to at the
+			// txn level) -- this way later batches from earlier txns don't just
+			// out compete batches from newer txns.
+			CreateTime:               start.UnixNano(),
+			Source:                   kvpb.AdmissionHeader_FROM_SQL,
+			NoMemoryReservedAtSource: true,
+		}
 		// NB: We use a raw request rather than the Scan() method because we want
 		// the MVCC timestamps which are encoded in the response but are filtered
 		// during result parsing.
@@ -164,7 +229,7 @@ func (p *scanRequestScanner) exportSpan(
 		if res.ResumeSpan != nil {
 			consumed := roachpb.Span{Key: remaining.Key, EndKey: res.ResumeSpan.Key}
 			if err := sink.Add(
-				ctx, kvevent.NewBackfillResolvedEvent(consumed, ts, jobspb.ResolvedSpan_NONE),
+				ctx, kvevent.NewBackfillResolvedEvent(consumed, ts, boundaryType),
 			); err != nil {
 				return err
 			}
@@ -173,7 +238,7 @@ func (p *scanRequestScanner) exportSpan(
 	}
 	// p.metrics.PollRequestNanosHist.RecordValue(scanDuration.Nanoseconds())
 	if err := sink.Add(
-		ctx, kvevent.NewBackfillResolvedEvent(span, ts, jobspb.ResolvedSpan_NONE),
+		ctx, kvevent.NewBackfillResolvedEvent(span, ts, boundaryType),
 	); err != nil {
 		return err
 	}
@@ -187,7 +252,7 @@ func (p *scanRequestScanner) exportSpan(
 func getSpansToProcess(
 	ctx context.Context, ds *kvcoord.DistSender, targetSpans []roachpb.Span,
 ) ([]roachpb.Span, error) {
-	ranges, err := allRangeSpans(ctx, ds, targetSpans)
+	ranges, err := AllRangeSpans(ctx, ds, targetSpans)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +297,7 @@ func getSpansToProcess(
 func slurpScanResponse(
 	ctx context.Context,
 	sink kvevent.Writer,
-	res *roachpb.ScanResponse,
+	res *kvpb.ScanResponse,
 	backfillTS hlc.Timestamp,
 	withDiff bool,
 	span roachpb.Span,
@@ -254,7 +319,8 @@ func slurpScanResponse(
 	return nil
 }
 
-func allRangeSpans(
+// AllRangeSpans returns the list of all ranges that for the specified list of spans.
+func AllRangeSpans(
 	ctx context.Context, ds *kvcoord.DistSender, spans []roachpb.Span,
 ) ([]roachpb.Span, error) {
 

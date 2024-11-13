@@ -76,11 +76,11 @@ var trPool = sync.Pool{
 
 // newTableReader creates a tableReader.
 func newTableReader(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*tableReader, error) {
 	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
 	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); ok && nodeID == 0 {
@@ -112,7 +112,7 @@ func newTableReader(
 	resolver := flowCtx.NewTypeResolver(flowCtx.Txn)
 	for i := range spec.FetchSpec.KeyAndSuffixColumns {
 		if err := typedesc.EnsureTypeIsHydrated(
-			flowCtx.EvalCtx.Ctx(), spec.FetchSpec.KeyAndSuffixColumns[i].Type, &resolver,
+			ctx, spec.FetchSpec.KeyAndSuffixColumns[i].Type, &resolver,
 		); err != nil {
 			return nil, err
 		}
@@ -123,14 +123,14 @@ func newTableReader(
 		resultTypes[i] = spec.FetchSpec.FetchedColumns[i].Type
 	}
 
-	tr.ignoreMisplannedRanges = flowCtx.Local
+	tr.ignoreMisplannedRanges = flowCtx.Local || spec.IgnoreMisplannedRanges
 	if err := tr.Init(
+		ctx,
 		tr,
 		post,
 		resultTypes,
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// We don't pass tr.input as an inputToDrain; tr.input is just an adapter
@@ -146,7 +146,7 @@ func newTableReader(
 
 	var fetcher row.Fetcher
 	if err := fetcher.Init(
-		flowCtx.EvalCtx.Context,
+		ctx,
 		row.FetcherInitArgs{
 			Txn:                        flowCtx.Txn,
 			Reverse:                    spec.Reverse,
@@ -154,7 +154,7 @@ func newTableReader(
 			LockWaitPolicy:             spec.LockingWaitPolicy,
 			LockTimeout:                flowCtx.EvalCtx.SessionData().LockTimeout,
 			Alloc:                      &tr.alloc,
-			MemMonitor:                 flowCtx.EvalCtx.Mon,
+			MemMonitor:                 flowCtx.Mon,
 			Spec:                       &spec.FetchSpec,
 			TraceKV:                    flowCtx.TraceKV,
 			ForceProductionKVBatchSize: flowCtx.EvalCtx.TestingKnobs.ForceProductionValues,
@@ -170,7 +170,7 @@ func newTableReader(
 		tr.MakeSpansCopy()
 	}
 
-	if execstats.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx.CollectStats) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		tr.fetcher = newRowFetcherStatCollector(&fetcher)
 		tr.ExecStatsForTrace = tr.execStatsForTrace
 	} else {
@@ -217,7 +217,7 @@ func (tr *tableReader) startScan(ctx context.Context) error {
 	} else {
 		initialTS := tr.FlowCtx.Txn.ReadTimestamp()
 		err = tr.fetcher.StartInconsistentScan(
-			ctx, tr.FlowCtx.Cfg.DB, initialTS, tr.maxTimestampAge, tr.Spans,
+			ctx, tr.FlowCtx.Cfg.DB.KV(), initialTS, tr.maxTimestampAge, tr.Spans,
 			bytesLimit, tr.limitHint, tr.EvalCtx.QualityOfService(),
 		)
 	}
@@ -254,7 +254,7 @@ func TestingSetScannedRowProgressFrequency(val int64) func() {
 func (tr *tableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	for tr.State == execinfra.StateRunning {
 		if !tr.scanStarted {
-			err := tr.startScan(tr.Ctx)
+			err := tr.startScan(tr.Ctx())
 			if err != nil {
 				tr.MoveToDraining(err)
 				break
@@ -269,7 +269,7 @@ func (tr *tableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata
 			return nil, meta
 		}
 
-		row, _, err := tr.fetcher.NextRow(tr.Ctx)
+		row, _, err := tr.fetcher.NextRow(tr.Ctx())
 		if row == nil || err != nil {
 			tr.MoveToDraining(err)
 			break
@@ -290,7 +290,7 @@ func (tr *tableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata
 func (tr *tableReader) close() {
 	if tr.InternalClose() {
 		if tr.fetcher != nil {
-			tr.fetcher.Close(tr.Ctx)
+			tr.fetcher.Close(tr.Ctx())
 		}
 	}
 }
@@ -306,17 +306,21 @@ func (tr *tableReader) execStatsForTrace() *execinfrapb.ComponentStats {
 	if !ok {
 		return nil
 	}
-	tr.scanStats = execstats.GetScanStats(tr.Ctx, tr.ExecStatsTrace)
+	tr.scanStats = execstats.GetScanStats(tr.Ctx(), tr.ExecStatsTrace)
+	contentionTime, contentionEvents := execstats.GetCumulativeContentionTime(tr.Ctx(), tr.ExecStatsTrace)
 	ret := &execinfrapb.ComponentStats{
 		KV: execinfrapb.KVStats{
 			BytesRead:           optional.MakeUint(uint64(tr.fetcher.GetBytesRead())),
 			TuplesRead:          is.NumTuples,
 			KVTime:              is.WaitTime,
-			ContentionTime:      optional.MakeTimeValue(execstats.GetCumulativeContentionTime(tr.Ctx, tr.ExecStatsTrace)),
+			ContentionTime:      optional.MakeTimeValue(contentionTime),
+			ContentionEvents:    contentionEvents,
 			BatchRequestsIssued: optional.MakeUint(uint64(tr.fetcher.GetBatchRequestsIssued())),
+			KVCPUTime:           optional.MakeTimeValue(is.kvCPUTime),
 		},
 		Output: tr.OutputHelper.Stats(),
 	}
+	ret.Exec.ConsumedRU = optional.MakeUint(tr.scanStats.ConsumedRU)
 	execstats.PopulateKVMVCCStats(&ret.KV, &tr.scanStats)
 	return ret
 }
@@ -326,13 +330,13 @@ func (tr *tableReader) generateMeta() []execinfrapb.ProducerMetadata {
 	if !tr.ignoreMisplannedRanges {
 		nodeID, ok := tr.FlowCtx.NodeID.OptionalNodeID()
 		if ok {
-			ranges := execinfra.MisplannedRanges(tr.Ctx, tr.SpansCopy, nodeID, tr.FlowCtx.Cfg.RangeCache)
+			ranges := execinfra.MisplannedRanges(tr.Ctx(), tr.SpansCopy, nodeID, tr.FlowCtx.Cfg.RangeCache)
 			if ranges != nil {
 				trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 			}
 		}
 	}
-	if tfs := execinfra.GetLeafTxnFinalState(tr.Ctx, tr.FlowCtx.Txn); tfs != nil {
+	if tfs := execinfra.GetLeafTxnFinalState(tr.Ctx(), tr.FlowCtx.Txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
 

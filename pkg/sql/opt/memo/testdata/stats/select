@@ -883,10 +883,9 @@ inner-join (lookup t_json_arr)
  │    ├── eq columns: [1] = [1]
  │    ├── left fixed columns: [7] = ['\x3761000112620001']
  │    ├── right fixed columns: [7] = ['\x3763000112640001']
- │    ├── stats: [rows=61.7284, distinct(1)=61.7284, null(1)=0]
+ │    ├── stats: [rows=61.7284]
  │    └── filters (true)
- └── filters
-      └── b:2 @> '{"a": "b", "c": "d"}' [type=bool, outer=(2), immutable, constraints=(/2: (/NULL - ])]
+ └── filters (true)
 
 # Should generate a select on the table with a JSON filter, since c does not
 # have an inverted index.
@@ -1301,24 +1300,24 @@ project
 
 # Sample testcase using exprgen.
 expr colstat=1 colstat=2
-(Select 
+(Select
   (FakeRel
     [
       (OutputCols [ (NewColumn "a" "int") (NewColumn "b" "int") (NewColumn "c" "int")] )
       (Cardinality "-")
-      (Stats `[
+      (stats `[
         {
           "columns": ["a"],
           "distinct_count": 100,
-          "null_count": 0, 
-          "row_count": 100, 
+          "null_count": 0,
+          "row_count": 100,
           "created_at": "2018-01-01 1:00:00.00000+00:00"
         },
         {
           "columns": ["b"],
           "distinct_count": 20,
-          "null_count": 5, 
-          "row_count": 100, 
+          "null_count": 5,
+          "row_count": 100,
           "created_at": "2018-01-01 1:00:00.00000+00:00"
         }
       ]`)
@@ -1968,18 +1967,18 @@ SELECT * FROM data WHERE created = '2020-04-11 06:25:41+00:00'
 select
  ├── columns: user_id:1(uuid!null) name:2(varchar) created:3(timestamptz!null)
  ├── stats: [rows=1.000001, distinct(3)=1, null(3)=0]
- │   histogram(3)=  0               1
- │                <--- '2020-04-11 06:25:41+00:00'
+ │   histogram(3)=  0             1
+ │                <--- '2020-04-11 06:25:41+00'
  ├── fd: ()-->(3)
  ├── scan data
  │    ├── columns: user_id:1(uuid!null) name:2(varchar) created:3(timestamptz)
  │    └── stats: [rows=10000, distinct(1)=1000, null(1)=0, distinct(3)=10000, null(3)=0]
  │        histogram(1)=  0                    1                     4998                    1                     4999                    1
  │                     <--- '3b57b3e4-a68a-9b47-2752-e365d7d8954e' ------ '6b49a786-387b-d5a2-6582-4e963eb4d537' ------ 'd9739a48-d5be-9a62-e752-34d877e56ba5'
- │        histogram(3)=  0               1               4998               1               4999               1
- │                     <--- '2020-02-11 07:25:00+00:00' ------ '2020-03-21 06:45:41+00:00' ------ '2020-04-21 06:25:41+00:00'
+ │        histogram(3)=  0             1              4998             1              4999             1
+ │                     <--- '2020-02-11 07:25:00+00' ------ '2020-03-21 06:45:41+00' ------ '2020-04-21 06:25:41+00'
  └── filters
-      └── created:3 = '2020-04-11 06:25:41+00:00' [type=bool, outer=(3), constraints=(/3: [/'2020-04-11 06:25:41+00:00' - /'2020-04-11 06:25:41+00:00']; tight), fd=()-->(3)]
+      └── created:3 = '2020-04-11 06:25:41+00' [type=bool, outer=(3), constraints=(/3: [/'2020-04-11 06:25:41+00' - /'2020-04-11 06:25:41+00']; tight), fd=()-->(3)]
 
 # Make sure that using a histogram produces correct stats with range
 # calculations for non-numeric types.
@@ -2568,14 +2567,14 @@ SELECT * FROM disjunction WHERE a = 'foo' OR b = 'foo' LIMIT 5
 limit
  ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
  ├── cardinality: [0 - 5]
- ├── stats: [rows=2]
+ ├── stats: [rows=1.9995]
  ├── key: (1)
  ├── fd: (1)-->(2-4)
  ├── distinct-on
  │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
  │    ├── grouping columns: k:1(int!null)
  │    ├── internal-ordering: +1
- │    ├── stats: [rows=2]
+ │    ├── stats: [rows=1.9995]
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── limit hint: 5.00
@@ -2627,14 +2626,14 @@ SELECT * FROM disjunction WHERE a = 'foo' OR b = 'foo' OR c = 'foo' LIMIT 5
 limit
  ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
  ├── cardinality: [0 - 5]
- ├── stats: [rows=3.000001]
+ ├── stats: [rows=2.998501]
  ├── key: (1)
  ├── fd: (1)-->(2-4)
  ├── distinct-on
  │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
  │    ├── grouping columns: k:1(int!null)
  │    ├── internal-ordering: +1
- │    ├── stats: [rows=3.000001]
+ │    ├── stats: [rows=2.998501]
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── limit hint: 5.00
@@ -2642,7 +2641,7 @@ limit
  │    │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
  │    │    ├── left columns: k:7(int) a:8(string) b:9(string) c:10(string)
  │    │    ├── right columns: k:13(int) a:14(string) b:15(string) c:16(string)
- │    │    ├── stats: [rows=3.000001]
+ │    │    ├── stats: [rows=2.999501]
  │    │    ├── ordering: +1
  │    │    ├── index-join disjunction
  │    │    │    ├── columns: k:7(int!null) a:8(string!null) b:9(string) c:10(string)
@@ -2660,7 +2659,7 @@ limit
  │    │    └── distinct-on
  │    │         ├── columns: k:13(int!null) a:14(string) b:15(string) c:16(string)
  │    │         ├── grouping columns: k:13(int!null)
- │    │         ├── stats: [rows=2]
+ │    │         ├── stats: [rows=1.9995]
  │    │         ├── key: (13)
  │    │         ├── fd: (13)-->(14-16)
  │    │         ├── ordering: +13
@@ -2718,12 +2717,12 @@ SELECT * FROM disjunction WHERE (a = 'foo' OR b = 'foo') AND c = 'foo' LIMIT 5
 limit
  ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string!null)
  ├── cardinality: [0 - 5]
- ├── stats: [rows=0.001]
+ ├── stats: [rows=0.0009997504]
  ├── key: (1)
  ├── fd: ()-->(4), (1)-->(2,3)
  ├── select
  │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string!null)
- │    ├── stats: [rows=0.001, distinct(4)=0.001, null(4)=0]
+ │    ├── stats: [rows=0.0009997504, distinct(4)=0.00099975, null(4)=0]
  │    ├── key: (1)
  │    ├── fd: ()-->(4), (1)-->(2,3)
  │    ├── limit hint: 5.00
@@ -2799,7 +2798,7 @@ limit
  ├── distinct-on
  │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
  │    ├── grouping columns: k:1(int!null)
- │    ├── stats: [rows=40]
+ │    ├── stats: [rows=39.96]
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── limit hint: 5.00
@@ -2866,7 +2865,7 @@ limit
  ├── distinct-on
  │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
  │    ├── grouping columns: k:1(int!null)
- │    ├── stats: [rows=60]
+ │    ├── stats: [rows=59.88008]
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── limit hint: 5.00
@@ -2874,7 +2873,7 @@ limit
  │    │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
  │    │    ├── left columns: k:7(int) a:8(string) b:9(string) c:10(string)
  │    │    ├── right columns: k:13(int) a:14(string) b:15(string) c:16(string)
- │    │    ├── stats: [rows=60]
+ │    │    ├── stats: [rows=59.96]
  │    │    ├── limit hint: 6.28
  │    │    ├── index-join disjunction
  │    │    │    ├── columns: k:7(int!null) a:8(string!null) b:9(string) c:10(string)
@@ -2896,7 +2895,7 @@ limit
  │    │    └── distinct-on
  │    │         ├── columns: k:13(int!null) a:14(string) b:15(string) c:16(string)
  │    │         ├── grouping columns: k:13(int!null)
- │    │         ├── stats: [rows=40]
+ │    │         ├── stats: [rows=39.96]
  │    │         ├── key: (13)
  │    │         ├── fd: (13)-->(14-16)
  │    │         ├── limit hint: 6.28
@@ -2963,14 +2962,14 @@ SELECT * FROM disjunction WHERE (a LIKE 'foo%' OR b LIKE 'foo%') AND c LIKE 'foo
 limit
  ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string!null)
  ├── cardinality: [0 - 5]
- ├── stats: [rows=0.08000001]
+ ├── stats: [rows=0.07992001]
  ├── key: (1)
  ├── fd: (1)-->(2-4)
  ├── select
  │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string!null)
- │    ├── stats: [rows=0.08000001, distinct(4)=0.08, null(4)=0]
- │    │   histogram(4)=  0  0.04   0.04    0
- │    │                <--- 'foo' ------ 'fop'
+ │    ├── stats: [rows=0.07992001, distinct(4)=0.07992, null(4)=0]
+ │    │   histogram(4)=  0 0.03996 0.03996    0
+ │    │                <--- 'foo' --------- 'fop'
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── limit hint: 5.00
@@ -3004,7 +3003,7 @@ limit
  ├── fd: (1)-->(2-4)
  ├── select
  │    ├── columns: k:1(int!null) a:2(string) b:3(string) c:4(string)
- │    ├── stats: [rows=10000]
+ │    ├── stats: [rows=9920]
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── limit hint: 5.00
@@ -3019,7 +3018,7 @@ limit
  │    │    │                <--- 'aaa' ----- 'foo' ---- 'fop' ------ 'zoo'
  │    │    ├── key: (1)
  │    │    ├── fd: (1)-->(2-4)
- │    │    └── limit hint: 5.00
+ │    │    └── limit hint: 5.04
  │    └── filters
  │         └── ((a:2 > 'fop') OR (b:3 > 'fop')) OR (c:4 > 'fop') [type=bool, outer=(2-4)]
  └── 5 [type=int]
@@ -3300,3 +3299,704 @@ project
  └── projections
       ├── NULL [as="?column?":33, type=unknown]
       └── 1 [as="?column?":34, type=int]
+
+# Regression test for #85499. Avoid overflow when calculating distinct count.
+exec-ddl
+CREATE TABLE t85499 (c0 INT);
+----
+
+norm
+SELECT t85499.rowid FROM t85499
+WHERE (t85499.rowid) BETWEEN (0) AND (
+  CASE  WHEN NULL THEN t85499.rowid
+  ELSE IF(NULL, 1, 9223372036854775807) END
+)
+UNION SELECT t85499.rowid FROM t85499;
+----
+union
+ ├── columns: rowid:9(int!null)
+ ├── left columns: t85499.rowid:2(int)
+ ├── right columns: t85499.rowid:6(int)
+ ├── stats: [rows=1111.111, distinct(9)=1111.11, null(9)=0]
+ ├── key: (9)
+ ├── select
+ │    ├── columns: t85499.rowid:2(int!null)
+ │    ├── stats: [rows=111.1111, distinct(2)=111.111, null(2)=0]
+ │    ├── key: (2)
+ │    ├── scan t85499
+ │    │    ├── columns: t85499.rowid:2(int!null)
+ │    │    ├── stats: [rows=1000, distinct(2)=1000, null(2)=0]
+ │    │    └── key: (2)
+ │    └── filters
+ │         └── (t85499.rowid:2 >= 0) AND (t85499.rowid:2 <= 9223372036854775807) [type=bool, outer=(2), constraints=(/2: [/0 - /9223372036854775807]; tight)]
+ └── scan t85499
+      ├── columns: t85499.rowid:6(int!null)
+      ├── stats: [rows=1000, distinct(6)=1000, null(6)=0]
+      └── key: (6)
+
+# Regression test for support issue #1821
+exec-ddl
+CREATE TABLE t1821 (
+    n INT8 NOT NULL,
+    a INT8 NULL,
+    b INT8 NULL,
+    c STRING NULL,
+    CONSTRAINT t1_pkey PRIMARY KEY (n ASC),
+    INDEX a_idx (a ASC),
+    INDEX b_idx (b ASC)
+)
+----
+
+exec-ddl
+ALTER TABLE t1821 INJECT STATISTICS '[
+    {
+        "avg_size": 4,
+        "columns": [
+            "n"
+        ],
+        "created_at": "2022-09-28 15:29:12.909895",
+        "distinct_count": 199241,
+        "null_count": 0,
+        "row_count": 200000
+    },
+    {
+        "avg_size": 3,
+        "columns": [
+            "a"
+        ],
+        "created_at": "2022-09-28 15:29:12.909895",
+        "distinct_count": 100000,
+        "histo_buckets": [
+            {
+                "distinct_range": 0,
+                "num_eq": 0,
+                "num_range": 0,
+                "upper_bound": "-9223372036854775808"
+            },
+            {
+                "distinct_range": 7.275957614183426E-12,
+                "num_eq": 50000,
+                "num_range": 0,
+                "upper_bound": "1"
+            },
+            {
+                "distinct_range": 417.004372929906,
+                "num_eq": 16,
+                "num_range": 150000,
+                "upper_bound": "200000"
+            },
+            {
+                "distinct_range": 7.275957614183426E-12,
+                "num_eq": 0,
+                "num_range": 0,
+                "upper_bound": "9223372036854775807"
+            }
+        ],
+        "histo_col_type": "INT8",
+        "histo_version": 2,
+        "null_count": 0,
+        "row_count": 200000
+    },
+    {
+        "avg_size": 3,
+        "columns": [
+            "b"
+        ],
+        "created_at": "2022-09-28 15:29:12.909895",
+        "distinct_count": 100000,
+        "histo_buckets": [
+            {
+                "distinct_range": 0,
+                "num_eq": 0,
+                "num_range": 0,
+                "upper_bound": "-9223372036854775808"
+            },
+            {
+                "distinct_range": 7.275957614183426E-12,
+                "num_eq": 50000,
+                "num_range": 0,
+                "upper_bound": "1"
+            },
+            {
+                "distinct_range": 417.004372929906,
+                "num_eq": 16,
+                "num_range": 150000,
+                "upper_bound": "200000"
+            },
+            {
+                "distinct_range": 7.275957614183426E-12,
+                "num_eq": 0,
+                "num_range": 0,
+                "upper_bound": "9223372036854775807"
+            }
+        ],
+        "histo_col_type": "INT8",
+        "histo_version": 2,
+        "null_count": 0,
+        "row_count": 200000
+    },
+    {
+        "avg_size": 3,
+        "columns": [
+            "c"
+        ],
+        "created_at": "2022-09-28 15:29:12.909895",
+        "distinct_count": 1,
+        "histo_buckets": [
+            {
+                "distinct_range": 0,
+                "num_eq": 200000,
+                "num_range": 0,
+                "upper_bound": "a"
+            }
+        ],
+        "histo_col_type": "STRING",
+        "histo_version": 2,
+        "null_count": 0,
+        "row_count": 200000
+    }
+]';
+----
+
+# Zig-zag join should not be picked due to high selectivity.
+opt
+SELECT count(*) FROM t1821 WHERE a = 1 AND b = 1
+----
+scalar-group-by
+ ├── columns: count:7(int!null)
+ ├── cardinality: [1 - 1]
+ ├── stats: [rows=1]
+ ├── key: ()
+ ├── fd: ()-->(7)
+ ├── select
+ │    ├── columns: a:2(int!null) b:3(int!null)
+ │    ├── stats: [rows=29371.93, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(2,3)=1, null(2,3)=0]
+ │    │   histogram(2)=  0 29372
+ │    │                <---- 1 -
+ │    │   histogram(3)=  0 29372
+ │    │                <---- 1 -
+ │    ├── fd: ()-->(2,3)
+ │    ├── scan t1821
+ │    │    ├── columns: a:2(int) b:3(int)
+ │    │    └── stats: [rows=200000, distinct(2)=100000, null(2)=0, distinct(3)=100000, null(3)=0, distinct(2,3)=200000, null(2,3)=0]
+ │    │        histogram(2)=  0           0            0 49996 1.4999e+05  15.999  0           0
+ │    │                     <--- -9223372036854775808 ---- 1 ------------- 200000 --- 9223372036854775807
+ │    │        histogram(3)=  0           0            0 49996 1.4999e+05  15.999  0           0
+ │    │                     <--- -9223372036854775808 ---- 1 ------------- 200000 --- 9223372036854775807
+ │    └── filters
+ │         ├── a:2 = 1 [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+ │         └── b:3 = 1 [type=bool, outer=(3), constraints=(/3: [/1 - /1]; tight), fd=()-->(3)]
+ └── aggregations
+      └── count-rows [as=count_rows:7, type=int]
+
+# Zig-zag join plus index join should not be picked due to high selectivity.
+opt
+SELECT count(c) FROM t1821 WHERE a = 1 AND b = 1
+----
+scalar-group-by
+ ├── columns: count:7(int!null)
+ ├── cardinality: [1 - 1]
+ ├── stats: [rows=1]
+ ├── key: ()
+ ├── fd: ()-->(7)
+ ├── select
+ │    ├── columns: a:2(int!null) b:3(int!null) c:4(string)
+ │    ├── stats: [rows=29371.93, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(2,3)=1, null(2,3)=0]
+ │    │   histogram(2)=  0 29372
+ │    │                <---- 1 -
+ │    │   histogram(3)=  0 29372
+ │    │                <---- 1 -
+ │    ├── fd: ()-->(2,3)
+ │    ├── scan t1821
+ │    │    ├── columns: a:2(int) b:3(int) c:4(string)
+ │    │    └── stats: [rows=200000, distinct(2)=100000, null(2)=0, distinct(3)=100000, null(3)=0, distinct(2,3)=200000, null(2,3)=0]
+ │    │        histogram(2)=  0           0            0 49996 1.4999e+05  15.999  0           0
+ │    │                     <--- -9223372036854775808 ---- 1 ------------- 200000 --- 9223372036854775807
+ │    │        histogram(3)=  0           0            0 49996 1.4999e+05  15.999  0           0
+ │    │                     <--- -9223372036854775808 ---- 1 ------------- 200000 --- 9223372036854775807
+ │    └── filters
+ │         ├── a:2 = 1 [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+ │         └── b:3 = 1 [type=bool, outer=(3), constraints=(/3: [/1 - /1]; tight), fd=()-->(3)]
+ └── aggregations
+      └── count [as=count:7, type=int, outer=(4)]
+           └── c:4 [type=string]
+
+# When the zig-zag join is covering, stats come from the Select group.
+opt
+SELECT 1 FROM t1821@{FORCE_ZIGZAG} WHERE a = 1 AND b = 1
+----
+project
+ ├── columns: "?column?":7(int!null)
+ ├── stats: [rows=29371.93]
+ ├── fd: ()-->(7)
+ ├── inner-join (zigzag t1821@a_idx t1821@b_idx)
+ │    ├── columns: a:2(int!null) b:3(int!null)
+ │    ├── eq columns: [1] = [1]
+ │    ├── left fixed columns: [2] = [1]
+ │    ├── right fixed columns: [3] = [1]
+ │    ├── stats: [rows=29371.93, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(2,3)=1, null(2,3)=0]
+ │    │   histogram(2)=  0 29372
+ │    │                <---- 1 -
+ │    │   histogram(3)=  0 29372
+ │    │                <---- 1 -
+ │    ├── fd: ()-->(2,3)
+ │    └── filters
+ │         ├── a:2 = 1 [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+ │         └── b:3 = 1 [type=bool, outer=(3), constraints=(/3: [/1 - /1]; tight), fd=()-->(3)]
+ └── projections
+      └── 1 [as="?column?":7, type=int]
+
+# When the zig-zag join is not covering and the stats come from memoizing the
+# zig-zag join, verify that the row count is the same as above.
+opt
+SELECT c FROM t1821@{FORCE_ZIGZAG} WHERE a = 1 AND b = 1
+----
+project
+ ├── columns: c:4(string)
+ ├── stats: [rows=29371.93]
+ └── inner-join (lookup t1821)
+      ├── columns: a:2(int!null) b:3(int!null) c:4(string)
+      ├── key columns: [1] = [1]
+      ├── lookup columns are key
+      ├── stats: [rows=29371.93, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(2,3)=1, null(2,3)=0]
+      │   histogram(2)=  0 29372
+      │                <---- 1 -
+      │   histogram(3)=  0 29372
+      │                <---- 1 -
+      ├── fd: ()-->(2,3)
+      ├── inner-join (zigzag t1821@a_idx t1821@b_idx)
+      │    ├── columns: n:1(int!null) a:2(int!null) b:3(int!null)
+      │    ├── eq columns: [1] = [1]
+      │    ├── left fixed columns: [2] = [1]
+      │    ├── right fixed columns: [3] = [1]
+      │    ├── stats: [rows=29371.93, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(2,3)=1, null(2,3)=0]
+      │    │   histogram(2)=  0 29372
+      │    │                <---- 1 -
+      │    │   histogram(3)=  0 29372
+      │    │                <---- 1 -
+      │    ├── fd: ()-->(2,3)
+      │    └── filters
+      │         ├── a:2 = 1 [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+      │         └── b:3 = 1 [type=bool, outer=(3), constraints=(/3: [/1 - /1]; tight), fd=()-->(3)]
+      └── filters (true)
+
+# Regression test for #100582. A bucket with an infinite upper bound should not
+# create NaNs in filtered histograms.
+exec-ddl
+CREATE TABLE t100582 (
+  id INT PRIMARY KEY,
+  s STRING NULL,
+  d DECIMAL NULL
+);
+----
+
+exec-ddl
+ALTER TABLE t100582 INJECT STATISTICS '[
+  {
+    "columns": ["d"],
+    "row_count": 3,
+    "distinct_count": 3,
+    "null_count": 0,
+    "histo_buckets": [
+      {
+        "distinct_range": 0,
+        "num_eq": 0,
+        "num_range": 0,
+        "upper_bound": "0"
+      },
+      {
+        "distinct_range": 0,
+        "num_eq": 1,
+        "num_range": 0,
+        "upper_bound": "1"
+      },
+      {
+        "distinct_range": 1,
+        "num_eq": 0,
+        "num_range": 1,
+        "upper_bound": "Infinity"
+      }
+    ],
+    "histo_col_type": "DECIMAL",
+    "created_at": "2023-04-04 07:47:43.132805",
+    "histo_version": 2
+  }
+]'
+----
+
+# The filtered histogram should not have a numRange of NaN.
+norm
+SELECT s FROM t100582 WHERE d >= 2;
+----
+project
+ ├── columns: s:2(string)
+ ├── immutable
+ ├── stats: [rows=0.75]
+ └── select
+      ├── columns: s:2(string) d:3(decimal!null)
+      ├── immutable
+      ├── stats: [rows=0.75, distinct(3)=0.5, null(3)=0]
+      │   histogram(3)=  0  0  0.5     0
+      │                <--- 2 ----- Infinity
+      ├── scan t100582
+      │    ├── columns: s:2(string) d:3(decimal)
+      │    └── stats: [rows=3, distinct(3)=3, null(3)=0]
+      │        histogram(3)=  0  0  0  1  1     0
+      │                     <--- 0 --- 1 --- Infinity
+      └── filters
+           └── d:3 >= 2 [type=bool, outer=(3), immutable, constraints=(/3: [/2 - ]; tight)]
+
+# Tests for selectivity of disjunctions
+
+exec-ddl
+CREATE TABLE t00 (c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, c5 INT)
+----
+
+# 6 columns with identical stats histograms
+exec-ddl
+ALTER TABLE t00 INJECT STATISTICS '[
+  {
+    "columns": ["c0"],
+    "created_at": "2019-02-08 04:10:40.001179+00:00",
+    "row_count": 10,
+    "distinct_count": 10,
+    "histo_buckets": [
+        {
+            "distinct_range": 0,
+            "num_eq": 0,
+            "num_range": 0,
+            "upper_bound": "0"
+        },
+        {
+            "distinct_range": 9,
+            "num_eq": 1,
+            "num_range": 9,
+            "upper_bound": "10"
+        }
+    ],
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "null_count": 0,
+    "avg_size": 3
+  },
+  {
+    "columns": ["c1"],
+    "created_at": "2019-02-08 04:10:40.001179+00:00",
+    "row_count": 10,
+    "distinct_count": 10,
+    "histo_buckets": [
+        {
+            "distinct_range": 0,
+            "num_eq": 0,
+            "num_range": 0,
+            "upper_bound": "0"
+        },
+        {
+            "distinct_range": 9,
+            "num_eq": 1,
+            "num_range": 9,
+            "upper_bound": "10"
+        }
+    ],
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "null_count": 0,
+    "avg_size": 3
+  },
+  {
+    "columns": ["c2"],
+    "created_at": "2019-02-08 04:10:40.001179+00:00",
+    "row_count": 10,
+    "distinct_count": 10,
+    "histo_buckets": [
+        {
+            "distinct_range": 0,
+            "num_eq": 0,
+            "num_range": 0,
+            "upper_bound": "0"
+        },
+        {
+            "distinct_range": 9,
+            "num_eq": 1,
+            "num_range": 9,
+            "upper_bound": "10"
+        }
+    ],
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "null_count": 0,
+    "avg_size": 3
+  },
+  {
+    "columns": ["c3"],
+    "created_at": "2019-02-08 04:10:40.001179+00:00",
+    "row_count": 10,
+    "distinct_count": 10,
+    "histo_buckets": [
+        {
+            "distinct_range": 0,
+            "num_eq": 0,
+            "num_range": 0,
+            "upper_bound": "0"
+        },
+        {
+            "distinct_range": 9,
+            "num_eq": 1,
+            "num_range": 9,
+            "upper_bound": "10"
+        }
+    ],
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "null_count": 0,
+    "avg_size": 3
+  },
+  {
+    "columns": ["c4"],
+    "created_at": "2019-02-08 04:10:40.001179+00:00",
+    "row_count": 10,
+    "distinct_count": 10,
+    "histo_buckets": [
+        {
+            "distinct_range": 0,
+            "num_eq": 0,
+            "num_range": 0,
+            "upper_bound": "0"
+        },
+        {
+            "distinct_range": 9,
+            "num_eq": 1,
+            "num_range": 9,
+            "upper_bound": "10"
+        }
+    ],
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "null_count": 0,
+    "avg_size": 3
+  },
+  {
+    "columns": ["c5"],
+    "created_at": "2019-02-08 04:10:40.001179+00:00",
+    "row_count": 10,
+    "distinct_count": 10,
+    "histo_buckets": [
+        {
+            "distinct_range": 0,
+            "num_eq": 0,
+            "num_range": 0,
+            "upper_bound": "0"
+        },
+        {
+            "distinct_range": 9,
+            "num_eq": 1,
+            "num_range": 9,
+            "upper_bound": "10"
+        }
+    ],
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "null_count": 0,
+    "avg_size": 3
+  }
+]'
+----
+
+# Expect estimate of 10 rows.
+opt
+SELECT c0 FROM t00 WHERE (c0 IS NOT NULL) OR (1 < ALL (c0, c0))
+----
+select
+ ├── columns: c0:1(int)
+ ├── stats: [rows=10]
+ ├── scan t00
+ │    ├── columns: c0:1(int)
+ │    └── stats: [rows=10, distinct(1)=10, null(1)=0]
+ │        histogram(1)=  0  0  9  1
+ │                     <--- 0 --- 10
+ └── filters
+      └── (c0:1 IS NOT NULL) OR (NOT (1 >= ANY (c0:1, c0:1))) [type=bool, outer=(1)]
+
+# ORed predicate selectivity should be approximately additive.
+opt
+SELECT c0 FROM t00 WHERE (c0 = 1) OR (c1 = 3)
+----
+project
+ ├── columns: c0:1(int)
+ ├── stats: [rows=1.9]
+ └── select
+      ├── columns: c0:1(int) c1:2(int)
+      ├── stats: [rows=1.9]
+      ├── scan t00
+      │    ├── columns: c0:1(int) c1:2(int)
+      │    └── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(2)=10, null(2)=0]
+      │        histogram(1)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(2)=  0  0  9  1
+      │                     <--- 0 --- 10
+      └── filters
+           └── (c0:1 = 1) OR (c1:2 = 3) [type=bool, outer=(1,2)]
+
+# The row counts are slightly different when using legacy disjunction stats
+# calculation.
+opt set=optimizer_use_improved_disjunction_stats=false
+SELECT c0 FROM t00 WHERE (c0 = 1) OR (c1 = 3)
+----
+project
+ ├── columns: c0:1(int)
+ ├── stats: [rows=2]
+ └── select
+      ├── columns: c0:1(int) c1:2(int)
+      ├── stats: [rows=2]
+      ├── scan t00
+      │    ├── columns: c0:1(int) c1:2(int)
+      │    └── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(2)=10, null(2)=0]
+      │        histogram(1)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(2)=  0  0  9  1
+      │                     <--- 0 --- 10
+      └── filters
+           └── (c0:1 = 1) OR (c1:2 = 3) [type=bool, outer=(1,2)]
+
+# ORed predicate selectivity when ANDed with a predicate which selects all rows
+# should not change.
+opt
+SELECT c0 FROM t00 WHERE (c0 BETWEEN 1 AND 10) AND (c0 = 1 OR c1 = 3)
+----
+project
+ ├── columns: c0:1(int!null)
+ ├── stats: [rows=1.9]
+ └── select
+      ├── columns: c0:1(int!null) c1:2(int)
+      ├── stats: [rows=1.9, distinct(1)=1.9, null(1)=0]
+      │   histogram(1)=  0  0  1.71 0.19
+      │                <--- 0 ------ 10
+      ├── scan t00
+      │    ├── columns: c0:1(int) c1:2(int)
+      │    └── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(2)=10, null(2)=0]
+      │        histogram(1)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(2)=  0  0  9  1
+      │                     <--- 0 --- 10
+      └── filters
+           ├── (c0:1 >= 1) AND (c0:1 <= 10) [type=bool, outer=(1), constraints=(/1: [/1 - /10]; tight)]
+           └── (c0:1 = 1) OR (c1:2 = 3) [type=bool, outer=(1,2)]
+
+# Extra zero-cardinality terms should not reduce estimated row count.
+opt
+SELECT c0 FROM t00 WHERE (c0 = 1) OR (c1 = 3) OR
+                         (c0 = -1) OR (c1 = -1)
+----
+project
+ ├── columns: c0:1(int)
+ ├── stats: [rows=1.9]
+ └── select
+      ├── columns: c0:1(int) c1:2(int)
+      ├── stats: [rows=1.9]
+      ├── scan t00
+      │    ├── columns: c0:1(int) c1:2(int)
+      │    └── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(2)=10, null(2)=0]
+      │        histogram(1)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(2)=  0  0  9  1
+      │                     <--- 0 --- 10
+      └── filters
+           └── (((c0:1 = 1) OR (c1:2 = 3)) OR (c0:1 = -1)) OR (c1:2 = -1) [type=bool, outer=(1,2)]
+
+# Selectivity should not exceed 1.
+opt
+SELECT c0 FROM t00 WHERE (c0 between 0 and 10) OR (c1 between 0 and 10)
+----
+project
+ ├── columns: c0:1(int)
+ ├── stats: [rows=10]
+ └── select
+      ├── columns: c0:1(int) c1:2(int)
+      ├── stats: [rows=10]
+      ├── scan t00
+      │    ├── columns: c0:1(int) c1:2(int)
+      │    └── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(2)=10, null(2)=0]
+      │        histogram(1)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(2)=  0  0  9  1
+      │                     <--- 0 --- 10
+      └── filters
+           └── ((c0:1 >= 0) AND (c0:1 <= 10)) OR ((c1:2 >= 0) AND (c1:2 <= 10)) [type=bool, outer=(1,2)]
+
+# Selectivity of ORed terms on multiple different columns is roughly additive.
+opt
+SELECT c0 FROM t00 WHERE
+(c0 = 1) OR (c1 = 1) OR (c2 = 1) OR (c3 = 1) OR (c4 = 1) OR (c5 = 1)
+----
+project
+ ├── columns: c0:1(int)
+ ├── stats: [rows=4.68559]
+ └── select
+      ├── columns: c0:1(int) c1:2(int) c2:3(int) c3:4(int) c4:5(int) c5:6(int)
+      ├── stats: [rows=4.68559]
+      ├── scan t00
+      │    ├── columns: c0:1(int) c1:2(int) c2:3(int) c3:4(int) c4:5(int) c5:6(int)
+      │    └── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=0, distinct(4)=10, null(4)=0, distinct(5)=10, null(5)=0, distinct(6)=10, null(6)=0]
+      │        histogram(1)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(2)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(3)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(4)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(5)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(6)=  0  0  9  1
+      │                     <--- 0 --- 10
+      └── filters
+           └── (((((c0:1 = 1) OR (c1:2 = 1)) OR (c2:3 = 1)) OR (c3:4 = 1)) OR (c4:5 = 1)) OR (c5:6 = 1) [type=bool, outer=(1-6)]
+
+# Expected row count 0.19
+opt
+SELECT c0 FROM t00 WHERE (c0 = 1 AND (c1 = 1 OR c2 = 1))
+----
+project
+ ├── columns: c0:1(int!null)
+ ├── stats: [rows=0.19]
+ ├── fd: ()-->(1)
+ └── select
+      ├── columns: c0:1(int!null) c1:2(int) c2:3(int)
+      ├── stats: [rows=0.19, distinct(1)=0.19, null(1)=0]
+      │   histogram(1)=  0 0.19
+      │                <--- 1 -
+      ├── fd: ()-->(1)
+      ├── scan t00
+      │    ├── columns: c0:1(int) c1:2(int) c2:3(int)
+      │    └── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=10, null(3)=0]
+      │        histogram(1)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(2)=  0  0  9  1
+      │                     <--- 0 --- 10
+      │        histogram(3)=  0  0  9  1
+      │                     <--- 0 --- 10
+      └── filters
+           ├── c0:1 = 1 [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
+           └── (c1:2 = 1) OR (c2:3 = 1) [type=bool, outer=(2,3)]
+
+# The estimated row count here should be approximately twice that of the above
+# query, but the optimizer is currently unable to handle more complex
+# predicates and ends up using the default 1/3 selectivity.
+# TODO(msirek): More work is needed for nested ANDs and ORs.
+opt
+SELECT c0 FROM t00 WHERE (c0 = 1 AND (c1 = 1 OR c2 = 1)) OR
+                         (c3 = 2 AND (c4 = 2 OR c5 = 2))
+----
+project
+ ├── columns: c0:1(int)
+ ├── stats: [rows=3.333333]
+ └── select
+      ├── columns: c0:1(int) c1:2(int) c2:3(int) c3:4(int) c4:5(int) c5:6(int)
+      ├── stats: [rows=3.333333]
+      ├── scan t00
+      │    ├── columns: c0:1(int) c1:2(int) c2:3(int) c3:4(int) c4:5(int) c5:6(int)
+      │    └── stats: [rows=10]
+      └── filters
+           └── ((c0:1 = 1) AND ((c1:2 = 1) OR (c2:3 = 1))) OR ((c3:4 = 2) AND ((c4:5 = 2) OR (c5:6 = 2))) [type=bool, outer=(1-6)]
+
+# End tests for selectivity of disjunctions

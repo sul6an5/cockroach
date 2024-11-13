@@ -17,16 +17,16 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn/connectionpb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 // externalConnectionRecord is a reflective representation of a row in a
@@ -40,6 +40,7 @@ type externalConnectionRecord struct {
 	ConnectionType    string                         `col:"connection_type"`
 	ConnectionDetails connectionpb.ConnectionDetails `col:"connection_details"`
 	Owner             username.SQLUsername           `col:"owner"`
+	OwnerID           oid.Oid                        `col:"owner_id"`
 }
 
 // MutableExternalConnection is a mutable representation of an External
@@ -90,13 +91,13 @@ func (e *externalConnectionNotFoundError) Error() string {
 // `system.external_connections` table and returns the read-only interface for
 // interacting with it.
 func LoadExternalConnection(
-	ctx context.Context, name string, ex sqlutil.InternalExecutor, txn *kv.Txn,
+	ctx context.Context, name string, txn isql.Txn,
 ) (ExternalConnection, error) {
 	// Loading an External Connection is only allowed for users with the `USAGE`
 	// privilege. We run the query as `node` since the user might not have
 	// `SELECT` on the system table.
-	row, cols, err := ex.QueryRowExWithCols(ctx, "lookup-schedule", txn,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+	row, cols, err := txn.QueryRowExWithCols(ctx, "lookup-schedule", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf("SELECT * FROM system.external_connections WHERE connection_name = '%s'", name))
 
 	if err != nil {
@@ -111,6 +112,11 @@ func LoadExternalConnection(
 		return nil, err
 	}
 	return ec, nil
+}
+
+// ConnectionName returns the connection_name.
+func (e *MutableExternalConnection) ConnectionName() string {
+	return e.rec.ConnectionName
 }
 
 // SetConnectionName updates the connection name.
@@ -152,9 +158,15 @@ func (e *MutableExternalConnection) SetOwner(owner username.SQLUsername) {
 	e.markDirty("owner")
 }
 
-// ConnectionName returns the connection_name.
-func (e *MutableExternalConnection) ConnectionName() string {
-	return e.rec.ConnectionName
+// OwnerID returns the user ID of the owner of the External Connection object.
+func (e *MutableExternalConnection) OwnerID() oid.Oid {
+	return e.rec.OwnerID
+}
+
+// SetOwnerID updates the External Connection object's owner user ID.
+func (e *MutableExternalConnection) SetOwnerID(id oid.Oid) {
+	e.rec.OwnerID = id
+	e.markDirty("owner_id")
 }
 
 // UnredactedConnectionStatement implements the External Connection interface.
@@ -182,6 +194,8 @@ func datumToNative(datum tree.Datum) (interface{}, error) {
 		return []byte(*d), nil
 	case *tree.DTimestamp:
 		return d.Time, nil
+	case *tree.DOid:
+		return d.Oid, nil
 	}
 	return nil, errors.Newf("cannot handle type %T", datum)
 }
@@ -279,9 +293,7 @@ func generatePlaceholders(n int) string {
 // Only the values initialized in the receiver are persisted in the system
 // table. If an error is returned, it is callers responsibility to handle it
 // (e.g. rollback transaction).
-func (e *MutableExternalConnection) Create(
-	ctx context.Context, ex sqlutil.InternalExecutor, user username.SQLUsername, txn *kv.Txn,
-) error {
+func (e *MutableExternalConnection) Create(ctx context.Context, txn isql.Txn) error {
 	cols, qargs, err := e.marshalChanges()
 	if err != nil {
 		return err
@@ -291,8 +303,8 @@ func (e *MutableExternalConnection) Create(
 	// `EXTERNALCONNECTION` system privilege. We run the query as `node`
 	// since the user might not have `INSERT` on the system table.
 	createQuery := "INSERT INTO system.external_connections (%s) VALUES (%s) RETURNING connection_name"
-	row, retCols, err := ex.QueryRowExWithCols(ctx, "ExternalConnection.Create", txn,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+	row, retCols, err := txn.QueryRowExWithCols(ctx, "ExternalConnection.Create", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf(createQuery, strings.Join(cols, ","), generatePlaceholders(len(qargs))),
 		qargs...,
 	)
@@ -338,6 +350,11 @@ func (e *MutableExternalConnection) marshalChanges() ([]string, []interface{}, e
 			arg, err = marshalProto(&e.rec.ConnectionDetails)
 		case `owner`:
 			arg = tree.NewDString(e.rec.Owner.Normalized())
+		case `owner_id`:
+			if e.rec.OwnerID == 0 {
+				continue
+			}
+			arg = tree.NewDOid(e.rec.OwnerID)
 		default:
 			return nil, nil, errors.Newf("cannot marshal column %q", col)
 		}

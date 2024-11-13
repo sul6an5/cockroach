@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"os/user"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq" // register postgres driver
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -84,12 +86,27 @@ func main() {
 	// ##teamcity[publishArtifacts] in Teamcity mode.
 	var literalArtifacts string
 	var httpPort int
-	var debugEnabled bool
+	var promPort int
+	var debugOnFailure bool
+	var debugAlways bool
+	var runSkipped bool
+	var skipInit bool
 	var clusterID string
 	var count = 1
 	var versionsBinaryOverride map[string]string
+	var enableFIPS bool
 
 	cobra.EnableCommandSorting = false
+
+	debugModeFromOpts := func() debugMode {
+		if debugAlways {
+			return DebugKeepAlways
+		}
+		if debugOnFailure {
+			return DebugKeepOnFailure
+		}
+		return NoDebug
+	}
 
 	var rootCmd = &cobra.Command{
 		Use:   "roachtest [command] (flags)",
@@ -173,10 +190,7 @@ Examples:
    roachtest list tag:weekly
 `,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r, err := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
-			if err != nil {
-				return err
-			}
+			r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
 			if !listBench {
 				tests.RegisterTests(&r)
 			} else {
@@ -186,7 +200,7 @@ Examples:
 			matchedTests := r.List(context.Background(), args)
 			for _, test := range matchedTests {
 				var skip string
-				if test.Skip != "" {
+				if test.Skip != "" && !runSkipped {
 					skip = " (skipped: " + test.Skip + ")"
 				}
 				fmt.Printf("%s [%s]%s\n", test.Name, test.Owner, skip)
@@ -220,30 +234,31 @@ runner itself.
 				args:                   args,
 				count:                  count,
 				cpuQuota:               cpuQuota,
-				debugEnabled:           debugEnabled,
+				runSkipped:             runSkipped,
+				debugMode:              debugModeFromOpts(),
+				skipInit:               skipInit,
 				httpPort:               httpPort,
+				promPort:               promPort,
 				parallelism:            parallelism,
 				artifactsDir:           artifacts,
 				literalArtifactsDir:    literalArtifacts,
 				user:                   username,
 				clusterID:              clusterID,
 				versionsBinaryOverride: versionsBinaryOverride,
+				enableFIPS:             enableFIPS,
 			})
 		},
 	}
 
-	// TODO(irfansharif): We could remove this by directly running `cockroach
-	// version` against the binary being tested, instead of what we do today
-	// which is defaulting to checking the last git release tag present in the
-	// local checkout.
-	runCmd.Flags().StringVar(
-		&buildTag, "build-tag", "", "build tag (auto-detect if empty)")
 	runCmd.Flags().StringVar(
 		&slackToken, "slack-token", "", "Slack bot token")
 	runCmd.Flags().BoolVar(
 		&teamCity, "teamcity", false, "include teamcity-specific markers in output")
 	runCmd.Flags().BoolVar(
 		&disableIssue, "disable-issue", false, "disable posting GitHub issue for failures")
+	runCmd.Flags().IntVar(
+		&promPort, "prom-port", 2113,
+		"the http port on which to expose prom metrics from the roachtest process")
 
 	var benchCmd = &cobra.Command{
 		// Don't display usage when tests fail.
@@ -259,13 +274,16 @@ runner itself.
 				args:                   args,
 				count:                  count,
 				cpuQuota:               cpuQuota,
-				debugEnabled:           debugEnabled,
+				runSkipped:             runSkipped,
+				debugMode:              debugModeFromOpts(),
+				skipInit:               skipInit,
 				httpPort:               httpPort,
 				parallelism:            parallelism,
 				artifactsDir:           artifacts,
 				user:                   username,
 				clusterID:              clusterID,
 				versionsBinaryOverride: versionsBinaryOverride,
+				enableFIPS:             enableFIPS,
 			})
 		},
 	}
@@ -283,7 +301,13 @@ runner itself.
 		cmd.Flags().IntVar(
 			&count, "count", 1, "the number of times to run each test")
 		cmd.Flags().BoolVarP(
-			&debugEnabled, "debug", "d", debugEnabled, "don't wipe and destroy cluster if test fails")
+			&debugOnFailure, "debug", "d", debugOnFailure, "don't wipe and destroy cluster if test fails")
+		cmd.Flags().BoolVar(
+			&debugAlways, "debug-always", debugAlways, "never wipe and destroy the cluster")
+		cmd.Flags().BoolVar(
+			&runSkipped, "run-skipped", runSkipped, "run skipped tests")
+		cmd.Flags().BoolVar(
+			&skipInit, "skip-init", false, "skip initialization step (imports, table creation, etc.) for tests that support it, useful when re-using clusters with --wipe=false")
 		cmd.Flags().IntVarP(
 			&parallelism, "parallelism", "p", parallelism, "number of tests to run in parallel")
 		cmd.Flags().StringVar(
@@ -312,6 +336,8 @@ runner itself.
 				"is present in the list,"+"the respective binary will be used when a "+
 				"multi-version test asks for the respective binary, instead of "+
 				"`roachprod stage <ver>`. Example: 20.1.4=cockroach-20.1,20.2.0=cockroach-20.2.")
+		cmd.Flags().BoolVar(
+			&enableFIPS, "fips", false, "Run tests in enableFIPS mode")
 	}
 
 	parseCreateOpts(runCmd.Flags(), &overrideOpts)
@@ -327,6 +353,8 @@ runner itself.
 		fmt.Fprintf(os.Stderr, "unable to lookup current user: %s\n", err)
 		os.Exit(1)
 	}
+	// Disable spinners and other fancy status messages since all IO is non-interactive.
+	config.Quiet = true
 
 	if err := roachprod.InitDirs(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
@@ -338,7 +366,7 @@ runner itself.
 		if errors.Is(err, errTestsFailed) {
 			code = ExitCodeTestsFailed
 		}
-		if errors.Is(err, errClusterProvisioningFailed) {
+		if errors.Is(err, errSomeClusterProvisioningFailed) {
 			code = ExitCodeClusterProvisioningFailed
 		}
 		// Cobra has already printed the error message.
@@ -350,34 +378,42 @@ type cliCfg struct {
 	args                   []string
 	count                  int
 	cpuQuota               int
-	debugEnabled           bool
+	debugMode              debugMode
+	runSkipped             bool
+	skipInit               bool
 	httpPort               int
+	promPort               int
 	parallelism            int
 	artifactsDir           string
 	literalArtifactsDir    string
 	user                   string
 	clusterID              string
 	versionsBinaryOverride map[string]string
+	enableFIPS             bool
 }
 
 func runTests(register func(registry.Registry), cfg cliCfg) error {
 	if cfg.count <= 0 {
 		return fmt.Errorf("--count (%d) must by greater than 0", cfg.count)
 	}
-	r, err := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
-	if err != nil {
-		return err
-	}
+	r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
 	register(&r)
 	cr := newClusterRegistry()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
-	runner := newTestRunner(cr, stopper, r.buildVersion)
+	runner := newTestRunner(cr, stopper)
 
-	filter := registry.NewTestFilter(cfg.args)
+	filter := registry.NewTestFilter(cfg.args, cfg.runSkipped)
 	clusterType := roachprodCluster
+	bindTo := ""
 	if local {
 		clusterType = localCluster
+
+		// This will suppress the annoying "Allow incoming network connections" popup from
+		// OSX when running a roachtest
+		bindTo = "localhost"
+
+		fmt.Printf("--local specified. Binding http listener to localhost only")
 		if cfg.parallelism != 1 {
 			fmt.Printf("--local specified. Overriding --parallelism to 1.\n")
 			cfg.parallelism = 1
@@ -385,14 +421,15 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	}
 
 	opt := clustersOpt{
-		typ:                       clusterType,
-		clusterName:               clusterName,
-		user:                      getUser(cfg.user),
-		cpuQuota:                  cfg.cpuQuota,
-		keepClustersOnTestFailure: cfg.debugEnabled,
-		clusterID:                 cfg.clusterID,
+		typ:         clusterType,
+		clusterName: clusterName,
+		user:        getUser(cfg.user),
+		cpuQuota:    cfg.cpuQuota,
+		debugMode:   cfg.debugMode,
+		clusterID:   cfg.clusterID,
+		enableFIPS:  cfg.enableFIPS,
 	}
-	if err := runner.runHTTPServer(cfg.httpPort, os.Stdout); err != nil {
+	if err := runner.runHTTPServer(cfg.httpPort, os.Stdout, bindTo); err != nil {
 		return err
 	}
 
@@ -405,6 +442,10 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 		// stdout/stderr.
 		cfg.parallelism = n * cfg.count
 	}
+	if opt.debugMode == DebugKeepAlways && n > 1 {
+		return errors.Newf("--debug-always is only allowed when running a single test")
+	}
+
 	runnerDir := filepath.Join(cfg.artifactsDir, runnerLogsDir)
 	runnerLogPath := filepath.Join(
 		runnerDir, fmt.Sprintf("test_runner-%d.log", timeutil.Now().Unix()))
@@ -418,15 +459,25 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 		literalArtifactsDir: cfg.literalArtifactsDir,
 		runnerLogPath:       runnerLogPath,
 	}
-
+	go func() {
+		if err := http.ListenAndServe(
+			fmt.Sprintf(":%d", cfg.promPort),
+			promhttp.HandlerFor(r.promRegistry, promhttp.HandlerOpts{}),
+		); err != nil {
+			l.Errorf("error serving prometheus: %v", err)
+		}
+	}()
 	// We're going to run all the workers (and thus all the tests) in a context
 	// that gets canceled when the Interrupt signal is received.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	CtrlC(ctx, l, cancel, cr)
-	err = runner.Run(
+	err := runner.Run(
 		ctx, tests, cfg.count, cfg.parallelism, opt,
-		testOpts{versionsBinaryOverride: cfg.versionsBinaryOverride},
+		testOpts{
+			versionsBinaryOverride: cfg.versionsBinaryOverride,
+			skipInit:               cfg.skipInit,
+		},
 		lopt, nil /* clusterAllocator */)
 
 	// Make sure we attempt to clean up. We run with a non-canceled ctx; the
@@ -531,11 +582,11 @@ func testRunnerLogger(
 func testsToRun(
 	ctx context.Context, r testRegistryImpl, filter *registry.TestFilter,
 ) []registry.TestSpec {
-	tests := r.GetTests(ctx, filter)
+	tests, tagMismatch := r.GetTests(ctx, filter)
 
 	var notSkipped []registry.TestSpec
 	for _, s := range tests {
-		if s.Skip == "" {
+		if s.Skip == "" || filter.RunSkipped {
 			notSkipped = append(notSkipped, s)
 		} else {
 			if teamCity {
@@ -544,6 +595,13 @@ func testsToRun(
 			}
 			fmt.Fprintf(os.Stdout, "--- SKIP: %s (%s)\n\t%s\n", s.Name, "0.00s", s.Skip)
 		}
+	}
+	for _, s := range tagMismatch {
+		if teamCity {
+			fmt.Fprintf(os.Stdout, "##teamcity[testIgnored name='%s' message='tag mismatch']\n",
+				s.Name)
+		}
+		fmt.Fprintf(os.Stdout, "--- SKIP: %s (%s)\n\ttag mismatch\n", s.Name, "0.00s")
 	}
 	return notSkipped
 }

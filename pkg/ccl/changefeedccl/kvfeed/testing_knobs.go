@@ -11,7 +11,8 @@ package kvfeed
 import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 // TestingKnobs are the testing knobs for kvfeed.
@@ -22,13 +23,16 @@ type TestingKnobs struct {
 	OnRangeFeedValue func() error
 	// ShouldSkipCheckpoint invoked when rangefed receives a checkpoint.
 	// Returns true if checkpoint should be skipped.
-	ShouldSkipCheckpoint func(*roachpb.RangeFeedCheckpoint) bool
+	ShouldSkipCheckpoint func(*kvpb.RangeFeedCheckpoint) bool
 	// OnRangeFeedStart invoked when rangefeed starts.  It is given
 	// the list of SpanTimePairs.
 	OnRangeFeedStart func(spans []kvcoord.SpanTimePair)
 	// EndTimeReached is a callback that may return true to indicate the
 	// feed should exit because its end time has been reached.
 	EndTimeReached func() bool
+	// ModifyTimestamps is called on the timestamp for each RangefeedMessage
+	// before converting it into a kv event.
+	ModifyTimestamps func(*hlc.Timestamp)
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

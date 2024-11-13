@@ -95,7 +95,8 @@ func impl() error {
 		for obj := range objs {
 			_, ok := usedPkgMap[obj]
 			if !ok {
-				failure := fmt.Sprintf("%s.%s", pkgPath, obj)
+				split := strings.Split(obj, ":")
+				failure := fmt.Sprintf("%s.%s (%s:%s)", pkgPath, split[0], split[1], split[2])
 				if !ignoreUnused(failure) {
 					failures = append(failures, failure)
 				}
@@ -131,6 +132,7 @@ func ignoreUnused(obj string) bool {
 		"github.com/cockroachdb/cockroach/pkg/geo/geographiclib.",
 		"github.com/cockroachdb/cockroach/pkg/util/goschedstats.",
 		"github.com/cockroachdb/cockroach/pkg/sql/parser.",
+		"github.com/cockroachdb/cockroach/pkg/sql/plpgsql/parser.",
 	}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(obj, prefix) {

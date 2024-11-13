@@ -18,15 +18,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupdest"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/scheduledjobs/schedulebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/redact"
 )
 
 type targetScope int
@@ -66,6 +65,7 @@ const (
 	telemetryOptionSkipMissingViews          = "skip_missing_views"
 	telemetryOptionSkipLocalitiesCheck       = "skip_localities_check"
 	telemetryOptionSchemaOnly                = "schema_only"
+	telemetryOptionSkipMissingUDFs           = "skip_missing_udfs"
 )
 
 // logBackupTelemetry publishes an eventpb.RecoveryEvent about a manually
@@ -94,7 +94,7 @@ func createBackupRecoveryEvent(
 
 	multiRegion := false
 	for i := range initialDetails.ResolvedTargets {
-		_, db, _, _, _ := descpb.FromDescriptor(&initialDetails.ResolvedTargets[i])
+		_, db, _, _, _ := descpb.GetDescriptors(&initialDetails.ResolvedTargets[i])
 		if db != nil {
 			if db.RegionConfig != nil {
 				multiRegion = true
@@ -167,6 +167,7 @@ func createBackupRecoveryEvent(
 		JobID:                   uint64(jobID),
 		AsOfInterval:            initialDetails.AsOfInterval,
 		Options:                 options,
+		ApplicationName:         initialDetails.ApplicationName,
 	}
 
 	event.DestinationAuthTypes = make([]string, 0, len(authTypes))
@@ -192,7 +193,7 @@ func getLargestScope(fullCluster bool, requestedDescriptors []descpb.Descriptor)
 	// Log the largest scope from the targets.
 	for i := range requestedDescriptors {
 		var scope targetScope
-		tbl, db, _, sc, _ := descpb.FromDescriptor(&requestedDescriptors[i])
+		tbl, db, _, sc, _ := descpb.GetDescriptors(&requestedDescriptors[i])
 		if tbl != nil {
 			scope = tableScope
 		} else if sc != nil {
@@ -269,8 +270,8 @@ func loggedSubdirType(subdir string) string {
 // backup schedule.
 func logCreateScheduleTelemetry(
 	ctx context.Context,
-	incRecurrence *scheduleRecurrence,
-	fullRecurrence *scheduleRecurrence,
+	incRecurrence *schedulebase.ScheduleRecurrence,
+	fullRecurrence *schedulebase.ScheduleRecurrence,
 	firstRun *time.Time,
 	ignoreExisting bool,
 	details jobspb.ScheduleDetails,
@@ -283,12 +284,12 @@ func logCreateScheduleTelemetry(
 
 	var recurringCron string
 	if incRecurrence != nil {
-		recurringCron = incRecurrence.cron
+		recurringCron = incRecurrence.Cron
 	}
 
 	var fullCron string
 	if fullRecurrence != nil {
-		fullCron = fullRecurrence.cron
+		fullCron = fullRecurrence.Cron
 	}
 
 	// For events about backup schedule creation, simply append the schedule-only
@@ -318,6 +319,7 @@ func logRestoreTelemetry(
 	descsByTablePattern map[tree.TablePattern]catalog.Descriptor,
 	restoreDBs []catalog.DatabaseDescriptor,
 	debugPauseOn string,
+	applicationName string,
 ) {
 	var requestedTargets []descpb.Descriptor
 	for _, desc := range descsByTablePattern {
@@ -395,6 +397,9 @@ func logRestoreTelemetry(
 	if opts.SkipMissingSequenceOwners {
 		options = append(options, telemetryOptionSkipMissingSequenceOwners)
 	}
+	if opts.SkipMissingUDFs {
+		options = append(options, telemetryOptionSkipMissingUDFs)
+	}
 	if opts.Detached {
 		options = append(options, telemetryOptionDetached)
 	}
@@ -417,6 +422,7 @@ func logRestoreTelemetry(
 		DebugPauseOn:            debugPauseOn,
 		JobID:                   uint64(jobID),
 		Options:                 options,
+		ApplicationName:         applicationName,
 	}
 
 	event.DestinationAuthTypes = make([]string, 0, len(authTypes))
@@ -430,38 +436,6 @@ func logRestoreTelemetry(
 		event.DestinationStorageTypes = append(event.DestinationStorageTypes, typ)
 	}
 	sort.Strings(event.DestinationStorageTypes)
-
-	log.StructuredEvent(ctx, event)
-}
-
-// logJobCompletion publishes an eventpb.RecoveryEvent about a successful or
-// failed backup or restore job.
-func logJobCompletion(
-	ctx context.Context,
-	eventType eventpb.RecoveryEventType,
-	jobID jobspb.JobID,
-	success bool,
-	jobErr error,
-) {
-	var redactedErr redact.RedactableString
-	if jobErr != nil {
-		redactedErr = redact.Sprint(jobErr)
-	}
-	status := jobs.StatusSucceeded
-	if !success {
-		if jobs.HasErrJobCanceled(jobErr) {
-			status = jobs.StatusCanceled
-		} else {
-			status = jobs.StatusFailed
-		}
-	}
-
-	event := &eventpb.RecoveryEvent{
-		RecoveryType: eventType,
-		JobID:        uint64(jobID),
-		ResultStatus: string(status),
-		ErrorText:    redactedErr,
-	}
 
 	log.StructuredEvent(ctx, event)
 }

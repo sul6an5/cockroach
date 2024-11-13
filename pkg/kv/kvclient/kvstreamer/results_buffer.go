@@ -58,6 +58,11 @@ type resultsBuffer interface {
 	// releaseOne decrements the number of unreleased Results by one.
 	releaseOne()
 
+	// clearOverhead releases some of the internal state of the resultsBuffer
+	// reducing its usage of the budget. The method should **only** be used when
+	// the resultsBuffer is empty.
+	clearOverhead(context.Context)
+
 	// close releases all of the resources associated with the buffer.
 	close(context.Context)
 
@@ -154,7 +159,9 @@ type resultsBufferBase struct {
 	hasResults chan struct{}
 	// overheadAccountedFor tracks how much overhead space for the Results in
 	// this results buffer has been consumed from the budget. Note that this
-	// does not include the footprint of Get and Scan responses.
+	// does not include the memory usage of Get and Scan responses (i.e. neither
+	// the footprint nor the overhead of a response is tracked by
+	// overheadAccountedFor).
 	overheadAccountedFor int64
 	err                  error
 }
@@ -254,6 +261,11 @@ func (b *resultsBufferBase) error() error {
 	return b.err
 }
 
+func (b *resultsBufferBase) clearOverhead(ctx context.Context) {
+	b.budget.release(ctx, b.overheadAccountedFor)
+	b.overheadAccountedFor = 0
+}
+
 // outOfOrderResultsBuffer is a resultsBuffer that returns the Results in an
 // arbitrary order (namely in the same order as the Results are added).
 type outOfOrderResultsBuffer struct {
@@ -289,6 +301,16 @@ const resultSize = int64(unsafe.Sizeof(Result{}))
 func (b *outOfOrderResultsBuffer) doneAddingLocked(ctx context.Context) {
 	b.accountForOverheadLocked(ctx, int64(cap(b.results))*resultSize)
 	b.signal()
+}
+
+func (b *outOfOrderResultsBuffer) clearOverhead(ctx context.Context) {
+	if buildutil.CrdbTestBuild {
+		if len(b.results) > 0 {
+			panic(errors.AssertionFailedf("non-empty resultsBuffer when clearOverhead is called"))
+		}
+	}
+	b.results = nil
+	b.resultsBufferBase.clearOverhead(ctx)
 }
 
 func (b *outOfOrderResultsBuffer) get(context.Context) ([]Result, bool, error) {
@@ -493,6 +515,17 @@ func (b *inOrderResultsBuffer) doneAddingLocked(ctx context.Context) {
 	if len(b.buffered) > 0 && b.buffered[0].Position == b.headOfLinePosition && b.buffered[0].subRequestIdx == b.headOfLineSubRequestIdx {
 		b.signal()
 	}
+}
+
+func (b *inOrderResultsBuffer) clearOverhead(ctx context.Context) {
+	if buildutil.CrdbTestBuild {
+		if len(b.buffered) > 0 {
+			panic(errors.AssertionFailedf("non-empty resultsBuffer when clearOverhead is called"))
+		}
+	}
+	b.buffered = nil
+	b.resultScratch = nil
+	b.resultsBufferBase.clearOverhead(ctx)
 }
 
 func (b *inOrderResultsBuffer) get(ctx context.Context) ([]Result, bool, error) {

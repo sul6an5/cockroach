@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanlatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -59,7 +60,7 @@ import (
 // utilization and runaway queuing for misbehaving clients, a role it is well
 // positioned to serve.
 var MaxLockWaitQueueLength = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.lock_table.maximum_lock_wait_queue_length",
 	"the maximum length of a lock wait-queue that read-write requests are willing "+
 		"to enter and wait in. The setting can be used to ensure some level of quality-of-service "+
@@ -92,7 +93,7 @@ var MaxLockWaitQueueLength = settings.RegisterIntSetting(
 // discoveredCount > 100,000, caused by stats collection, where we definitely
 // want to avoid adding these locks to the lock table, if possible.
 var DiscoveredLocksThresholdToConsultFinalizedTxnCache = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.lock_table.discovered_locks_threshold_for_consulting_finalized_txn_cache",
 	"the maximum number of discovered locks by a waiter, above which the finalized txn cache"+
 		"is consulted and resolvable locks are not added to the lock table -- this should be a small"+
@@ -341,7 +342,7 @@ func (m *managerImpl) sequenceReqWithGuard(
 // into queues and optionally update its internal state based on the requests.
 func (m *managerImpl) maybeInterceptReq(ctx context.Context, req Request) (Response, *Error) {
 	switch {
-	case req.isSingle(roachpb.PushTxn):
+	case req.isSingle(kvpb.PushTxn):
 		// If necessary, wait in the txnWaitQueue for the pushee transaction to
 		// expire or to move to a finalized state.
 		t := req.Requests[0].GetPushTxn()
@@ -351,7 +352,7 @@ func (m *managerImpl) maybeInterceptReq(ctx context.Context, req Request) (Respo
 		} else if resp != nil {
 			return makeSingleResponse(resp), nil
 		}
-	case req.isSingle(roachpb.QueryTxn):
+	case req.isSingle(kvpb.QueryTxn):
 		// If necessary, wait in the txnWaitQueue for a transaction state update
 		// or for a dependent transaction to change.
 		t := req.Requests[0].GetQueryTxn()
@@ -361,9 +362,9 @@ func (m *managerImpl) maybeInterceptReq(ctx context.Context, req Request) (Respo
 		// table to allow contending transactions to proceed.
 		// for _, arg := range req.Requests {
 		// 	switch t := arg.GetInner().(type) {
-		// 	case *roachpb.ResolveIntentRequest:
+		// 	case *kvpb.ResolveIntentRequest:
 		// 		_ = t
-		// 	case *roachpb.ResolveIntentRangeRequest:
+		// 	case *kvpb.ResolveIntentRangeRequest:
 		// 		_ = t
 		// 	}
 		// }
@@ -379,10 +380,10 @@ func (m *managerImpl) maybeInterceptReq(ctx context.Context, req Request) (Respo
 // they could wait on them, even if they don't acquire latches.
 func shouldIgnoreLatches(req Request) bool {
 	switch {
-	case req.ReadConsistency != roachpb.CONSISTENT:
+	case req.ReadConsistency != kvpb.CONSISTENT:
 		// Only acquire latches for consistent operations.
 		return true
-	case req.isSingle(roachpb.RequestLease):
+	case req.isSingle(kvpb.RequestLease):
 		// Ignore latches for lease requests. These requests are run on replicas
 		// that do not hold the lease, so acquiring latches wouldn't help
 		// synchronize with other requests.
@@ -394,7 +395,7 @@ func shouldIgnoreLatches(req Request) bool {
 // shouldWaitOnLatchesWithoutAcquiring determines if this is a request that
 // only waits on existing latches without acquiring any new ones.
 func shouldWaitOnLatchesWithoutAcquiring(req Request) bool {
-	return req.isSingle(roachpb.Barrier)
+	return req.isSingle(kvpb.Barrier)
 }
 
 // PoisonReq implements the RequestSequencer interface.
@@ -435,7 +436,7 @@ func (m *managerImpl) FinishReq(g *Guard) {
 
 // HandleWriterIntentError implements the ContentionHandler interface.
 func (m *managerImpl) HandleWriterIntentError(
-	ctx context.Context, g *Guard, seq roachpb.LeaseSequence, t *roachpb.WriteIntentError,
+	ctx context.Context, g *Guard, seq roachpb.LeaseSequence, t *kvpb.WriteIntentError,
 ) (*Guard, *Error) {
 	if g.ltg == nil {
 		log.Fatalf(ctx, "cannot handle WriteIntentError %v for request without "+
@@ -497,7 +498,7 @@ func (m *managerImpl) HandleWriterIntentError(
 
 // HandleTransactionPushError implements the ContentionHandler interface.
 func (m *managerImpl) HandleTransactionPushError(
-	ctx context.Context, g *Guard, t *roachpb.TransactionPushError,
+	ctx context.Context, g *Guard, t *kvpb.TransactionPushError,
 ) *Guard {
 	m.twq.EnqueueTxn(&t.PusheeTxn)
 
@@ -630,7 +631,7 @@ func (r *Request) txnMeta() *enginepb.TxnMeta {
 	return &r.Txn.TxnMeta
 }
 
-func (r *Request) isSingle(m roachpb.Method) bool {
+func (r *Request) isSingle(m kvpb.Method) bool {
 	if len(r.Requests) != 1 {
 		return false
 	}
@@ -749,12 +750,15 @@ func (g *Guard) CheckOptimisticNoLatchConflicts() (ok bool) {
 	return g.lm.CheckOptimisticNoConflicts(g.lg, g.Req.LatchSpans)
 }
 
-// IsKeyLockedByConflictingTxn returns whether the provided key is locked by a
-// conflicting transaction in the Guard's snapshot of the lock table, given the
-// caller's own desired locking strength. If so, the lock holder is returned. A
-// transaction's own lock does not appear to be locked to itself. The method is
-// used by requests in conjunction with the SkipLocked wait policy to determine
-// which keys they should skip over during evaluation.
+// IsKeyLockedByConflictingTxn returns whether the specified key is locked or
+// reserved (see lockTable "reservations") by a conflicting transaction in the
+// Guard's snapshot of the lock table, given the caller's own desired locking
+// strength. If so, true is returned. If the key is locked, the lock holder is
+// also returned. Otherwise, if the key is reserved, nil is also returned. A
+// transaction's own lock or reservation does not appear to be locked to itself
+// (false is returned). The method is used by requests in conjunction with the
+// SkipLocked wait policy to determine which keys they should skip over during
+// evaluation.
 func (g *Guard) IsKeyLockedByConflictingTxn(
 	key roachpb.Key, strength lock.Strength,
 ) (bool, *enginepb.TxnMeta) {
@@ -774,7 +778,7 @@ func (g *Guard) moveLockTableGuard() lockTableGuard {
 	return ltg
 }
 
-func makeSingleResponse(r roachpb.Response) Response {
+func makeSingleResponse(r kvpb.Response) Response {
 	ru := make(Response, 1)
 	ru[0].MustSetInner(r)
 	return ru

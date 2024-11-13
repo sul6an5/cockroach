@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -48,8 +49,8 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	// Node. We use the TestingEvalFilter to make sure that the second Node
 	// waits for the first.
 	testKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			et, ok := filterArgs.Req.(*roachpb.EndTxnRequest)
+		func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+			et, ok := filterArgs.Req.(*kvpb.EndTxnRequest)
 			if !ok || filterArgs.Sid != 2 {
 				return nil
 			}
@@ -98,7 +99,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 		repl1 := store.LookupReplica(roachpb.RKey(k))
 		require.NotNil(t, repl1)
 
-		eng := store.Engine()
+		eng := store.TODOEngine()
 
 		// Put some bogus sideloaded data on the replica which we're about to
 		// remove. Then, at the end of the test, check that that sideloaded

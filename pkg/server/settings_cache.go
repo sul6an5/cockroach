@@ -27,6 +27,8 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// settingsCacheWriter is responsible for persisting the cluster
+// settings on KV nodes across restarts.
 type settingsCacheWriter struct {
 	stopper *stop.Stopper
 	eng     storage.Engine
@@ -142,7 +144,7 @@ func initializeCachedSettings(
 ) error {
 	dec := settingswatcher.MakeRowDecoder(codec)
 	for _, kv := range kvs {
-		settings, val, _, err := dec.DecodeRow(kv)
+		settings, val, _, err := dec.DecodeRow(kv, nil /* alloc */)
 		if err != nil {
 			return errors.Wrap(err, `while decoding settings data
 -this likely indicates the settings table structure or encoding has been altered;

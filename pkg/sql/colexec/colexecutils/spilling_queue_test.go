@@ -89,7 +89,7 @@ func TestSpillingQueue(t *testing.T) {
 			// tuples and will be comparing against a window into them.
 			var tuples *AppendOnlyBufferedBatch
 			// Create random input.
-			op := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
+			op, typs := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
 				NumBatches: numBatches,
 				BatchSize:  inputBatchSize,
 				Nulls:      true,
@@ -104,7 +104,6 @@ func TestSpillingQueue(t *testing.T) {
 				},
 			})
 			op.Init(ctx)
-			typs := op.Typs()
 
 			queueCfg.SetCacheMode(diskQueueCacheMode)
 			queueCfg.TestingKnobs.AlwaysCompress = alwaysCompress
@@ -128,6 +127,7 @@ func TestSpillingQueue(t *testing.T) {
 						DiskQueueCfg:       queueCfg,
 						FDSemaphore:        colexecop.NewTestingSemaphore(2),
 						DiskAcc:            testDiskAcc,
+						ConverterMemAcc:    testMemAcc,
 					},
 				)
 			} else {
@@ -139,6 +139,7 @@ func TestSpillingQueue(t *testing.T) {
 						DiskQueueCfg:       queueCfg,
 						FDSemaphore:        colexecop.NewTestingSemaphore(2),
 						DiskAcc:            testDiskAcc,
+						ConverterMemAcc:    testMemAcc,
 					},
 				)
 			}
@@ -228,7 +229,7 @@ func TestSpillingQueue(t *testing.T) {
 				}
 
 				if rewindable {
-					require.NoError(t, q.Rewind())
+					require.NoError(t, q.Rewind(ctx))
 					numAlreadyDequeuedTuples = numDequeuedTuplesBeforeReading
 					dequeuedBatches = dequeuedBatches[:numDequeuedBatchesBeforeReading]
 					dequeuedBatchLengths = dequeuedBatchLengths[:numDequeuedBatchesBeforeReading]
@@ -261,7 +262,7 @@ func TestSpillingQueueDidntSpill(t *testing.T) {
 
 	rng, _ := randutil.NewTestRand()
 	numBatches := int(spillingQueueInitialItemsLen)*(1+rng.Intn(4)) + rng.Intn(int(spillingQueueInitialItemsLen))
-	op := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
+	op, typs := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
 		// TODO(yuzefovich): for some types (e.g. types.MakeArray(types.Int))
 		// the memory estimation diverges from 0 after Enqueue() / Dequeue()
 		// sequence. Figure it out.
@@ -272,7 +273,6 @@ func TestSpillingQueueDidntSpill(t *testing.T) {
 	})
 	op.Init(ctx)
 
-	typs := op.Typs()
 	// Choose a memory limit such that at most two batches can be kept in the
 	// in-memory buffer at a time (single batch is not enough because the queue
 	// delays the release of the memory by one batch).
@@ -296,6 +296,7 @@ func TestSpillingQueueDidntSpill(t *testing.T) {
 			DiskQueueCfg:       queueCfg,
 			FDSemaphore:        colexecop.NewTestingSemaphore(2),
 			DiskAcc:            testDiskAcc,
+			ConverterMemAcc:    testMemAcc,
 		},
 	)
 
@@ -362,6 +363,7 @@ func TestSpillingQueueMemoryAccounting(t *testing.T) {
 				DiskQueueCfg:       queueCfg,
 				FDSemaphore:        colexecop.NewTestingSemaphore(2),
 				DiskAcc:            testDiskAcc,
+				ConverterMemAcc:    testMemAcc,
 			}
 			var q *SpillingQueue
 			if rewindable {
@@ -372,7 +374,8 @@ func TestSpillingQueueMemoryAccounting(t *testing.T) {
 
 			numInputBatches := int(spillingQueueInitialItemsLen)*(1+rng.Intn(4)) + rng.Intn(int(spillingQueueInitialItemsLen))
 			numDequeuedBatches := 0
-			batch := coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), coldata.BatchSize(), 0.1 /* nullProbability */)
+			args := coldatatestutils.RandomVecArgs{Rand: rng, NullProbability: 0.1}
+			batch := coldatatestutils.RandomBatch(testAllocator, args, typs, coldata.BatchSize(), coldata.BatchSize())
 			batchSize := colmem.GetBatchMemSize(batch)
 			getExpectedMemUsage := func(numEnqueuedBatches int) int64 {
 				batchesAccountedFor := numEnqueuedBatches
@@ -465,6 +468,7 @@ func TestSpillingQueueMovingTailWhenSpilling(t *testing.T) {
 			DiskQueueCfg:       queueCfg,
 			FDSemaphore:        colexecop.NewTestingSemaphore(2),
 			DiskAcc:            testDiskAcc,
+			ConverterMemAcc:    testMemAcc,
 		}
 		q := NewSpillingQueue(newQueueArgs)
 

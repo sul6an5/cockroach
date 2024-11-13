@@ -18,13 +18,13 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -55,28 +55,21 @@ type BackupKMSEnv struct {
 	// Conf represents the ExternalIODirConfig that applies to the BackupKMSEnv.
 	Conf *base.ExternalIODirConfig
 	// DB is the database handle that applies to the BackupKMSEnv.
-	DB *kv.DB
+	DB isql.DB
 	// Username is the use that applies to the BackupKMSEnv.
 	Username username.SQLUsername
-	// InternalEx is the InternalExecutor that applies to the BackupKMSEnv.
-	InternalEx sqlutil.InternalExecutor
 }
 
 // MakeBackupKMSEnv returns an instance of `BackupKMSEnv` that defines the
 // environment in which KMS is configured and used.
 func MakeBackupKMSEnv(
-	settings *cluster.Settings,
-	conf *base.ExternalIODirConfig,
-	db *kv.DB,
-	user username.SQLUsername,
-	ie sqlutil.InternalExecutor,
+	settings *cluster.Settings, conf *base.ExternalIODirConfig, db isql.DB, user username.SQLUsername,
 ) BackupKMSEnv {
 	return BackupKMSEnv{
-		Settings:   settings,
-		Conf:       conf,
-		DB:         db,
-		Username:   user,
-		InternalEx: ie,
+		Settings: settings,
+		Conf:     conf,
+		DB:       db,
+		Username: user,
 	}
 }
 
@@ -93,18 +86,13 @@ func (p *BackupKMSEnv) KMSConfig() *base.ExternalIODirConfig {
 }
 
 // DBHandle implements the cloud.KMSEnv interface.
-func (p *BackupKMSEnv) DBHandle() *kv.DB {
+func (p *BackupKMSEnv) DBHandle() isql.DB {
 	return p.DB
 }
 
 // User returns the user associated with the KMSEnv.
 func (p *BackupKMSEnv) User() username.SQLUsername {
 	return p.Username
-}
-
-// InternalExecutor returns the internal executor associated with the KMSEnv.
-func (p *BackupKMSEnv) InternalExecutor() sqlutil.InternalExecutor {
-	return p.InternalEx
 }
 
 type (
@@ -237,7 +225,7 @@ func MakeNewEncryptionOptions(
 		encryptionInfo = &jobspb.EncryptionInfo{Salt: salt}
 		encryptionOptions = &jobspb.BackupEncryptionOptions{
 			Mode: jobspb.EncryptionMode_Passphrase,
-			Key:  storageccl.GenerateKey([]byte(encryptionParams.RawPassphrae), salt),
+			Key:  storageccl.GenerateKey([]byte(encryptionParams.RawPassphrase), salt),
 		}
 	case jobspb.EncryptionMode_KMS:
 		// Generate a 32 byte/256-bit crypto-random number which will serve as
@@ -354,7 +342,7 @@ func WriteNewEncryptionInfoToBackup(
 	return cloud.WriteFile(ctx, dest, newEncryptionInfoFile, bytes.NewReader(buf))
 }
 
-// GetEncryptionFromBase retrieves the encryption options of a base backup. It
+// GetEncryptionFromBase retrieves the encryption options of the base backup. It
 // is expected that incremental backups use the same encryption options as the
 // base backups.
 func GetEncryptionFromBase(
@@ -381,7 +369,7 @@ func GetEncryptionFromBase(
 		case jobspb.EncryptionMode_Passphrase:
 			encryptionOptions = &jobspb.BackupEncryptionOptions{
 				Mode: jobspb.EncryptionMode_Passphrase,
-				Key:  storageccl.GenerateKey([]byte(encryptionParams.RawPassphrae), opts[0].Salt),
+				Key:  storageccl.GenerateKey([]byte(encryptionParams.RawPassphrase), opts[0].Salt),
 			}
 		case jobspb.EncryptionMode_KMS:
 			var defaultKMSInfo *jobspb.BackupEncryptionOptions_KMSInfo
@@ -483,7 +471,7 @@ func GetEncryptionInfoFiles(ctx context.Context, dest cloud.ExternalStorage) ([]
 	var files []string
 	// Look for all files in dest that start with "/ENCRYPTION-INFO"
 	// and return them.
-	err := dest.List(ctx, "", "", func(p string) error {
+	err := dest.List(ctx, "", backupbase.ListingDelimDataSlash, func(p string) error {
 		paths := strings.Split(p, "/")
 		p = paths[len(paths)-1]
 		if match := strings.HasPrefix(p, backupEncryptionInfoFile); match {

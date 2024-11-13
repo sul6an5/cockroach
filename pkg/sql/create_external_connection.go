@@ -14,16 +14,18 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const externalConnectionOp = "CREATE EXTERNAL CONNECTION"
@@ -43,32 +45,35 @@ func (c *createExternalConectionNode) startExec(params runParams) error {
 	return params.p.createExternalConnection(params, c.n)
 }
 
-type externalConnectionEval struct {
-	externalConnectionName     func() (string, error)
-	externalConnectionEndpoint func() (string, error)
+type externalConnection struct {
+	name     string
+	endpoint string
 }
 
-func (p *planner) makeExternalConnectionEval(
+func (p *planner) parseExternalConnection(
 	ctx context.Context, n *tree.CreateExternalConnection,
-) (*externalConnectionEval, error) {
-	var err error
-	eval := &externalConnectionEval{}
-	eval.externalConnectionName, err = p.TypeAsString(ctx, n.ConnectionLabelSpec.Label, externalConnectionOp)
-	if err != nil {
-		return nil, err
+) (ec externalConnection, err error) {
+	exprEval := p.ExprEvaluator(externalConnectionOp)
+	if ec.name, err = exprEval.String(
+		ctx, n.ConnectionLabelSpec.Label,
+	); err != nil {
+		return externalConnection{}, errors.Wrap(err, "failed to resolve External Connection name")
 	}
-
-	eval.externalConnectionEndpoint, err = p.TypeAsString(ctx, n.As, externalConnectionOp)
-	return eval, err
+	if ec.endpoint, err = exprEval.String(ctx, n.As); err != nil {
+		return externalConnection{}, errors.Wrap(err, "failed to resolve External Connection endpoint")
+	}
+	return ec, nil
 }
 
 func (p *planner) createExternalConnection(
 	params runParams, n *tree.CreateExternalConnection,
 ) error {
-	if !p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.SystemExternalConnectionsTable) {
+	txn := p.InternalSQLTxn()
+
+	if !p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.TODODelete_V22_2SystemExternalConnectionsTable) {
 		return pgerror.Newf(pgcode.FeatureNotSupported,
 			"version %v must be finalized to create an External Connection",
-			clusterversion.ByKey(clusterversion.SystemExternalConnectionsTable))
+			clusterversion.ByKey(clusterversion.TODODelete_V22_2SystemExternalConnectionsTable))
 	}
 
 	if err := params.p.CheckPrivilege(params.ctx, syntheticprivilege.GlobalPrivilegeObject,
@@ -81,52 +86,93 @@ func (p *planner) createExternalConnection(
 	// TODO(adityamaru): Add some metrics to track CREATE EXTERNAL CONNECTION
 	// usage.
 
-	eval, err := p.makeExternalConnectionEval(params.ctx, n)
+	ec, err := p.parseExternalConnection(params.ctx, n)
 	if err != nil {
 		return err
 	}
 
 	ex := externalconn.NewMutableExternalConnection()
-	name, err := eval.externalConnectionName()
-	if err != nil {
-		return errors.Wrap(err, "failed to resolve External Connection name")
-	}
 	// TODO(adityamaru): Revisit if we need to reject certain kinds of names.
-	ex.SetConnectionName(name)
+	ex.SetConnectionName(ec.name)
 
 	// TODO(adityamaru): Create an entry in the `system.privileges` table for the
 	// newly created External Connection with the appropriate privileges. We will
 	// grant root/admin, and the user that created the object ALL privileges.
 
+	if err = logAndSanitizeExternalConnectionURI(params.ctx, ec.endpoint); err != nil {
+		return errors.Wrap(err, "failed to log and sanitize External Connection")
+	}
+
+	var SkipCheckingExternalStorageConnection bool
+	var SkipCheckingKMSConnection bool
+	if tk := params.ExecCfg().ExternalConnectionTestingKnobs; tk != nil {
+		if tk.SkipCheckingExternalStorageConnection != nil {
+			SkipCheckingExternalStorageConnection = params.ExecCfg().ExternalConnectionTestingKnobs.SkipCheckingExternalStorageConnection()
+		}
+		if tk.SkipCheckingKMSConnection != nil {
+			SkipCheckingKMSConnection = params.ExecCfg().ExternalConnectionTestingKnobs.SkipCheckingKMSConnection()
+		}
+	}
+
+	env := externalconn.MakeExternalConnEnv(
+		params.ExecCfg().Settings,
+		&params.ExecCfg().ExternalIODirConfig,
+		params.ExecCfg().InternalDB,
+		p.User(),
+		params.ExecCfg().DistSQLSrv.ExternalStorageFromURI,
+		SkipCheckingExternalStorageConnection,
+		SkipCheckingKMSConnection,
+		&params.ExecCfg().DistSQLSrv.ServerConfig,
+	)
+
 	// Construct the ConnectionDetails for the external resource represented by
 	// the External Connection.
-	as, err := eval.externalConnectionEndpoint()
-	if err != nil {
-		return errors.Wrap(err, "failed to resolve External Connection endpoint")
-	}
-	exConn, err := externalconn.ExternalConnectionFromURI(params.ctx, params.ExecCfg(), p.User(), as)
+	exConn, err := externalconn.ExternalConnectionFromURI(
+		params.ctx, env, ec.endpoint,
+	)
 	if err != nil {
 		return errors.Wrap(err, "failed to construct External Connection details")
 	}
 	ex.SetConnectionDetails(*exConn.ConnectionProto())
 	ex.SetConnectionType(exConn.ConnectionType())
 	ex.SetOwner(p.User())
+	if p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.V23_1ExternalConnectionsTableHasOwnerIDColumn) {
+		row, err := txn.QueryRowEx(params.ctx, `get-user-id`, txn.KV(),
+			sessiondata.NodeUserSessionDataOverride,
+			`SELECT user_id FROM system.users WHERE username = $1`,
+			p.User(),
+		)
+		if err != nil {
+			return errors.Wrap(err, "failed to get owner ID for External Connection")
+		}
+		ownerID := tree.MustBeDOid(row[0]).Oid
+		ex.SetOwnerID(ownerID)
+	}
 
 	// Create the External Connection and persist it in the
 	// `system.external_connections` table.
-	if err := ex.Create(params.ctx, params.ExecCfg().InternalExecutor, params.p.User(), p.Txn()); err != nil {
+	if err := ex.Create(params.ctx, txn); err != nil {
 		return errors.Wrap(err, "failed to create external connection")
 	}
 
 	// Grant user `ALL` on the newly created External Connection.
 	grantStatement := fmt.Sprintf(`GRANT ALL ON EXTERNAL CONNECTION "%s" TO %s`,
-		name, p.User().SQLIdentifier())
-	_, err = params.ExecCfg().InternalExecutor.ExecEx(params.ctx,
-		"grant-on-create-external-connection", p.Txn(),
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()}, grantStatement)
+		ec.name, p.User().SQLIdentifier())
+	_, err = txn.ExecEx(params.ctx,
+		"grant-on-create-external-connection", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride, grantStatement)
 	if err != nil {
 		return errors.Wrap(err, "failed to grant on newly created External Connection")
 	}
+	return nil
+}
+
+func logAndSanitizeExternalConnectionURI(ctx context.Context, externalConnectionURI string) error {
+	clean, err := cloud.SanitizeExternalStorageURI(externalConnectionURI, nil)
+	if err != nil {
+		return err
+	}
+	log.Ops.Infof(ctx, "external connection planning on connecting to destination %v", redact.Safe(clean))
 	return nil
 }
 

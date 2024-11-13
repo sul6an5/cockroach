@@ -4,6 +4,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "sqlutils",
     srcs = [
+        "fingerprint.go",
         "inject.go",
         "pg_url.go",
         "pretty.go",
@@ -32,6 +33,7 @@ go_library(
         "@com_github_cockroachdb_cockroach_go_v2//crdb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_jackc_pgx_v4//:pgx",
+        "@com_github_lib_pq//:pq",
         "@com_github_stretchr_testify//require",
     ],
 )

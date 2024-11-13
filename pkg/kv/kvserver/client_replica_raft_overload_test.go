@@ -44,17 +44,20 @@ func TestReplicaRaftOverload(t *testing.T) {
 	on.Store(false)
 	var args base.TestClusterArgs
 	args.ReplicationMode = base.ReplicationManual
-	args.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{StoreGossipIntercept: func(descriptor *roachpb.StoreDescriptor) {
-		if !on.Load().(bool) || descriptor.StoreID != 3 {
-			return
-		}
-		descriptor.Capacity.IOThreshold = admissionpb.IOThreshold{
-			L0NumSubLevels:          1000000,
-			L0NumSubLevelsThreshold: 1,
-			L0NumFiles:              1000000,
-			L0NumFilesThreshold:     1,
-		}
-	}}
+	args.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
+		GossipTestingKnobs: kvserver.StoreGossipTestingKnobs{
+			StoreGossipIntercept: func(descriptor *roachpb.StoreDescriptor) {
+				if !on.Load().(bool) || descriptor.StoreID != 3 {
+					return
+				}
+				descriptor.Capacity.IOThreshold = admissionpb.IOThreshold{
+					L0NumSubLevels:          1000000,
+					L0NumSubLevelsThreshold: 1,
+					L0NumFiles:              1000000,
+					L0NumFilesThreshold:     1,
+				}
+			},
+		}}
 	tc := testcluster.StartTestCluster(t, 3, args)
 	defer tc.Stopper().Stop(ctx)
 
@@ -80,7 +83,7 @@ func TestReplicaRaftOverload(t *testing.T) {
 		// See: https://github.com/cockroachdb/cockroach/issues/84252
 		require.NoError(t, tc.Servers[0].DB().Put(ctx, tc.ScratchRange(t), "foo"))
 		s1 := tc.GetFirstStoreFromServer(t, 0)
-		require.NoError(t, s1.ComputeMetrics(ctx, 0 /* tick */))
+		require.NoError(t, s1.ComputeMetrics(ctx))
 		if n := s1.Metrics().RaftPausedFollowerCount.Value(); n == 0 {
 			return errors.New("no paused followers")
 		}
@@ -95,7 +98,7 @@ func TestReplicaRaftOverload(t *testing.T) {
 	require.NoError(t, tc.GetFirstStoreFromServer(t, 2 /* n3 */).GossipStore(ctx, false /* useCached */))
 	testutils.SucceedsSoon(t, func() error {
 		s1 := tc.GetFirstStoreFromServer(t, 0)
-		require.NoError(t, s1.ComputeMetrics(ctx, 0 /* tick */))
+		require.NoError(t, s1.ComputeMetrics(ctx))
 		if n := s1.Metrics().RaftPausedFollowerCount.Value(); n > 0 {
 			return errors.Errorf("%d paused followers", n)
 		}

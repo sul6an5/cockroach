@@ -19,8 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
@@ -40,8 +43,9 @@ func (p *planner) createDropDatabaseJob(
 	schemasToDrop []descpb.ID,
 	tableDropDetails []jobspb.DroppedTableDetails,
 	typesToDrop []*typedesc.Mutable,
+	functionsToDrop []*funcdesc.Mutable,
 	jobDesc string,
-) error {
+) {
 	// TODO (lucy): This should probably be deleting the queued jobs for all the
 	// tables being dropped, so that we don't have duplicate schema changers.
 	tableIDs := make([]descpb.ID, 0, len(tableDropDetails))
@@ -52,7 +56,11 @@ func (p *planner) createDropDatabaseJob(
 	for _, t := range typesToDrop {
 		typeIDs = append(typeIDs, t.ID)
 	}
-	jobRecord := jobs.Record{
+	funcIDs := make([]descpb.ID, 0, len(functionsToDrop))
+	for _, t := range functionsToDrop {
+		funcIDs = append(funcIDs, t.ID)
+	}
+	jobRecord := &jobs.Record{
 		Description:   jobDesc,
 		Username:      p.User(),
 		DescriptorIDs: tableIDs,
@@ -60,18 +68,15 @@ func (p *planner) createDropDatabaseJob(
 			DroppedSchemas:    schemasToDrop,
 			DroppedTables:     tableDropDetails,
 			DroppedTypes:      typeIDs,
+			DroppedFunctions:  funcIDs,
 			DroppedDatabaseID: databaseID,
 			FormatVersion:     jobspb.DatabaseJobFormatVersion,
 		},
 		Progress:      jobspb.SchemaChangeProgress{},
 		NonCancelable: true,
 	}
-	newJob, err := p.extendedEvalCtx.QueueJob(ctx, jobRecord)
-	if err != nil {
-		return err
-	}
-	log.Infof(ctx, "queued new drop database job %d for database %d", newJob.ID(), databaseID)
-	return nil
+	jobID := p.extendedEvalCtx.QueueJob(jobRecord)
+	log.Infof(ctx, "queued new drop database job %d for database %d", jobID, databaseID)
 }
 
 // CreateNonDropDatabaseChangeJob covers all database descriptor updates other
@@ -80,8 +85,8 @@ func (p *planner) createDropDatabaseJob(
 // don't queue multiple jobs for the same database.
 func (p *planner) createNonDropDatabaseChangeJob(
 	ctx context.Context, databaseID descpb.ID, jobDesc string,
-) error {
-	jobRecord := jobs.Record{
+) {
+	jobRecord := &jobs.Record{
 		Description: jobDesc,
 		Username:    p.User(),
 		Details: jobspb.SchemaChangeDetails{
@@ -91,12 +96,8 @@ func (p *planner) createNonDropDatabaseChangeJob(
 		Progress:      jobspb.SchemaChangeProgress{},
 		NonCancelable: true,
 	}
-	newJob, err := p.extendedEvalCtx.QueueJob(ctx, jobRecord)
-	if err != nil {
-		return err
-	}
-	log.Infof(ctx, "queued new database schema change job %d for database %d", newJob.ID(), databaseID)
-	return nil
+	jobID := p.extendedEvalCtx.QueueJob(jobRecord)
+	log.Infof(ctx, "queued new database schema change job %d for database %d", jobID, databaseID)
 }
 
 // createOrUpdateSchemaChangeJob queues a new job for the schema change if there
@@ -110,11 +111,11 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 	// changer, then we must fail and wait for that schema change to conclude.
 	// The error here will be dealt with in
 	// (*connExecutor).handleWaitingForConcurrentSchemaChanges().
-	if tableDesc.GetDeclarativeSchemaChangerState() != nil {
+	if catalog.HasConcurrentDeclarativeSchemaChange(tableDesc) {
 		return scerrors.ConcurrentSchemaChangeError(tableDesc)
 	}
 
-	record, recordExists := p.extendedEvalCtx.SchemaChangeJobRecords[tableDesc.ID]
+	record, recordExists := p.extendedEvalCtx.jobs.uniqueToCreate[tableDesc.ID]
 	if p.extendedEvalCtx.ExecCfg.TestingKnobs.RunAfterSCJobsCacheLookup != nil {
 		p.extendedEvalCtx.ExecCfg.TestingKnobs.RunAfterSCJobsCacheLookup(record)
 	}
@@ -172,7 +173,7 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 			// have mutations, e.g., in CREATE TABLE AS VALUES.
 			NonCancelable: mutationID == descpb.InvalidMutationID && !tableDesc.Adding(),
 		}
-		p.extendedEvalCtx.SchemaChangeJobRecords[tableDesc.ID] = &newRecord
+		p.extendedEvalCtx.jobs.uniqueToCreate[tableDesc.ID] = &newRecord
 		// Only add a MutationJob if there's an associated mutation.
 		// TODO (lucy): get rid of this when we get rid of MutationJobs.
 		if mutationID != descpb.InvalidMutationID {
@@ -303,7 +304,8 @@ func (p *planner) writeTableDescToBatch(
 	}
 
 	version := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
-	if err := descbuilder.ValidateSelf(tableDesc, version); err != nil {
+	dvmp := catsessiondata.NewDescriptorSessionDataProvider(p.SessionData())
+	if err := descs.ValidateSelf(tableDesc, version, dvmp); err != nil {
 		return errors.NewAssertionErrorWithWrappedErrf(err, "table descriptor is not valid\n%v\n", tableDesc)
 	}
 

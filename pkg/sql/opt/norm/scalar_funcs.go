@@ -139,12 +139,12 @@ func (c *CustomFuncs) UnifyComparison(
 	// means we don't lose any information needed to generate spans, and combined
 	// with monotonicity means that it's safe to convert the RHS to the type of
 	// the LHS.
-	convertedDatum, err := eval.PerformCast(c.f.evalCtx, cnst.Value, desiredType)
+	convertedDatum, err := eval.PerformCast(c.f.ctx, c.f.evalCtx, cnst.Value, desiredType)
 	if err != nil {
 		return nil, false
 	}
 
-	convertedBack, err := eval.PerformCast(c.f.evalCtx, convertedDatum, originalType)
+	convertedBack, err := eval.PerformCast(c.f.ctx, c.f.evalCtx, convertedDatum, originalType)
 	if err != nil {
 		return nil, false
 	}
@@ -386,4 +386,10 @@ func (c *CustomFuncs) SplitTupleEq(lhs, rhs *memo.TupleExpr) memo.FiltersExpr {
 		res[i] = c.f.ConstructFiltersItem(c.f.ConstructEq(lhs.Elems[i], rhs.Elems[i]))
 	}
 	return res
+}
+
+// CanNormalizeArrayFlatten returns true if the input is correlated or if the
+// ArrayFlatten exists within a UDF.
+func (c *CustomFuncs) CanNormalizeArrayFlatten(input memo.RelExpr, p *memo.SubqueryPrivate) bool {
+	return c.HasOuterCols(input) || p.WithinUDF
 }

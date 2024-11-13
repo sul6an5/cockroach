@@ -12,6 +12,7 @@ package tabledesc
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -19,7 +20,9 @@ import (
 )
 
 var _ catalog.TableElementMaybeMutation = maybeMutation{}
-var _ catalog.TableElementMaybeMutation = constraintToUpdate{}
+var _ catalog.TableElementMaybeMutation = checkConstraint{}
+var _ catalog.TableElementMaybeMutation = foreignKeyConstraint{}
+var _ catalog.TableElementMaybeMutation = uniqueWithoutIndexConstraint{}
 var _ catalog.TableElementMaybeMutation = primaryKeySwap{}
 var _ catalog.TableElementMaybeMutation = computedColumnSwap{}
 var _ catalog.TableElementMaybeMutation = materializedViewRefresh{}
@@ -29,10 +32,11 @@ var _ catalog.Mutation = mutation{}
 // and is embedded in table element interface implementations column and index
 // as well as mutation.
 type maybeMutation struct {
-	mutationID         descpb.MutationID
-	mutationDirection  descpb.DescriptorMutation_Direction
-	mutationState      descpb.DescriptorMutation_State
-	mutationIsRollback bool
+	mutationID                     descpb.MutationID
+	mutationDirection              descpb.DescriptorMutation_Direction
+	mutationState                  descpb.DescriptorMutation_State
+	mutationIsRollback             bool
+	mutationForcePutForIndexWrites bool
 }
 
 // IsMutation returns true iff this table element is in a mutation.
@@ -54,7 +58,7 @@ func (mm maybeMutation) MutationID() descpb.MutationID {
 // WriteAndDeleteOnly returns true iff the table element is in a mutation in
 // the delete-and-write-only state.
 func (mm maybeMutation) WriteAndDeleteOnly() bool {
-	return mm.mutationState == descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY
+	return mm.mutationState == descpb.DescriptorMutation_WRITE_ONLY
 }
 
 // DeleteOnly returns true iff the table element is in a mutation in the
@@ -83,80 +87,6 @@ func (mm maybeMutation) Adding() bool {
 // Dropped returns true iff the table element is in a drop mutation.
 func (mm maybeMutation) Dropped() bool {
 	return mm.mutationDirection == descpb.DescriptorMutation_DROP
-}
-
-// constraintToUpdate implements the catalog.ConstraintToUpdate interface.
-// It also
-type constraintToUpdate struct {
-	maybeMutation
-	desc *descpb.ConstraintToUpdate
-}
-
-// ConstraintToUpdateDesc returns the underlying protobuf descriptor.
-func (c constraintToUpdate) ConstraintToUpdateDesc() *descpb.ConstraintToUpdate {
-	return c.desc
-}
-
-// GetName returns the name of this constraint update mutation.
-func (c constraintToUpdate) GetName() string {
-	return c.desc.Name
-}
-
-// IsCheck returns true iff this is an update for a check constraint.
-func (c constraintToUpdate) IsCheck() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_CHECK
-}
-
-// Check returns the underlying check constraint, if there is one.
-func (c constraintToUpdate) Check() descpb.TableDescriptor_CheckConstraint {
-	return c.desc.Check
-}
-
-// IsForeignKey returns true iff this is an update for a fk constraint.
-func (c constraintToUpdate) IsForeignKey() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_FOREIGN_KEY
-}
-
-// ForeignKey returns the underlying fk constraint, if there is one.
-func (c constraintToUpdate) ForeignKey() descpb.ForeignKeyConstraint {
-	return c.desc.ForeignKey
-}
-
-// IsNotNull returns true iff this is an update for a not-null constraint.
-func (c constraintToUpdate) IsNotNull() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_NOT_NULL
-}
-
-// NotNullColumnID returns the underlying not-null column ID, if there is one.
-func (c constraintToUpdate) NotNullColumnID() descpb.ColumnID {
-	return c.desc.NotNullColumn
-}
-
-// IsUniqueWithoutIndex returns true iff this is an update for a unique without
-// index constraint.
-func (c constraintToUpdate) IsUniqueWithoutIndex() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX
-}
-
-// UniqueWithoutIndex returns the underlying unique without index constraint, if
-// there is one.
-func (c constraintToUpdate) UniqueWithoutIndex() descpb.UniqueWithoutIndexConstraint {
-	return c.desc.UniqueWithoutIndexConstraint
-}
-
-// GetConstraintID returns the ID for the constraint.
-func (c constraintToUpdate) GetConstraintID() descpb.ConstraintID {
-	switch c.desc.ConstraintType {
-	case descpb.ConstraintToUpdate_CHECK:
-		return c.desc.Check.ConstraintID
-	case descpb.ConstraintToUpdate_FOREIGN_KEY:
-		return c.ForeignKey().ConstraintID
-	case descpb.ConstraintToUpdate_NOT_NULL:
-		return 0
-	case descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX:
-		return c.UniqueWithoutIndex().ConstraintID
-	}
-	panic("unknown constraint type")
 }
 
 // modifyRowLevelTTL implements the catalog.ModifyRowLevelTTL interface.
@@ -293,14 +223,16 @@ func (c materializedViewRefresh) TableWithNewIndexes(
 // mutation implements the
 type mutation struct {
 	maybeMutation
-	column            catalog.Column
-	index             catalog.Index
-	constraint        catalog.ConstraintToUpdate
-	pkSwap            catalog.PrimaryKeySwap
-	ccSwap            catalog.ComputedColumnSwap
-	mvRefresh         catalog.MaterializedViewRefresh
-	modifyRowLevelTTL catalog.ModifyRowLevelTTL
-	mutationOrdinal   int
+	column             catalog.Column
+	index              catalog.Index
+	check              catalog.CheckConstraint
+	foreignKey         catalog.ForeignKeyConstraint
+	uniqueWithoutIndex catalog.UniqueWithoutIndexConstraint
+	pkSwap             catalog.PrimaryKeySwap
+	ccSwap             catalog.ComputedColumnSwap
+	mvRefresh          catalog.MaterializedViewRefresh
+	modifyRowLevelTTL  catalog.ModifyRowLevelTTL
+	mutationOrdinal    int
 }
 
 // AsColumn returns the corresponding Column if the mutation is on a column,
@@ -315,10 +247,38 @@ func (m mutation) AsIndex() catalog.Index {
 	return m.index
 }
 
-// AsConstraint returns the corresponding ConstraintToUpdate if the
-// mutation is on a constraint, nil otherwise.
-func (m mutation) AsConstraint() catalog.ConstraintToUpdate {
-	return m.constraint
+// AsConstraintWithoutIndex implements the catalog.Mutation interface.
+func (m mutation) AsConstraintWithoutIndex() catalog.WithoutIndexConstraint {
+	if m.check != nil {
+		return m.check
+	}
+	if m.foreignKey != nil {
+		return m.foreignKey
+	}
+	return m.uniqueWithoutIndex
+}
+
+// AsCheck implements the catalog.ConstraintProvider interface.
+func (m mutation) AsCheck() catalog.CheckConstraint {
+	return m.check
+}
+
+// AsForeignKey implements the catalog.ConstraintProvider interface.
+func (m mutation) AsForeignKey() catalog.ForeignKeyConstraint {
+	return m.foreignKey
+}
+
+// AsUniqueWithoutIndex implements the catalog.ConstraintProvider interface.
+func (m mutation) AsUniqueWithoutIndex() catalog.UniqueWithoutIndexConstraint {
+	return m.uniqueWithoutIndex
+}
+
+// AsUniqueWithIndex implements the catalog.ConstraintProvider interface.
+func (m mutation) AsUniqueWithIndex() catalog.UniqueWithIndexConstraint {
+	if m.index == nil {
+		return nil
+	}
+	return m.index.AsUniqueWithIndex()
 }
 
 // AsPrimaryKeySwap returns the corresponding PrimaryKeySwap if the mutation
@@ -353,9 +313,10 @@ func (m mutation) MutationOrdinal() int {
 
 // mutationCache contains precomputed slices of catalog.Mutation interfaces.
 type mutationCache struct {
-	all     []catalog.Mutation
-	columns []catalog.Mutation
-	indexes []catalog.Mutation
+	all                               []catalog.Mutation
+	columns                           []catalog.Mutation
+	indexes                           []catalog.Mutation
+	checks, fks, uniqueWithoutIndexes []catalog.Mutation
 }
 
 // newMutationCache returns a fresh fully-populated mutationCache struct for the
@@ -370,7 +331,9 @@ func newMutationCache(desc *descpb.TableDescriptor) *mutationCache {
 	backingStructs := make([]mutation, len(desc.Mutations))
 	var columns []column
 	var indexes []index
-	var constraints []constraintToUpdate
+	var checks []checkConstraint
+	var fks []foreignKeyConstraint
+	var uniqueWithoutIndexes []uniqueWithoutIndexConstraint
 	var pkSwaps []primaryKeySwap
 	var ccSwaps []computedColumnSwap
 	var mvRefreshes []materializedViewRefresh
@@ -394,18 +357,36 @@ func newMutationCache(desc *descpb.TableDescriptor) *mutationCache {
 			})
 			backingStructs[i].column = &columns[len(columns)-1]
 		} else if pb := m.GetIndex(); pb != nil {
-			indexes = append(indexes, index{
+			idx := index{
 				maybeMutation: mm,
 				desc:          pb,
 				ordinal:       1 + len(desc.Indexes) + len(indexes),
-			})
+			}
+			idx.mutationForcePutForIndexWrites = determineIfIndexNeedsForcePuts(idx, desc)
+			indexes = append(indexes, idx)
 			backingStructs[i].index = &indexes[len(indexes)-1]
 		} else if pb := m.GetConstraint(); pb != nil {
-			constraints = append(constraints, constraintToUpdate{
-				maybeMutation: mm,
-				desc:          pb,
-			})
-			backingStructs[i].constraint = &constraints[len(constraints)-1]
+			switch pb.ConstraintType {
+			case descpb.ConstraintToUpdate_CHECK, descpb.ConstraintToUpdate_NOT_NULL:
+				checks = append(checks, checkConstraint{
+					constraintBase: constraintBase{maybeMutation: mm},
+					desc:           &pb.Check,
+				})
+				backingStructs[i].check = &checks[len(checks)-1]
+			case descpb.ConstraintToUpdate_FOREIGN_KEY:
+				fks = append(fks, foreignKeyConstraint{
+					constraintBase: constraintBase{maybeMutation: mm},
+					desc:           &pb.ForeignKey,
+				})
+				backingStructs[i].foreignKey = &fks[len(fks)-1]
+			case descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX:
+				uniqueWithoutIndexes = append(uniqueWithoutIndexes, uniqueWithoutIndexConstraint{
+					constraintBase: constraintBase{maybeMutation: mm},
+					desc:           &pb.UniqueWithoutIndexConstraint,
+				})
+				backingStructs[i].uniqueWithoutIndex = &uniqueWithoutIndexes[len(uniqueWithoutIndexes)-1]
+
+			}
 		} else if pb := m.GetPrimaryKeySwap(); pb != nil {
 			pkSwaps = append(pkSwaps, primaryKeySwap{
 				maybeMutation: mm,
@@ -445,12 +426,50 @@ func newMutationCache(desc *descpb.TableDescriptor) *mutationCache {
 	if len(indexes) > 0 {
 		c.indexes = make([]catalog.Mutation, 0, len(indexes))
 	}
+	if len(checks) > 0 {
+		c.checks = make([]catalog.Mutation, 0, len(checks))
+	}
+	if len(fks) > 0 {
+		c.fks = make([]catalog.Mutation, 0, len(fks))
+	}
+	if len(uniqueWithoutIndexes) > 0 {
+		c.uniqueWithoutIndexes = make([]catalog.Mutation, 0, len(uniqueWithoutIndexes))
+	}
 	for _, m := range c.all {
 		if col := m.AsColumn(); col != nil {
 			c.columns = append(c.columns, m)
 		} else if idx := m.AsIndex(); idx != nil {
 			c.indexes = append(c.indexes, m)
+		} else if ck := m.AsCheck(); ck != nil {
+			c.checks = append(c.checks, m)
+		} else if fk := m.AsForeignKey(); fk != nil {
+			c.fks = append(c.fks, m)
+		} else if uwoi := m.AsUniqueWithoutIndex(); uwoi != nil {
+			c.uniqueWithoutIndexes = append(c.uniqueWithoutIndexes, m)
 		}
 	}
 	return &c
+}
+
+// determineIfIndexNeedsForcePuts based on a given index this function will
+// determine if this mutation should set the force puts flag. This flag indicates
+// that conditional puts are not safe. See index.ForcePut for the exact
+// scenarios.
+func determineIfIndexNeedsForcePuts(index catalog.Index, tableDesc *descpb.TableDescriptor) bool {
+	// If we are doing any of the following mutations, then force puts:
+	//   - delete preserving indexes
+	//   - merging indexes
+	//   - dropping primary indexes
+	if index.Merging() || index.IndexDesc().UseDeletePreservingEncoding ||
+		index.Dropped() && index.IsUnique() && index.GetEncodingType() == catenumpb.PrimaryIndexEncoding {
+		return true
+	}
+
+	// If we are adding primary indexes with new columns (same key), then
+	// we should also force puts. Attempting conditional puts for UPDATE's
+	// can end badly since we need to compute the expected value with the
+	// new columns.
+	return index.GetEncodingType() == catenumpb.PrimaryIndexEncoding &&
+		catalog.MakeTableColSet(tableDesc.PrimaryIndex.KeyColumnIDs...).Equals(
+			catalog.MakeTableColSet(index.IndexDesc().KeyColumnIDs...))
 }

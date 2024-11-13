@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
-	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
 // DefaultSearchPath is the search path used by virgin sessions.
@@ -36,6 +36,7 @@ type SearchPath struct {
 	containsPgTempSchema bool
 	tempSchemaName       string
 	userSchemaName       string
+	duplicatedIndexes    intsets.Fast
 }
 
 // EmptySearchPath is a SearchPath with no schema names in it.
@@ -50,25 +51,31 @@ func DefaultSearchPathForUser(userName username.SQLUsername) SearchPath {
 // MakeSearchPath returns a new immutable SearchPath struct. The paths slice
 // must not be modified after hand-off to MakeSearchPath.
 func MakeSearchPath(paths []string) SearchPath {
-	containsPgCatalog := false
-	containsPgExtension := false
-	containsPgTempSchema := false
-	for _, e := range paths {
+	exists := func(p []string, e string) bool {
+		for i := range p {
+			if p[i] == e {
+				return true
+			}
+		}
+		return false
+	}
+
+	sp := SearchPath{paths: paths}
+
+	for i, e := range paths {
 		switch e {
 		case catconstants.PgCatalogName:
-			containsPgCatalog = true
+			sp.containsPgCatalog = true
 		case catconstants.PgTempSchemaName:
-			containsPgTempSchema = true
+			sp.containsPgTempSchema = true
 		case catconstants.PgExtensionSchemaName:
-			containsPgExtension = true
+			sp.containsPgExtension = true
+		}
+		if exists(paths[:i], e) {
+			sp.duplicatedIndexes.Add(i)
 		}
 	}
-	return SearchPath{
-		paths:                paths,
-		containsPgCatalog:    containsPgCatalog,
-		containsPgExtension:  containsPgExtension,
-		containsPgTempSchema: containsPgTempSchema,
-	}
+	return sp
 }
 
 // WithTemporarySchemaName returns a new immutable SearchPath struct with
@@ -83,6 +90,7 @@ func (s SearchPath) WithTemporarySchemaName(tempSchemaName string) SearchPath {
 		containsPgExtension:  s.containsPgExtension,
 		userSchemaName:       s.userSchemaName,
 		tempSchemaName:       tempSchemaName,
+		duplicatedIndexes:    s.duplicatedIndexes,
 	}
 }
 
@@ -96,6 +104,7 @@ func (s SearchPath) WithUserSchemaName(userSchemaName string) SearchPath {
 		containsPgExtension:  s.containsPgExtension,
 		userSchemaName:       userSchemaName,
 		tempSchemaName:       s.tempSchemaName,
+		duplicatedIndexes:    s.duplicatedIndexes,
 	}
 }
 
@@ -144,6 +153,7 @@ func (s SearchPath) Iter() SearchPathIter {
 		implicitPgTempSchema: implicitPgTempSchema,
 		tempSchemaName:       s.tempSchemaName,
 		userSchemaName:       s.userSchemaName,
+		duplicatedIndexes:    s.duplicatedIndexes,
 	}
 	return sp
 }
@@ -157,6 +167,7 @@ func (s SearchPath) IterWithoutImplicitPGSchemas() SearchPathIter {
 		implicitPgTempSchema: false,
 		tempSchemaName:       s.tempSchemaName,
 		userSchemaName:       s.userSchemaName,
+		duplicatedIndexes:    s.duplicatedIndexes,
 	}
 	return sp
 }
@@ -168,9 +179,15 @@ func (s SearchPath) GetPathArray() []string {
 }
 
 // Contains returns true iff the SearchPath contains the given string.
-func (s SearchPath) Contains(target string) bool {
-	for _, candidate := range s.GetPathArray() {
-		if candidate == target {
+func (s SearchPath) Contains(target string, includeImplicit bool) bool {
+	var iter SearchPathIter
+	if includeImplicit {
+		iter = s.Iter()
+	} else {
+		iter = s.IterWithoutImplicitPGSchemas()
+	}
+	for candidate, ok := iter.Next(); ok; candidate, ok = iter.Next() {
+		if target == candidate {
 			return true
 		}
 	}
@@ -215,20 +232,35 @@ func (s SearchPath) Equals(other *SearchPath) bool {
 	return true
 }
 
-// SQLIdentifiers returns quotes for string starting with special characters.
-func (s SearchPath) SQLIdentifiers() string {
-	var buf bytes.Buffer
-	for i, path := range s.paths {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		lexbase.EncodeRestrictedSQLIdent(&buf, path, lexbase.EncNoFlags)
-	}
-	return buf.String()
+func (s SearchPath) String() string {
+	return FormatSearchPaths(s.paths)
 }
 
-func (s SearchPath) String() string {
-	return strings.Join(s.paths, ",")
+// FormatSearchPaths formats a search path for display. Each element in the
+// array is treated as a SQL identifier and quoted if necessary.
+func FormatSearchPaths(paths []string) string {
+	builder := &strings.Builder{}
+	delimiter := ""
+	for _, v := range paths {
+		builder.WriteString(delimiter)
+		var buf bytes.Buffer
+		lexbase.EncodeRestrictedSQLIdent(&buf, v, lexbase.EncNoFlags)
+		builder.WriteString(buf.String())
+		delimiter = ", "
+	}
+	return builder.String()
+}
+
+// ParseSearchPath parses a string into a list of schema names. In the output,
+// each schema name is a bare SQL identifier. In the input, the schema names
+// are comma separated and may be quoted. This function is meant to roundtrip
+// with FormatSearchPaths.
+func ParseSearchPath(s string) ([]string, error) {
+	paths, ok := doParseSearchPathFromString(s)
+	if !ok {
+		return nil, pgerror.Newf(pgcode.InvalidTextRepresentation, `invalid value for parameter "search_path": "%s"`, s)
+	}
+	return paths, nil
 }
 
 // SearchPathIter enables iteration over the search paths without triggering an
@@ -243,6 +275,7 @@ type SearchPathIter struct {
 	implicitPgTempSchema bool
 	tempSchemaName       string
 	userSchemaName       string
+	duplicatedIndexes    intsets.Fast
 	i                    int
 }
 
@@ -260,6 +293,7 @@ func (iter *SearchPathIter) Next() (path string, ok bool) {
 	}
 
 	if iter.i < len(iter.paths) {
+		var ret string
 		iter.i++
 		// If pg_temp is explicitly present in the paths, it must be resolved to the
 		// session specific temp schema (if one exists). tempSchemaName is set in the
@@ -270,7 +304,7 @@ func (iter *SearchPathIter) Next() (path string, ok bool) {
 			if iter.tempSchemaName == "" {
 				return iter.Next()
 			}
-			return iter.tempSchemaName, true
+			ret = iter.tempSchemaName
 		}
 		if iter.paths[iter.i-1] == catconstants.UserSchemaName {
 			// In case the user schema name is unset, we simply iterate to the next
@@ -278,29 +312,54 @@ func (iter *SearchPathIter) Next() (path string, ok bool) {
 			if iter.userSchemaName == "" {
 				return iter.Next()
 			}
-			return iter.userSchemaName, true
+			ret = iter.userSchemaName
 		}
 		// pg_extension should be read before delving into the schema.
 		if iter.paths[iter.i-1] == catconstants.PublicSchemaName && iter.implicitPgExtension {
 			iter.implicitPgExtension = false
 			// Go back one so `public` can be found again next.
 			iter.i--
-			return catconstants.PgExtensionSchemaName, true
+			ret = catconstants.PgExtensionSchemaName
 		}
-		return iter.paths[iter.i-1], true
+
+		if ret == "" {
+			ret = iter.paths[iter.i-1]
+		}
+
+		for iter.i < len(iter.paths) && iter.duplicatedIndexes.Contains(iter.i) {
+			iter.i++
+		}
+
+		return ret, true
 	}
 	return "", false
 }
 
-// IterateSearchPath iterates the search path. If a non-nil error is
-// returned, iteration is stopped. If iterutils.StopIteration() is returned
-// from the iteration function,  a nil error is returned to the caller.
-func (s *SearchPath) IterateSearchPath(f func(schema string) error) error {
+// NumElements returns the number of elements in the search path.
+func (s *SearchPath) NumElements() int {
+	// TODO(ajwerner): Refactor this so that we don't need to do an O(N)
+	// operation to find the number of elements. In practice it doesn't matter
+	// much because search paths tend to be short.
 	iter := s.Iter()
-	for schema, ok := iter.Next(); ok; schema, ok = iter.Next() {
-		if err := f(schema); err != nil {
-			return iterutil.Map(err)
-		}
+	var i int
+	for _, ok := iter.Next(); ok; _, ok = iter.Next() {
+		i++
 	}
-	return nil
+	return i
+}
+
+// GetSchema returns the ith schema element if it is in range.
+func (s *SearchPath) GetSchema(ord int) string {
+	// TODO(ajwerner): Refactor this so that we don't need to do an O(n)
+	// operation to find the nth element. In practice it doesn't matter
+	// much because search paths tend to be short.
+	iter := s.Iter()
+	var i int
+	for schema, ok := iter.Next(); ok; schema, ok = iter.Next() {
+		if ord == i {
+			return schema
+		}
+		i++
+	}
+	return ""
 }

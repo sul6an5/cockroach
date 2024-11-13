@@ -10,12 +10,12 @@
 
 syntax = "proto3";
 package cockroach.server.diagnostics.diagnosticspb;
-option go_package = "diagnosticspb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/server/diagnostics/diagnosticspb";
 
 import "build/info.proto";
 import "config/zonepb/zone.proto";
 import "gogoproto/gogo.proto";
-import "roachpb/app_stats.proto";
+import "sql/appstatspb/app_stats.proto";
 import "sql/catalog/descpb/structured.proto";
 import "roachpb/metadata.proto";
 

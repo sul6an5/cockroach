@@ -53,9 +53,9 @@ func (p *planner) AlterIndexVisible(
 		return newZeroNode(nil /* columns */), nil
 	}
 
-	// Check if the index actually exists. FindIndexWithName returns the first
+	// Check if the index actually exists. MustFindIndexByName returns the first
 	// catalog.Index in tableDesc.AllIndexes().
-	idx, err := tableDesc.FindIndexWithName(string(n.Index.Index))
+	idx, err := catalog.MustFindIndexByName(tableDesc, string(n.Index.Index))
 	if err != nil {
 		if n.IfExists {
 			// Nothing needed if no index exists and IfExists is true.
@@ -66,6 +66,11 @@ func (p *planner) AlterIndexVisible(
 	}
 
 	if err := p.CheckPrivilege(ctx, tableDesc, privilege.CREATE); err != nil {
+		return nil, err
+	}
+
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
 		return nil, err
 	}
 

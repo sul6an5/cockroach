@@ -17,8 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -38,7 +37,7 @@ func TestPopulateTableWithRandData(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	rng, _ := randutil.NewTestRand()
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
 	sqlDB := sqlutils.MakeSQLRunner(dbConn)
 	sqlDB.Exec(t, "CREATE DATABASE rand")
@@ -64,12 +63,12 @@ func TestPopulateTableWithRandData(t *testing.T) {
 	// To prevent the test from being flaky, pass the test if PopulateTableWithRandomData
 	// inserts at least one row in at least one table.
 	success := false
-	for i := 1; i <= numTables; i++ {
-		tableName := tablePrefix + fmt.Sprint(i)
+	for i := 0; i < numTables; i++ {
+		tableName := string(stmts[i].(*tree.CreateTable).Table.ObjectName)
 		numRows := 30
 		numRowsInserted, err := randgen.PopulateTableWithRandData(rng, dbConn, tableName, numRows)
 		require.NoError(t, err)
-		res := sqlDB.QueryStr(t, fmt.Sprintf("SELECT count(*) FROM %s", tableName))
+		res := sqlDB.QueryStr(t, fmt.Sprintf("SELECT count(*) FROM %s", tree.NameString(tableName)))
 		require.Equal(t, fmt.Sprint(numRowsInserted), res[0][0])
 		if numRowsInserted > 0 {
 			success = true

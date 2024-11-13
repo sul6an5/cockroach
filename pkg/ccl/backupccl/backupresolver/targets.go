@@ -14,13 +14,14 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
@@ -97,7 +98,11 @@ type DescriptorResolver struct {
 	// Map: dbID -> schema name -> schemaID
 	SchemasByName map[descpb.ID]map[string]descpb.ID
 	// Map: dbID -> schema name -> obj name -> obj ID
+	// Note: this map does not contain any user-defined functions because function
+	// descriptors don't have namespace entries.
 	ObjsByName map[descpb.ID]map[string]map[string]descpb.ID
+	// Map: dbID -> schema name -> []obj ID
+	ObjIDsBySchema map[descpb.ID]map[string]*catalog.DescriptorIDSet
 }
 
 // LookupSchema implements the resolver.ObjectNameTargetResolver interface.
@@ -175,10 +180,11 @@ func (r *DescriptorResolver) LookupObject(
 // known set of descriptors.
 func NewDescriptorResolver(descs []catalog.Descriptor) (*DescriptorResolver, error) {
 	r := &DescriptorResolver{
-		DescByID:      make(map[descpb.ID]catalog.Descriptor),
-		SchemasByName: make(map[descpb.ID]map[string]descpb.ID),
-		DbsByName:     make(map[string]descpb.ID),
-		ObjsByName:    make(map[descpb.ID]map[string]map[string]descpb.ID),
+		DescByID:       make(map[descpb.ID]catalog.Descriptor),
+		SchemasByName:  make(map[descpb.ID]map[string]descpb.ID),
+		DbsByName:      make(map[string]descpb.ID),
+		ObjsByName:     make(map[descpb.ID]map[string]map[string]descpb.ID),
+		ObjIDsBySchema: make(map[descpb.ID]map[string]*catalog.DescriptorIDSet),
 	}
 
 	// Iterate to find the databases first. We need that because we also
@@ -196,10 +202,12 @@ func NewDescriptorResolver(descs []catalog.Descriptor) (*DescriptorResolver, err
 			r.DbsByName[desc.GetName()] = desc.GetID()
 			r.ObjsByName[desc.GetID()] = make(map[string]map[string]descpb.ID)
 			r.SchemasByName[desc.GetID()] = make(map[string]descpb.ID)
+			r.ObjIDsBySchema[desc.GetID()] = make(map[string]*catalog.DescriptorIDSet)
 
 			if !desc.(catalog.DatabaseDescriptor).HasPublicSchemaWithDescriptor() {
 				r.ObjsByName[desc.GetID()][tree.PublicSchema] = make(map[string]descpb.ID)
 				r.SchemasByName[desc.GetID()][tree.PublicSchema] = keys.PublicSchemaIDForBackup
+				r.ObjIDsBySchema[desc.GetID()][tree.PublicSchema] = &catalog.DescriptorIDSet{}
 			}
 		}
 
@@ -230,6 +238,13 @@ func NewDescriptorResolver(descs []catalog.Descriptor) (*DescriptorResolver, err
 			}
 			schemaNameMap[sc.GetName()] = sc.GetID()
 			r.SchemasByName[sc.GetParentID()] = schemaNameMap
+
+			objIDsMap := r.ObjIDsBySchema[sc.GetParentID()]
+			if objIDsMap == nil {
+				objIDsMap = make(map[string]*catalog.DescriptorIDSet)
+			}
+			objIDsMap[sc.GetName()] = &catalog.DescriptorIDSet{}
+			r.ObjIDsBySchema[sc.GetParentID()] = objIDsMap
 		}
 	}
 
@@ -270,12 +285,27 @@ func NewDescriptorResolver(descs []catalog.Descriptor) (*DescriptorResolver, err
 		if objMap == nil {
 			objMap = make(map[string]descpb.ID)
 		}
-		if _, ok := objMap[desc.GetName()]; ok {
-			return errors.Errorf("duplicate %s name: %q.%q.%q used for ID %d and %d",
-				kind, parentDesc.GetName(), scName, desc.GetName(), desc.GetID(), objMap[desc.GetName()])
+		descName := desc.GetName()
+		// Handle special case of system.namespace table which used to be named
+		// system.namespace2.
+		if desc.GetID() == keys.NamespaceTableID &&
+			desc.GetPostDeserializationChanges().Contains(catalog.UpgradedNamespaceName) {
+			descName = catconstants.PreMigrationNamespaceTableName
 		}
-		objMap[desc.GetName()] = desc.GetID()
+		if _, ok := objMap[descName]; ok {
+			return errors.Errorf("duplicate %s name: %q.%q.%q used for ID %d and %d",
+				kind, parentDesc.GetName(), scName, descName, desc.GetID(), objMap[descName])
+		}
+		objMap[descName] = desc.GetID()
 		r.ObjsByName[parentDesc.GetID()][scName] = objMap
+
+		objIDsMap := r.ObjIDsBySchema[parentDesc.GetID()]
+		objIDs := objIDsMap[scName]
+		if objIDs == nil {
+			objIDs = &catalog.DescriptorIDSet{}
+		}
+		objIDs.Add(desc.GetID())
+		r.ObjIDsBySchema[parentDesc.GetID()][scName] = objIDs
 		return nil
 	}
 
@@ -293,6 +323,8 @@ func NewDescriptorResolver(descs []catalog.Descriptor) (*DescriptorResolver, err
 			typeToRegister = "table"
 		case catalog.TypeDescriptor:
 			typeToRegister = "type"
+		case catalog.FunctionDescriptor:
+			typeToRegister = "function"
 		}
 		if typeToRegister != "" {
 			if err := registerDesc(desc.GetParentID(), desc, typeToRegister); err != nil {
@@ -345,16 +377,13 @@ func DescriptorsMatchingTargets(
 		if _, ok := alreadyRequestedDBs[dbID]; !ok {
 			desc := r.DescByID[dbID]
 			// Verify that the database is in the correct state.
-			doesNotExistErr := errors.Errorf(`database %q does not exist`, d)
-			if err := catalog.FilterDescriptorState(
-				desc, tree.CommonLookupFlags{},
-			); err != nil {
+			if desc == nil || !desc.Public() {
 				// Return a does not exist error if explicitly asking for this database.
-				return ret, doesNotExistErr
+				return ret, errors.Errorf(`database %q does not exist`, d)
 			}
 			ret.Descs = append(ret.Descs, desc)
-			ret.RequestedDBs = append(ret.RequestedDBs,
-				desc.(catalog.DatabaseDescriptor))
+			ret.RequestedDBs = append(ret.RequestedDBs, desc.(catalog.DatabaseDescriptor))
+			// If backup a whole DB, we need to expand the DB like what we do for "db.*"
 			ret.ExpandedDB = append(ret.ExpandedDB, dbID)
 			alreadyRequestedDBs[dbID] = struct{}{}
 			alreadyExpandedDBs[dbID] = struct{}{}
@@ -369,15 +398,14 @@ func DescriptorsMatchingTargets(
 		}
 		if _, ok := alreadyRequestedSchemas[id]; !ok {
 			schemaDesc := r.DescByID[id]
-			if err := catalog.FilterDescriptorState(
-				schemaDesc, tree.CommonLookupFlags{IncludeOffline: !requirePublic},
-			); err != nil {
+			if schemaDesc == nil || !schemaDesc.Public() {
 				if requirePublic {
 					return errors.Wrapf(err, "schema %d was expected to be PUBLIC", id)
+				} else if schemaDesc == nil || !schemaDesc.Offline() {
+					// If the schema is not public, but we don't require it to be, ignore
+					// it.
+					return nil
 				}
-				// If the schema is not public, but we don't require it to be, ignore
-				// it.
-				return nil
 			}
 			alreadyRequestedSchemas[id] = struct{}{}
 			ret.Descs = append(ret.Descs, r.DescByID[id])
@@ -453,16 +481,8 @@ func DescriptorsMatchingTargets(
 			}
 			tableDesc, isTable := descI.(catalog.TableDescriptor)
 			// If the type assertion didn't work, then we resolved a type instead, so
-			// error out.
-			if !isTable {
-				return ret, doesNotExistErr
-			}
-
-			// Verify that the table is in the correct state.
-			if err := catalog.FilterDescriptorState(
-				tableDesc, tree.CommonLookupFlags{},
-			); err != nil {
-				// Return a does not exist error if explicitly asking for this table.
+			// error out. Otherwise verify that the table is in the correct state.
+			if !isTable || tableDesc == nil || !tableDesc.Public() {
 				return ret, doesNotExistErr
 			}
 
@@ -495,7 +515,9 @@ func DescriptorsMatchingTargets(
 			for _, id := range typeIDs {
 				maybeAddTypeDesc(id)
 			}
-
+			// TODO(chengxiong): get all the user-defined functions used by this
+			// table. This is needed when we start supporting udf references from
+			// other objects.
 		case *tree.AllTablesSelector:
 			// We should only back up targets in the scoped schema if the table
 			// pattern is fully qualified, i.e., `db.schema.*`, both the schema
@@ -554,12 +576,10 @@ func DescriptorsMatchingTargets(
 		}
 	}
 
-	addObjectDescsInSchema := func(objects map[string]descpb.ID) error {
-		for _, id := range objects {
+	addObjectDescsInSchema := func(objectsIDs *catalog.DescriptorIDSet) error {
+		for _, id := range objectsIDs.Ordered() {
 			desc := r.DescByID[id]
-			if err := catalog.FilterDescriptorState(
-				desc, tree.CommonLookupFlags{IncludeOffline: true},
-			); err != nil {
+			if desc == nil || (!desc.Public() && !desc.Offline()) {
 				// Don't include this object in the expansion since it's not in a valid
 				// state. Silently fail since this object was not directly requested,
 				// but was just part of an expansion.
@@ -590,8 +610,18 @@ func DescriptorsMatchingTargets(
 				for _, id := range typeIDs {
 					maybeAddTypeDesc(id)
 				}
+				// TODO(chengxiong): get all the user-defined functions used by this
+				// table. This is needed when we start supporting udf references from
+				// other objects.
 			case catalog.TypeDescriptor:
 				maybeAddTypeDesc(desc.GetID())
+			case catalog.FunctionDescriptor:
+				// It's safe to append the Function descriptor directly since functions
+				// are only added when adding all descriptors in a schema.
+				ret.Descs = append(ret.Descs, desc)
+				for _, id := range desc.GetDependsOnTypes() {
+					maybeAddTypeDesc(id)
+				}
 			}
 		}
 		return nil
@@ -600,7 +630,9 @@ func DescriptorsMatchingTargets(
 	// Then process the database expansions.
 	for dbID := range alreadyExpandedDBs {
 		if requestedSchemas, ok := alreadyRequestedSchemasByDBs[dbID]; !ok {
-			for schemaName, objects := range r.ObjsByName[dbID] {
+			// If it's an expanded DB but no specific schema requested, then it's a
+			// "db.*" expansion. We need to loop through all schemas of the DB.
+			for schemaName, objIDs := range r.ObjIDsBySchema[dbID] {
 				schemaID, err := getSchemaIDByName(schemaName, dbID)
 				if err != nil {
 					return ret, err
@@ -608,14 +640,14 @@ func DescriptorsMatchingTargets(
 				if err := maybeAddSchemaDesc(schemaID, false /* requirePublic */); err != nil {
 					return ret, err
 				}
-				if err := addObjectDescsInSchema(objects); err != nil {
+				if err := addObjectDescsInSchema(objIDs); err != nil {
 					return ret, err
 				}
 			}
 		} else {
 			for schemaName := range requestedSchemas {
-				objects := r.ObjsByName[dbID][schemaName]
-				if err := addObjectDescsInSchema(objects); err != nil {
+				objIDs := r.ObjIDsBySchema[dbID][schemaName]
+				if err := addObjectDescsInSchema(objIDs); err != nil {
 					return ret, err
 				}
 			}
@@ -629,12 +661,12 @@ func DescriptorsMatchingTargets(
 func LoadAllDescs(
 	ctx context.Context, execCfg *sql.ExecutorConfig, asOf hlc.Timestamp,
 ) (allDescs []catalog.Descriptor, _ error) {
-	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		err := txn.SetFixedTimestamp(ctx, asOf)
+	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		err := txn.KV().SetFixedTimestamp(ctx, asOf)
 		if err != nil {
 			return err
 		}
-		all, err := col.GetAllDescriptors(ctx, txn)
+		all, err := col.GetAllDescriptors(ctx, txn.KV())
 		allDescs = all.OrderedDescriptors()
 		return err
 	}); err != nil {

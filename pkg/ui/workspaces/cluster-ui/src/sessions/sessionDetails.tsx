@@ -23,10 +23,10 @@ import {
 } from "./sessionsTable";
 
 import { SummaryCard, SummaryCardItem } from "../summaryCard";
-import SQLActivityError from "../sqlActivity/errorComponent";
+import LoadingError from "../sqlActivity/errorComponent";
 
 import { DurationToMomentDuration, TimestampToMoment } from "src/util/convert";
-import { Bytes, DATE_FORMAT } from "src/util/format";
+import { Bytes, DATE_FORMAT_24_TZ, Count } from "src/util/format";
 import { Col, Row } from "antd";
 import "antd/lib/col/style";
 import "antd/lib/row/style";
@@ -55,7 +55,8 @@ import classNames from "classnames/bind";
 import { commonStyles } from "src/common";
 import { CircleFilled } from "../icon";
 import { createTimeScaleFromDateRange, TimeScale } from "src/timeScaleDropdown";
-import moment from "moment";
+import moment from "moment-timezone";
+import { Timestamp } from "../timestamp";
 
 const cx = classNames.bind(styles);
 const statementsPageCx = classNames.bind(statementsPageStyles);
@@ -100,10 +101,6 @@ export const MemoryUsageItem: React.FC<{
 export class SessionDetails extends React.Component<SessionDetailsProps> {
   terminateSessionRef: React.RefObject<TerminateSessionModalRef>;
   terminateQueryRef: React.RefObject<TerminateQueryModalRef>;
-  static defaultProps = {
-    uiConfig: { showGatewayNodeLink: true },
-    isTenant: false,
-  };
 
   componentDidMount(): void {
     if (!this.props.isTenant) {
@@ -214,7 +211,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
             error={this.props.sessionError}
             render={this.renderContent}
             renderError={() =>
-              SQLActivityError({
+              LoadingError({
                 statsType: "sessions",
               })
             }
@@ -287,7 +284,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
               <SummaryCard className={cx("summary-card")}>
                 <SummaryCardItem
                   label={"Transaction Start Time"}
-                  value={start.format(DATE_FORMAT)}
+                  value={<Timestamp time={start} format={DATE_FORMAT_24_TZ} />}
                 />
                 <SummaryCardItem
                   label={"Number of Statements Executed"}
@@ -324,7 +321,10 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
         </>
       );
     }
-    let curStmtInfo = (
+
+    let curStmtInfo = session.last_active_query ? (
+      <SqlBox value={session.last_active_query} size={SqlBoxSize.custom} />
+    ) : (
       <SummaryCard className={cx("details-section")}>
         No Active Statement
       </SummaryCard>
@@ -340,7 +340,12 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
               <Col className="gutter-row" span={10}>
                 <SummaryCardItem
                   label={"Execution Start Time"}
-                  value={TimestampToMoment(stmt.start).format(DATE_FORMAT)}
+                  value={
+                    <Timestamp
+                      time={TimestampToMoment(stmt.start)}
+                      format={DATE_FORMAT_24_TZ}
+                    />
+                  }
                   className={cx("details-item")}
                 />
               </Col>
@@ -365,12 +370,22 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
             <SummaryCard className={cx("summary-card")}>
               <SummaryCardItem
                 label="Session Start Time"
-                value={TimestampToMoment(session.start).format(DATE_FORMAT)}
+                value={
+                  <Timestamp
+                    time={TimestampToMoment(session.start)}
+                    format={DATE_FORMAT_24_TZ}
+                  />
+                }
               />
               {session.end && (
                 <SummaryCardItem
                   label={"Session End Time"}
-                  value={TimestampToMoment(session.end).format(DATE_FORMAT)}
+                  value={
+                    <Timestamp
+                      time={TimestampToMoment(session.end)}
+                      format={DATE_FORMAT_24_TZ}
+                    />
+                  }
                 />
               )}
               <SummaryCardItem
@@ -383,7 +398,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                 <SummaryCardItem
                   label={"Gateway Node"}
                   value={
-                    this.props.uiConfig.showGatewayNodeLink ? (
+                    this.props.uiConfig?.showGatewayNodeLink ? (
                       <div className={cx("session-details-link")}>
                         <NodeLink
                           nodeId={session.node_id.toString()}
@@ -426,7 +441,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
               <SummaryCardItem label={"User Name"} value={session.username} />
               <SummaryCardItem
                 label="Transaction Count"
-                value={session.num_txns_executed}
+                value={Count(session.num_txns_executed)}
               />
             </SummaryCard>
           </Col>

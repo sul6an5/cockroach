@@ -1,4 +1,4 @@
-# LogicTest: default-configs local-mixed-22.1-22.2
+# LogicTest: default-configs
 
 statement ok
 CREATE TABLE t (
@@ -25,14 +25,14 @@ CREATE INDEX bar ON t (c)
 statement error index \"bar\" contains duplicate column \"b\"
 CREATE INDEX bar ON t (b, b);
 
-query TTBITTBBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM t
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit  visible
-t           foo         true        1             b            ASC        false    false     true
-t           foo         true        2             a            ASC        false    true      true
-t           t_pkey      false       1             a            ASC        false    false     true
-t           t_pkey      false       2             b            N/A        true     false     true
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
+t           foo         true        1             b            b           ASC        false    false     true
+t           foo         true        2             a            a           ASC        false    true      true
+t           t_pkey      false       1             a            a           ASC        false    false     true
+t           t_pkey      false       2             b            b           N/A        true     false     true
 
 statement ok
 INSERT INTO t VALUES (2,1)
@@ -40,14 +40,14 @@ INSERT INTO t VALUES (2,1)
 statement error pgcode 23505 violates unique constraint "bar"
 CREATE UNIQUE INDEX bar ON t (b)
 
-query TTBITTBBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM t
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit  visible
-t           foo         true        1             b            ASC        false    false     true
-t           foo         true        2             a            ASC        false    true      true
-t           t_pkey      false       1             a            ASC        false    false     true
-t           t_pkey      false       2             b            N/A        true     false     true
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
+t           foo         true        1             b            b           ASC        false    false     true
+t           foo         true        2             a            a           ASC        false    true      true
+t           t_pkey      false       1             a            a           ASC        false    false     true
+t           t_pkey      false       2             b            b           N/A        true     false     true
 
 # test for DESC index
 
@@ -70,18 +70,18 @@ CREATE INDEX b_desc ON t (b DESC)
 statement ok
 CREATE INDEX b_asc ON t (b ASC, c DESC)
 
-query TTBITTBBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM t
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit  visible
-t           b_asc       true        1             b            ASC        false    false     true
-t           b_asc       true        2             c            DESC       false    false     true
-t           b_asc       true        3             a            ASC        false    true      true
-t           b_desc      true        1             b            DESC       false    false     true
-t           b_desc      true        2             a            ASC        false    true      true
-t           t_pkey      false       1             a            ASC        false    false     true
-t           t_pkey      false       2             b            N/A        true     false     true
-t           t_pkey      false       3             c            N/A        true     false     true
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
+t           b_asc       true        1             b            b           ASC        false    false     true
+t           b_asc       true        2             c            c           DESC       false    false     true
+t           b_asc       true        3             a            a           ASC        false    true      true
+t           b_desc      true        1             b            b           DESC       false    false     true
+t           b_desc      true        2             a            a           ASC        false    true      true
+t           t_pkey      false       1             a            a           ASC        false    false     true
+t           t_pkey      false       2             b            b           N/A        true     false     true
+t           t_pkey      false       3             c            c           N/A        true     false     true
 
 statement error pgcode 42P01 relation "foo" does not exist
 CREATE INDEX fail ON foo (b DESC)
@@ -97,17 +97,25 @@ CREATE TABLE privs (a INT PRIMARY KEY, b INT)
 
 user testuser
 
+skipif config local-legacy-schema-changer
+skipif config local-mixed-22.2-23.1
+statement error must be owner of table privs or have CREATE privilege on table privs
+CREATE INDEX foo ON privs (b)
+
+onlyif config local-legacy-schema-changer
+onlyif config local-mixed-22.2-23.1
 statement error user testuser does not have CREATE privilege on relation privs
 CREATE INDEX foo ON privs (b)
 
+
 user root
 
-query TTBITTBBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM privs
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit  visible
-privs       privs_pkey  false       1             a            ASC        false    false     true
-privs       privs_pkey  false       2             b            N/A        true     false     true
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
+privs       privs_pkey  false       1             a            a           ASC        false    false     true
+privs       privs_pkey  false       2             b            b           N/A        true     false     true
 
 statement ok
 GRANT CREATE ON privs TO testuser
@@ -117,14 +125,14 @@ user testuser
 statement ok
 CREATE INDEX foo ON privs (b)
 
-query TTBITTBBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM privs
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit  visible
-privs       foo         true        1             b            ASC        false    false     true
-privs       foo         true        2             a            ASC        false    true      true
-privs       privs_pkey  false       1             a            ASC        false    false     true
-privs       privs_pkey  false       2             b            N/A        true     false     true
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
+privs       foo         true        1             b            b           ASC        false    false     true
+privs       foo         true        2             a            a           ASC        false    true      true
+privs       privs_pkey  false       1             a            a           ASC        false    false     true
+privs       privs_pkey  false       2             b            b           N/A        true     false     true
 
 
 user root
@@ -168,11 +176,11 @@ query TT
 SHOW CREATE TABLE create_index_concurrently_tbl
 ----
 create_index_concurrently_tbl  CREATE TABLE public.create_index_concurrently_tbl (
-                               a INT8 NULL,
-                               rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                               CONSTRAINT create_index_concurrently_tbl_pkey PRIMARY KEY (rowid ASC),
-                               INDEX create_index_concurrently_idx (a ASC)
-)
+                                 a INT8 NULL,
+                                 rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+                                 CONSTRAINT create_index_concurrently_tbl_pkey PRIMARY KEY (rowid ASC),
+                                 INDEX create_index_concurrently_idx (a ASC)
+                               )
 
 query T noticetrace
 DROP INDEX CONCURRENTLY create_index_concurrently_idx
@@ -190,10 +198,10 @@ query TT
 SHOW CREATE TABLE create_index_concurrently_tbl
 ----
 create_index_concurrently_tbl  CREATE TABLE public.create_index_concurrently_tbl (
-                               a INT8 NULL,
-                               rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                               CONSTRAINT create_index_concurrently_tbl_pkey PRIMARY KEY (rowid ASC)
-)
+                                 a INT8 NULL,
+                                 rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+                                 CONSTRAINT create_index_concurrently_tbl_pkey PRIMARY KEY (rowid ASC)
+                               )
 
 statement ok
 DROP TABLE create_index_concurrently_tbl
@@ -276,7 +284,7 @@ let $spans
                 SELECT j->'schemaChange'->'resumeSpanList'->0->'resumeSpans'->0 AS span
                   FROM (
                         SELECT crdb_internal.pb_to_json('payload', payload) AS j
-                          FROM system.jobs
+                          FROM crdb_internal.system_jobs
                        )
                  WHERE j->>'description' LIKE 'CREATE INDEX pauseidx%'
             ),
@@ -321,16 +329,16 @@ SELECT json_build_array(
 # sure that on resume it re-keys the spans correctly. We pretty_key these below
 # to confirm/show what is in them.
 statement ok
-UPDATE system.jobs
-  SET payload = crdb_internal.json_to_pb(
+UPDATE system.job_info
+  SET value = crdb_internal.json_to_pb(
     'cockroach.sql.jobs.jobspb.Payload',
       json_set(
-        crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', payload),
+        crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', value),
         ARRAY['schemaChange', 'resumeSpanList', '0'],
         '{"resumeSpans": $spans}'::jsonb
       )
     )
-WHERE crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', payload)->>'description' LIKE 'CREATE INDEX pauseidx%';
+WHERE info_key = 'legacy_payload' AND crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', value)->>'description' LIKE 'CREATE INDEX pauseidx%';
 
 # confirm we see these bogus start and end keys in the job, both for the wrong
 # tenant and for no tenant.
@@ -341,13 +349,13 @@ SELECT
   crdb_internal.pretty_key(decode(j->'schemaChange'->'resumeSpanList'->0->'resumeSpans'->1->>'key', 'base64'), 0),
   crdb_internal.pretty_key(decode(j->'schemaChange'->'resumeSpanList'->0->'resumeSpans'->1->>'endKey', 'base64'), 0)
 FROM (
-  SELECT crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', payload) j FROM system.jobs
+  SELECT crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', payload) j FROM crdb_internal.system_jobs
 ) WHERE j->>'description' LIKE 'CREATE INDEX pauseidx%';
 ----
 /103/Table/114/1  /103/Table/114/1/100  /114/1/100  /114/2
 
 # resume the job and ensure it completes, which includes validation.
-statement ok 
+statement ok
 RESUME JOB (SELECT job_id FROM crdb_internal.jobs WHERE description LIKE 'CREATE INDEX pauseidx%');
 
 query T
@@ -379,18 +387,18 @@ statement ok
 CREATE UNIQUE INDEX idx_t_hash_b ON t_hash (b) USING HASH WITH BUCKET_COUNT = 5;
 
 query T
-SELECT @2 FROM [SHOW CREATE TABLE t_hash]
+SELECT create_statement FROM [SHOW CREATE TABLE t_hash]
 ----
 CREATE TABLE public.t_hash (
-   pk INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   crdb_internal_a_shard_5 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(a)), 5:::INT8)) VIRTUAL,
-   crdb_internal_b_shard_5 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(b)), 5:::INT8)) VIRTUAL,
-   CONSTRAINT t_hash_pkey PRIMARY KEY (pk ASC),
-   INDEX idx_t_hash_a (a ASC) USING HASH WITH (bucket_count=5),
-   UNIQUE INDEX idx_t_hash_b (b ASC) USING HASH WITH (bucket_count=5),
-   FAMILY fam_0_pk_a_b (pk, a, b)
+  pk INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  crdb_internal_a_shard_5 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(a)), 5:::INT8)) VIRTUAL,
+  crdb_internal_b_shard_5 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(b)), 5:::INT8)) VIRTUAL,
+  CONSTRAINT t_hash_pkey PRIMARY KEY (pk ASC),
+  INDEX idx_t_hash_a (a ASC) USING HASH WITH (bucket_count=5),
+  UNIQUE INDEX idx_t_hash_b (b ASC) USING HASH WITH (bucket_count=5),
+  FAMILY fam_0_pk_a_b (pk, a, b)
 )
 
 statement ok
@@ -398,10 +406,27 @@ CREATE TABLE opclasses (a INT PRIMARY KEY, b TEXT, c JSON)
 
 # Make sure that we don't permit creating indexes with opclasses that aren't
 # inverted.
-statement error operator class "blah_ops" does not exist
+statement error pgcode 42804 operator classes are only allowed for the last column of an inverted index
 CREATE INDEX ON opclasses(b blah_ops)
 
 # Make sure that we don't permit creating indexes with opclasses that aren't
 # inverted, even if the type is invertible.
-statement error operator class "blah_ops" does not exist
+statement error pgcode 42804 operator classes are only allowed for the last column of an inverted index
 CREATE INDEX ON opclasses(c blah_ops)
+
+# Make sure that we don't permit creating indexes with opclasses that don't exist
+statement error pgcode 42704 operator class "blah_ops" does not exist
+CREATE INVERTED INDEX ON opclasses(c blah_ops)
+
+subtest create_index_on_materialized_view
+
+statement ok
+DROP TABLE t CASCADE;
+CREATE TABLE t (a INT PRIMARY KEY);
+INSERT INTO t SELECT generate_series(0, 9);
+
+statement ok
+CREATE MATERIALIZED VIEW v (b) AS SELECT a * 2 FROM t WITH DATA;
+
+statement ok
+CREATE INDEX ON v (b);

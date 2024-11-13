@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
@@ -103,6 +104,7 @@ var aggregateFuncToNumArguments = map[execinfrapb.AggregatorSpec_Func]int{
 	execinfrapb.FinalCovarSamp:          1,
 	execinfrapb.FinalCorr:               1,
 	execinfrapb.FinalSqrdiff:            3,
+	execinfrapb.ArrayCatAgg:             1,
 }
 
 // TestAggregateFuncToNumArguments ensures that all aggregate functions are
@@ -261,7 +263,8 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 									execinfrapb.StExtent,
 									execinfrapb.StUnion,
 									execinfrapb.StCollect,
-									execinfrapb.ArrayAgg:
+									execinfrapb.ArrayAgg,
+									execinfrapb.ArrayCatAgg:
 									for _, typ := range aggFnInputTypes {
 										if typ.Family() == types.TupleFamily || (typ.Family() == types.ArrayFamily && typ.ArrayContents().Family() == types.TupleFamily) {
 											invalid = true
@@ -1496,9 +1499,9 @@ func generateWindowFrame(
 			// We can assume that there is exactly one ordering column of an additive
 			// type, since we checked above.
 			colIdx := ordering.Columns[0].ColIdx
-			colEncoding := descpb.DatumEncoding_ASCENDING_KEY
+			colEncoding := catenumpb.DatumEncoding_ASCENDING_KEY
 			if ordering.Columns[0].Direction == execinfrapb.Ordering_Column_DESC {
-				colEncoding = descpb.DatumEncoding_DESCENDING_KEY
+				colEncoding = catenumpb.DatumEncoding_DESCENDING_KEY
 			}
 			offsetType := colexecwindow.GetOffsetTypeFromOrderColType(t, inputTypes[colIdx])
 			startOffset := colexectestutils.MakeRandWindowFrameRangeOffset(t, rng, offsetType)

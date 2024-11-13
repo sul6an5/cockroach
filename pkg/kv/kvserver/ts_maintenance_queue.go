@@ -84,6 +84,8 @@ type timeSeriesMaintenanceQueue struct {
 	mem            *mon.BytesMonitor
 }
 
+var _ queueImpl = &timeSeriesMaintenanceQueue{}
+
 // newTimeSeriesMaintenanceQueue returns a new instance of
 // timeSeriesMaintenanceQueue.
 func newTimeSeriesMaintenanceQueue(
@@ -110,7 +112,7 @@ func newTimeSeriesMaintenanceQueue(
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
-			needsSystemConfig:    false,
+			needsSpanConfigs:     false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.TimeSeriesMaintenanceQueueSuccesses,
 			failures:             store.metrics.TimeSeriesMaintenanceQueueFailures,
@@ -146,7 +148,7 @@ func (q *timeSeriesMaintenanceQueue) process(
 	ctx context.Context, repl *Replica, _ spanconfig.StoreReader,
 ) (processed bool, err error) {
 	desc := repl.Desc()
-	snap := repl.store.Engine().NewSnapshot()
+	snap := repl.store.TODOEngine().NewSnapshot()
 	now := repl.store.Clock().Now()
 	defer snap.Close()
 	if err := q.tsData.MaintainTimeSeries(
@@ -159,6 +161,11 @@ func (q *timeSeriesMaintenanceQueue) process(
 		log.VErrEventf(ctx, 2, "failed to update last processed time: %v", err)
 	}
 	return true, nil
+}
+
+func (*timeSeriesMaintenanceQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 func (q *timeSeriesMaintenanceQueue) timer(duration time.Duration) time.Duration {

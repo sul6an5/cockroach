@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -54,8 +55,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 		return nil, pgerror.DangerousStatementf("RENAME DATABASE on current database")
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
-		tree.DatabaseLookupFlags{Required: true})
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -119,15 +119,16 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 	// Rather than trying to rewrite them with the changed DB name, we
 	// simply disallow such renames for now.
 	// See #34416.
-	lookupFlags := p.CommonLookupFlags(true /*required*/)
-	// DDL statements bypass the cache.
-	lookupFlags.AvoidLeased = true
 	schemas, err := p.Descriptors().GetSchemasForDatabase(ctx, p.txn, dbDesc)
 	if err != nil {
 		return err
 	}
 	for _, schema := range schemas {
-		if err := maybeFailOnDependentDescInRename(ctx, p, dbDesc, schema, lookupFlags, catalog.Database); err != nil {
+		sc, err := p.Descriptors().ByName(p.txn).Get().Schema(ctx, dbDesc, schema)
+		if err != nil {
+			return err
+		}
+		if err := maybeFailOnDependentDescInRename(ctx, p, dbDesc, sc, !p.skipDescriptorCache, catalog.Database); err != nil {
 			return err
 		}
 	}
@@ -197,35 +198,28 @@ func getQualifiedDependentObjectName(
 func maybeFailOnDependentDescInRename(
 	ctx context.Context,
 	p *planner,
-	dbDesc catalog.DatabaseDescriptor,
-	schema string,
-	lookupFlags tree.CommonLookupFlags,
+	db catalog.DatabaseDescriptor,
+	sc catalog.SchemaDescriptor,
+	withLeased bool,
 	renameDescType catalog.DescriptorType,
 ) error {
-	tbNames, _, err := p.Descriptors().GetObjectNamesAndIDs(
-		ctx,
-		p.txn,
-		dbDesc,
-		schema,
-		tree.DatabaseListFlags{
-			CommonLookupFlags: lookupFlags,
-			ExplicitPrefix:    true,
-		},
-	)
+	_, ids, err := p.GetObjectNamesAndIDs(ctx, db, sc)
 	if err != nil {
 		return err
 	}
-	lookupFlags.Required = false
-	// TODO(ajwerner): Make this do something better than one-at-a-time lookups
-	// followed by catalogkv reads on each dependency.
-	for i := range tbNames {
-		found, tbDesc, err := p.Descriptors().GetImmutableTableByName(
-			ctx, p.txn, &tbNames[i], tree.ObjectLookupFlags{CommonLookupFlags: lookupFlags},
-		)
-		if err != nil {
-			return err
-		}
-		if !found {
+	var b descs.ByIDGetterBuilder
+	if withLeased {
+		b = p.Descriptors().ByIDWithLeased(p.txn)
+	} else {
+		b = p.Descriptors().ByID(p.txn)
+	}
+	descs, err := b.WithoutNonPublic().Get().Descs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for _, desc := range descs {
+		tbDesc, ok := desc.(catalog.TableDescriptor)
+		if !ok {
 			continue
 		}
 
@@ -237,18 +231,18 @@ func maybeFailOnDependentDescInRename(
 		}
 
 		if err := tbDesc.ForeachDependedOnBy(func(dependedOn *descpb.TableDescriptor_Reference) error {
-			dependentDesc, err := p.Descriptors().GetMutableDescriptorByID(ctx, p.txn, dependedOn.ID)
+			dependentDesc, err := p.Descriptors().MutableByID(p.txn).Desc(ctx, dependedOn.ID)
 			if err != nil {
 				return err
 			}
 
 			tbTableName := tree.MakeTableNameWithSchema(
-				tree.Name(dbDesc.GetName()),
-				tree.Name(schema),
+				tree.Name(db.GetName()),
+				tree.Name(sc.GetName()),
 				tree.Name(tbDesc.GetName()),
 			)
 			dependentDescQualifiedString, err := getQualifiedDependentObjectName(
-				ctx, p, dbDesc.GetName(), schema, tbDesc, dependentDesc,
+				ctx, p, db.GetName(), sc.GetName(), tbDesc, dependentDesc,
 			)
 			if err != nil {
 				return err

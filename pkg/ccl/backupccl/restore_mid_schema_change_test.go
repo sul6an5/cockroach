@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -28,11 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/stretchr/testify/require"
-)
-
-var (
-	clusterRestoreVersion = version.MustParse("v20.1.0")
-	noNonMVCCAddSSTable   = version.MustParse("v22.1.0")
 )
 
 // TestRestoreMidSchemaChanges attempts to RESTORE several BACKUPs that are
@@ -64,15 +60,15 @@ func TestRestoreMidSchemaChange(t *testing.T) {
 	skip.UnderRaceWithIssue(t, 56584)
 
 	var (
-		testdataBase = testutils.TestDataPath(t, "restore_mid_schema_change")
+		testdataBase = datapathutils.TestDataPath(t, "restore_mid_schema_change")
 		exportDirs   = testdataBase + "/exports"
 	)
-	for _, isSchemaOnly := range []bool{true, false} {
+	testutils.RunTrueAndFalse(t, "schema-only", func(t *testing.T, isSchemaOnly bool) {
 		name := "regular-"
 		if isSchemaOnly {
 			name = "schema-only-"
 		}
-		for _, isClusterRestore := range []bool{true, false} {
+		testutils.RunTrueAndFalse(t, "cluster-restore", func(t *testing.T, isClusterRestore bool) {
 			name = name + "table"
 			if isClusterRestore {
 				name = name + "cluster"
@@ -87,10 +83,6 @@ func TestRestoreMidSchemaChange(t *testing.T) {
 						for _, clusterVersionDir := range versionDirs {
 							clusterVersion, err := parseMajorVersion(clusterVersionDir.Name())
 							require.NoError(t, err)
-
-							if !clusterVersion.AtLeast(clusterRestoreVersion) && isClusterRestore {
-								continue
-							}
 
 							t.Run(clusterVersionDir.Name(), func(t *testing.T) {
 								require.True(t, clusterVersionDir.IsDir())
@@ -114,8 +106,8 @@ func TestRestoreMidSchemaChange(t *testing.T) {
 					})
 				}
 			})
-		}
-	}
+		})
+	})
 }
 
 // parseMajorVersion parses our major-versioned directory names as if they were
@@ -138,15 +130,10 @@ func expectedSCJobCount(scName string, ver *version.Version) int {
 	case "midmultitable":
 		expNumSCJobs = 2 // this test perform a schema change for each table
 	case "midprimarykeyswap":
-		if ver.AtLeast(noNonMVCCAddSSTable) {
-			// PK change and PK cleanup
-			expNumSCJobs = 2
-		} else {
-			// This will fail so we expect no cleanup job.
-			expNumSCJobs = 1
-		}
+		// PK change and PK cleanup
+		expNumSCJobs = 2
 	case "midprimarykeyswapcleanup":
-		expNumSCJobs = 1
+		expNumSCJobs = 2
 	default:
 		// Most test cases only have 1 schema change under test.
 		expNumSCJobs = 1
@@ -209,7 +196,7 @@ func verifyMidSchemaChange(
 	expNumSchemaChangeJobs := expectedSCJobCount(scName, majorVer)
 
 	synthesizedSchemaChangeJobs := sqlDB.QueryStr(t,
-		"SELECT description FROM crdb_internal.jobs WHERE job_type = 'SCHEMA CHANGE' AND description LIKE '%RESTORING%'")
+		`SELECT description FROM "".crdb_internal.jobs WHERE job_type = 'SCHEMA CHANGE' AND description LIKE '%RESTORING%'`)
 	require.Equal(t, expNumSchemaChangeJobs, len(synthesizedSchemaChangeJobs),
 		"Expected %d schema change jobs but found %v", expNumSchemaChangeJobs, synthesizedSchemaChangeJobs)
 
@@ -256,14 +243,23 @@ func restoreMidSchemaChange(
 		require.NoError(t, err)
 
 		sqlDB.Exec(t, "USE defaultdb")
-		restoreQuery := "RESTORE defaultdb.* FROM $1"
+		// The restore queries are run with `UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
+		// option to ensure the restore is successful on development branches. This
+		// is because, while the backups were generated on release branches and have
+		// versions such as 22.2 in their manifest, the development branch will have
+		// a BinaryMinSupportedVersion offset by the clusterversion.DevOffset
+		// described in `pkg/clusterversion/cockroach_versions.go`. This will mean
+		// that the manifest version is always less than the
+		// BinaryMinSupportedVersion which will in turn fail the restore unless we
+		// pass in the specified option to elide the compatability check.
+		restoreQuery := "RESTORE defaultdb.* FROM LATEST IN $1 WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION"
 		if isClusterRestore {
-			restoreQuery = "RESTORE FROM $1"
+			restoreQuery = "RESTORE FROM LATEST IN $1 WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION"
 		}
 		if isSchemaOnly {
-			restoreQuery = restoreQuery + "with schema_only"
+			restoreQuery = restoreQuery + ", schema_only"
 		}
-		log.Infof(context.Background(), "%+v", sqlDB.QueryStr(t, "SHOW BACKUP $1", localFoo))
+		log.Infof(context.Background(), "%+v", sqlDB.QueryStr(t, "SHOW BACKUP LATEST IN $1", localFoo))
 		sqlDB.Exec(t, restoreQuery, localFoo)
 		// Wait for all jobs to terminate. Some may fail since we don't restore
 		// adding spans.

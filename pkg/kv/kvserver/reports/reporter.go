@@ -21,18 +21,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -44,7 +46,7 @@ import (
 // ReporterInterval is the interval between two generations of the reports.
 // When set to zero - disables the report generation.
 var ReporterInterval = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.replication_reports.interval",
 	"the frequency for generating the replication_constraint_stats, replication_stats_report and "+
 		"replication_critical_localities reports (set to 0 to disable)",
@@ -73,7 +75,7 @@ type Reporter struct {
 	liveness  *liveness.NodeLiveness
 	settings  *cluster.Settings
 	storePool *storepool.StorePool
-	executor  sqlutil.InternalExecutor
+	executor  isql.Executor
 	cfgs      config.SystemConfigProvider
 
 	frequencyMu struct {
@@ -90,7 +92,7 @@ func NewReporter(
 	storePool *storepool.StorePool,
 	st *cluster.Settings,
 	liveness *liveness.NodeLiveness,
-	executor sqlutil.InternalExecutor,
+	executor isql.Executor,
 	provider config.SystemConfigProvider,
 ) *Reporter {
 	r := Reporter{
@@ -127,9 +129,12 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 		stats.frequencyMu.interval = ReporterInterval.Get(&stats.settings.SV)
 	})
 	_ = stopper.RunAsyncTask(ctx, "stats-reporter", func(ctx context.Context) {
+		ctx = logtags.AddTag(ctx, "replication-reporter", nil /* value */)
+		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		defer cancel()
+
 		var timer timeutil.Timer
 		defer timer.Stop()
-		ctx = logtags.AddTag(ctx, "replication-reporter", nil /* value */)
 
 		replStatsSaver := makeReplicationStatsReportSaver()
 		constraintsSaver := makeReplicationConstraintStatusReportSaver()
@@ -164,6 +169,8 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 			case <-timerCh:
 				timer.Read = true
 			case <-changeCh:
+			case <-ctx.Done():
+				return
 			case <-stopper.ShouldQuiesce():
 				return
 			}
@@ -266,7 +273,7 @@ func (stats *Reporter) update(
 func (stats *Reporter) meta1LeaseHolderStore(ctx context.Context) *kvserver.Store {
 	const meta1RangeID = roachpb.RangeID(1)
 	repl, store, err := stats.localStores.GetReplicaForRangeID(ctx, meta1RangeID)
-	if roachpb.IsRangeNotFoundError(err) {
+	if kvpb.IsRangeNotFoundError(err) {
 		return nil
 	}
 	if err != nil {
@@ -451,23 +458,22 @@ func visitAncestors(
 
 	// TODO(ajwerner): Reconsider how this zone config picking apart happens. This
 	// isn't how we want to be retreiving table descriptors in general.
-	var desc descpb.Descriptor
-	if err := descVal.GetProto(&desc); err != nil {
+	b, err := descbuilder.FromSerializedValue(descVal)
+	if err != nil {
 		return false, err
 	}
-	tableDesc, _, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, descVal.Timestamp)
 	// If it's a database, the parent is the default zone.
-	if tableDesc == nil {
+	if b == nil || b.DescriptorType() != catalog.Table {
 		return visitDefaultZone(ctx, cfg, visitor), nil
 	}
-
+	tableDesc := b.BuildImmutable()
 	// If it's a table, the parent is a database.
-	zone, err := getZoneByID(config.ObjectID(tableDesc.ParentID), cfg)
+	zone, err := getZoneByID(config.ObjectID(tableDesc.GetParentID()), cfg)
 	if err != nil {
 		return false, err
 	}
 	if zone != nil {
-		if visitor(ctx, zone, MakeZoneKey(config.ObjectID(tableDesc.ParentID), NoSubzone)) {
+		if visitor(ctx, zone, MakeZoneKey(config.ObjectID(tableDesc.GetParentID()), NoSubzone)) {
 			return true, nil
 		}
 	}
@@ -588,6 +594,11 @@ func visitRanges(
 			break
 		}
 
+		// Check for context cancellation.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		newKey, err := resolver.resolveRange(ctx, &rd, cfg)
 		if err != nil {
 			return err
@@ -628,7 +639,7 @@ type RangeIterator interface {
 	// the iterator is not to be used any more (except for calling Close(), which will be a no-op).
 	//
 	// The returned error can be a retriable one (i.e.
-	// *roachpb.TransactionRetryWithProtoRefreshError, possibly wrapped). In that case, the iterator
+	// *kvpb.TransactionRetryWithProtoRefreshError, possibly wrapped). In that case, the iterator
 	// is reset automatically; the next Next() call ( should there be one) will
 	// return the first descriptor.
 	// In case of any other error, the iterator is automatically closed.
@@ -744,7 +755,7 @@ func (r *meta2RangeIter) readBatch(ctx context.Context) (retErr error) {
 }
 
 func errIsRetriable(err error) bool {
-	return errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil))
+	return errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil))
 }
 
 // handleErr manipulates the iterator's state in response to an error.
@@ -760,8 +771,11 @@ func (r *meta2RangeIter) handleErr(ctx context.Context, err error) {
 	}
 	if !errIsRetriable(err) {
 		if r.txn != nil {
+			log.Eventf(ctx, "non-retriable error: %s", err)
 			// On any non-retriable error, rollback.
-			r.txn.CleanupOnError(ctx, err)
+			if rollbackErr := r.txn.Rollback(ctx); rollbackErr != nil {
+				log.Eventf(ctx, "rollback failed: %s", rollbackErr)
+			}
 			r.txn = nil
 		}
 		r.reset()
@@ -783,13 +797,13 @@ type reportID int
 // getReportGenerationTime returns the time at a particular report was last
 // generated. Returns time.Time{} if the report is not found.
 func getReportGenerationTime(
-	ctx context.Context, rid reportID, ex sqlutil.InternalExecutor, txn *kv.Txn,
+	ctx context.Context, rid reportID, ex isql.Executor, txn *kv.Txn,
 ) (time.Time, error) {
 	row, err := ex.QueryRowEx(
 		ctx,
 		"get-previous-timestamp",
 		txn,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		"select generated from system.reports_meta where id = $1",
 		rid,
 	)

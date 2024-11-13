@@ -271,14 +271,14 @@ query TT
 SHOW CREATE TABLE b
 ----
 b  CREATE TABLE public.b (
-   parent_id INT8 NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   d INT8 NULL DEFAULT 23:::INT8,
-   CONSTRAINT b_pkey PRIMARY KEY (rowid ASC),
-   CONSTRAINT b_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id),
-   INDEX foo (parent_id ASC),
-   UNIQUE INDEX bar (parent_id ASC)
-)
+     parent_id INT8 NULL,
+     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+     d INT8 NULL DEFAULT 23:::INT8,
+     CONSTRAINT b_pkey PRIMARY KEY (rowid ASC),
+     CONSTRAINT b_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id),
+     INDEX foo (parent_id ASC),
+     UNIQUE INDEX bar (parent_id ASC)
+   )
 
 # table b is not visible to the transaction #17949
 statement error pgcode 55000 table "b" is being added
@@ -954,9 +954,9 @@ check_table  d_0               CHECK        CHECK ((d > 0))            true
 query TTBTTTB
 SHOW COLUMNS FROM check_table
 ----
-k  INT8  false  NULL      ·  {check_table_pkey}  false
-c  INT8  true   NULL      ·  {check_table_pkey}  false
-d  INT8  true   1:::INT8  ·  {check_table_pkey}  false
+k  INT8  false  NULL  ·  {check_table_pkey}  false
+c  INT8  true   NULL  ·  {check_table_pkey}  false
+d  INT8  true   1     ·  {check_table_pkey}  false
 
 statement ok
 DROP TABLE check_table
@@ -1036,7 +1036,7 @@ ALTER TABLE check_table ADD g INT
 statement ok
 ALTER TABLE check_table ADD CONSTRAINT g_0 CHECK (g > 0)
 
-statement error unimplemented: constraint "g_0" in the middle of being added, try again later
+statement error pgcode 0A000 constraint "g_0" in the middle of being added, try again later
 ALTER TABLE check_table DROP COLUMN g
 
 statement ok
@@ -1950,3 +1950,50 @@ DROP SCHEMA sc;
 # Prior to fixing this bug, this commit would hang indefinitely.
 statement ok
 COMMIT;
+
+# This is a regression test to handle the case where a newly created table or
+# a previously unleased table are referenced in a transaction involving
+# transactional constraint validation.
+subtest validate_constraint_referencing_modified_table
+
+statement ok
+CREATE TABLE t1 (id STRING PRIMARY KEY, other_id STRING NOT NULL);
+CREATE TABLE t2 (id STRING PRIMARY KEY);
+ALTER TABLE t1 ADD CONSTRAINT fk FOREIGN KEY (other_id) REFERENCES t2(id) NOT VALID;
+
+statement ok
+BEGIN;
+SET TRANSACTION PRIORITY HIGH;
+ALTER TABLE t2 RENAME TO t3;
+ALTER TABLE t1 VALIDATE CONSTRAINT fk;
+COMMIT;
+
+statement ok
+DROP TABLE t1, t3 CASCADE
+
+statement ok
+CREATE TABLE t1 (id STRING PRIMARY KEY, other_id STRING NOT NULL);
+CREATE TABLE t2 (id STRING PRIMARY KEY);
+ALTER TABLE t1 ADD CONSTRAINT fk FOREIGN KEY (other_id) REFERENCES t2(id) NOT VALID;
+
+statement ok
+BEGIN;
+SET TRANSACTION PRIORITY HIGH;
+ALTER TABLE t1 RENAME TO t3;
+ALTER TABLE t3 VALIDATE CONSTRAINT fk;
+COMMIT;
+
+statement ok
+DROP TABLE t2, t3 CASCADE
+
+statement ok
+BEGIN;
+SET TRANSACTION PRIORITY HIGH;
+CREATE TABLE t1 (id STRING PRIMARY KEY, other_id STRING NOT NULL);
+CREATE TABLE t2 (id STRING PRIMARY KEY);
+ALTER TABLE t1 ADD CONSTRAINT fk FOREIGN KEY (other_id) REFERENCES t2(id);
+ALTER TABLE t1 VALIDATE CONSTRAINT fk;
+COMMIT;
+
+statement ok
+DROP TABLE t1, t2 CASCADE

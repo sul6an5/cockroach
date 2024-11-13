@@ -19,12 +19,23 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+)
+
+type SessionType int
+
+const (
+	UnknownSession SessionType = iota
+	SingleTenantSession
+	MultiTenantSession
 )
 
 // TestTenantInterface defines SQL-only tenant functionality that tests need; it
@@ -36,7 +47,12 @@ type TestTenantInterface interface {
 	// SQLServer. Each tenant can have zero or more running SQLServer instances.
 	SQLInstanceID() base.SQLInstanceID
 
-	// SQLAddr returns the tenant's SQL address.
+	// SQLAddr returns the tenant's SQL address. Note that for "shared-process
+	// tenants" (i.e. tenants created with TestServer.StartSharedProcessTenant),
+	// simply connecting to this address connects to the system tenant, not to
+	// this tenant. In order to connect to this tenant,
+	// "cluster:<tenantName>/<databaseName>" needs to be added to the connection
+	// string as the database name.
 	SQLAddr() string
 
 	// HTTPAddr returns the tenant's http address.
@@ -44,6 +60,9 @@ type TestTenantInterface interface {
 
 	// RPCAddr returns the tenant's RPC address.
 	RPCAddr() string
+
+	// DB returns a handle to the cluster's KV interface.
+	DB() *kv.DB
 
 	// PGServer returns the tenant's *pgwire.Server as an interface{}.
 	PGServer() interface{}
@@ -88,6 +107,10 @@ type TestTenantInterface interface {
 	// this tenant.
 	ClusterSettings() *cluster.Settings
 
+	// SettingsWatcher returns the *settingswatcher.SettingsWatcher used by the
+	// tenant server.
+	SettingsWatcher() interface{}
+
 	// Stopper returns the stopper used by the tenant.
 	Stopper() *stop.Stopper
 
@@ -97,6 +120,10 @@ type TestTenantInterface interface {
 	// SpanConfigKVAccessor returns the underlying spanconfig.KVAccessor as an
 	// interface{}.
 	SpanConfigKVAccessor() interface{}
+
+	// SpanConfigReporter returns the underlying spanconfig.Reporter as an
+	// interface{}.
+	SpanConfigReporter() interface{}
 
 	// SpanConfigReconciler returns the underlying spanconfig.Reconciler as an
 	// interface{}.
@@ -132,7 +159,7 @@ type TestTenantInterface interface {
 	GetAdminHTTPClient() (http.Client, error)
 	// GetAuthenticatedHTTPClient returns an http client which has been
 	// authenticated to access Admin API methods (via a cookie).
-	GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, error)
+	GetAuthenticatedHTTPClient(isAdmin bool, sessionType SessionType) (http.Client, error)
 	// GetEncodedSession returns a byte array containing a valid auth
 	// session.
 	GetAuthSession(isAdmin bool) (*serverpb.SessionCookie, error)
@@ -146,6 +173,21 @@ type TestTenantInterface interface {
 	// MustGetSQLCounter returns the value of a counter metric from the server's
 	// SQL Executor. Runs in O(# of metrics) time, which is fine for test code.
 	MustGetSQLCounter(name string) int64
+
+	// Codec returns this tenant's codec (or keys.SystemSQLCodec if this is the
+	// system tenant).
+	Codec() keys.SQLCodec
+
+	// RangeDescIteratorFactory returns the underlying rangedesc.IteratorFactory
+	// as an interface{}.
+	RangeDescIteratorFactory() interface{}
+
+	// Tracer returns a reference to the tenant's Tracer.
+	Tracer() *tracing.Tracer
+
+	// MigrationServer returns the tenant's migration server, which is used in
+	// upgrade testing.
+	MigrationServer() interface{}
 
 	// TODO(irfansharif): We'd benefit from an API to construct a *gosql.DB, or
 	// better yet, a *sqlutils.SQLRunner. We use it all the time, constructing

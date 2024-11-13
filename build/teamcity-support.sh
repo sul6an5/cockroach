@@ -44,8 +44,6 @@ run_counter=-1
 function run_json_test() {
   run_counter=$((run_counter+1))
   tc_start_block "prep"
-  # TODO(tbg): better to go through builder for all of this.
-  go install github.com/cockroachdb/cockroach/pkg/cmd/github-post
   mkdir -p artifacts
   tmpfile="artifacts/raw.${run_counter}.json.txt"
   tc_end_block "prep"
@@ -59,29 +57,6 @@ function run_json_test() {
   status=$?
   set -e
   tc_end_block "run"
-
-  # Post issues, if on a release branch. Note that we're feeding github-post all
-  # of the build output; it also does some slow test analysis.
-  if tc_release_branch; then
-    if [ -z "${GITHUB_API_TOKEN-}" ]; then
-      # GITHUB_API_TOKEN must be in the env or github-post will barf if it's
-      # ever asked to post, so enforce that on all runs.
-      # The way this env var is made available here is quite tricky. The build
-      # calling this method is usually a build that is invoked from PRs, so it
-      # can't have secrets available to it (for the PR could modify
-      # build/teamcity-* to leak the secret). Instead, we provide the secrets
-      # to a higher-level job (Publish Bleeding Edge) and use TeamCity magic to
-      # pass that env var through when it's there. This means we won't have the
-      # env var on PR builds, but we'll have it for builds that are triggered
-      # from the release branches.
-      echo "GITHUB_API_TOKEN must be set"
-      exit 1
-    else
-      tc_start_block "post issues"
-      github-post < "${tmpfile}"
-      tc_end_block "post issues"
-    fi
-  fi
 
   tc_start_block "artifacts"
   # Create (or append to) failures.txt artifact and delete stripped.txt.
@@ -128,24 +103,6 @@ function would_stress() {
   else
     return 0
   fi
-}
-
-function maybe_stress() {
-   # NB: This code doesn't know about posting Github issues as we don't stress on
-   # the release branches.
-  if ! would_stress; then
-    return 0
-  fi
-
-  target=$1
-  shift
-
-  block="Maybe ${target} pull request"
-  tc_start_block "${block}"
-  run build/builder.sh make protobuf
-  run build/builder.sh go install ./pkg/cmd/github-pull-request-make
-  run_json_test build/builder.sh env BUILD_VCS_NUMBER="$BUILD_VCS_NUMBER" TARGET="${target}" github-pull-request-make
-  tc_end_block "${block}"
 }
 
 # Returns the list of release branches from origin (origin/release-*), ordered

@@ -17,10 +17,13 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/gogo/protobuf/types"
@@ -60,7 +63,7 @@ func TestTracingOffRecording(t *testing.T) {
 	noop2 := tr.StartSpan("noop2", WithParent(noop1), WithDetachedRecording())
 	require.True(t, noop2.IsNoop())
 
-	// Noop span returns empty recording.
+	// Noop span returns Empty recording.
 	require.Nil(t, noop1.GetRecording(tracingpb.RecordingVerbose))
 }
 
@@ -89,7 +92,7 @@ func TestTracerRecording(t *testing.T) {
 	rec := s1.GetRecording(tracingpb.RecordingStructured)
 	require.Len(t, rec, 1)
 	require.Nil(t, rec[0].Logs)
-	require.Nil(t, rec[0].Tags)
+	require.Nil(t, rec[0].TagGroups)
 	require.Empty(t, rec[0].ChildrenMetadata)
 	require.Empty(t, rec[0].StructuredRecords)
 
@@ -482,7 +485,8 @@ func getSpanOpsWithFinished(t *testing.T, tr *Tracer) map[string]bool {
 	spanOpsWithFinished := make(map[string]bool)
 
 	require.NoError(t, tr.VisitSpans(func(sp RegistrySpan) error {
-		for _, rec := range sp.GetFullRecording(tracingpb.RecordingVerbose) {
+		rec := sp.GetFullRecording(tracingpb.RecordingVerbose)
+		for _, rec := range rec.Flatten() {
 			spanOpsWithFinished[rec.Operation] = rec.Finished
 		}
 		return nil
@@ -499,7 +503,8 @@ func getSortedSpanOps(t *testing.T, tr *Tracer) []string {
 	var spanOps []string
 
 	require.NoError(t, tr.VisitSpans(func(sp RegistrySpan) error {
-		for _, rec := range sp.GetFullRecording(tracingpb.RecordingVerbose) {
+		rec := sp.GetFullRecording(tracingpb.RecordingVerbose)
+		for _, rec := range rec.Flatten() {
 			spanOps = append(spanOps, rec.Operation)
 		}
 		return nil
@@ -735,25 +740,43 @@ span: test
 	require.Equal(t, rec1, rec2)
 }
 
+// Check that it is illegal to create a child with a different Tracer than the
+// parent.
 func TestChildNeedsSameTracerAsParent(t *testing.T) {
-	// Check that it is illegal to create a child with a different Tracer than the
-	// parent.
-	tr1 := NewTracer()
-	tr2 := NewTracer()
-	parent := tr1.StartSpan("parent")
-	defer parent.Finish()
-	require.Panics(t, func() {
-		tr2.StartSpan("child", WithParent(parent))
-	})
+	type testCase struct {
+		sterileParent bool
+		noopParent    bool
+	}
+	for _, tc := range []testCase{
+		{},
+		{sterileParent: true},
+		{noopParent: true},
+	} {
+		t.Run("", func(t *testing.T) {
+			tr1 := NewTracerWithOpt(context.Background(), WithTracingMode(TracingModeOnDemand))
+			tr2 := NewTracer()
 
-	// Sterile spans can have children created with a different Tracer (because
-	// they are not really children).
-	parent = tr1.StartSpan("parent", WithSterile())
-	defer parent.Finish()
-	require.NotPanics(t, func() {
-		sp := tr2.StartSpan("child", WithParent(parent))
-		sp.Finish()
-	})
+			var opt []SpanOption
+			if tc.sterileParent {
+				opt = append(opt, WithSterile())
+			}
+			if !tc.noopParent {
+				opt = append(opt, WithForceRealSpan())
+			}
+			parent := tr1.StartSpan("parent", opt...)
+			defer parent.Finish()
+			if tc.noopParent {
+				require.True(t, parent.IsNoop())
+			}
+			if tc.sterileParent {
+				require.True(t, parent.IsSterile())
+			}
+
+			require.Panics(t, func() {
+				tr2.StartSpan("child", WithParent(parent))
+			})
+		})
+	}
 }
 
 // TestSpanReuse checks that spans are reused through the Tracer's pool, instead
@@ -877,4 +900,137 @@ func TestTracerClusterSettings(t *testing.T) {
 	sp = tr.StartSpan("test")
 	require.False(t, sp.IsNoop())
 	sp.Finish()
+}
+
+func TestTracerSnapshots(t *testing.T) {
+	tr := NewTracer()
+
+	s1 := tr.SaveSnapshot()
+	require.Equal(t, SnapshotID(1), s1.ID)
+	_ = tr.SaveSnapshot()
+	s3 := tr.SaveSnapshot()
+	require.Equal(t, SnapshotID(3), s3.ID)
+	require.Equal(t, 3, len(tr.GetSnapshots()))
+
+	b1 := tr.SaveAutomaticSnapshot()
+	require.Equal(t, SnapshotID(1), b1.ID)
+	b2 := tr.SaveAutomaticSnapshot()
+	require.Equal(t, SnapshotID(2), b2.ID)
+	require.Equal(t, 3, len(tr.GetSnapshots()))
+	require.Equal(t, 2, len(tr.GetAutomaticSnapshots()))
+
+	for _, i := range []SnapshotID{1, 2, 3} {
+		_, err := tr.GetSnapshot(i)
+		require.NoError(t, err)
+	}
+	for _, i := range []SnapshotID{1, 2} {
+		_, err := tr.GetAutomaticSnapshot(i)
+		require.NoError(t, err)
+	}
+}
+
+func TestTracerSnapshotLoop(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tr := NewTracer()
+	ctx := context.Background()
+
+	sv := settings.Values{}
+	periodicSnapshotInterval.Override(ctx, &sv, 0)
+
+	setting, done, testKnob := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	defer close(done)
+	defer close(testKnob)
+
+	go tr.runPeriodicSnapshotsLoop(&sv, setting, done, testKnob)
+
+	// Verify our snapshot loop is running by sending rate-change notifications
+	// and then verify it is not snapshotting since it is disabled.
+	setting <- struct{}{}
+	setting <- struct{}{}
+	require.Empty(t, tr.GetAutomaticSnapshots())
+
+	periodicSnapshotInterval.Override(ctx, &sv, time.Microsecond)
+	for sent := false; !sent; {
+		select {
+		case setting <- struct{}{}:
+		case testKnob <- struct{}{}:
+			sent = true
+		}
+	}
+
+	snaps := tr.GetAutomaticSnapshots()
+	require.NotEmpty(t, snaps)
+}
+
+// helper that blocks long enough to appear in the stack.
+func blockingFunc1(ch chan<- struct{}) {
+	ch <- struct{}{} // allow snapshot to start.
+	ch <- struct{}{} // wait for snapshot to be done.
+}
+
+// helper that blocks long enough to appear in the stack.
+func blockingFunc2(ch chan<- struct{}) {
+	ch <- struct{}{}
+	ch <- struct{}{}
+}
+
+// helper that blocks long enough to appear in the stack.
+func blockingFunc3(ch chan<- struct{}) {
+	ch <- struct{}{}
+	ch <- struct{}{}
+}
+
+func blockingCaller(ch chan<- struct{}) {
+	blockingFunc2(ch)
+}
+
+// TestTracerStackHistory tests MaybeRecordStackHistory.
+func TestTracerStackHistory(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tr := NewTracer()
+
+	for _, verbose := range []bool{true, false} {
+		sp := tr.StartSpan("test", WithRecording(tracingpb.RecordingStructured))
+		if verbose {
+			sp = tr.StartSpan("test", WithRecording(tracingpb.RecordingVerbose))
+		}
+		ch := make(chan struct{})
+		defer close(ch)
+		go func() {
+			for range ch {
+				tr.SaveAutomaticSnapshot()
+				<-ch // read again to unpark func.
+			}
+		}()
+
+		blockingFunc1(ch)
+		started := timeutil.Now()
+		blockingFunc2(ch)
+		blockingFunc3(ch)
+		blockingCaller(ch)
+
+		sp.MaybeRecordStackHistory(started)
+
+		rec := sp.FinishAndGetConfiguredRecording()[0]
+		require.Len(t, rec.StructuredRecords, 3)
+		stacks := make([]string, 3)
+		for i, rec := range rec.StructuredRecords {
+			var stack tracingpb.CapturedStack
+			require.NoError(t, types.UnmarshalAny(rec.Payload, &stack))
+			stacks[i] = stack.Stack
+		}
+		require.Contains(t, stacks[0], "tracing.blockingFunc2")
+		require.Contains(t, stacks[1], "tracing.blockingFunc3")
+		require.Contains(t, stacks[2], "tracing.blockingCaller")
+
+		if verbose {
+			require.Len(t, rec.Logs, 3)
+			for i := range rec.Logs {
+				require.NotContains(t, rec.Logs[i].Message, "tracing.blockingFunc1")
+			}
+			require.Contains(t, rec.Logs[0].Message, "tracing.blockingFunc2")
+			require.Contains(t, rec.Logs[1].Message, "tracing.blockingFunc3")
+			require.Contains(t, rec.Logs[2].Message, "tracing.blockingCaller")
+		}
+	}
 }

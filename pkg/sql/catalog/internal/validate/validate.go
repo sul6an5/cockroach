@@ -58,6 +58,15 @@ func Validate(
 	targetLevel catalog.ValidationLevel,
 	descriptors ...catalog.Descriptor,
 ) catalog.ValidationErrors {
+	for i, d := range descriptors {
+		// Replace mutable descriptors with immutable copies. Validation is
+		// read-only in any case, and using immutables can have a significant
+		// impact on performance when validating tables due to columns, indexes,
+		// and so forth being cached.
+		if mut, ok := d.(catalog.MutableDescriptor); ok {
+			descriptors[i] = mut.ImmutableCopy()
+		}
+	}
 	vea := validationErrorAccumulator{
 		ValidationTelemetry: telemetry,
 		targetLevel:         targetLevel,
@@ -235,15 +244,15 @@ func (vea *validationErrorAccumulator) decorate(err error) error {
 		// This contrived switch case is required to make the linter happy.
 		switch vea.currentDescriptor.DescriptorType() {
 		case catalog.Table:
-			err = errors.Wrapf(err, catalog.Table+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Table)+" %q (%d)", name, id)
 		case catalog.Database:
-			err = errors.Wrapf(err, catalog.Database+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Database)+" %q (%d)", name, id)
 		case catalog.Schema:
-			err = errors.Wrapf(err, catalog.Schema+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Schema)+" %q (%d)", name, id)
 		case catalog.Type:
-			err = errors.Wrapf(err, catalog.Type+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Type)+" %q (%d)", name, id)
 		case catalog.Function:
-			err = errors.Wrapf(err, catalog.Function+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Function)+" %q (%d)", name, id)
 		default:
 			return err
 		}
@@ -409,9 +418,17 @@ func (cs *collectorState) getMissingDescs(
 		return nil, err
 	}
 	for _, desc := range resps {
-		if desc != nil {
-			cs.vdg.descriptors[desc.GetID()] = desc
+		if desc == nil {
+			continue
 		}
+		if mut, ok := desc.(catalog.MutableDescriptor); ok {
+			// Replace mutable descriptors with immutable copies. Validation is
+			// read-only in any case, and using immutables can have a significant
+			// impact on performance when validating tables due to columns, indexes,
+			// and so forth being cached.
+			desc = mut.ImmutableCopy()
+		}
+		cs.vdg.descriptors[desc.GetID()] = desc
 	}
 	return resps, nil
 }

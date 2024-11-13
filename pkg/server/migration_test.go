@@ -15,23 +15,27 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/startupmigrations"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
 )
 
 func TestValidateTargetClusterVersion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := func(major, minor int32) roachpb.Version {
 		return roachpb.Version{Major: major, Minor: minor}
@@ -108,6 +112,7 @@ func TestValidateTargetClusterVersion(t *testing.T) {
 // version.
 func TestBumpClusterVersion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := func(major, minor int32) roachpb.Version {
 		return roachpb.Version{Major: major, Minor: minor}
@@ -188,7 +193,7 @@ func TestBumpClusterVersion(t *testing.T) {
 			}
 
 			// Check to see that our bumped cluster version was persisted to disk.
-			synthesizedCV, err := kvserver.SynthesizeClusterVersionFromEngines(
+			synthesizedCV, err := kvstorage.SynthesizeClusterVersionFromEngines(
 				ctx, s.Engines(), test.binaryVersion,
 				test.activeClusterVersion.Version,
 			)
@@ -204,6 +209,7 @@ func TestBumpClusterVersion(t *testing.T) {
 
 func TestMigrationPurgeOutdatedReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	const numStores = 3
 	var storeSpecs []base.StoreSpec
@@ -241,6 +247,7 @@ func TestMigrationPurgeOutdatedReplicas(t *testing.T) {
 // version.
 func TestUpgradeHappensAfterMigrations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettingsWithVersions(
@@ -248,14 +255,16 @@ func TestUpgradeHappensAfterMigrations(t *testing.T) {
 		clusterversion.TestingBinaryMinSupportedVersion,
 		false, /* initializeVersion */
 	)
+	automaticUpgrade := make(chan struct{})
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Settings: st,
 		Knobs: base.TestingKnobs{
 			Server: &TestingKnobs{
-				BinaryVersionOverride: clusterversion.TestingBinaryMinSupportedVersion,
+				DisableAutomaticVersionUpgrade: automaticUpgrade,
+				BinaryVersionOverride:          clusterversion.TestingBinaryMinSupportedVersion,
 			},
-			StartupMigrationManager: &startupmigrations.MigrationManagerTestingKnobs{
-				AfterEnsureMigrations: func() {
+			UpgradeManager: &upgradebase.TestingKnobs{
+				AfterRunPermanentUpgrades: func() {
 					// Try to encourage other goroutines to run.
 					const N = 100
 					for i := 0; i < N; i++ {
@@ -266,10 +275,15 @@ func TestUpgradeHappensAfterMigrations(t *testing.T) {
 			},
 		},
 	})
-	sqlutils.MakeSQLRunner(db).
-		CheckQueryResultsRetry(t, `
+	close(automaticUpgrade)
+	sr := sqlutils.MakeSQLRunner(db)
+
+	// Allow more than the default 45 seconds for the upgrades to run. Migrations
+	// can take some time, especially under stress.
+	sr.SucceedsSoonDuration = 3 * time.Minute
+	sr.CheckQueryResultsRetry(t, `
 SELECT version = crdb_internal.node_executable_version()
   FROM [SHOW CLUSTER SETTING version]`,
-			[][]string{{"true"}})
+		[][]string{{"true"}})
 	s.Stopper().Stop(context.Background())
 }

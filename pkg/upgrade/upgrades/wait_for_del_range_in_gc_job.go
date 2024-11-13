@@ -16,12 +16,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -31,9 +31,12 @@ import (
 // waitForDelRangeInGCJob ensures that any running GC jobs have adopted the new
 // DeleteRange protocol.
 func waitForDelRangeInGCJob(
-	ctx context.Context, _ clusterversion.ClusterVersion, deps upgrade.TenantDeps, _ *jobs.Job,
+	ctx context.Context, _ clusterversion.ClusterVersion, deps upgrade.TenantDeps,
 ) error {
 	for r := retry.StartWithCtx(ctx, retry.Options{}); r.Next(); {
+		if !storage.CanUseMVCCRangeTombstones(ctx, deps.Settings) {
+			return nil
+		}
 		jobIDs, err := collectJobIDsFromQuery(
 			ctx, deps.InternalExecutor, "wait-for-gc-job-upgrades", `
         WITH jobs AS (
@@ -80,7 +83,10 @@ func waitForDelRangeInGCJob(
          elements AS (SELECT * FROM tables UNION ALL SELECT * FROM indexes)
   SELECT id
     FROM elements
-   WHERE COALESCE(progress->>'status' NOT IN ('WAITING_FOR_MVCC_GC', 'CLEARED'), true)
+-- While we are waiting for the GC TTL, the status will be WAITING_FOR_CLEAR because omitempty
+-- set on this field it will not exist in the JSON output. Because tombstone adoption unconditionally
+-- enabled by an earlier version, we should be safe to skip any job that hasn't started GCing yet.
+   WHERE COALESCE(progress->>'status' NOT IN ('WAITING_FOR_MVCC_GC', 'CLEARED'), false)
 GROUP BY id;
 `)
 		if err != nil || len(jobIDs) == 0 {
@@ -117,12 +123,10 @@ SELECT job_id
 // collectJobIDsFromQuery is a helper to execute a query which returns rows
 // where the first column is a jobID and returns the job IDs from those rows.
 func collectJobIDsFromQuery(
-	ctx context.Context, ie sqlutil.InternalExecutor, opName string, query string,
+	ctx context.Context, ie isql.Executor, opName string, query string,
 ) (jobIDs []jobspb.JobID, retErr error) {
 	it, err := ie.QueryIteratorEx(ctx, opName, nil, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.NodeUserName(),
-		}, query)
+		sessiondata.NodeUserSessionDataOverride, query)
 	if err != nil {
 		return nil, err
 	}

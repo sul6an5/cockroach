@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -34,8 +35,6 @@ type explainVecNode struct {
 		lines []string
 		// The current row returned by the node.
 		values tree.Datums
-		// cleanup will be called after closing the input tree.
-		cleanup func()
 	}
 }
 
@@ -43,7 +42,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	n.run.values = make(tree.Datums, 1)
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
 	distribution := getPlanDistribution(
-		params.ctx, params.p, params.extendedEvalCtx.ExecCfg.NodeInfo.NodeID,
+		params.ctx, params.p.Descriptors().HasUncommittedTypes(),
 		params.extendedEvalCtx.SessionData().DistSQLMode, n.plan.main,
 	)
 	outerSubqueries := params.p.curPlan.subqueryPlans
@@ -51,7 +50,8 @@ func (n *explainVecNode) startExec(params runParams) error {
 	defer func() {
 		planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 	}()
-	physPlan, err := newPhysPlanForExplainPurposes(params.ctx, planCtx, distSQLPlanner, n.plan.main)
+	physPlan, cleanup, err := newPhysPlanForExplainPurposes(params.ctx, planCtx, distSQLPlanner, n.plan.main)
+	defer cleanup()
 	if err != nil {
 		if len(n.plan.subqueryPlans) > 0 {
 			return errors.New("running EXPLAIN (VEC) on this query is " +
@@ -60,9 +60,10 @@ func (n *explainVecNode) startExec(params runParams) error {
 		return err
 	}
 
-	distSQLPlanner.finalizePlanWithRowCount(planCtx, physPlan, n.plan.mainRowCount)
+	finalizePlanWithRowCount(params.ctx, planCtx, physPlan, n.plan.mainRowCount)
 	flows := physPlan.GenerateFlowSpecs()
-	flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p)
+	flowCtx, cleanup := newFlowCtxForExplainPurposes(params.ctx, planCtx, params.p)
+	defer cleanup()
 
 	// We want to get the vectorized plan which would be executed with the
 	// current 'vectorize' option. If 'vectorize' is set to 'off', then the
@@ -75,9 +76,13 @@ func (n *explainVecNode) startExec(params runParams) error {
 	}
 	verbose := n.options.Flags[tree.ExplainFlagVerbose]
 	willDistribute := physPlan.Distribution.WillDistribute()
-	n.run.lines, n.run.cleanup, err = colflow.ExplainVec(
+	// When running EXPLAIN (VEC) we choose the option of "not recording stats"
+	// since we don't know whether the next invocation of the explained
+	// statement would result in the collection of execution stats or not.
+	const recordingStats = false
+	n.run.lines, err = colflow.ExplainVec(
 		params.ctx, flowCtx, flows, physPlan.LocalProcessors, nil, /* opChains */
-		distSQLPlanner.gatewaySQLInstanceID, verbose, willDistribute,
+		distSQLPlanner.gatewaySQLInstanceID, verbose, willDistribute, recordingStats,
 	)
 	if err != nil {
 		return err
@@ -85,10 +90,27 @@ func (n *explainVecNode) startExec(params runParams) error {
 	return nil
 }
 
-func newFlowCtxForExplainPurposes(planCtx *PlanningCtx, p *planner) *execinfra.FlowCtx {
+func newFlowCtxForExplainPurposes(
+	ctx context.Context, planCtx *PlanningCtx, p *planner,
+) (_ *execinfra.FlowCtx, cleanup func()) {
+	monitor := mon.NewMonitor(
+		"explain", /* name */
+		mon.MemoryResource,
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment */
+		math.MaxInt64, /* noteworthy */
+		p.execCfg.Settings,
+	)
+	monitor.StartNoReserved(ctx, p.Mon())
+	cleanup = func() {
+		monitor.Stop(ctx)
+	}
 	return &execinfra.FlowCtx{
 		NodeID:  planCtx.EvalContext().NodeID,
 		EvalCtx: planCtx.EvalContext(),
+		Mon:     monitor,
+		Txn:     p.txn,
 		Cfg: &execinfra.ServerConfig{
 			Settings:         p.execCfg.Settings,
 			LogicalClusterID: p.DistSQLPlanner().distSQLSrv.ServerConfig.LogicalClusterID,
@@ -97,7 +119,7 @@ func newFlowCtxForExplainPurposes(planCtx *PlanningCtx, p *planner) *execinfra.F
 		},
 		Descriptors: p.Descriptors(),
 		DiskMonitor: &mon.BytesMonitor{},
-	}
+	}, cleanup
 }
 
 func newPlanningCtxForExplainPurposes(
@@ -112,7 +134,6 @@ func newPlanningCtxForExplainPurposes(
 	}
 	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx,
 		params.p, params.p.txn, distribute)
-	planCtx.ignoreClose = true
 	planCtx.planner.curPlan.subqueryPlans = subqueryPlans
 	for i := range planCtx.planner.curPlan.subqueryPlans {
 		p := &planCtx.planner.curPlan.subqueryPlans[i]
@@ -135,7 +156,4 @@ func (n *explainVecNode) Next(runParams) (bool, error) {
 func (n *explainVecNode) Values() tree.Datums { return n.run.values }
 func (n *explainVecNode) Close(ctx context.Context) {
 	n.plan.close(ctx)
-	if n.run.cleanup != nil {
-		n.run.cleanup()
-	}
 }

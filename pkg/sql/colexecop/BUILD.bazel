@@ -13,13 +13,13 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/col/coldata",
+        "//pkg/kv/kvpb",
         "//pkg/sql/colexecerror",
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra/execopnode",
         "//pkg/sql/execinfrapb",
         "//pkg/sql/execstats",
         "//pkg/sql/types",
-        "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )

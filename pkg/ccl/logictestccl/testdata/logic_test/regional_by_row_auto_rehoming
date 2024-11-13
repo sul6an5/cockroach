@@ -1,8 +1,8 @@
-# tenant-cluster-setting-override-opt: allow-multi-region-abstractions-for-secondary-tenants
+# tenant-cluster-setting-override-opt: sql.multi_region.allow_abstractions_for_secondary_tenants.enabled=true
 # LogicTest: multiregion-9node-3region-3azs multiregion-9node-3region-3azs-tenant multiregion-9node-3region-3azs-no-los
 
 statement ok
-SET experimental_enable_auto_rehoming = true;
+SET enable_auto_rehoming = true;
 CREATE DATABASE testdb PRIMARY REGION "ca-central-1" REGIONS "ap-southeast-2";
 
 statement ok

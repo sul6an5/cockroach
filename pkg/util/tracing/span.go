@@ -290,9 +290,9 @@ func (sp *Span) FinishAndGetConfiguredRecording() tracingpb.Recording {
 	rec := tracingpb.Recording(nil)
 	recType := sp.RecordingType()
 	if recType != tracingpb.RecordingOff {
+		// Reach directly into sp.i to pass the finishing argument.
 		rec = sp.i.GetRecording(recType, true /* finishing */)
 	}
-	// Reach directly into sp.i to pass the finishing argument.
 	sp.finishInternal()
 	return rec
 }
@@ -316,9 +316,13 @@ func (sp *Span) FinishAndGetConfiguredRecording() tracingpb.Recording {
 //
 // A few internal tags are added to denote span properties:
 //
-//	"_unfinished"	The span was never Finish()ed
-//	"_verbose"	The span is a verbose one
-//	"_dropped"	The span dropped recordings due to sizing constraints
+//	"_unfinished":	The span was never Finish()ed.
+//	"_verbose":	The span is a verbose one.
+//	"_dropped_logs":	The span dropped events due to size limits.
+//	"_dropped_children": Some (direct) child spans were dropped because of the
+//											 trace size limit.
+//	"_dropped_indirect_children": Some indirect child spans were dropped
+//																because of the trace size limit.
 //
 // If recType is RecordingStructured, the return value will be nil if the span
 // doesn't have any structured events.
@@ -348,41 +352,72 @@ func (sp *Span) GetConfiguredRecording() tracingpb.Recording {
 	return sp.i.GetRecording(recType, false /* finishing */)
 }
 
+// GetTraceRecording returns the span's recording as a Trace.
+//
+// See also GetRecording(), which returns a tracingpb.Recording.
+func (sp *Span) GetTraceRecording(recType tracingpb.RecordingType) Trace {
+	if sp.detectUseAfterFinish() {
+		return Trace{}
+	}
+	return sp.i.GetTraceRecording(recType, false /* finishing */)
+}
+
+// FinishAndGetTraceRecording finishes the span and returns its recording as a
+// Trace.
+//
+// See also FinishAndGetRecording(), which returns a tracingpb.Recording.
+func (sp *Span) FinishAndGetTraceRecording(recType tracingpb.RecordingType) Trace {
+	if sp.detectUseAfterFinish() {
+		return Trace{}
+	}
+	rec := sp.i.GetTraceRecording(recType, true /* finishing */)
+	sp.Finish()
+	return rec
+}
+
 // ImportRemoteRecording adds the spans in remoteRecording as children of the
 // receiver. As a result of this, the imported recording will be a part of the
-// GetRecording() output for the receiver.
+// GetRecording() output for the receiver. All the structured events from the
+// trace are passed to the receiver's event listeners.
 //
 // This function is used to import a recording from another node.
 func (sp *Span) ImportRemoteRecording(remoteRecording tracingpb.Recording) {
-	// TODO(benbardin): Remove for 23.1
-	// Nodes running <= 22.1 do not support tag groups. For backwards
-	// compatibility, copy the top-level tags to tag groups. This will only be
-	// necessary for 22.2.
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	// Handle recordings coming from 22.2 nodes that don't have the
+	// StructuredRecordsSizeBytes field set.
+	// TODO(andrei): remove this in 23.2.
 	for i := range remoteRecording {
-		span := &remoteRecording[i]
-		if len(span.TagGroups) == 0 {
-			anonymousTagGroup := tracingpb.TagGroup{
-				Tags: make([]tracingpb.Tag, len(span.Tags)),
+		if len(remoteRecording[i].StructuredRecords) != 0 && remoteRecording[i].StructuredRecordsSizeBytes == 0 {
+			size := int64(0)
+			for _, rec := range remoteRecording[i].StructuredRecords {
+				size += int64(rec.MemorySize())
 			}
-			i := 0
-			for tagKey, tagValue := range span.Tags {
-				anonymousTagGroup.Tags[i] = tracingpb.Tag{
-					Key:   tagKey,
-					Value: tagValue,
-				}
-				i++
-			}
-			span.TagGroups = []tracingpb.TagGroup{anonymousTagGroup}
+			remoteRecording[i].StructuredRecordsSizeBytes = size
 		}
 	}
-	if !sp.detectUseAfterFinish() {
-		sp.i.ImportRemoteRecording(remoteRecording)
+
+	sp.ImportTrace(treeifyRecording(remoteRecording))
+}
+
+// ImportTrace takes a trace recording and, depending on the receiver's
+// recording mode, adds it as a child to sp. All the structured events from the
+// trace are passed to the receiver's event listeners.
+//
+// ImportTrace takes ownership of trace; the caller should not use it anymore.
+// The caller can call Trace.PartialClone() to make a sufficient copy for
+// passing into ImportTrace.
+func (sp *Span) ImportTrace(trace Trace) {
+	if sp.detectUseAfterFinish() {
+		return
 	}
+	sp.i.ImportTrace(trace)
 }
 
 // Meta returns the information which needs to be propagated across process
 // boundaries in order to derive child spans from this Span. This may return an
-// empty SpanMeta (which is a valid input to WithRemoteParentFromSpanMeta) if
+// Empty SpanMeta (which is a valid input to WithRemoteParentFromSpanMeta) if
 // the Span has been optimized out.
 func (sp *Span) Meta() SpanMeta {
 	if sp.detectUseAfterFinish() {
@@ -438,7 +473,8 @@ func (sp *Span) Recordf(format string, args ...interface{}) {
 // if the underlying Span has been optimized out (i.e. is a noop span). Payloads
 // may also be dropped due to sizing constraints.
 //
-// The caller must not mutate the item once RecordStructured has been called.
+// RecordStructured does not take ownership of item; it marshals it into an Any
+// proto.
 func (sp *Span) RecordStructured(item Structured) {
 	if sp.detectUseAfterFinish() {
 		return
@@ -552,11 +588,6 @@ func (sp *Span) UpdateGoroutineIDToCurrent() {
 	sp.i.crdb.setGoroutineID(goid.Get())
 }
 
-// parentFinished makes sp a root.
-func (sp *Span) parentFinished() {
-	sp.i.crdb.parentFinished()
-}
-
 // reset prepares sp for (re-)use.
 //
 // sp might be a re-allocated span that was previously used and Finish()ed. In
@@ -609,7 +640,7 @@ func (sp *Span) reset(
 			// quiet. We've detected a Span leak nonetheless, but it's likely that the
 			// test that leaked the span has already finished. Panicking in the middle
 			// of an unrelated test would be poor UX.
-			if sp.Tracer().closed() {
+			if sp.i.Tracer().closed() {
 				return
 			}
 			panic(fmt.Sprintf("Span not finished or references not released; "+
@@ -651,7 +682,7 @@ func (sp *Span) reset(
 		if len(c.mu.tags) != 0 {
 			panic(fmt.Sprintf("unexpected tags in span being reset: %v", c.mu.tags))
 		}
-		if len(c.mu.recording.finishedChildren) != 0 {
+		if !c.mu.recording.finishedChildren.Empty() {
 			panic(fmt.Sprintf("unexpected finished children in span being reset: %v", c.mu.recording.finishedChildren))
 		}
 		if c.mu.recording.structured.Len() != 0 {
@@ -667,15 +698,16 @@ func (sp *Span) reset(
 			openChildren: h.childrenAlloc[:0],
 			goroutineID:  goroutineID,
 			recording: recordingState{
-				logs:             makeSizeLimitedBuffer(maxLogBytesPerSpan, nil /* scratch */),
-				structured:       makeSizeLimitedBuffer(maxStructuredBytesPerSpan, h.structuredEventsAlloc[:]),
+				logs:             makeSizeLimitedBuffer[*tracingpb.LogRecord](maxLogBytesPerSpan, nil /* scratch */),
+				structured:       makeSizeLimitedBuffer[*tracingpb.StructuredRecord](maxStructuredBytesPerSpan, h.structuredEventsAlloc[:]),
 				childrenMetadata: h.childrenMetadataAlloc,
+				finishedChildren: MakeTrace(tracingpb.RecordedSpan{}),
 			},
 			tags: h.tagsAlloc[:0],
 		}
 
 		if kind != oteltrace.SpanKindUnspecified {
-			c.setTagLocked(spanKindTagKey, attribute.StringValue(kind.String()))
+			c.setTagLocked(SpanKindTagKey, attribute.StringValue(kind.String()))
 		}
 		c.mu.Unlock()
 	}
@@ -686,13 +718,6 @@ func (sp *Span) reset(
 	// reorderings.
 	atomic.StoreInt32(&sp.finished, 0)
 	sp.finishStack = ""
-}
-
-// visitOpenChildren calls the visitor for every open child. The receiver's lock
-// is held for the duration of the iteration, so the visitor should be quick.
-// The visitor is not allowed to hold on to children after it returns.
-func (sp *Span) visitOpenChildren(visitor func(sp *Span)) {
-	sp.i.crdb.visitOpenChildren(visitor)
 }
 
 // SetOtelStatus sets the status of the OpenTelemetry span (if any).
@@ -762,7 +787,7 @@ func tryMakeSpanRef(sp *Span) (spanRef, bool) {
 		if cnt == 0 {
 			// sp was Finish()ed, and it might be in the pool awaiting reallocation.
 			// It'd be unsafe to hold a reference to sp because of deadlock hazards,
-			// so we'll return an empty option (i.e. the resulting child will be a
+			// so we'll return an Empty option (i.e. the resulting child will be a
 			// root).
 			return spanRef{}, false
 		}
@@ -800,7 +825,7 @@ func (sr *spanRef) empty() bool {
 // Returns true if the span's refcount dropped to zero.
 func (sr *spanRef) release() bool {
 	if sr.empty() {
-		// There's no parent; nothing to do.
+		// There's no reference; nothing to do.
 		return false
 	}
 	sp := sr.Span

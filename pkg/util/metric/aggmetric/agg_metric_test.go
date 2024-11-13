@@ -19,6 +19,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/echotest"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
@@ -52,6 +54,11 @@ func TestAggMetric(t *testing.T) {
 	}, "tenant_id")
 	r.AddMetric(c)
 
+	d := aggmetric.NewCounterFloat64(metric.Metadata{
+		Name: "fob_counter",
+	}, "tenant_id")
+	r.AddMetric(d)
+
 	g := aggmetric.NewGauge(metric.Metadata{
 		Name: "bar_gauge",
 	}, "tenant_id")
@@ -61,16 +68,23 @@ func TestAggMetric(t *testing.T) {
 		Name: "baz_gauge",
 	}, "tenant_id")
 	r.AddMetric(f)
-
-	h := aggmetric.NewHistogram(metric.Metadata{
-		Name: "histo_gram",
-	}, base.DefaultHistogramWindowInterval(), metric.Count1KBuckets, "tenant_id")
+	h := aggmetric.NewHistogram(metric.HistogramOptions{
+		Metadata: metric.Metadata{
+			Name: "histo_gram",
+		},
+		Duration: base.DefaultHistogramWindowInterval(),
+		MaxVal:   100,
+		SigFigs:  1,
+		Buckets:  metric.Count1KBuckets,
+	}, "tenant_id")
 	r.AddMetric(h)
 
-	tenant2 := roachpb.MakeTenantID(2)
-	tenant3 := roachpb.MakeTenantID(3)
+	tenant2 := roachpb.MustMakeTenantID(2)
+	tenant3 := roachpb.MustMakeTenantID(3)
 	c2 := c.AddChild(tenant2.String())
 	c3 := c.AddChild(tenant3.String())
+	d2 := d.AddChild(tenant2.String())
+	d3 := d.AddChild(tenant3.String())
 	g2 := g.AddChild(tenant2.String())
 	g3 := g.AddChild(tenant3.String())
 	f2 := f.AddChild(tenant2.String())
@@ -81,6 +95,8 @@ func TestAggMetric(t *testing.T) {
 	t.Run("basic", func(t *testing.T) {
 		c2.Inc(2)
 		c3.Inc(4)
+		d2.Inc(123456.5)
+		d3.Inc(789089.5)
 		g2.Inc(2)
 		g3.Inc(3)
 		g3.Dec(1)
@@ -88,108 +104,33 @@ func TestAggMetric(t *testing.T) {
 		f3.Update(2.5)
 		h2.RecordValue(10)
 		h3.RecordValue(90)
-		require.Equal(t,
-			`bar_gauge 4
-bar_gauge{tenant_id="2"} 2
-bar_gauge{tenant_id="3"} 2
-baz_gauge 4
-baz_gauge{tenant_id="2"} 1.5
-baz_gauge{tenant_id="3"} 2.5
-foo_counter 6
-foo_counter{tenant_id="2"} 2
-foo_counter{tenant_id="3"} 4
-histo_gram_bucket{le="+Inf"} 2
-histo_gram_bucket{le="1"} 0
-histo_gram_bucket{le="1024"} 2
-histo_gram_bucket{le="128"} 2
-histo_gram_bucket{le="16"} 1
-histo_gram_bucket{le="2"} 0
-histo_gram_bucket{le="256"} 2
-histo_gram_bucket{le="32"} 1
-histo_gram_bucket{le="4"} 0
-histo_gram_bucket{le="512"} 2
-histo_gram_bucket{le="64"} 1
-histo_gram_bucket{le="8"} 0
-histo_gram_bucket{tenant_id="2",le="+Inf"} 1
-histo_gram_bucket{tenant_id="2",le="1"} 0
-histo_gram_bucket{tenant_id="2",le="1024"} 1
-histo_gram_bucket{tenant_id="2",le="128"} 1
-histo_gram_bucket{tenant_id="2",le="16"} 1
-histo_gram_bucket{tenant_id="2",le="2"} 0
-histo_gram_bucket{tenant_id="2",le="256"} 1
-histo_gram_bucket{tenant_id="2",le="32"} 1
-histo_gram_bucket{tenant_id="2",le="4"} 0
-histo_gram_bucket{tenant_id="2",le="512"} 1
-histo_gram_bucket{tenant_id="2",le="64"} 1
-histo_gram_bucket{tenant_id="2",le="8"} 0
-histo_gram_bucket{tenant_id="3",le="+Inf"} 1
-histo_gram_bucket{tenant_id="3",le="1"} 0
-histo_gram_bucket{tenant_id="3",le="1024"} 1
-histo_gram_bucket{tenant_id="3",le="128"} 1
-histo_gram_bucket{tenant_id="3",le="16"} 0
-histo_gram_bucket{tenant_id="3",le="2"} 0
-histo_gram_bucket{tenant_id="3",le="256"} 1
-histo_gram_bucket{tenant_id="3",le="32"} 0
-histo_gram_bucket{tenant_id="3",le="4"} 0
-histo_gram_bucket{tenant_id="3",le="512"} 1
-histo_gram_bucket{tenant_id="3",le="64"} 0
-histo_gram_bucket{tenant_id="3",le="8"} 0
-histo_gram_count 2
-histo_gram_count{tenant_id="2"} 1
-histo_gram_count{tenant_id="3"} 1
-histo_gram_sum 100
-histo_gram_sum{tenant_id="2"} 10
-histo_gram_sum{tenant_id="3"} 90`,
-			writePrometheusMetrics(t))
+		testFile := "basic.txt"
+		if metric.HdrEnabled() {
+			testFile = "basic_hdr.txt"
+		}
+		echotest.Require(t, writePrometheusMetrics(t), datapathutils.TestDataPath(t, testFile))
 	})
 
 	t.Run("destroy", func(t *testing.T) {
-		g3.Destroy()
-		c2.Destroy()
-		f3.Destroy()
-		h3.Destroy()
-		require.Equal(t,
-			`bar_gauge 2
-bar_gauge{tenant_id="2"} 2
-baz_gauge 1.5
-baz_gauge{tenant_id="2"} 1.5
-foo_counter 6
-foo_counter{tenant_id="3"} 4
-histo_gram_bucket{le="+Inf"} 2
-histo_gram_bucket{le="1"} 0
-histo_gram_bucket{le="1024"} 2
-histo_gram_bucket{le="128"} 2
-histo_gram_bucket{le="16"} 1
-histo_gram_bucket{le="2"} 0
-histo_gram_bucket{le="256"} 2
-histo_gram_bucket{le="32"} 1
-histo_gram_bucket{le="4"} 0
-histo_gram_bucket{le="512"} 2
-histo_gram_bucket{le="64"} 1
-histo_gram_bucket{le="8"} 0
-histo_gram_bucket{tenant_id="2",le="+Inf"} 1
-histo_gram_bucket{tenant_id="2",le="1"} 0
-histo_gram_bucket{tenant_id="2",le="1024"} 1
-histo_gram_bucket{tenant_id="2",le="128"} 1
-histo_gram_bucket{tenant_id="2",le="16"} 1
-histo_gram_bucket{tenant_id="2",le="2"} 0
-histo_gram_bucket{tenant_id="2",le="256"} 1
-histo_gram_bucket{tenant_id="2",le="32"} 1
-histo_gram_bucket{tenant_id="2",le="4"} 0
-histo_gram_bucket{tenant_id="2",le="512"} 1
-histo_gram_bucket{tenant_id="2",le="64"} 1
-histo_gram_bucket{tenant_id="2",le="8"} 0
-histo_gram_count 2
-histo_gram_count{tenant_id="2"} 1
-histo_gram_sum 100
-histo_gram_sum{tenant_id="2"} 10`,
-			writePrometheusMetrics(t))
+		g3.Unlink()
+		c2.Unlink()
+		d3.Unlink()
+		f3.Unlink()
+		h3.Unlink()
+		testFile := "destroy.txt"
+		if metric.HdrEnabled() {
+			testFile = "destroy_hdr.txt"
+		}
+		echotest.Require(t, writePrometheusMetrics(t), datapathutils.TestDataPath(t, testFile))
 	})
 
 	t.Run("panic on already exists", func(t *testing.T) {
 		// These are the tenants which still exist.
 		require.Panics(t, func() {
 			c.AddChild(tenant3.String())
+		})
+		require.Panics(t, func() {
+			d.AddChild(tenant2.String())
 		})
 		require.Panics(t, func() {
 			g.AddChild(tenant2.String())
@@ -202,67 +143,27 @@ histo_gram_sum{tenant_id="2"} 10`,
 	t.Run("add after destroy", func(t *testing.T) {
 		g3 = g.AddChild(tenant3.String())
 		c2 = c.AddChild(tenant2.String())
+		d3 = d.AddChild(tenant3.String())
 		f3 = f.AddChild(tenant3.String())
 		h3 = h.AddChild(tenant3.String())
-		require.Equal(t,
-			`bar_gauge 2
-bar_gauge{tenant_id="2"} 2
-bar_gauge{tenant_id="3"} 0
-baz_gauge 1.5
-baz_gauge{tenant_id="2"} 1.5
-baz_gauge{tenant_id="3"} 0
-foo_counter 6
-foo_counter{tenant_id="2"} 0
-foo_counter{tenant_id="3"} 4
-histo_gram_bucket{le="+Inf"} 2
-histo_gram_bucket{le="1"} 0
-histo_gram_bucket{le="1024"} 2
-histo_gram_bucket{le="128"} 2
-histo_gram_bucket{le="16"} 1
-histo_gram_bucket{le="2"} 0
-histo_gram_bucket{le="256"} 2
-histo_gram_bucket{le="32"} 1
-histo_gram_bucket{le="4"} 0
-histo_gram_bucket{le="512"} 2
-histo_gram_bucket{le="64"} 1
-histo_gram_bucket{le="8"} 0
-histo_gram_bucket{tenant_id="2",le="+Inf"} 1
-histo_gram_bucket{tenant_id="2",le="1"} 0
-histo_gram_bucket{tenant_id="2",le="1024"} 1
-histo_gram_bucket{tenant_id="2",le="128"} 1
-histo_gram_bucket{tenant_id="2",le="16"} 1
-histo_gram_bucket{tenant_id="2",le="2"} 0
-histo_gram_bucket{tenant_id="2",le="256"} 1
-histo_gram_bucket{tenant_id="2",le="32"} 1
-histo_gram_bucket{tenant_id="2",le="4"} 0
-histo_gram_bucket{tenant_id="2",le="512"} 1
-histo_gram_bucket{tenant_id="2",le="64"} 1
-histo_gram_bucket{tenant_id="2",le="8"} 0
-histo_gram_bucket{tenant_id="3",le="+Inf"} 0
-histo_gram_bucket{tenant_id="3",le="1"} 0
-histo_gram_bucket{tenant_id="3",le="1024"} 0
-histo_gram_bucket{tenant_id="3",le="128"} 0
-histo_gram_bucket{tenant_id="3",le="16"} 0
-histo_gram_bucket{tenant_id="3",le="2"} 0
-histo_gram_bucket{tenant_id="3",le="256"} 0
-histo_gram_bucket{tenant_id="3",le="32"} 0
-histo_gram_bucket{tenant_id="3",le="4"} 0
-histo_gram_bucket{tenant_id="3",le="512"} 0
-histo_gram_bucket{tenant_id="3",le="64"} 0
-histo_gram_bucket{tenant_id="3",le="8"} 0
-histo_gram_count 2
-histo_gram_count{tenant_id="2"} 1
-histo_gram_count{tenant_id="3"} 0
-histo_gram_sum 100
-histo_gram_sum{tenant_id="2"} 10
-histo_gram_sum{tenant_id="3"} 0`,
-			writePrometheusMetrics(t))
+		testFile := "add_after_destroy.txt"
+		if metric.HdrEnabled() {
+			testFile = "add_after_destroy_hdr.txt"
+		}
+		echotest.Require(t, writePrometheusMetrics(t), datapathutils.TestDataPath(t, testFile))
 	})
 
 	t.Run("panic on label length mismatch", func(t *testing.T) {
 		require.Panics(t, func() { c.AddChild() })
+		require.Panics(t, func() { d.AddChild() })
 		require.Panics(t, func() { g.AddChild("", "") })
 	})
+}
+
+type Eacher interface {
+	Each(
+		labels []*prometheusgo.LabelPair, f func(metric *prometheusgo.Metric),
+	)
 }
 
 func TestAggMetricBuilder(t *testing.T) {
@@ -270,20 +171,34 @@ func TestAggMetricBuilder(t *testing.T) {
 
 	b := aggmetric.MakeBuilder("tenant_id")
 	c := b.Counter(metric.Metadata{Name: "foo_counter"})
+	d := b.CounterFloat64(metric.Metadata{Name: "fob_counter"})
 	g := b.Gauge(metric.Metadata{Name: "bar_gauge"})
 	f := b.GaugeFloat64(metric.Metadata{Name: "baz_gauge"})
-	h := b.Histogram(metric.Metadata{Name: "histo_gram"},
-		base.DefaultHistogramWindowInterval(), metric.Count1KBuckets)
+	h := b.Histogram(metric.HistogramOptions{
+		Metadata: metric.Metadata{Name: "histo_gram"},
+		Duration: base.DefaultHistogramWindowInterval(),
+		MaxVal:   100,
+		SigFigs:  1,
+		Buckets:  metric.Count1KBuckets,
+	})
 
 	for i := 5; i < 10; i++ {
-		tenantLabel := roachpb.MakeTenantID(uint64(i)).String()
+		tenantLabel := roachpb.MustMakeTenantID(uint64(i)).String()
 		c.AddChild(tenantLabel)
+		d.AddChild(tenantLabel)
 		g.AddChild(tenantLabel)
 		f.AddChild(tenantLabel)
 		h.AddChild(tenantLabel)
 	}
 
-	c.Each(nil, func(pm *prometheusgo.Metric) {
-		require.Equal(t, 1, len(pm.GetLabel()))
-	})
+	for _, m := range [5]Eacher{
+		c, d, g, f, h,
+	} {
+		numChildren := 0
+		m.Each(nil, func(pm *prometheusgo.Metric) {
+			require.Equal(t, 1, len(pm.GetLabel()))
+			numChildren += 1
+		})
+		require.Equal(t, 5, numChildren)
+	}
 }

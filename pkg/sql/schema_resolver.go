@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -33,13 +34,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
 
 var _ resolver.SchemaResolver = &schemaResolver{}
 
-// schemaResolve implements the resolver.SchemaResolver interface.
+// schemaResolver implements the resolver.SchemaResolver interface.
 // Currently, this is only being embedded in the planner but also a convenience
 // for inejcting it into the declarative schema changer.
 // It holds sessionDataStack and a transaction handle which are reset when
@@ -65,9 +67,40 @@ type schemaResolver struct {
 	typeResolutionDbID descpb.ID
 }
 
-// Accessor implements the resolver.SchemaResolver interface.
-func (sr *schemaResolver) Accessor() catalog.Accessor {
-	return sr.descCollection
+// GetObjectNamesAndIDs implements the resolver.SchemaResolver interface.
+func (sr *schemaResolver) GetObjectNamesAndIDs(
+	ctx context.Context, db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor,
+) (objectNames tree.TableNames, objectIDs descpb.IDs, _ error) {
+	c, err := sr.descCollection.GetAllObjectsInSchema(ctx, sr.txn, db, sc)
+	if err != nil {
+		return nil, nil, err
+	}
+	var mc nstree.MutableCatalog
+	_ = c.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		if !desc.SkipNamespace() && !desc.Dropped() {
+			mc.UpsertNamespaceEntry(desc, desc.GetID(), hlc.Timestamp{})
+		}
+		return nil
+	})
+	_ = mc.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
+		tn := tree.MakeTableNameWithSchema(
+			tree.Name(db.GetName()), tree.Name(sc.GetName()), tree.Name(e.GetName()),
+		)
+		objectNames = append(objectNames, tn)
+		objectIDs = append(objectIDs, e.GetID())
+		return nil
+	})
+	return objectNames, objectIDs, nil
+}
+
+// MustGetCurrentSessionDatabase implements the resolver.SchemaResolver interface.
+func (sr *schemaResolver) MustGetCurrentSessionDatabase(
+	ctx context.Context,
+) (catalog.DatabaseDescriptor, error) {
+	if sr.skipDescriptorCache {
+		return sr.descCollection.ByName(sr.txn).Get().Database(ctx, sr.CurrentDatabase())
+	}
+	return sr.descCollection.ByNameWithLeased(sr.txn).Get().Database(ctx, sr.CurrentDatabase())
 }
 
 // CurrentSearchPath implements the resolver.SchemaResolver interface.
@@ -75,21 +108,24 @@ func (sr *schemaResolver) CurrentSearchPath() sessiondata.SearchPath {
 	return sr.sessionDataStack.Top().SearchPath
 }
 
-// CommonLookupFlags implements the resolver.SchemaResolver interface.
-func (sr *schemaResolver) CommonLookupFlags(required bool) tree.CommonLookupFlags {
-	return tree.CommonLookupFlags{
-		Required:    required,
-		AvoidLeased: sr.skipDescriptorCache,
+func (sr *schemaResolver) byIDGetterBuilder() descs.ByIDGetterBuilder {
+	if sr.skipDescriptorCache {
+		return sr.descCollection.ByID(sr.txn)
 	}
+	return sr.descCollection.ByIDWithLeased(sr.txn)
+}
+
+func (sr *schemaResolver) byNameGetterBuilder() descs.ByNameGetterBuilder {
+	if sr.skipDescriptorCache {
+		return sr.descCollection.ByName(sr.txn)
+	}
+	return sr.descCollection.ByNameWithLeased(sr.txn)
 }
 
 // LookupObject implements the tree.ObjectNameExistingResolver interface.
 func (sr *schemaResolver) LookupObject(
 	ctx context.Context, flags tree.ObjectLookupFlags, dbName, scName, obName string,
-) (found bool, prefix catalog.ResolvedObjectPrefix, objMeta catalog.Descriptor, err error) {
-	sc := sr.Accessor()
-	flags.CommonLookupFlags.Required = false
-	flags.CommonLookupFlags.AvoidLeased = sr.skipDescriptorCache
+) (found bool, prefix catalog.ResolvedObjectPrefix, desc catalog.Descriptor, err error) {
 
 	// Check if we are looking up a type which matches a built-in type in
 	// CockroachDB but is an extension type on the public schema in PostgreSQL.
@@ -103,8 +139,7 @@ func (sr *schemaResolver) LookupObject(
 			if err != nil || !found {
 				return found, prefix, nil, err
 			}
-			dbDesc, err := sr.descCollection.GetImmutableDatabaseByName(ctx, sr.txn, dbName,
-				tree.DatabaseLookupFlags{AvoidLeased: sr.skipDescriptorCache})
+			dbDesc, err := sr.byNameGetterBuilder().MaybeGet().Database(ctx, dbName)
 			if err != nil {
 				return found, prefix, nil, err
 			}
@@ -116,31 +151,53 @@ func (sr *schemaResolver) LookupObject(
 		}
 	}
 
-	prefix, objMeta, err = sc.GetObjectDesc(ctx, sr.txn, dbName, scName, obName, flags)
-	return objMeta != nil, prefix, objMeta, err
+	b := sr.descCollection.ByName(sr.txn)
+	if !sr.skipDescriptorCache && !flags.RequireMutable {
+		b = sr.descCollection.ByNameWithLeased(sr.txn)
+	}
+	if flags.IncludeOffline {
+		b = b.WithOffline()
+	}
+	g := b.MaybeGet()
+	tn := tree.MakeQualifiedTypeName(dbName, scName, obName)
+	switch flags.DesiredObjectKind {
+	case tree.TableObject:
+		prefix, desc, err = descs.PrefixAndTable(ctx, g, &tn)
+	case tree.TypeObject:
+		prefix, desc, err = descs.PrefixAndType(ctx, g, &tn)
+	default:
+		return false, prefix, nil, errors.AssertionFailedf(
+			"unknown desired object kind %v", flags.DesiredObjectKind,
+		)
+	}
+	if errors.Is(err, catalog.ErrDescriptorWrongType) {
+		return false, prefix, nil, nil
+	}
+	if flags.RequireMutable && desc != nil {
+		switch flags.DesiredObjectKind {
+		case tree.TableObject:
+			desc, err = sr.descCollection.MutableByID(sr.txn).Table(ctx, desc.GetID())
+		case tree.TypeObject:
+			desc, err = sr.descCollection.MutableByID(sr.txn).Type(ctx, desc.GetID())
+		}
+	}
+	return desc != nil, prefix, desc, err
 }
 
 // LookupSchema implements the resolver.ObjectNameTargetResolver interface.
 func (sr *schemaResolver) LookupSchema(
 	ctx context.Context, dbName, scName string,
 ) (found bool, scMeta catalog.ResolvedObjectPrefix, err error) {
-	dbDesc, err := sr.descCollection.GetImmutableDatabaseByName(ctx, sr.txn, dbName,
-		tree.DatabaseLookupFlags{AvoidLeased: sr.skipDescriptorCache})
-	if err != nil || dbDesc == nil {
+	g := sr.byNameGetterBuilder().MaybeGet()
+	db, err := g.Database(ctx, dbName)
+	if err != nil || db == nil {
 		return false, catalog.ResolvedObjectPrefix{}, err
 	}
-	sc := sr.Accessor()
-	var resolvedSchema catalog.SchemaDescriptor
-	resolvedSchema, err = sc.GetSchemaByName(
-		ctx, sr.txn, dbDesc, scName, sr.CommonLookupFlags(false /* required */),
-	)
-	if err != nil || resolvedSchema == nil {
+	sc, err := g.Schema(ctx, db, scName)
+	if err != nil || sc == nil {
 		return false, catalog.ResolvedObjectPrefix{}, err
 	}
-	return true, catalog.ResolvedObjectPrefix{
-		Database: dbDesc,
-		Schema:   resolvedSchema,
-	}, nil
+	return true, catalog.ResolvedObjectPrefix{Database: db, Schema: sc}, nil
 }
 
 // CurrentDatabase implements the tree.QualifiedNameResolver interface.
@@ -153,14 +210,7 @@ func (sr *schemaResolver) CurrentDatabase() string {
 func (sr *schemaResolver) GetQualifiedTableNameByID(
 	ctx context.Context, id int64, requiredType tree.RequiredTableKind,
 ) (*tree.TableName, error) {
-	lookupFlags := tree.ObjectLookupFlags{
-		CommonLookupFlags:    tree.CommonLookupFlags{Required: true},
-		DesiredObjectKind:    tree.TableObject,
-		DesiredTableDescKind: requiredType,
-	}
-
-	table, err := sr.descCollection.GetImmutableTableByID(
-		ctx, sr.txn, descpb.ID(id), lookupFlags)
+	table, err := sr.descCollection.ByIDWithLeased(sr.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(id))
 	if err != nil {
 		return nil, err
 	}
@@ -173,13 +223,10 @@ func (sr *schemaResolver) GetQualifiedTableNameByID(
 func (sr *schemaResolver) getQualifiedTableName(
 	ctx context.Context, desc catalog.TableDescriptor,
 ) (*tree.TableName, error) {
-	_, dbDesc, err := sr.descCollection.GetImmutableDatabaseByID(ctx, sr.txn, desc.GetParentID(),
-		tree.DatabaseLookupFlags{
-			Required:       true,
-			IncludeOffline: true,
-			IncludeDropped: true,
-			AvoidLeased:    true,
-		})
+	// When getting the fully qualified name allow use of leased descriptors,
+	// since these will not involve any round trip.
+	descGetter := sr.descCollection.ByIDWithLeased(sr.txn)
+	dbDesc, err := descGetter.Get().Database(ctx, desc.GetParentID())
 	if err != nil {
 		return nil, err
 	}
@@ -193,12 +240,7 @@ func (sr *schemaResolver) getQualifiedTableName(
 	// information from the namespace table.
 	var schemaName tree.Name
 	schemaID := desc.GetParentSchemaID()
-	scDesc, err := sr.descCollection.GetImmutableSchemaByID(ctx, sr.txn, schemaID,
-		tree.SchemaLookupFlags{
-			IncludeOffline: true,
-			IncludeDropped: true,
-			AvoidLeased:    true,
-		})
+	scDesc, err := descGetter.Get().Schema(ctx, schemaID)
 	switch {
 	case scDesc != nil:
 		schemaName = tree.Name(scDesc.GetName())
@@ -224,20 +266,26 @@ func (sr *schemaResolver) getQualifiedTableName(
 	return &tbName, nil
 }
 
-func (sr *schemaResolver) getQualifiedFunctionName(
-	ctx context.Context, fnDesc catalog.FunctionDescriptor,
+// GetQualifiedFunctionNameByID returns the qualified name of the table,
+// view or sequence represented by the provided ID and table kind.
+func (sr *schemaResolver) GetQualifiedFunctionNameByID(
+	ctx context.Context, id int64,
 ) (*tree.FunctionName, error) {
-	lookupFlags := tree.CommonLookupFlags{
-		Required:       true,
-		IncludeOffline: true,
-		IncludeDropped: true,
-		AvoidLeased:    true,
-	}
-	_, dbDesc, err := sr.descCollection.GetImmutableDatabaseByID(ctx, sr.txn, fnDesc.GetParentID(), lookupFlags)
+	fn, err := sr.descCollection.ByIDWithLeased(sr.txn).WithoutNonPublic().Get().Function(ctx, descpb.ID(id))
 	if err != nil {
 		return nil, err
 	}
-	scDesc, err := sr.descCollection.GetImmutableSchemaByID(ctx, sr.txn, fnDesc.GetParentSchemaID(), lookupFlags)
+	return sr.getQualifiedFunctionName(ctx, fn)
+}
+
+func (sr *schemaResolver) getQualifiedFunctionName(
+	ctx context.Context, fnDesc catalog.FunctionDescriptor,
+) (*tree.FunctionName, error) {
+	dbDesc, err := sr.descCollection.ByIDWithLeased(sr.txn).Get().Database(ctx, fnDesc.GetParentID())
+	if err != nil {
+		return nil, err
+	}
+	scDesc, err := sr.descCollection.ByIDWithLeased(sr.txn).Get().Schema(ctx, fnDesc.GetParentSchemaID())
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +299,8 @@ func (sr *schemaResolver) ResolveType(
 	ctx context.Context, name *tree.UnresolvedObjectName,
 ) (*types.T, error) {
 	lookupFlags := tree.ObjectLookupFlags{
-		CommonLookupFlags: tree.CommonLookupFlags{Required: true, RequireMutable: false},
+		Required:          true,
+		RequireMutable:    false,
 		DesiredObjectKind: tree.TypeObject,
 	}
 	desc, prefix, err := resolver.ResolveExistingObject(ctx, sr, name, lookupFlags)
@@ -267,7 +316,7 @@ func (sr *schemaResolver) ResolveType(
 	tn := tree.MakeTypeNameWithPrefix(prefix.NamePrefix(), name.Object())
 	tdesc := desc.(catalog.TypeDescriptor)
 
-	// Disllow cross-database type resolution. Note that we check
+	// Disallow cross-database type resolution. Note that we check
 	// typeResolutionDbID != descpb.InvalidID when we have been restricted to
 	// accessing types in the database with ID = typeResolutionDbID by
 	// p.runWithOptions. So, check to see if the resolved descriptor's parentID
@@ -285,41 +334,38 @@ func (sr *schemaResolver) ResolveType(
 		return nil, err
 	}
 
-	return tdesc.MakeTypesT(ctx, &tn, sr)
+	return typedesc.HydratedTFromDesc(ctx, &tn, tdesc, sr)
 }
 
 // ResolveTypeByOID implements the tree.TypeReferenceResolver interface.
+// Note: Type resolution only works for OIDs of user-defined types. Builtin
+// types do not need to be hydrated.
 func (sr *schemaResolver) ResolveTypeByOID(ctx context.Context, oid oid.Oid) (*types.T, error) {
-	id, err := typedesc.UserDefinedTypeOIDToID(oid)
-	if err != nil {
-		return nil, err
-	}
-	name, desc, err := sr.GetTypeDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return desc.MakeTypesT(ctx, &name, sr)
+	return typedesc.ResolveHydratedTByOID(ctx, oid, sr)
 }
 
 // GetTypeDescriptor implements the catalog.TypeDescriptorResolver interface.
 func (sr *schemaResolver) GetTypeDescriptor(
 	ctx context.Context, id descpb.ID,
 ) (tree.TypeName, catalog.TypeDescriptor, error) {
-	desc, err := sr.descCollection.GetImmutableTypeByID(ctx, sr.txn, id, tree.ObjectLookupFlags{})
+	g := sr.byIDGetterBuilder().WithoutNonPublic().WithoutOtherParent(sr.typeResolutionDbID).Get()
+	desc, err := g.Type(ctx, id)
 	if err != nil {
 		return tree.TypeName{}, nil, err
 	}
-	// Note that the value of required doesn't matter for lookups by ID.
-	_, dbDesc, err := sr.descCollection.GetImmutableDatabaseByID(ctx, sr.txn, desc.GetParentID(), sr.CommonLookupFlags(true /* required */))
+	dbName := sr.CurrentDatabase()
+	if !descpb.IsVirtualTable(desc.GetID()) {
+		db, err := g.Database(ctx, desc.GetParentID())
+		if err != nil {
+			return tree.TypeName{}, nil, err
+		}
+		dbName = db.GetName()
+	}
+	sc, err := g.Schema(ctx, desc.GetParentSchemaID())
 	if err != nil {
 		return tree.TypeName{}, nil, err
 	}
-	sc, err := sr.descCollection.GetImmutableSchemaByID(
-		ctx, sr.txn, desc.GetParentSchemaID(), tree.SchemaLookupFlags{Required: true})
-	if err != nil {
-		return tree.TypeName{}, nil, err
-	}
-	name := tree.MakeQualifiedTypeName(dbDesc.GetName(), sc.GetName(), desc.GetName())
+	name := tree.MakeQualifiedTypeName(dbName, sc.GetName(), desc.GetName())
 	return name, desc, nil
 }
 
@@ -340,7 +386,8 @@ func (sr *schemaResolver) canResolveDescUnderSchema(
 	case catalog.SchemaUserDefined:
 		return sr.authAccessor.CheckPrivilegeForUser(ctx, scDesc, privilege.USAGE, sr.sessionDataStack.Top().User())
 	default:
-		panic(errors.AssertionFailedf("unknown schema kind %d", kind))
+		forLog := kind // prevents kind from escaping
+		panic(errors.AssertionFailedf("unknown schema kind %d", forLog))
 	}
 }
 
@@ -386,64 +433,20 @@ func (sr *schemaResolver) ResolveFunction(
 		return nil, pgerror.New(pgcode.FeatureNotSupported, "cross-database function references not allowed")
 	}
 
-	// Get builtin functions if there is any match.
+	// Get builtin and udf functions if there is any match.
 	builtinDef, err := tree.GetBuiltinFuncDefinition(fn, path)
 	if err != nil {
 		return nil, err
 	}
-
-	var udfDef *tree.ResolvedFunctionDefinition
-	if fn.ExplicitSchema && fn.Schema() != catconstants.CRDBInternalSchemaName {
-		found, prefix, err := sr.LookupSchema(ctx, sr.CurrentDatabase(), fn.Schema())
-		if err != nil {
-			return nil, err
-		}
-
-		if !found {
-			return nil, pgerror.Newf(pgcode.UndefinedSchema, "schema %q does not exist", fn.Schema())
-		}
-
-		sc := prefix.Schema
-		udfDef, _ = sc.GetResolvedFuncDefinition(fn.Object())
-	} else {
-		if err := path.IterateSearchPath(func(schema string) error {
-			found, prefix, err := sr.LookupSchema(ctx, sr.CurrentDatabase(), schema)
-			if err != nil {
-				return err
-			}
-			if !found {
-				return nil
-			}
-			curUdfDef, found := prefix.Schema.GetResolvedFuncDefinition(fn.Object())
-			if !found {
-				return nil
-			}
-
-			udfDef, err = udfDef.MergeWith(curUdfDef)
-			return err
-		}); err != nil {
-			return nil, err
-		}
+	udfDef, err := maybeLookUpUDF(ctx, sr, path, fn)
+	if err != nil {
+		return nil, err
 	}
 
-	if builtinDef == nil && udfDef == nil {
-		// If nothing found, there is a chance that user typed in a quoted function
-		// name which is not lowercase. So here we try to lowercase the given
-		// function name and find a suggested function name if possible.
-		extraMsg := ""
-		lowerName := tree.MakeUnresolvedName(strings.ToLower(name.Parts[0]))
-		if lowerName != *name {
-			alternative, err := sr.ResolveFunction(ctx, &lowerName, path)
-			if err == nil && alternative != nil {
-				extraMsg = fmt.Sprintf(", but %s() exists", alternative.Name)
-			}
-		}
-		return nil, errors.Wrapf(tree.ErrFunctionUndefined, "unknown function: %s()%s", tree.ErrString(name), extraMsg)
-	}
-	if builtinDef == nil {
-		return udfDef, nil
-	}
-	if udfDef == nil {
+	switch {
+	case builtinDef != nil && udfDef != nil:
+		return builtinDef.MergeWith(udfDef)
+	case builtinDef != nil:
 		props, _ := builtinsregistry.GetBuiltinProperties(builtinDef.Name)
 		if props.UnsupportedWithIssue != 0 {
 			// Note: no need to embed the function name in the message; the
@@ -458,42 +461,124 @@ func (sr *schemaResolver) ResolveFunction(
 			return nil, pgerror.Wrapf(unImplErr, pgcode.InvalidParameterValue, "%s()", builtinDef.Name)
 		}
 		return builtinDef, nil
+	case udfDef != nil:
+		return udfDef, nil
+	default:
+		return nil, makeFunctionUndefinedError(ctx, name, path, fn, sr)
+	}
+}
+
+// If nothing found, there is a chance that user typed in a quoted function
+// name which is not lowercase. So here we try to lowercase the given
+// function name and find a suggested function name if possible.
+func makeFunctionUndefinedError(
+	ctx context.Context,
+	name *tree.UnresolvedName,
+	path tree.SearchPath,
+	fn tree.FunctionName,
+	sr *schemaResolver,
+) error {
+	var lowerName tree.UnresolvedName
+	if fn.ExplicitSchema {
+		lowerName = tree.MakeUnresolvedName(strings.ToLower(name.Parts[0]), strings.ToLower(name.Parts[1]))
+	} else {
+		lowerName = tree.MakeUnresolvedName(strings.ToLower(name.Parts[0]))
+	}
+	wrap := func(err error) error { return err }
+	if lowerName != *name {
+		alternative, err := sr.ResolveFunction(ctx, &lowerName, path)
+		if err != nil {
+			switch pgerror.GetPGCode(err) {
+			case pgcode.UndefinedFunction, pgcode.UndefinedSchema:
+				// Lower-case function does not exist.
+			default:
+				return errors.Wrapf(err,
+					"failed to look up alternative name for %v which does not exist", &fn,
+				)
+			}
+		} else if alternative != nil {
+			wrap = func(err error) error {
+				return errors.WithHintf(
+					err, "lower-case alternative %s exists", &lowerName,
+				)
+			}
+		}
+	}
+	return wrap(errors.Wrapf(
+		tree.ErrFunctionUndefined, "unknown function: %s()", tree.ErrString(name),
+	))
+}
+
+func maybeLookUpUDF(
+	ctx context.Context, sr *schemaResolver, path tree.SearchPath, fn tree.FunctionName,
+) (*tree.ResolvedFunctionDefinition, error) {
+	if sr.txn == nil {
+		return nil, nil
 	}
 
-	return builtinDef.MergeWith(udfDef)
+	if fn.ExplicitSchema && fn.Schema() != catconstants.CRDBInternalSchemaName {
+		found, prefix, err := sr.LookupSchema(ctx, sr.CurrentDatabase(), fn.Schema())
+		if err != nil {
+			return nil, err
+		}
+
+		if !found {
+			return nil, pgerror.Newf(pgcode.UndefinedSchema, "schema %q does not exist", fn.Schema())
+		}
+
+		udfDef, _ := prefix.Schema.GetResolvedFuncDefinition(fn.Object())
+		return udfDef, nil
+	}
+
+	var udfDef *tree.ResolvedFunctionDefinition
+	for i, n := 0, path.NumElements(); i < n; i++ {
+		schema := path.GetSchema(i)
+		found, prefix, err := sr.LookupSchema(ctx, sr.CurrentDatabase(), schema)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		curUdfDef, found := prefix.Schema.GetResolvedFuncDefinition(fn.Object())
+		if !found {
+			continue
+		}
+		udfDef, err = udfDef.MergeWith(curUdfDef)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return udfDef, nil
 }
 
 func (sr *schemaResolver) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (name string, fn *tree.Overload, err error) {
+) (name *tree.FunctionName, fn *tree.Overload, err error) {
 	if !funcdesc.IsOIDUserDefinedFunc(oid) {
-		name, ok := tree.OidToBuiltinName[oid]
+		qol, ok := tree.OidToQualifiedBuiltinOverload[oid]
 		if !ok {
-			return "", nil, errors.Wrapf(tree.ErrFunctionUndefined, "function %d not found", oid)
+			return nil, nil, errors.Wrapf(tree.ErrFunctionUndefined, "function %d not found", oid)
 		}
-		funcDef := tree.FunDefs[name]
-		for _, o := range funcDef.Definition {
-			if o.Oid == oid {
-				return funcDef.Name, o, nil
-			}
-		}
+		fnName := tree.MakeQualifiedFunctionName(sr.CurrentDatabase(), qol.Schema, tree.OidToBuiltinName[oid])
+		return &fnName, qol.Overload, nil
 	}
 
-	flags := tree.ObjectLookupFlagsWithRequired()
-	flags.AvoidLeased = sr.skipDescriptorCache
-	descID, err := funcdesc.UserDefinedFunctionOIDToID(oid)
+	g := sr.byIDGetterBuilder().WithoutNonPublic().WithoutOtherParent(sr.typeResolutionDbID).Get()
+	descID := funcdesc.UserDefinedFunctionOIDToID(oid)
+	funcDesc, err := g.Function(ctx, descID)
 	if err != nil {
-		return "", nil, err
-	}
-	funcDesc, err := sr.descCollection.GetImmutableFunctionByID(ctx, sr.txn, descID, flags)
-	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	ret, err := funcDesc.ToOverload()
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
-	return funcDesc.GetName(), ret, nil
+	fnName, err := sr.getQualifiedFunctionName(ctx, funcDesc)
+	if err != nil {
+		return nil, nil, err
+	}
+	return fnName, ret, nil
 }
 
 // NewSkippingCacheSchemaResolver constructs a schemaResolver which always skip

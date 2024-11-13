@@ -11,6 +11,8 @@
 package distribution
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
@@ -22,7 +24,9 @@ import (
 
 // CanProvide returns true if the given operator returns rows that can
 // satisfy the given required distribution.
-func CanProvide(evalCtx *eval.Context, expr memo.RelExpr, required *physical.Distribution) bool {
+func CanProvide(
+	ctx context.Context, evalCtx *eval.Context, expr memo.RelExpr, required *physical.Distribution,
+) bool {
 	if required.Any() {
 		return true
 	}
@@ -40,7 +44,11 @@ func CanProvide(evalCtx *eval.Context, expr memo.RelExpr, required *physical.Dis
 
 	case *memo.ScanExpr:
 		tabMeta := t.Memo().Metadata().TableMeta(t.Table)
-		provided.FromIndexScan(evalCtx, tabMeta, t.Index, t.Constraint)
+		if t.Distribution.Regions != nil {
+			provided = t.Distribution
+		} else {
+			provided.FromIndexScan(ctx, evalCtx, tabMeta, t.Index, t.Constraint)
+		}
 
 	case *memo.LookupJoinExpr:
 		if t.LocalityOptimized {
@@ -86,7 +94,7 @@ func BuildChildRequired(
 // This function assumes that the provided distributions have already been set in
 // the children of the expression.
 func BuildProvided(
-	evalCtx *eval.Context, expr memo.RelExpr, required *physical.Distribution,
+	ctx context.Context, evalCtx *eval.Context, expr memo.RelExpr, required *physical.Distribution,
 ) physical.Distribution {
 	var provided physical.Distribution
 	switch t := expr.(type) {
@@ -98,7 +106,11 @@ func BuildProvided(
 
 	case *memo.ScanExpr:
 		tabMeta := t.Memo().Metadata().TableMeta(t.Table)
-		provided.FromIndexScan(evalCtx, tabMeta, t.Index, t.Constraint)
+		if t.Distribution.Regions != nil {
+			provided = t.Distribution
+		} else {
+			provided.FromIndexScan(ctx, evalCtx, tabMeta, t.Index, t.Constraint)
+		}
 
 	default:
 		// TODO(msirek): Clarify the distinction between a distribution which can
@@ -139,14 +151,21 @@ func GetDEnumAsStringFromConstantExpr(expr opt.Expr) (enumAsString string, ok bo
 
 // BuildLookupJoinLookupTableDistribution builds the Distribution that results
 // from performing lookups of a LookupJoin, if that distribution can be
-// statically determined.
+// statically determined. If crdbRegionColID is non-zero, it is the column ID
+// of the input REGIONAL BY ROW table holding the crdb_region column, and
+// inputDistribution is the distribution of the operation on that table
+// (Scan or LocalityOptimizedSearch).
 func BuildLookupJoinLookupTableDistribution(
-	evalCtx *eval.Context, lookupJoin *memo.LookupJoinExpr,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	lookupJoin *memo.LookupJoinExpr,
+	crdbRegionColID opt.ColumnID,
+	inputDistribution physical.Distribution,
 ) (provided physical.Distribution) {
 	lookupTableMeta := lookupJoin.Memo().Metadata().TableMeta(lookupJoin.Table)
 	lookupTable := lookupTableMeta.Table
 
-	if lookupJoin.LocalityOptimized {
+	if lookupJoin.LocalityOptimized || lookupJoin.ChildOfLocalityOptimizedSearch {
 		provided.FromLocality(evalCtx.Locality)
 		return provided
 	} else if lookupTable.IsGlobalTable() {
@@ -173,8 +192,15 @@ func BuildLookupJoinLookupTableDistribution(
 					return provided
 				}
 			}
-		} else if lookupJoin.LookupJoinPrivate.LookupColsAreTableKey &&
-			len(lookupJoin.LookupJoinPrivate.LookupExpr) > 0 {
+			if crdbRegionColID == firstKeyColID {
+				provided.FromIndexScan(ctx, evalCtx, lookupTableMeta, lookupJoin.Index, nil)
+				if !inputDistribution.Any() &&
+					(provided.Any() || len(provided.Regions) > len(inputDistribution.Regions)) {
+					return inputDistribution
+				}
+				return provided
+			}
+		} else if len(lookupJoin.LookupJoinPrivate.LookupExpr) > 0 {
 			if filterIdx, ok := lookupJoin.GetConstPrefixFilter(lookupJoin.Memo().Metadata()); ok {
 				firstIndexColEqExpr := lookupJoin.LookupJoinPrivate.LookupExpr[filterIdx].Condition
 				if firstIndexColEqExpr.Op() == opt.EqOp {
@@ -183,10 +209,18 @@ func BuildLookupJoinLookupTableDistribution(
 						return provided
 					}
 				}
+			} else if lookupJoin.ColIsEquivalentWithLookupIndexPrefix(lookupJoin.Memo().Metadata(), crdbRegionColID) {
+				// We have a `crdb_region = crdb_region` term in `LookupJoinPrivate.LookupExpr`.
+				provided.FromIndexScan(ctx, evalCtx, lookupTableMeta, lookupJoin.Index, nil)
+				if !inputDistribution.Any() &&
+					(provided.Any() || len(provided.Regions) > len(inputDistribution.Regions)) {
+					return inputDistribution
+				}
+				return provided
 			}
 		}
 	}
-	provided.FromIndexScan(evalCtx, lookupTableMeta, lookupJoin.Index, nil)
+	provided.FromIndexScan(ctx, evalCtx, lookupTableMeta, lookupJoin.Index, nil)
 	return provided
 }
 
@@ -194,7 +228,7 @@ func BuildLookupJoinLookupTableDistribution(
 // from performing lookups of an inverted join, if that distribution can be
 // statically determined.
 func BuildInvertedJoinLookupTableDistribution(
-	evalCtx *eval.Context, invertedJoin *memo.InvertedJoinExpr,
+	ctx context.Context, evalCtx *eval.Context, invertedJoin *memo.InvertedJoinExpr,
 ) (provided physical.Distribution) {
 	lookupTableMeta := invertedJoin.Memo().Metadata().TableMeta(invertedJoin.Table)
 	lookupTable := lookupTableMeta.Table
@@ -215,7 +249,7 @@ func BuildInvertedJoinLookupTableDistribution(
 			}
 		}
 	}
-	provided.FromIndexScan(evalCtx, lookupTableMeta, invertedJoin.Index, nil)
+	provided.FromIndexScan(ctx, evalCtx, lookupTableMeta, invertedJoin.Index, nil)
 	return provided
 }
 

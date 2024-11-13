@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/errors"
 )
 
 // PlaceholderIdx is the 0-based index of a placeholder. Placeholder "$1"
@@ -96,10 +95,6 @@ type PlaceholderTypesInfo struct {
 	// Types contains the final types set for each placeholder after type
 	// checking.
 	Types PlaceholderTypes
-
-	// FromSQLPrepare is true when the placeholder is in a statement from a
-	// PREPARE SQL stmt (rather than a pgwire prepare stmt).
-	FromSQLPrepare bool
 }
 
 // Type returns the known type of a placeholder. If there is no known type yet
@@ -139,7 +134,12 @@ func (p *PlaceholderTypesInfo) SetType(idx PlaceholderIdx, typ *types.T) error {
 				pgcode.DatatypeMismatch,
 				"placeholder %s already has type %s, cannot assign %s", idx, t, typ)
 		}
-		return nil
+		// If `t` is not ambiguous or if `typ` is ambiguous, then we shouldn't
+		// change the type that's already set. Otherwise, we can use `typ` since
+		// it is more specific.
+		if !t.IsAmbiguous() || typ.IsAmbiguous() {
+			return nil
+		}
 	}
 	p.Types[idx] = typ
 	return nil
@@ -154,25 +154,15 @@ type PlaceholderInfo struct {
 
 // Init initializes a PlaceholderInfo structure appropriate for the given number
 // of placeholders, and with the given (optional) type hints.
-func (p *PlaceholderInfo) Init(
-	numPlaceholders int, typeHints PlaceholderTypes, fromSQL bool,
-) error {
-	if fromSQL {
-		if typeHints == nil { // This should not happen, but...
-			return errors.AssertionFailedf("There should be at least one type hint for a sql-level PREPARE statement")
-		}
-		p.Types = make(PlaceholderTypes, len(typeHints))
-	} else {
-		p.Types = make(PlaceholderTypes, numPlaceholders)
-	}
-
+func (p *PlaceholderInfo) Init(numPlaceholders int, typeHints PlaceholderTypes) error {
 	if typeHints == nil {
 		p.TypeHints = make(PlaceholderTypes, numPlaceholders)
+		p.Types = make(PlaceholderTypes, numPlaceholders)
 	} else {
+		p.Types = make(PlaceholderTypes, len(typeHints))
 		p.TypeHints = typeHints
 	}
 	p.Values = nil
-	p.FromSQLPrepare = fromSQL
 	return nil
 }
 
@@ -183,7 +173,7 @@ func (p *PlaceholderInfo) Assign(src *PlaceholderInfo, numPlaceholders int) erro
 		*p = *src
 		return nil
 	}
-	return p.Init(numPlaceholders, nil /* typeHints */, false /* fromSQL */)
+	return p.Init(numPlaceholders, nil /* typeHints */)
 }
 
 // MaybeExtendTypes is to fill the nil types with the type hints, if exists.

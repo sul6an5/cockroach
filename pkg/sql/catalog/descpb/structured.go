@@ -16,7 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
 // ID, ColumnID, FamilyID, and IndexID are all uint32, but are each given a
@@ -158,12 +158,12 @@ func (c ColumnIDs) Equals(input ColumnIDs) bool {
 // PermutationOf returns true if this list and the input list contain the same
 // set of column IDs in any order. Duplicate ColumnIDs have no effect.
 func (c ColumnIDs) PermutationOf(input ColumnIDs) bool {
-	ourColsSet := util.MakeFastIntSet()
+	ourColsSet := intsets.MakeFast()
 	for _, col := range c {
 		ourColsSet.Add(int(col))
 	}
 
-	inputColsSet := util.MakeFastIntSet()
+	inputColsSet := intsets.MakeFast()
 	for _, inputCol := range input {
 		inputColsSet.Add(int(inputCol))
 	}
@@ -180,23 +180,6 @@ func (c ColumnIDs) Contains(i ColumnID) bool {
 	}
 	return false
 }
-
-// IndexDescriptorEncodingType is a custom type to represent different encoding types
-// for secondary indexes.
-type IndexDescriptorEncodingType uint32
-
-const (
-	// SecondaryIndexEncoding corresponds to the standard way of encoding secondary indexes
-	// as described in docs/tech-notes/encoding.md. We allow the 0 value of this type
-	// to have a value so that existing descriptors are encoding using this encoding.
-	SecondaryIndexEncoding IndexDescriptorEncodingType = iota
-	// PrimaryIndexEncoding corresponds to when a secondary index is encoded using the
-	// primary index encoding as described in docs/tech-notes/encoding.md.
-	PrimaryIndexEncoding
-)
-
-// Remove unused warning.
-var _ = SecondaryIndexEncoding
 
 // MutationID is a custom type for TableDescriptor mutations.
 type MutationID uint32
@@ -334,37 +317,6 @@ func (DescriptorMutation_State) SafeValue() {}
 
 // SafeValue implements the redact.SafeValue interface.
 func (DescriptorState) SafeValue() {}
-
-// SafeValue implements the redact.SafeValue interface.
-func (ConstraintType) SafeValue() {}
-
-// UniqueConstraint is an interface for a unique constraint. It allows
-// both UNIQUE indexes and UNIQUE WITHOUT INDEX constraints to serve as
-// the referenced side of a foreign key constraint.
-type UniqueConstraint interface {
-	// IsValidReferencedUniqueConstraint returns whether the unique constraint can
-	// serve as a referenced unique constraint for a foreign key constraint with the
-	// provided set of referencedColumnIDs.
-	IsValidReferencedUniqueConstraint(referencedColIDs ColumnIDs) bool
-
-	// GetName returns the constraint name.
-	GetName() string
-}
-
-var _ UniqueConstraint = &UniqueWithoutIndexConstraint{}
-var _ UniqueConstraint = &IndexDescriptor{}
-
-// IsValidReferencedUniqueConstraint is part of the UniqueConstraint interface.
-func (u *UniqueWithoutIndexConstraint) IsValidReferencedUniqueConstraint(
-	referencedColIDs ColumnIDs,
-) bool {
-	return !u.IsPartial() && ColumnIDs(u.ColumnIDs).PermutationOf(referencedColIDs)
-}
-
-// GetName is part of the UniqueConstraint interface.
-func (u *UniqueWithoutIndexConstraint) GetName() string {
-	return u.Name
-}
 
 // IsPartial returns true if the constraint is a partial unique constraint.
 func (u *UniqueWithoutIndexConstraint) IsPartial() bool {

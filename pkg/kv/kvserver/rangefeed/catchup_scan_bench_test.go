@@ -19,6 +19,8 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -30,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -45,13 +46,14 @@ func runCatchUpBenchmark(b *testing.B, emk engineMaker, opts benchOptions) (numE
 		EndKey: endKey,
 	}
 
+	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		func() {
-			iter := rangefeed.NewCatchUpIterator(eng, span, opts.ts, nil)
+			iter := rangefeed.NewCatchUpIterator(eng, span, opts.ts, nil, nil)
 			defer iter.Close()
 			counter := 0
-			err := iter.CatchUpScan(func(*roachpb.RangeFeedEvent) error {
+			err := iter.CatchUpScan(ctx, func(*kvpb.RangeFeedEvent) error {
 				counter++
 				return nil
 			}, opts.withDiff)
@@ -201,7 +203,6 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 	opts.FS = vfs.Default
 	opts.LBaseMaxBytes = lBaseMaxBytes
 	opts.ReadOnly = readOnly
-	opts.FormatMajorVersion = pebble.FormatRangeKeys
 	peb, err := storage.NewPebble(
 		context.Background(),
 		storage.PebbleConfig{
@@ -230,6 +231,7 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 func setupData(
 	ctx context.Context, b *testing.B, emk engineMaker, opts benchDataOptions,
 ) (storage.Engine, string) {
+	verStr := fmt.Sprintf("v%s", clusterversion.TestingBinaryVersion.String())
 	orderStr := "linear"
 	if opts.randomKeyOrder {
 		orderStr = "random"
@@ -238,8 +240,8 @@ func setupData(
 	if opts.readOnlyEngine {
 		readOnlyStr = "_readonly"
 	}
-	loc := fmt.Sprintf("rangefeed_bench_data_%s%s_%d_%d_%d_%d",
-		orderStr, readOnlyStr, opts.numKeys, opts.valueBytes, opts.lBaseMaxBytes, opts.numRangeKeys)
+	loc := fmt.Sprintf("rangefeed_bench_data_%s_%s%s_%d_%d_%d_%d",
+		verStr, orderStr, readOnlyStr, opts.numKeys, opts.valueBytes, opts.lBaseMaxBytes, opts.numRangeKeys)
 	exists := true
 	if _, err := os.Stat(loc); oserror.IsNotExist(err) {
 		exists = false
@@ -247,13 +249,18 @@ func setupData(
 		b.Fatal(err)
 	}
 
+	absPath, err := filepath.Abs(loc)
+	if err != nil {
+		absPath = loc
+	}
 	if exists {
+		log.Infof(ctx, "using existing refresh range benchmark data: %s", absPath)
 		testutils.ReadAllFiles(filepath.Join(loc, "*"))
 		return emk(b, loc, opts.lBaseMaxBytes, opts.readOnlyEngine), loc
 	}
 
 	eng := emk(b, loc, opts.lBaseMaxBytes, false)
-	log.Infof(ctx, "creating rangefeed benchmark data: %s", loc)
+	log.Infof(ctx, "creating rangefeed benchmark data: %s", absPath)
 
 	// Generate the same data every time.
 	rng := rand.New(rand.NewSource(1449168817))

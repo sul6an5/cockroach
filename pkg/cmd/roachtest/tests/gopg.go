@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/errors"
 )
@@ -88,16 +89,8 @@ func registerGopg(r registry.Registry) {
 		); err != nil {
 			t.Fatal(err)
 		}
-
-		blocklistName, expectedFailures, ignorelistName, ignorelist := gopgBlocklists.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No gopg blocklist defined for cockroach version %s", version)
-		}
-		if ignorelist == nil {
-			t.Fatalf("No gopg ignorelist defined for cockroach version %s", version)
-		}
 		t.L().Printf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
-			version, blocklistName, ignorelistName)
+			version, "gopgBlockList", "gopgIgnoreList")
 
 		if err := c.RunE(ctx, node, fmt.Sprintf("mkdir -p %s", resultsDirPath)); err != nil {
 			t.Fatal(err)
@@ -115,16 +108,10 @@ func registerGopg(r registry.Registry) {
 				destPath, removeColorCodes, resultsFilePath),
 		)
 
-		// Expected to fail but we should still scan the error to check if
-		// there's an SSH/roachprod error.
-		if err != nil {
-			// install.NonZeroExitCode includes unrelated to SSH errors ("255")
-			// or roachprod errors, so we call t.Fatal if the error is not an
-			// install.NonZeroExitCode error
-			commandError := (*install.NonZeroExitCode)(nil)
-			if !errors.As(err, &commandError) {
-				t.Fatal(err)
-			}
+		// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+		// Proceed for any other (command) errors
+		if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+			t.Fatal(err)
 		}
 
 		rawResults := []byte(result.Stdout + result.Stderr)
@@ -136,7 +123,7 @@ func registerGopg(r registry.Registry) {
 		// test suites in themselves. Those are run with TestGinkgo test harness.
 		// First, we parse the result of running TestGinkgo.
 		if err := gopgParseTestGinkgoOutput(
-			results, rawResults, expectedFailures, ignorelist,
+			results, rawResults, gopgBlockList, gopgIgnoreList,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -152,30 +139,24 @@ func registerGopg(r registry.Registry) {
 				destPath, goPath, resultsFilePath, goPath),
 		)
 
-		// Expected to fail but we should still scan the error to check if
-		// there's an SSH/roachprod error.
-		if err != nil {
-			// install.NonZeroExitCode includes unrelated to SSH errors ("255")
-			// or roachprod errors, so we call t.Fatal if the error is not an
-			// install.NonZeroExitCode error
-			commandError := (*install.NonZeroExitCode)(nil)
-			if !errors.As(err, &commandError) {
-				t.Fatal(err)
-			}
+		// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+		// Proceed for any other (command) errors
+		if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+			t.Fatal(err)
 		}
 
 		xmlResults := []byte(result.Stdout + result.Stderr)
 
-		results.parseJUnitXML(t, expectedFailures, ignorelist, xmlResults)
+		results.parseJUnitXML(t, gopgBlockList, gopgIgnoreList, xmlResults)
 		results.summarizeFailed(
-			t, "gopg", blocklistName, expectedFailures, version, gopgSupportedTag,
+			t, "gopg", "gopgBlockList", gopgBlockList, version, gopgSupportedTag,
 			0, /* notRunCount */
 		)
 	}
 
 	r.Add(registry.TestSpec{
 		Name:    "gopg",
-		Owner:   registry.OwnerSQLExperience,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
 		Tags:    []string{`default`, `orm`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {

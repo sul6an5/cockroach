@@ -61,7 +61,7 @@ func (ot *OptTester) ReorderJoins() (string, error) {
 			ot.separator("-")
 			ot.output(fmt.Sprintf("Join Tree #%d\n", treeNum))
 			ot.separator("-")
-			ot.indent(o.FormatExpr(join, memo.ExprFmtHideAll))
+			ot.indent(o.FormatExpr(join, memo.ExprFmtHideAll, false /* redactableValues */))
 			ot.output("Vertexes\n")
 			for i := range vertexes {
 				ot.indent(jof.formatVertex(vertexes[i]))
@@ -113,16 +113,15 @@ func (ot *OptTester) ReorderJoins() (string, error) {
 type joinOrderFormatter struct {
 	o *xform.Optimizer
 
-	// relLabels is a map from the first ColumnID of each base relation to its
-	// assigned label.
-	relLabels map[opt.ColumnID]string
+	// relLabels is a map from each base relation to its assigned label.
+	relLabels map[memo.RelExpr]string
 }
 
 // newJoinOrderFormatter returns an initialized joinOrderFormatter.
 func newJoinOrderFormatter(o *xform.Optimizer) *joinOrderFormatter {
 	return &joinOrderFormatter{
 		o:         o,
-		relLabels: make(map[opt.ColumnID]string),
+		relLabels: make(map[memo.RelExpr]string),
 	}
 }
 
@@ -132,7 +131,7 @@ func (jof *joinOrderFormatter) formatVertex(vertex memo.RelExpr) string {
 	var b strings.Builder
 	b.WriteString(jof.relLabel(vertex))
 	b.WriteString(":\n")
-	expr := jof.o.FormatExpr(vertex, memo.ExprFmtHideAll)
+	expr := jof.o.FormatExpr(vertex, memo.ExprFmtHideAll, false /* redactableValues */)
 	expr = strings.TrimRight(expr, " \n\t\r")
 	lines := strings.Split(expr, "\n")
 	for _, line := range lines {
@@ -162,7 +161,9 @@ func (jof *joinOrderFormatter) formatEdge(edge xform.OnReorderEdgeParam) string 
 			if i != 0 {
 				b.WriteString(", ")
 			}
-			b.WriteString(strings.TrimSuffix(jof.o.FormatExpr(&edge.Filters[i], memo.ExprFmtHideAll), "\n"))
+			b.WriteString(strings.TrimSuffix(
+				jof.o.FormatExpr(&edge.Filters[i], memo.ExprFmtHideAll, false /* redactableValues*/), "\n",
+			))
 		}
 	}
 	b.WriteString(fmt.Sprintf(
@@ -195,11 +196,7 @@ func (jof *joinOrderFormatter) formatRules(rules []xform.OnReorderRuleParam) str
 // relLabel returns the label for the given relation. Labels will follow the
 // pattern A, B, ..., Z, A1, B1, etc.
 func (jof *joinOrderFormatter) relLabel(e memo.RelExpr) string {
-	firstCol, ok := e.Relational().OutputCols.Next(0)
-	if !ok {
-		panic(errors.AssertionFailedf("failed to retrieve column from %v", e.Op()))
-	}
-	if label, ok := jof.relLabels[firstCol]; ok {
+	if label, ok := jof.relLabels[e]; ok {
 		return label
 	}
 	const lenAlphabet = 26
@@ -210,7 +207,7 @@ func (jof *joinOrderFormatter) relLabel(e memo.RelExpr) string {
 		// Names will follow the pattern: A, B, ..., Z, A1, B1, etc.
 		label += strconv.Itoa(number)
 	}
-	jof.relLabels[firstCol] = label
+	jof.relLabels[e] = label
 	return label
 }
 
